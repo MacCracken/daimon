@@ -2,7 +2,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 
 fn bench_config_default(c: &mut Criterion) {
     c.bench_function("config_default", |b| {
-        b.iter(|| daimon::Config::default());
+        b.iter(daimon::Config::default);
     });
 }
 

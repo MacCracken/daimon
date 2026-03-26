@@ -70,9 +70,7 @@ impl IntoResponse for DaimonError {
                 (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
             }
             DaimonError::IpcError(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
-            DaimonError::SchedulerError(_) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
-            }
+            DaimonError::SchedulerError(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
             DaimonError::FederationError(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
             }
