@@ -1,26 +1,8 @@
 # Daimon Roadmap
 
-## Completed
-
-- [x] Initial scaffold (0.1.0)
-- [x] Error types with axum IntoResponse
-- [x] Config with serde + defaults
-- [x] Module stubs for all subsystems
-- [x] CI/CD pipelines
-
 ## Backlog
 
-- [ ] Extract HTTP API handlers from `userland/agent-runtime/src/http_api/`
-- [ ] Extract supervisor from `userland/agent-runtime/src/supervisor/`
-- [ ] Extract IPC from `userland/agent-runtime/src/ipc.rs`
-- [ ] Extract scheduler from `userland/agent-runtime/src/scheduler/`
-- [ ] Extract federation from `userland/agent-runtime/src/federation/`
-- [ ] Extract edge fleet from `userland/agent-runtime/src/edge/`
-- [ ] Extract memory/vector/RAG stores
-- [ ] Extract MCP dispatch from `userland/agent-runtime/src/mcp_server/`
-- [ ] Extract screen capture/recording
-- [ ] Integration tests (full HTTP round-trip)
-- [ ] Benchmark suite (agent registration throughput, API latency, MCP dispatch)
+_(empty — all extraction and scaffolding work is complete)_
 
 ## Future
 
