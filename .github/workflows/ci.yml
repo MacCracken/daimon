@@ -17,6 +17,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: MacCracken/agnostik
+          path: ../agnostik
+      - uses: actions/checkout@v4
+        with:
+          repository: MacCracken/agnosys
+          path: ../agnosys
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -29,6 +37,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: MacCracken/agnostik
+          path: ../agnostik
+      - uses: actions/checkout@v4
+        with:
+          repository: MacCracken/agnosys
+          path: ../agnosys
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo install cargo-audit
       - run: cargo audit
@@ -37,6 +53,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: MacCracken/agnostik
+          path: ../agnostik
+      - uses: actions/checkout@v4
+        with:
+          repository: MacCracken/agnosys
+          path: ../agnosys
       - uses: EmbarkStudios/cargo-deny-action@v2
   test:
     name: Test (${{ matrix.os }})
@@ -50,6 +74,14 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: MacCracken/agnostik
+          path: ../agnostik
+      - uses: actions/checkout@v4
+        with:
+          repository: MacCracken/agnosys
+          path: ../agnosys
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-features
@@ -59,6 +91,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: MacCracken/agnostik
+          path: ../agnostik
+      - uses: actions/checkout@v4
+        with:
+          repository: MacCracken/agnosys
+          path: ../agnosys
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.89"
@@ -71,6 +111,14 @@ jobs:
     needs: [check]
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: MacCracken/agnostik
+          path: ../agnostik
+      - uses: actions/checkout@v4
+        with:
+          repository: MacCracken/agnosys
+          path: ../agnosys
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
@@ -95,6 +143,14 @@ jobs:
     needs: [check]
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: MacCracken/agnostik
+          path: ../agnostik
+      - uses: actions/checkout@v4
+        with:
+          repository: MacCracken/agnosys
+          path: ../agnosys
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
@@ -104,5 +160,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: MacCracken/agnostik
+          path: ../agnostik
+      - uses: actions/checkout@v4
+        with:
+          repository: MacCracken/agnosys
+          path: ../agnosys
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo bench --all-features -- --test
