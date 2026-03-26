@@ -13,7 +13,12 @@
 pub fn try_init() {
     use tracing_subscriber::EnvFilter;
 
-    let filter = EnvFilter::try_from_env("DAIMON_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_env("DAIMON_LOG").unwrap_or_else(|e| {
+        if std::env::var("DAIMON_LOG").is_ok() {
+            eprintln!("daimon: invalid DAIMON_LOG filter, falling back to 'info': {e}");
+        }
+        EnvFilter::new("info")
+    });
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)

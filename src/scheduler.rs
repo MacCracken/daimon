@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -762,13 +762,12 @@ impl CronScheduler {
                 true
             };
 
+            let current_hour = now.time().hour() as u8;
+            let current_minute = now.time().minute() as u8;
             let time_matches = match (entry.specific_hour, entry.specific_minute) {
-                (Some(h), Some(m)) => {
-                    now.format("%H").to_string().parse::<u8>().unwrap_or(0) == h
-                        && now.format("%M").to_string().parse::<u8>().unwrap_or(0) == m
-                }
-                (Some(h), None) => now.format("%H").to_string().parse::<u8>().unwrap_or(0) == h,
-                (None, Some(m)) => now.format("%M").to_string().parse::<u8>().unwrap_or(0) == m,
+                (Some(h), Some(m)) => current_hour == h && current_minute == m,
+                (Some(h), None) => current_hour == h,
+                (None, Some(m)) => current_minute == m,
                 (None, None) => true,
             };
 

@@ -55,10 +55,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/health", get(health))
         // Agents (supervisor)
         .route("/v1/agents", get(list_agents))
-        .route("/v1/agents/:agent_id", get(get_agent))
+        .route("/v1/agents/{agent_id}", get(get_agent))
         // MCP
         .route("/v1/mcp/tools", get(list_mcp_tools).post(register_mcp_tool))
-        .route("/v1/mcp/tools/:name", delete(deregister_mcp_tool))
+        .route("/v1/mcp/tools/{name}", delete(deregister_mcp_tool))
         .route("/v1/mcp/call", post(call_mcp_tool))
         // RAG
         .route("/v1/rag/ingest", post(rag_ingest))
@@ -68,24 +68,24 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/v1/edge/nodes",
             get(list_edge_nodes).post(register_edge_node),
         )
-        .route("/v1/edge/nodes/:node_id", get(get_edge_node))
-        .route("/v1/edge/nodes/:node_id/heartbeat", post(edge_heartbeat))
+        .route("/v1/edge/nodes/{node_id}", get(get_edge_node))
+        .route("/v1/edge/nodes/{node_id}/heartbeat", post(edge_heartbeat))
         .route(
-            "/v1/edge/nodes/:node_id/decommission",
+            "/v1/edge/nodes/{node_id}/decommission",
             post(edge_decommission),
         )
         .route("/v1/edge/stats", get(edge_stats))
         // Scheduler
         .route("/v1/scheduler/tasks", get(list_tasks).post(submit_task))
-        .route("/v1/scheduler/tasks/:task_id", get(get_task))
-        .route("/v1/scheduler/tasks/:task_id/cancel", post(cancel_task))
+        .route("/v1/scheduler/tasks/{task_id}", get(get_task))
+        .route("/v1/scheduler/tasks/{task_id}/cancel", post(cancel_task))
         .route("/v1/scheduler/nodes", post(register_scheduler_node))
         .route("/v1/scheduler/schedule", post(schedule_pending))
         .route("/v1/scheduler/stats", get(scheduler_stats))
         // Metrics
         .route("/v1/metrics", get(metrics))
         .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive())
+        .layer(CorsLayer::new())
         .with_state(state)
 }
 
@@ -259,7 +259,7 @@ async fn list_agents(State(state): State<Arc<AppState>>) -> Json<serde_json::Val
     Json(serde_json::json!({ "agents": agents }))
 }
 
-/// GET /v1/agents/:agent_id — get single agent health
+/// GET /v1/agents/{agent_id} — get single agent health
 async fn get_agent(
     State(state): State<Arc<AppState>>,
     Path(agent_id): Path<String>,
@@ -301,7 +301,7 @@ async fn register_mcp_tool(
     ))
 }
 
-/// DELETE /v1/mcp/tools/:name — deregister an external tool
+/// DELETE /v1/mcp/tools/{name} — deregister an external tool
 async fn deregister_mcp_tool(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -319,9 +319,12 @@ async fn call_mcp_tool(
     Json(call): Json<McpToolCall>,
 ) -> std::result::Result<Json<McpToolResult>, DaimonError> {
     let reg = state.mcp.read().await;
-    let _tool = reg
-        .find_tool(&call.name)
-        .ok_or_else(|| DaimonError::AgentNotFound(format!("tool not found: {}", call.name)))?;
+    if reg.find_tool(&call.name).is_none() {
+        return Err(DaimonError::AgentNotFound(format!(
+            "tool not found: {}",
+            call.name
+        )));
+    }
 
     // For external tools, we would forward to the callback URL.
     // For built-in tools, dispatch here. Currently return a placeholder.
@@ -377,7 +380,11 @@ async fn list_edge_nodes(
     let nodes = mgr.list_nodes(filter);
     let list: Vec<serde_json::Value> = nodes
         .iter()
-        .filter_map(|n| serde_json::to_value(n).ok())
+        .filter_map(|n| {
+            serde_json::to_value(n)
+                .inspect_err(|e| tracing::warn!("failed to serialize edge node: {e}"))
+                .ok()
+        })
         .collect();
     Json(serde_json::json!({ "nodes": list }))
 }
@@ -399,7 +406,7 @@ async fn register_edge_node(
     Ok((StatusCode::CREATED, Json(serde_json::json!({ "id": id }))))
 }
 
-/// GET /v1/edge/nodes/:node_id
+/// GET /v1/edge/nodes/{node_id}
 async fn get_edge_node(
     State(state): State<Arc<AppState>>,
     Path(node_id): Path<String>,
@@ -413,7 +420,7 @@ async fn get_edge_node(
     Ok(Json(val))
 }
 
-/// POST /v1/edge/nodes/:node_id/heartbeat
+/// POST /v1/edge/nodes/{node_id}/heartbeat
 async fn edge_heartbeat(
     State(state): State<Arc<AppState>>,
     Path(node_id): Path<String>,
@@ -426,7 +433,7 @@ async fn edge_heartbeat(
     }))
 }
 
-/// POST /v1/edge/nodes/:node_id/decommission
+/// POST /v1/edge/nodes/{node_id}/decommission
 async fn edge_decommission(
     State(state): State<Arc<AppState>>,
     Path(node_id): Path<String>,
@@ -451,7 +458,11 @@ async fn list_tasks(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
     let pending = sched.pending_tasks();
     let tasks: Vec<serde_json::Value> = pending
         .iter()
-        .filter_map(|t| serde_json::to_value(t).ok())
+        .filter_map(|t| {
+            serde_json::to_value(t)
+                .inspect_err(|e| tracing::warn!("failed to serialize task: {e}"))
+                .ok()
+        })
         .collect();
     Json(serde_json::json!({
         "stats": stats,
@@ -484,7 +495,7 @@ async fn submit_task(
     ))
 }
 
-/// GET /v1/scheduler/tasks/:task_id
+/// GET /v1/scheduler/tasks/{task_id}
 async fn get_task(
     State(state): State<Arc<AppState>>,
     Path(task_id): Path<String>,
@@ -498,7 +509,7 @@ async fn get_task(
     Ok(Json(val))
 }
 
-/// POST /v1/scheduler/tasks/:task_id/cancel
+/// POST /v1/scheduler/tasks/{task_id}/cancel
 async fn cancel_task(
     State(state): State<Arc<AppState>>,
     Path(task_id): Path<String>,
@@ -543,7 +554,11 @@ async fn schedule_pending(State(state): State<Arc<AppState>>) -> Json<serde_json
     let decisions = sched.schedule_pending();
     let list: Vec<serde_json::Value> = decisions
         .iter()
-        .filter_map(|d| serde_json::to_value(d).ok())
+        .filter_map(|d| {
+            serde_json::to_value(d)
+                .inspect_err(|e| tracing::warn!("failed to serialize decision: {e}"))
+                .ok()
+        })
         .collect();
     Json(serde_json::json!({ "decisions": list }))
 }

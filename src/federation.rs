@@ -131,7 +131,7 @@ impl Default for FederationConfig {
         Self {
             enabled: false,
             node_name: "node-1".into(),
-            bind_addr: "127.0.0.1:8091".parse().unwrap(),
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 8091)),
             peers: HashMap::new(),
             scheduling_strategy: SchedulingStrategy::Balanced,
         }

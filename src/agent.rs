@@ -5,12 +5,10 @@
 //! the [`agnostik`] crate; this module adds the stateful process wrapper that
 //! manages a running agent's OS process, IPC handle, and (optionally) sandbox.
 
-use std::path::PathBuf;
-use std::process::Stdio;
-use std::time::Instant;
-
 use agnostik::{AgentConfig, AgentId, AgentStatus, ResourceUsage, StopReason};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::process::Stdio;
 use tokio::process::{Child, Command};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -71,7 +69,8 @@ pub struct Agent {
     config: AgentConfig,
     status: RwLock<AgentStatus>,
     process: Option<Child>,
-    started_at: Option<Instant>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
     #[cfg(feature = "sandbox")]
     _sandbox: Option<kavach::Sandbox>,
 }
@@ -89,6 +88,7 @@ impl Agent {
             config,
             status: RwLock::new(AgentStatus::Pending),
             process: None,
+            created_at: chrono::Utc::now(),
             started_at: None,
             #[cfg(feature = "sandbox")]
             _sandbox: None,
@@ -103,6 +103,7 @@ impl Agent {
             config,
             status: RwLock::new(AgentStatus::Pending),
             process: None,
+            created_at: chrono::Utc::now(),
             started_at: None,
             #[cfg(feature = "sandbox")]
             _sandbox: None,
@@ -122,8 +123,8 @@ impl Agent {
             id: self.id,
             name: self.config.name.clone(),
             status: *self.status.read().await,
-            created_at: chrono::Utc::now(),
-            started_at: self.started_at.map(|_| chrono::Utc::now()),
+            created_at: self.created_at,
+            started_at: self.started_at,
             resource_usage: self.resource_usage().await,
             pid,
         }
@@ -187,7 +188,7 @@ impl Agent {
         info!("agent {} started with PID {:?}", self.id, child.id());
 
         self.process = Some(child);
-        self.started_at = Some(Instant::now());
+        self.started_at = Some(chrono::Utc::now());
         *self.status.write().await = AgentStatus::Running;
 
         Ok(())

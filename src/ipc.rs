@@ -142,7 +142,9 @@ impl AgentIpc {
         {
             use std::os::unix::fs::PermissionsExt;
             let perms = std::fs::Permissions::from_mode(0o700);
-            std::fs::set_permissions(&self.socket_path, perms).ok();
+            if let Err(e) = std::fs::set_permissions(&self.socket_path, perms) {
+                warn!(path = %self.socket_path.display(), err = %e, "failed to set socket permissions");
+            }
         }
 
         info!(agent_id = %self.agent_id, path = %self.socket_path.display(), "IPC listening");
@@ -349,18 +351,24 @@ impl MessageBus {
 
         if is_broadcast {
             for tx in subs.values() {
-                let _ = tx.try_send(message.clone());
+                if tx.try_send(message.clone()).is_err() {
+                    warn!("dropped broadcast message (queue full or closed)");
+                }
             }
         } else {
             let names = self.agent_names.read().await;
             if let Some(id) = names.get(&message.target) {
-                if let Some(tx) = subs.get(id) {
-                    let _ = tx.try_send(message.clone());
+                if let Some(tx) = subs.get(id)
+                    && tx.try_send(message.clone()).is_err()
+                {
+                    warn!(target_agent = %message.target, "dropped directed message (queue full or closed)");
                 }
             } else {
                 debug!(target = %message.target, "target not found, broadcasting");
                 for tx in subs.values() {
-                    let _ = tx.try_send(message.clone());
+                    if tx.try_send(message.clone()).is_err() {
+                        warn!("dropped fallback broadcast message (queue full or closed)");
+                    }
                 }
             }
         }
@@ -368,7 +376,9 @@ impl MessageBus {
         // Always send to global subscribers.
         let globals = self.global_subscribers.read().await;
         for tx in globals.iter() {
-            let _ = tx.try_send(message.clone());
+            if tx.try_send(message.clone()).is_err() {
+                warn!("dropped global subscriber message (queue full or closed)");
+            }
         }
 
         Ok(())
@@ -590,7 +600,7 @@ impl RpcRegistry {
 
 struct PendingCall {
     sender: tokio::sync::oneshot::Sender<RpcResponse>,
-    _sent_at: std::time::Instant,
+    sent_at: std::time::Instant,
 }
 
 /// Routes RPC calls to registered handlers and manages pending responses.
@@ -621,12 +631,15 @@ impl RpcRouter {
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
-            let mut pending = self.pending.lock().unwrap();
+            let mut pending = self
+                .pending
+                .lock()
+                .expect("pending RPC store lock poisoned");
             pending.insert(
                 request.id,
                 PendingCall {
                     sender: tx,
-                    _sent_at: std::time::Instant::now(),
+                    sent_at: std::time::Instant::now(),
                 },
             );
         }
@@ -667,8 +680,16 @@ impl RpcRouter {
 
     /// Deliver a response for a pending call.
     pub fn handle_response(&self, response: RpcResponse) {
-        let mut pending = self.pending.lock().unwrap();
+        let mut pending = self
+            .pending
+            .lock()
+            .expect("pending RPC store lock poisoned");
         if let Some(call) = pending.remove(&response.request_id) {
+            debug!(
+                request_id = %response.request_id,
+                elapsed_ms = call.sent_at.elapsed().as_millis() as u64,
+                "RPC response delivered"
+            );
             let _ = call.sender.send(response);
         }
     }
@@ -676,11 +697,17 @@ impl RpcRouter {
     /// Number of calls awaiting a response.
     #[must_use]
     pub fn pending_count(&self) -> usize {
-        self.pending.lock().unwrap().len()
+        self.pending
+            .lock()
+            .expect("pending RPC store lock poisoned")
+            .len()
     }
 
     fn cleanup_pending(&self, request_id: &Uuid) {
-        self.pending.lock().unwrap().remove(request_id);
+        self.pending
+            .lock()
+            .expect("pending RPC store lock poisoned")
+            .remove(request_id);
     }
 }
 
