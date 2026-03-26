@@ -64,7 +64,9 @@ jobs:
           repository: MacCracken/agnosys
           path: _siblings/agnosys
       - run: mv _siblings/agnostik ../agnostik && mv _siblings/agnosys ../agnosys && rm -rf _siblings
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-deny
+      - run: cargo deny check
   test:
     name: Test (${{ matrix.os }})
     needs: [check]
