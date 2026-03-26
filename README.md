@@ -6,7 +6,7 @@ The core runtime for the AGNOS ecosystem: agent lifecycle, HTTP API (port 8090),
 
 ## Status
 
-Scaffolded (v0.1.0). Source extraction from `userland/agent-runtime/` in progress.
+Extraction complete. HTTP API, tests, and benchmarks in place. Hardening in progress toward v1.0.
 
 ## License
 
