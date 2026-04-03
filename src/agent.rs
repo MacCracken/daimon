@@ -44,7 +44,7 @@ pub struct AgentHandle {
 // ---------------------------------------------------------------------------
 
 /// Trait that the supervisor uses to manage agent health and lifecycle.
-#[async_trait::async_trait]
+#[allow(async_fn_in_trait)]
 pub trait AgentControl: Send + Sync {
     /// Check whether the agent is healthy (process alive, responsive).
     async fn check_health(&self) -> Result<bool>;
@@ -344,7 +344,6 @@ impl Agent {
 // AgentControl impl
 // ---------------------------------------------------------------------------
 
-#[async_trait::async_trait]
 impl AgentControl for Agent {
     async fn check_health(&self) -> Result<bool> {
         if let Some(ref process) = self.process

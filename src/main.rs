@@ -1,9 +1,12 @@
 //! Daimon — AGNOS agent orchestrator binary.
 
-use anyhow::Result;
-
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> daimon::Result<()> {
+    #[cfg(feature = "http-forward")]
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+
     #[cfg(feature = "logging")]
     daimon::logging::try_init();
 

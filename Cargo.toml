@@ -16,6 +16,7 @@ exclude = [".claude/", ".github/", "docs/", "scripts/"]
 [features]
 default = ["logging"]
 logging = ["dep:tracing-subscriber"]
+http-forward = ["dep:reqwest", "dep:rustls", "dep:hyper-rustls"]
 sandbox = ["dep:kavach"]
 pubsub = ["dep:majra"]
 audit = ["dep:libro"]
@@ -24,18 +25,18 @@ workflow = ["dep:szal"]
 gpu = ["dep:ai-hwaccel"]
 mcp-security = ["dep:t-ron"]
 firewall = ["dep:nein", "mcp"]
-full = ["logging", "sandbox", "pubsub", "audit", "mcp", "workflow", "gpu", "mcp-security", "firewall"]
+full = ["logging", "http-forward", "sandbox", "pubsub", "audit", "mcp", "workflow", "gpu", "mcp-security", "firewall"]
 
 [dependencies]
 agnostik = { path = "../agnostik" }
 agnosys = { path = "../agnosys" }
-anyhow = "1"
-async-trait = "0.1"
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 libc = "0.2"
 nix = { version = "0.31", features = ["signal", "process"] }
-reqwest = { version = "0.13", features = ["json"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider", "http2"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"], optional = true }
+hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "http1", "http2", "tls12", "native-tokio"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

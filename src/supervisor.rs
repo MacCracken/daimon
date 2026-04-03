@@ -466,10 +466,10 @@ impl Supervisor {
     }
 
     /// Perform a health check on a single agent via its [`AgentControl`] impl.
-    pub async fn check_health(
+    pub async fn check_health<A: AgentControl>(
         &mut self,
         agent_id: &AgentId,
-        agent: &dyn AgentControl,
+        agent: &A,
     ) -> Result<bool> {
         let start = Instant::now();
 

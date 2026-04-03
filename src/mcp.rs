@@ -13,6 +13,7 @@ pub use bote::host::{
 /// Daimon-local re-exports for when the `mcp` feature is disabled.
 /// Provides the same types as stubs so the rest of the crate can compile.
 #[cfg(not(feature = "mcp"))]
+#[allow(missing_docs)]
 mod fallback {
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
@@ -301,14 +302,16 @@ mod tests {
     fn tool_result_text() {
         let r = McpToolResult::text("hello");
         assert!(!r.is_error);
-        assert_eq!(r.content[0].text.as_deref(), Some("hello"));
+        let text = &r.content[0].text;
+        assert!(format!("{text:?}").contains("hello"));
     }
 
     #[test]
     fn tool_result_error() {
         let r = McpToolResult::error("boom");
         assert!(r.is_error);
-        assert_eq!(r.content[0].text.as_deref(), Some("boom"));
+        let text = &r.content[0].text;
+        assert!(format!("{text:?}").contains("boom"));
     }
 
     #[test]

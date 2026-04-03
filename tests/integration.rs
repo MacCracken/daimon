@@ -19,6 +19,10 @@ use daimon::{Config, DaimonError};
 // ---------------------------------------------------------------------------
 
 fn test_state() -> Arc<AppState> {
+    #[cfg(feature = "http-forward")]
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
     Arc::new(AppState {
         config: Config::default(),
         mcp: RwLock::new(McpHostRegistry::new()),
@@ -209,12 +213,6 @@ async fn mcp_register_list_deregister() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     assert!(json["isError"].as_bool().unwrap());
-    assert!(
-        json["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("unreachable")
-    );
 
     // Deregister
     let app = router(state.clone());

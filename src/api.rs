@@ -103,7 +103,9 @@ pub fn router(state: Arc<AppState>) -> Router {
 ///
 /// Binds to `config.listen_addr:config.port` and serves the REST API.
 pub async fn serve(config: &Config) -> Result<()> {
+    #[allow(unused_mut)]
     let mut mcp_registry = McpHostRegistry::new();
+    #[allow(unused_mut)]
     let mut mcp_handlers = HashMap::new();
 
     // Register built-in MCP tool handlers
@@ -360,30 +362,43 @@ async fn call_mcp_tool(
     // External tools: forward to the registered callback URL.
     if let Some(url) = reg.external_callback(&call.name).map(String::from) {
         drop(reg); // Release read lock before HTTP call.
-        tracing::info!(tool = %call.name, url = %url, "forwarding MCP call to external tool");
-        let client = reqwest::Client::new();
-        let resp = match client.post(&url).json(&call).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(tool = %call.name, url = %url, error = %e, "external tool call failed");
+
+        #[cfg(feature = "http-forward")]
+        {
+            tracing::info!(tool = %call.name, url = %url, "forwarding MCP call to external tool");
+            let client = reqwest::Client::new();
+            let resp = match client.post(&url).json(&call).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(tool = %call.name, url = %url, error = %e, "external tool call failed");
+                    return Ok(Json(McpToolResult::error(format!(
+                        "external tool unreachable: {e}"
+                    ))));
+                }
+            };
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
                 return Ok(Json(McpToolResult::error(format!(
-                    "external tool unreachable: {e}"
+                    "external tool returned HTTP {status}: {body}"
                 ))));
             }
-        };
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Ok(Json(McpToolResult::error(format!(
-                "external tool returned HTTP {status}: {body}"
-            ))));
+            let result: McpToolResult = resp.json().await.map_err(|e| {
+                DaimonError::ApiError(format!("failed to parse external tool response: {e}"))
+            })?;
+            return Ok(Json(result));
         }
 
-        let result: McpToolResult = resp.json().await.map_err(|e| {
-            DaimonError::ApiError(format!("failed to parse external tool response: {e}"))
-        })?;
-        return Ok(Json(result));
+        #[cfg(not(feature = "http-forward"))]
+        {
+            let _ = url;
+            return Ok(Json(McpToolResult::error(format!(
+                "external tool forwarding requires the 'http-forward' feature: '{}'",
+                call.name
+            ))));
+        }
     }
 
     // Built-in tools: look up handler in the builtin dispatch table.
