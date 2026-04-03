@@ -6,6 +6,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-04-03
+
+### Added
+
+- `http-forward` feature gate — external MCP tool forwarding via reqwest is now opt-in, keeping the default binary lean.
+- `Serialize`/`Deserialize` on 8 previously non-serializable types: `RagPipeline`, `OutputCapture`, `EdgeFleetManager`, `McpHostRegistry` (fallback), `TaskScheduler`, `CronScheduler`, `RpcRegistry`, `VectorIndex`.
+- `#[must_use]` on `IpcMessage::new()`, `TaskScheduler::new()`, `CronScheduler::new()`.
+- `#[non_exhaustive]` on `VectorIndex` and `RagPipeline`.
+- Input validation: positive CPU/memory on scheduler node registration, cron entry hour (0–23) and minute (0–59) bounds.
+- 13 new tests (305 total): serde roundtrips for newly serializable types, cron validation, boundary validation integration tests.
+- 4 new benchmarks (19 total): `rag_query_50_docs` (30 µs), `edge_heartbeat_100_nodes` (8 µs), `edge_stats_500_nodes` (765 ns), `federation_score_100_nodes` (1.7 µs).
+
+### Fixed
+
+- **Security**: External MCP tool-not-found now returns 400 Bad Request (`InvalidParameter`) instead of leaking 404 (`AgentNotFound`).
+- **Security**: Firewall table filter used substring `.contains()` match — replaced with exact match to prevent unintended rule inclusion.
+- **Safety**: `setrlimit` return values in `apply_rlimits()` are now checked and logged on failure.
+- **Safety**: Scheduler `schedule_pending()` replaced direct HashMap indexing (`self.tasks[&id]`) with `.get()` to prevent potential panics.
+- **Safety**: `RpcRouter` mutex locks replaced `.expect()` with `map_err`/`match` — no more panics in library code on lock poisoning.
+- **Correctness**: `cargo fmt` and `cargo clippy` violations resolved (collapsible-if in firewall, benchmark type rename).
+- **Correctness**: Benchmark file updated for `McpHostRegistry` rename and missing `mcp_handlers` field.
+
+### Changed
+
+- **Binary size**: Default binary 12 MB → **4.0 MB** (−64%) by feature-gating reqwest behind `http-forward`.
+- **Binary size**: With `http-forward`, 12 MB → **8.2 MB** (−32%) by switching TLS from aws-lc-rs to ring.
+- **Dependencies**: Dropped `anyhow` (replaced with crate's own `Result` in binary).
+- **Dependencies**: Dropped `async-trait` (native async traits, edition 2024).
+- **Dependencies**: `reqwest` moved to optional, default-features disabled, uses `rustls-no-provider` + ring.
+- **Dependencies**: Default dependency count 354 → 193 (−45%).
+- `Supervisor::check_health` now generic (`<A: AgentControl>`) instead of `dyn` dispatch.
+- `http-forward` included in the `full` feature set.
+
+### Breaking
+
+- `reqwest` is no longer a default dependency. Consumers calling external MCP tools must enable the `http-forward` feature. Without it, external tool calls return an error message indicating the feature is required.
+- `Supervisor::check_health` signature changed from `&dyn AgentControl` to generic `<A: AgentControl>`. Callers passing trait objects must switch to concrete types or generics.
+
 ## [0.5.0] - 2026-03-26
 
 ### Added
