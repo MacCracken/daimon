@@ -48,7 +48,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 # Optional dependencies (published crates)
 ai-hwaccel = { version = "0.23.3", optional = true }
-bote = { version = "0.91.0", features = ["host"], optional = true }
+bote = { version = "0.92.0", features = ["host"], optional = true }
 kavach = { version = "1.0.1", optional = true }
 libro = { version = "0.25.3", optional = true }
 majra = { version = "0.26.3", optional = true }
