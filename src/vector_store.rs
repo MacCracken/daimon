@@ -95,6 +95,7 @@ pub fn normalize(v: &[f64]) -> Vec<f64> {
 /// Dimensionality is inferred from the first inserted vector or set explicitly
 /// via [`VectorIndex::with_dimension`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct VectorIndex {
     entries: HashMap<Uuid, VectorEntry>,
     dimension: Option<usize>,

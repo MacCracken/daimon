@@ -331,6 +331,7 @@ pub struct OutputLine {
 }
 
 /// Ring buffer for agent stdout/stderr capture.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutputCapture {
     lines: Vec<OutputLine>,
     max_lines: usize,
@@ -854,5 +855,15 @@ mod tests {
         let back: OutputLine = serde_json::from_str(&json).unwrap();
         assert_eq!(back.stream, OutputStream::Stderr);
         assert_eq!(back.content, "error msg");
+    }
+
+    #[test]
+    fn output_capture_serde_roundtrip() {
+        let mut cap = OutputCapture::new(10);
+        cap.push(OutputStream::Stdout, "hello".into());
+        cap.push(OutputStream::Stderr, "error".into());
+        let json = serde_json::to_string(&cap).unwrap();
+        let back: OutputCapture = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.len(), 2);
     }
 }

@@ -74,6 +74,7 @@ pub struct IpcMessage {
 
 impl IpcMessage {
     /// Create a new message.
+    #[must_use]
     pub fn new(
         source: impl Into<String>,
         target: impl Into<String>,
@@ -538,7 +539,7 @@ impl RpcResponse {
 // ---------------------------------------------------------------------------
 
 /// Registry mapping RPC method names to handler agents.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RpcRegistry {
     methods: HashMap<String, AgentId>,
     agent_methods: HashMap<AgentId, Vec<String>>,
@@ -634,7 +635,7 @@ impl RpcRouter {
             let mut pending = self
                 .pending
                 .lock()
-                .expect("pending RPC store lock poisoned");
+                .map_err(|_| DaimonError::IpcError("pending RPC store lock poisoned".into()))?;
             pending.insert(
                 request.id,
                 PendingCall {
@@ -680,10 +681,13 @@ impl RpcRouter {
 
     /// Deliver a response for a pending call.
     pub fn handle_response(&self, response: RpcResponse) {
-        let mut pending = self
-            .pending
-            .lock()
-            .expect("pending RPC store lock poisoned");
+        let mut pending = match self.pending.lock() {
+            Ok(p) => p,
+            Err(e) => {
+                error!("pending RPC store lock poisoned: {e}");
+                return;
+            }
+        };
         if let Some(call) = pending.remove(&response.request_id) {
             debug!(
                 request_id = %response.request_id,
@@ -697,17 +701,13 @@ impl RpcRouter {
     /// Number of calls awaiting a response.
     #[must_use]
     pub fn pending_count(&self) -> usize {
-        self.pending
-            .lock()
-            .expect("pending RPC store lock poisoned")
-            .len()
+        self.pending.lock().map(|p| p.len()).unwrap_or(0)
     }
 
     fn cleanup_pending(&self, request_id: &Uuid) {
-        self.pending
-            .lock()
-            .expect("pending RPC store lock poisoned")
-            .remove(request_id);
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.remove(request_id);
+        }
     }
 }
 
@@ -1118,5 +1118,15 @@ mod tests {
             assert!(ACK != NACK_QUEUE_FULL);
             assert!(ACK != NACK_INVALID);
         }
+    }
+
+    #[test]
+    fn rpc_registry_serde_roundtrip() {
+        let mut reg = RpcRegistry::new();
+        let id = AgentId(uuid::Uuid::from_bytes([1; 16]));
+        reg.register_method(id, "test.method");
+        let json = serde_json::to_string(&reg).unwrap();
+        let back: RpcRegistry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.find_handler("test.method"), Some(id));
     }
 }

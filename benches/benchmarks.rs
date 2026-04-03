@@ -5,19 +5,21 @@ use axum::http::Request;
 use criterion::{Criterion, criterion_group, criterion_main};
 use daimon::api::{AppState, router};
 use daimon::edge::EdgeFleetManager;
-use daimon::mcp::McpToolRegistry;
+use daimon::mcp::McpHostRegistry;
 use daimon::rag::{RagConfig, RagPipeline};
 use daimon::scheduler::TaskScheduler;
 use daimon::supervisor::Supervisor;
 use daimon::vector_store::{VectorIndex, cosine_similarity};
 use serde_json::json;
+use std::collections::HashMap;
 use tokio::sync::RwLock;
 use tower::ServiceExt;
 
 fn test_state() -> Arc<AppState> {
     Arc::new(AppState {
         config: daimon::Config::default(),
-        mcp: RwLock::new(McpToolRegistry::new()),
+        mcp: RwLock::new(McpHostRegistry::new()),
+        mcp_handlers: HashMap::new(),
         rag: RwLock::new(RagPipeline::new(rag_config(50, 10))),
         edge: RwLock::new(EdgeFleetManager::default()),
         scheduler: RwLock::new(TaskScheduler::new()),
@@ -166,7 +168,7 @@ fn bench_supervisor_register(c: &mut Criterion) {
 fn bench_mcp_register_tools(c: &mut Criterion) {
     c.bench_function("mcp_register_100_tools", |bench| {
         bench.iter(|| {
-            let mut reg = McpToolRegistry::new();
+            let mut reg = McpHostRegistry::new();
             for i in 0..100 {
                 reg.register_builtin(make_tool(&format!("tool-{i}")));
             }
@@ -175,7 +177,7 @@ fn bench_mcp_register_tools(c: &mut Criterion) {
 }
 
 fn bench_mcp_manifest(c: &mut Criterion) {
-    let mut reg = McpToolRegistry::new();
+    let mut reg = McpHostRegistry::new();
     for i in 0..100 {
         reg.register_builtin(make_tool(&format!("tool-{i:03}")));
     }
@@ -186,7 +188,7 @@ fn bench_mcp_manifest(c: &mut Criterion) {
 }
 
 fn bench_mcp_find_tool(c: &mut Criterion) {
-    let mut reg = McpToolRegistry::new();
+    let mut reg = McpHostRegistry::new();
     for i in 0..100 {
         reg.register_builtin(make_tool(&format!("tool-{i:03}")));
     }
@@ -289,6 +291,136 @@ fn bench_edge_register_nodes(c: &mut Criterion) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// RAG query benchmarks
+// ---------------------------------------------------------------------------
+
+fn bench_rag_query(c: &mut Criterion) {
+    let mut pipeline = RagPipeline::new(rag_config(100, 20));
+    for i in 0..50 {
+        pipeline
+            .ingest_text(
+                &format!("Document {i} contains information about topic {}", i % 10),
+                json!({"doc": i}),
+            )
+            .unwrap();
+    }
+
+    c.bench_function("rag_query_50_docs", |bench| {
+        bench.iter(|| pipeline.query_text("information about topic 5"));
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Federation scoring benchmarks
+// ---------------------------------------------------------------------------
+
+fn bench_federation_scoring(c: &mut Criterion) {
+    use daimon::federation::*;
+
+    // Build nodes and requirements via serde (workaround for #[non_exhaustive]).
+    let reqs: AgentRequirements = serde_json::from_value(json!({
+        "cpu_cores": 2,
+        "memory_mb": 4096,
+        "gpu_required": false,
+        "preferred_node": null,
+        "affinity_nodes": [],
+    }))
+    .unwrap();
+
+    let nodes: Vec<FederationNode> = (0..100)
+        .map(|i| {
+            serde_json::from_value(json!({
+                "node_id": format!("node-{i}"),
+                "name": format!("Node {i}"),
+                "address": "127.0.0.1:8080",
+                "role": "Follower",
+                "status": "Online",
+                "last_heartbeat": chrono::Utc::now(),
+                "capabilities": {
+                    "cpu_cores": 8,
+                    "memory_mb": 16384,
+                    "gpu_count": if i % 3 == 0 { 1 } else { 0 },
+                },
+                "current_term": 1,
+                "voted_for": null,
+            }))
+            .unwrap()
+        })
+        .collect();
+
+    c.bench_function("federation_score_100_nodes", |bench| {
+        bench.iter(|| {
+            let scorer = NodeScorer::new();
+            for node in &nodes {
+                let _ = scorer.score_node(node, &reqs);
+            }
+        });
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Edge fleet heartbeat throughput
+// ---------------------------------------------------------------------------
+
+fn bench_edge_heartbeat(c: &mut Criterion) {
+    use daimon::edge::*;
+
+    let mut mgr = EdgeFleetManager::default();
+    let ids: Vec<String> = (0..100)
+        .map(|i| {
+            mgr.register_node(
+                format!("hb-node-{i}"),
+                EdgeCapabilities::default(),
+                "/usr/bin/agent".into(),
+                "0.1.0".into(),
+                "Linux".into(),
+                "http://localhost:8090".into(),
+            )
+            .unwrap()
+        })
+        .collect();
+
+    let hb: HeartbeatData = serde_json::from_value(json!({
+        "active_tasks": 2,
+        "tasks_completed": 50,
+    }))
+    .unwrap();
+
+    c.bench_function("edge_heartbeat_100_nodes", |bench| {
+        bench.iter(|| {
+            for id in &ids {
+                mgr.heartbeat(id, hb.clone()).unwrap();
+            }
+        });
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Edge fleet stats aggregation
+// ---------------------------------------------------------------------------
+
+fn bench_edge_stats(c: &mut Criterion) {
+    use daimon::edge::*;
+
+    let mut mgr = EdgeFleetManager::default();
+    for i in 0..500 {
+        mgr.register_node(
+            format!("stat-node-{i}"),
+            EdgeCapabilities::default(),
+            "/usr/bin/agent".into(),
+            "0.1.0".into(),
+            "Linux".into(),
+            "http://localhost:8090".into(),
+        )
+        .unwrap();
+    }
+
+    c.bench_function("edge_stats_500_nodes", |bench| {
+        bench.iter(|| mgr.stats());
+    });
+}
+
 criterion_group!(
     benches,
     // Core
@@ -297,6 +429,7 @@ criterion_group!(
     bench_vector_insert,
     bench_vector_search,
     bench_rag_ingest,
+    bench_rag_query,
     bench_scheduler_schedule_pending,
     // Agent registration throughput
     bench_supervisor_register,
@@ -311,5 +444,9 @@ criterion_group!(
     bench_api_metrics,
     // Edge fleet
     bench_edge_register_nodes,
+    bench_edge_heartbeat,
+    bench_edge_stats,
+    // Federation
+    bench_federation_scoring,
 );
 criterion_main!(benches);

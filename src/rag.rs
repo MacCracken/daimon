@@ -180,7 +180,8 @@ pub fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> 
 ///
 /// Wraps a [`VectorIndex`] and provides chunking, ingestion, and formatted
 /// retrieval.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RagPipeline {
     /// The underlying vector index.
     pub index: VectorIndex,
@@ -535,5 +536,17 @@ mod tests {
         let back: RagContext = serde_json::from_str(&json).unwrap();
         assert_eq!(back.chunks.len(), 1);
         assert_eq!(back.total_tokens_estimate, 10);
+    }
+
+    #[test]
+    fn rag_pipeline_serde_roundtrip() {
+        let mut pipeline = RagPipeline::new(RagConfig::default());
+        pipeline
+            .ingest_text("hello world test data", json!({}))
+            .unwrap();
+        let json = serde_json::to_string(&pipeline).unwrap();
+        let back: RagPipeline = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.index.len(), pipeline.index.len());
+        assert_eq!(back.config.top_k, pipeline.config.top_k);
     }
 }

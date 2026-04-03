@@ -451,8 +451,9 @@ fn apply_rlimits(max_memory: u64, max_cpu_time: u64) {
             rlim_cur: max_memory,
             rlim_max: max_memory,
         };
-        unsafe {
-            setrlimit(RLIMIT_AS, &limit);
+        let ret = unsafe { setrlimit(RLIMIT_AS, &limit) };
+        if ret != 0 {
+            eprintln!("warning: setrlimit(RLIMIT_AS) failed: {ret}");
         }
     }
 
@@ -461,8 +462,9 @@ fn apply_rlimits(max_memory: u64, max_cpu_time: u64) {
             rlim_cur: max_cpu_time,
             rlim_max: max_cpu_time,
         };
-        unsafe {
-            setrlimit(RLIMIT_CPU, &limit);
+        let ret = unsafe { setrlimit(RLIMIT_CPU, &limit) };
+        if ret != 0 {
+            eprintln!("warning: setrlimit(RLIMIT_CPU) failed: {ret}");
         }
     }
 }

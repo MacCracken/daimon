@@ -22,7 +22,7 @@ use tracing::info;
 use crate::config::Config;
 use crate::edge::{EdgeCapabilities, EdgeFleetManager, EdgeNodeStatus, HeartbeatData};
 use crate::error::{DaimonError, Result};
-use crate::mcp::{McpToolCall, McpHostRegistry, McpToolResult, RegisterMcpToolRequest};
+use crate::mcp::{McpHostRegistry, McpToolCall, McpToolResult, RegisterMcpToolRequest};
 use crate::rag::{RagConfig, RagPipeline};
 use crate::scheduler::{NodeCapacity, ResourceReq, ScheduledTask, TaskScheduler};
 use crate::supervisor::Supervisor;
@@ -33,11 +33,7 @@ use crate::supervisor::Supervisor;
 
 /// Async handler for a built-in MCP tool.
 pub type McpToolHandler = Arc<
-    dyn Fn(
-            serde_json::Value,
-        ) -> Pin<Box<dyn Future<Output = McpToolResult> + Send>>
-        + Send
-        + Sync,
+    dyn Fn(serde_json::Value) -> Pin<Box<dyn Future<Output = McpToolResult> + Send>> + Send + Sync,
 >;
 
 /// Shared state for the API server.
@@ -355,7 +351,7 @@ async fn call_mcp_tool(
 ) -> std::result::Result<Json<McpToolResult>, DaimonError> {
     let reg = state.mcp.read().await;
     if reg.find_tool(&call.name).is_none() {
-        return Err(DaimonError::AgentNotFound(format!(
+        return Err(DaimonError::InvalidParameter(format!(
             "tool not found: {}",
             call.name
         )));
@@ -594,6 +590,16 @@ async fn register_scheduler_node(
     if req.node_id.is_empty() {
         return Err(DaimonError::InvalidParameter(
             "node_id cannot be empty".into(),
+        ));
+    }
+    if req.total_cpu <= 0.0 {
+        return Err(DaimonError::InvalidParameter(
+            "total_cpu must be positive".into(),
+        ));
+    }
+    if req.total_memory_mb == 0 {
+        return Err(DaimonError::InvalidParameter(
+            "total_memory_mb must be positive".into(),
         ));
     }
     let node = NodeCapacity::new(

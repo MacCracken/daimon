@@ -408,6 +408,7 @@ pub struct SchedulerStats {
 // ---------------------------------------------------------------------------
 
 /// Core task scheduler.
+#[derive(Serialize, Deserialize)]
 pub struct TaskScheduler {
     tasks: HashMap<String, ScheduledTask>,
     nodes: HashMap<String, NodeCapacity>,
@@ -415,6 +416,7 @@ pub struct TaskScheduler {
 
 impl TaskScheduler {
     /// Create a new empty scheduler.
+    #[must_use]
     pub fn new() -> Self {
         info!("task scheduler initialised");
         Self {
@@ -522,8 +524,11 @@ impl TaskScheduler {
         };
 
         for task_id in pending_ids {
-            let req = self.tasks[&task_id].resource_requirements.clone();
-            let pref = self.tasks[&task_id].node_preference.clone();
+            let Some(task_ref) = self.tasks.get(&task_id) else {
+                continue;
+            };
+            let req = task_ref.resource_requirements.clone();
+            let pref = task_ref.node_preference.clone();
 
             let chosen = if let Some(ref pref_id) = pref {
                 if self.nodes.get(pref_id).is_some_and(|n| n.can_fit(&req)) {
@@ -536,7 +541,11 @@ impl TaskScheduler {
             };
 
             if let Some(node_id) = chosen {
-                let score = 1.0 - self.nodes[&node_id].utilization();
+                let score = self
+                    .nodes
+                    .get(&node_id)
+                    .map(|n| 1.0 - n.utilization())
+                    .unwrap_or(0.0);
 
                 if let Some(node) = self.nodes.get_mut(&node_id) {
                     node.reserve(&req);
@@ -704,12 +713,14 @@ pub struct CronTaskTemplate {
 }
 
 /// Manages cron-like recurring task triggers.
+#[derive(Serialize, Deserialize)]
 pub struct CronScheduler {
     entries: HashMap<String, CronEntry>,
 }
 
 impl CronScheduler {
     /// Create a new cron scheduler.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
@@ -721,6 +732,20 @@ impl CronScheduler {
         if entry.name.is_empty() {
             return Err(DaimonError::SchedulerError(
                 "cron entry name cannot be empty".into(),
+            ));
+        }
+        if let Some(h) = entry.specific_hour
+            && h > 23
+        {
+            return Err(DaimonError::SchedulerError(
+                "specific_hour must be 0-23".into(),
+            ));
+        }
+        if let Some(m) = entry.specific_minute
+            && m > 59
+        {
+            return Err(DaimonError::SchedulerError(
+                "specific_minute must be 0-59".into(),
             ));
         }
         info!(name = %entry.name, interval = entry.interval_seconds, "cron entry added");
@@ -1431,5 +1456,81 @@ mod tests {
         let json = serde_json::to_string(&stats).unwrap();
         let back: SchedulerStats = serde_json::from_str(&json).unwrap();
         assert_eq!(back.total_tasks, 10);
+    }
+
+    #[test]
+    fn task_scheduler_serde_roundtrip() {
+        let mut sched = TaskScheduler::new();
+        let task = ScheduledTask::new("test", "desc", "agent-1", 5, ResourceReq::default());
+        sched.submit_task(task).unwrap();
+        let json = serde_json::to_string(&sched).unwrap();
+        let back: TaskScheduler = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.stats().total_tasks, 1);
+    }
+
+    #[test]
+    fn cron_scheduler_serde_roundtrip() {
+        let mut cron = CronScheduler::new();
+        cron.add_entry(CronEntry {
+            name: "test-cron".into(),
+            interval_seconds: 300,
+            specific_hour: None,
+            specific_minute: None,
+            enabled: true,
+            last_fired: None,
+            task_template: CronTaskTemplate {
+                name: "cron-task".into(),
+                description: "test".into(),
+                agent_id: "agent-1".into(),
+                priority: 5,
+                resource_requirements: ResourceReq::default(),
+            },
+        })
+        .unwrap();
+        let json = serde_json::to_string(&cron).unwrap();
+        let back: CronScheduler = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.list_entries().len(), 1);
+    }
+
+    #[test]
+    fn cron_entry_invalid_hour_rejected() {
+        let mut cron = CronScheduler::new();
+        let entry = CronEntry {
+            name: "bad-hour".into(),
+            interval_seconds: 60,
+            specific_hour: Some(25),
+            specific_minute: None,
+            enabled: true,
+            last_fired: None,
+            task_template: CronTaskTemplate {
+                name: "task".into(),
+                description: "test".into(),
+                agent_id: "a".into(),
+                priority: 5,
+                resource_requirements: ResourceReq::default(),
+            },
+        };
+        assert!(cron.add_entry(entry).is_err());
+    }
+
+    #[test]
+    fn cron_entry_invalid_minute_rejected() {
+        let mut cron = CronScheduler::new();
+        let entry = CronEntry {
+            name: "bad-min".into(),
+            interval_seconds: 60,
+            specific_hour: None,
+            specific_minute: Some(60),
+            enabled: true,
+            last_fired: None,
+            task_template: CronTaskTemplate {
+                name: "task".into(),
+                description: "test".into(),
+                agent_id: "a".into(),
+                priority: 5,
+                resource_requirements: ResourceReq::default(),
+            },
+        };
+        assert!(cron.add_entry(entry).is_err());
     }
 }

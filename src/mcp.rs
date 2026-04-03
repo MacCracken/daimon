@@ -146,6 +146,7 @@ mod fallback {
         }
     }
 
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct McpHostRegistry {
         builtin: HashMap<String, McpToolDescription>,
         external: HashMap<String, ExternalMcpTool>,
@@ -172,11 +173,7 @@ mod fallback {
             if req.name.is_empty() {
                 return Err("tool name cannot be empty".into());
             }
-            let tool = McpToolDescription::new(
-                req.name.clone(),
-                req.description,
-                req.input_schema,
-            );
+            let tool = McpToolDescription::new(req.name.clone(), req.description, req.input_schema);
             let external = ExternalMcpTool {
                 tool,
                 callback_url: req.callback_url,
@@ -243,7 +240,11 @@ mod tests {
     use serde_json::json;
 
     fn test_tool(name: &str) -> McpToolDescription {
-        McpToolDescription::new(name, format!("Test tool: {name}"), json!({"type": "object"}))
+        McpToolDescription::new(
+            name,
+            format!("Test tool: {name}"),
+            json!({"type": "object"}),
+        )
     }
 
     fn test_register_req(name: &str) -> RegisterMcpToolRequest {
@@ -324,5 +325,17 @@ mod tests {
         let json_str = serde_json::to_string(&result).unwrap();
         let back: McpToolResult = serde_json::from_str(&json_str).unwrap();
         assert!(!back.is_error);
+    }
+
+    #[cfg(not(feature = "mcp"))]
+    #[test]
+    fn mcp_host_registry_serde_roundtrip() {
+        let mut reg = McpHostRegistry::new();
+        reg.register_builtin(test_tool("scan"));
+        reg.register_external(test_register_req("ext"), false)
+            .unwrap();
+        let json = serde_json::to_string(&reg).unwrap();
+        let back: McpHostRegistry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tool_count(), 2);
     }
 }

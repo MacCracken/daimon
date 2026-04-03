@@ -30,129 +30,141 @@ pub fn register(registry: &mut McpHostRegistry) -> HashMap<String, McpToolHandle
     // nein_status handler
     handlers.insert(
         "nein_status".into(),
-        Arc::new(|_args: serde_json::Value| -> Pin<Box<dyn Future<Output = McpToolResult> + Send>> {
-            Box::pin(async move {
-                match nein::inspect::status().await {
-                    Ok(status) => {
-                        let resp = nein::mcp::StatusResponse {
-                            tables: status.tables,
-                            total_rules: status.total_rules,
-                            raw_ruleset: status.raw_ruleset,
-                        };
-                        match serde_json::to_string_pretty(&resp) {
-                            Ok(json) => McpToolResult::text(json),
-                            Err(e) => McpToolResult::error(format!("serialization error: {e}")),
+        Arc::new(
+            |_args: serde_json::Value| -> Pin<Box<dyn Future<Output = McpToolResult> + Send>> {
+                Box::pin(async move {
+                    match nein::inspect::status().await {
+                        Ok(status) => {
+                            let resp = nein::mcp::StatusResponse {
+                                tables: status.tables,
+                                total_rules: status.total_rules,
+                                raw_ruleset: status.raw_ruleset,
+                            };
+                            match serde_json::to_string_pretty(&resp) {
+                                Ok(json) => McpToolResult::text(json),
+                                Err(e) => McpToolResult::error(format!("serialization error: {e}")),
+                            }
                         }
+                        Err(e) => McpToolResult::error(format!("nein_status failed: {e}")),
                     }
-                    Err(e) => McpToolResult::error(format!("nein_status failed: {e}")),
-                }
-            })
-        }),
+                })
+            },
+        ),
     );
 
     // nein_allow handler
     handlers.insert(
         "nein_allow".into(),
-        Arc::new(|args: serde_json::Value| -> Pin<Box<dyn Future<Output = McpToolResult> + Send>> {
-            Box::pin(async move {
-                let req: nein::mcp::AllowRequest = match serde_json::from_value(args) {
-                    Ok(r) => r,
-                    Err(e) => return McpToolResult::error(format!("invalid request: {e}")),
-                };
-                let table = req.table.clone();
-                let chain = req.chain.clone();
-                match nein::mcp::build_allow_rule(&req) {
-                    Ok(rule) => match nein::apply::add_rule("inet", &table, &chain, &rule).await {
-                        Ok(()) => McpToolResult::text(format!("rule added: {rule}")),
-                        Err(e) => McpToolResult::error(format!("apply failed: {e}")),
-                    },
-                    Err(e) => McpToolResult::error(e),
-                }
-            })
-        }),
+        Arc::new(
+            |args: serde_json::Value| -> Pin<Box<dyn Future<Output = McpToolResult> + Send>> {
+                Box::pin(async move {
+                    let req: nein::mcp::AllowRequest = match serde_json::from_value(args) {
+                        Ok(r) => r,
+                        Err(e) => return McpToolResult::error(format!("invalid request: {e}")),
+                    };
+                    let table = req.table.clone();
+                    let chain = req.chain.clone();
+                    match nein::mcp::build_allow_rule(&req) {
+                        Ok(rule) => {
+                            match nein::apply::add_rule("inet", &table, &chain, &rule).await {
+                                Ok(()) => McpToolResult::text(format!("rule added: {rule}")),
+                                Err(e) => McpToolResult::error(format!("apply failed: {e}")),
+                            }
+                        }
+                        Err(e) => McpToolResult::error(e),
+                    }
+                })
+            },
+        ),
     );
 
     // nein_deny handler
     handlers.insert(
         "nein_deny".into(),
-        Arc::new(|args: serde_json::Value| -> Pin<Box<dyn Future<Output = McpToolResult> + Send>> {
-            Box::pin(async move {
-                let req: nein::mcp::DenyRequest = match serde_json::from_value(args) {
-                    Ok(r) => r,
-                    Err(e) => return McpToolResult::error(format!("invalid request: {e}")),
-                };
-                let table = req.table.clone();
-                let chain = req.chain.clone();
-                match nein::mcp::build_deny_rule(&req) {
-                    Ok(rule) => match nein::apply::add_rule("inet", &table, &chain, &rule).await {
-                        Ok(()) => McpToolResult::text(format!("rule added: {rule}")),
-                        Err(e) => McpToolResult::error(format!("apply failed: {e}")),
-                    },
-                    Err(e) => McpToolResult::error(e),
-                }
-            })
-        }),
+        Arc::new(
+            |args: serde_json::Value| -> Pin<Box<dyn Future<Output = McpToolResult> + Send>> {
+                Box::pin(async move {
+                    let req: nein::mcp::DenyRequest = match serde_json::from_value(args) {
+                        Ok(r) => r,
+                        Err(e) => return McpToolResult::error(format!("invalid request: {e}")),
+                    };
+                    let table = req.table.clone();
+                    let chain = req.chain.clone();
+                    match nein::mcp::build_deny_rule(&req) {
+                        Ok(rule) => {
+                            match nein::apply::add_rule("inet", &table, &chain, &rule).await {
+                                Ok(()) => McpToolResult::text(format!("rule added: {rule}")),
+                                Err(e) => McpToolResult::error(format!("apply failed: {e}")),
+                            }
+                        }
+                        Err(e) => McpToolResult::error(e),
+                    }
+                })
+            },
+        ),
     );
 
     // nein_list handler
     handlers.insert(
         "nein_list".into(),
-        Arc::new(|args: serde_json::Value| -> Pin<Box<dyn Future<Output = McpToolResult> + Send>> {
-            Box::pin(async move {
-                let req: nein::mcp::ListRequest = match serde_json::from_value(args) {
-                    Ok(r) => r,
-                    Err(e) => return McpToolResult::error(format!("invalid request: {e}")),
-                };
-                match nein::apply::list_ruleset().await {
-                    Ok(raw) => {
-                        let lines: Vec<&str> = raw.lines().collect();
-                        let mut rules = vec![];
-                        let mut current_table = String::new();
-                        let mut current_chain = String::new();
+        Arc::new(
+            |args: serde_json::Value| -> Pin<Box<dyn Future<Output = McpToolResult> + Send>> {
+                Box::pin(async move {
+                    let req: nein::mcp::ListRequest = match serde_json::from_value(args) {
+                        Ok(r) => r,
+                        Err(e) => return McpToolResult::error(format!("invalid request: {e}")),
+                    };
+                    match nein::apply::list_ruleset().await {
+                        Ok(raw) => {
+                            let lines: Vec<&str> = raw.lines().collect();
+                            let mut rules = vec![];
+                            let mut current_table = String::new();
+                            let mut current_chain = String::new();
 
-                        for line in &lines {
-                            let trimmed = line.trim();
-                            if let Some(rest) = trimmed.strip_prefix("table ") {
-                                current_table = rest.trim_end_matches(" {").to_string();
-                            } else if let Some(rest) = trimmed.strip_prefix("chain ") {
-                                current_chain = rest.trim_end_matches(" {").to_string();
-                            } else if !trimmed.is_empty()
-                                && !trimmed.starts_with("type ")
-                                && trimmed != "}"
-                            {
-                                // Apply optional table/chain filters
-                                if let Some(ref tf) = req.table {
-                                    if !current_table.contains(tf) {
+                            for line in &lines {
+                                let trimmed = line.trim();
+                                if let Some(rest) = trimmed.strip_prefix("table ") {
+                                    current_table = rest.trim_end_matches(" {").to_string();
+                                } else if let Some(rest) = trimmed.strip_prefix("chain ") {
+                                    current_chain = rest.trim_end_matches(" {").to_string();
+                                } else if !trimmed.is_empty()
+                                    && !trimmed.starts_with("type ")
+                                    && trimmed != "}"
+                                {
+                                    // Apply optional table/chain filters
+                                    if let Some(ref tf) = req.table
+                                        && current_table != *tf
+                                    {
                                         continue;
                                     }
-                                }
-                                if let Some(ref cf) = req.chain {
-                                    if current_chain != *cf {
+                                    if let Some(ref cf) = req.chain
+                                        && current_chain != *cf
+                                    {
                                         continue;
                                     }
+                                    rules.push(nein::mcp::ListEntry {
+                                        table: current_table.clone(),
+                                        chain: current_chain.clone(),
+                                        rule: trimmed.to_string(),
+                                        handle: None,
+                                    });
                                 }
-                                rules.push(nein::mcp::ListEntry {
-                                    table: current_table.clone(),
-                                    chain: current_chain.clone(),
-                                    rule: trimmed.to_string(),
-                                    handle: None,
-                                });
+                            }
+
+                            let resp = nein::mcp::ListResponse {
+                                count: rules.len(),
+                                rules,
+                            };
+                            match serde_json::to_string_pretty(&resp) {
+                                Ok(json) => McpToolResult::text(json),
+                                Err(e) => McpToolResult::error(format!("serialization error: {e}")),
                             }
                         }
-
-                        let resp = nein::mcp::ListResponse {
-                            count: rules.len(),
-                            rules,
-                        };
-                        match serde_json::to_string_pretty(&resp) {
-                            Ok(json) => McpToolResult::text(json),
-                            Err(e) => McpToolResult::error(format!("serialization error: {e}")),
-                        }
+                        Err(e) => McpToolResult::error(format!("nein_list failed: {e}")),
                     }
-                    Err(e) => McpToolResult::error(format!("nein_list failed: {e}")),
-                }
-            })
-        }),
+                })
+            },
+        ),
     );
 
     tracing::info!(tools = 4, "registered nein firewall MCP tools");

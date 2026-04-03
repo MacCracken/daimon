@@ -209,10 +209,12 @@ async fn mcp_register_list_deregister() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     assert!(json["isError"].as_bool().unwrap());
-    assert!(json["content"][0]["text"]
-        .as_str()
-        .unwrap()
-        .contains("unreachable"));
+    assert!(
+        json["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("unreachable")
+    );
 
     // Deregister
     let app = router(state.clone());
@@ -236,7 +238,7 @@ async fn mcp_call_unknown_tool() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 // ---------------------------------------------------------------------------
@@ -567,4 +569,45 @@ async fn unknown_route_returns_404() {
     let app = router(test_state());
     let resp = app.oneshot(get("/v1/nonexistent")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// -- Additional edge case tests --
+
+#[tokio::test]
+async fn register_scheduler_node_zero_cpu_rejected() {
+    let app = router(test_state());
+    let resp = app
+        .oneshot(post_json(
+            "/v1/scheduler/nodes",
+            json!({"node_id": "n1", "total_cpu": 0.0, "total_memory_mb": 1024}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn register_scheduler_node_zero_memory_rejected() {
+    let app = router(test_state());
+    let resp = app
+        .oneshot(post_json(
+            "/v1/scheduler/nodes",
+            json!({"node_id": "n1", "total_cpu": 4.0, "total_memory_mb": 0}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn register_edge_node_empty_name_rejected() {
+    let app = router(test_state());
+    let resp = app
+        .oneshot(post_json(
+            "/v1/edge/nodes",
+            json!({"name": "", "capabilities": {}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }

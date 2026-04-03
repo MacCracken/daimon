@@ -183,6 +183,7 @@ pub struct HeartbeatData {
 // ---------------------------------------------------------------------------
 
 /// Manages the edge node fleet — registration, heartbeats, health, and stats.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EdgeFleetManager {
     config: EdgeFleetConfig,
     nodes: HashMap<String, EdgeNode>,
@@ -540,5 +541,39 @@ mod tests {
         let json = serde_json::to_string(&cfg).unwrap();
         let back: EdgeFleetConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.max_nodes, cfg.max_nodes);
+    }
+
+    #[test]
+    fn edge_fleet_manager_serde_roundtrip() {
+        let mut mgr = EdgeFleetManager::default();
+        register_test_node(&mut mgr, "serde-mgr");
+        let json = serde_json::to_string(&mgr).unwrap();
+        let back: EdgeFleetManager = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.stats().total_nodes, 1);
+    }
+
+    #[test]
+    fn edge_capabilities_serde_roundtrip() {
+        let caps = EdgeCapabilities::default();
+        let json = serde_json::to_string(&caps).unwrap();
+        let back: EdgeCapabilities = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.arch, caps.arch);
+        assert_eq!(back.cpu_cores, caps.cpu_cores);
+    }
+
+    #[test]
+    fn heartbeat_data_serde_roundtrip() {
+        let hb = HeartbeatData {
+            active_tasks: 3,
+            tasks_completed: 42,
+            gpu_utilization_pct: Some(75.5),
+            gpu_memory_used_mb: Some(4096),
+            gpu_temperature_c: Some(70.0),
+            loaded_models: Some(vec!["model-a".into()]),
+        };
+        let json = serde_json::to_string(&hb).unwrap();
+        let back: HeartbeatData = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.active_tasks, 3);
+        assert_eq!(back.gpu_utilization_pct, Some(75.5));
     }
 }
