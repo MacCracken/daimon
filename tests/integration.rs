@@ -8,7 +8,7 @@ use tower::ServiceExt;
 
 use daimon::api::{AppState, router};
 use daimon::edge::EdgeFleetManager;
-use daimon::mcp::McpToolRegistry;
+use daimon::mcp::McpHostRegistry;
 use daimon::rag::{RagConfig, RagPipeline};
 use daimon::scheduler::TaskScheduler;
 use daimon::supervisor::Supervisor;
@@ -21,7 +21,8 @@ use daimon::{Config, DaimonError};
 fn test_state() -> Arc<AppState> {
     Arc::new(AppState {
         config: Config::default(),
-        mcp: RwLock::new(McpToolRegistry::new()),
+        mcp: RwLock::new(McpHostRegistry::new()),
+        mcp_handlers: std::collections::HashMap::new(),
         rag: RwLock::new(RagPipeline::new(RagConfig::default())),
         edge: RwLock::new(EdgeFleetManager::default()),
         scheduler: RwLock::new(TaskScheduler::new()),
@@ -196,7 +197,7 @@ async fn mcp_register_list_deregister() {
     assert_eq!(json["tools"].as_array().unwrap().len(), 1);
     assert_eq!(json["tools"][0]["name"], "scan");
 
-    // Call the tool
+    // Call the tool — callback URL is unreachable in tests, so we get an error result.
     let app = router(state.clone());
     let resp = app
         .oneshot(post_json(
@@ -207,7 +208,11 @@ async fn mcp_register_list_deregister() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
-    assert!(!json["is_error"].as_bool().unwrap());
+    assert!(json["isError"].as_bool().unwrap());
+    assert!(json["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("unreachable"));
 
     // Deregister
     let app = router(state.clone());

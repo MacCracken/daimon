@@ -23,7 +23,8 @@ mcp = ["dep:bote"]
 workflow = ["dep:szal"]
 gpu = ["dep:ai-hwaccel"]
 mcp-security = ["dep:t-ron"]
-full = ["logging", "sandbox", "pubsub", "audit", "mcp", "workflow", "gpu", "mcp-security"]
+firewall = ["dep:nein", "mcp"]
+full = ["logging", "sandbox", "pubsub", "audit", "mcp", "workflow", "gpu", "mcp-security", "firewall"]
 
 [dependencies]
 agnostik = { path = "../agnostik" }
@@ -46,11 +47,12 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 # Optional dependencies (published crates)
 ai-hwaccel = { version = "0.23.3", optional = true }
-bote = { version = "0.22.3", optional = true }
+bote = { path = "../bote", features = ["host"], optional = true }
 kavach = { version = "1.0.1", optional = true }
 libro = { version = "0.25.3", optional = true }
 majra = { version = "0.26.3", optional = true }
 szal = { version = "0.26.3", optional = true }
+nein = { version = "0.24", features = ["mcp", "apply", "inspect"], optional = true }
 t-ron = { version = "0.22.4", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
 

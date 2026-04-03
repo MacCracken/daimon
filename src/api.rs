@@ -2,6 +2,9 @@
 //!
 //! Endpoints: /v1/health, /v1/agents, /v1/metrics, /v1/mcp, /v1/rag, /v1/edge, /v1/scheduler.
 
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use axum::Router;
@@ -19,7 +22,7 @@ use tracing::info;
 use crate::config::Config;
 use crate::edge::{EdgeCapabilities, EdgeFleetManager, EdgeNodeStatus, HeartbeatData};
 use crate::error::{DaimonError, Result};
-use crate::mcp::{McpToolCall, McpToolRegistry, McpToolResult, RegisterMcpToolRequest};
+use crate::mcp::{McpToolCall, McpHostRegistry, McpToolResult, RegisterMcpToolRequest};
 use crate::rag::{RagConfig, RagPipeline};
 use crate::scheduler::{NodeCapacity, ResourceReq, ScheduledTask, TaskScheduler};
 use crate::supervisor::Supervisor;
@@ -28,12 +31,23 @@ use crate::supervisor::Supervisor;
 // Shared state
 // ---------------------------------------------------------------------------
 
+/// Async handler for a built-in MCP tool.
+pub type McpToolHandler = Arc<
+    dyn Fn(
+            serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = McpToolResult> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Shared state for the API server.
 pub struct AppState {
     /// Service configuration.
     pub config: Config,
     /// MCP tool registry.
-    pub mcp: RwLock<McpToolRegistry>,
+    pub mcp: RwLock<McpHostRegistry>,
+    /// Built-in MCP tool handlers, keyed by tool name.
+    pub mcp_handlers: HashMap<String, McpToolHandler>,
     /// RAG pipeline.
     pub rag: RwLock<RagPipeline>,
     /// Edge fleet manager.
@@ -93,9 +107,20 @@ pub fn router(state: Arc<AppState>) -> Router {
 ///
 /// Binds to `config.listen_addr:config.port` and serves the REST API.
 pub async fn serve(config: &Config) -> Result<()> {
+    let mut mcp_registry = McpHostRegistry::new();
+    let mut mcp_handlers = HashMap::new();
+
+    // Register built-in MCP tool handlers
+    #[cfg(feature = "firewall")]
+    {
+        let firewall_handlers = crate::firewall::register(&mut mcp_registry);
+        mcp_handlers.extend(firewall_handlers);
+    }
+
     let state = Arc::new(AppState {
         config: config.clone(),
-        mcp: RwLock::new(McpToolRegistry::new()),
+        mcp: RwLock::new(mcp_registry),
+        mcp_handlers,
         rag: RwLock::new(RagPipeline::new(RagConfig::default())),
         edge: RwLock::new(EdgeFleetManager::default()),
         scheduler: RwLock::new(TaskScheduler::new()),
@@ -291,7 +316,12 @@ async fn register_mcp_tool(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RegisterMcpToolRequest>,
 ) -> std::result::Result<(StatusCode, Json<StatusResponse>), DaimonError> {
-    state.mcp.write().await.register_external(req)?;
+    state
+        .mcp
+        .write()
+        .await
+        .register_external(req, true)
+        .map_err(DaimonError::InvalidParameter)?;
     Ok((
         StatusCode::CREATED,
         Json(StatusResponse {
@@ -306,7 +336,12 @@ async fn deregister_mcp_tool(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> std::result::Result<Json<StatusResponse>, DaimonError> {
-    state.mcp.write().await.deregister(&name)?;
+    state
+        .mcp
+        .write()
+        .await
+        .deregister(&name)
+        .map_err(DaimonError::InvalidParameter)?;
     Ok(Json(StatusResponse {
         ok: true,
         message: None,
@@ -326,17 +361,47 @@ async fn call_mcp_tool(
         )));
     }
 
-    // For external tools, we would forward to the callback URL.
-    // For built-in tools, dispatch here. Currently return a placeholder.
-    if let Some(url) = reg.external_callback(&call.name) {
-        // In production this would POST to the callback URL.
-        Ok(Json(McpToolResult::text(format!("dispatched to {url}"))))
-    } else {
-        Ok(Json(McpToolResult::text(format!(
-            "built-in tool '{}' executed",
-            call.name
-        ))))
+    // External tools: forward to the registered callback URL.
+    if let Some(url) = reg.external_callback(&call.name).map(String::from) {
+        drop(reg); // Release read lock before HTTP call.
+        tracing::info!(tool = %call.name, url = %url, "forwarding MCP call to external tool");
+        let client = reqwest::Client::new();
+        let resp = match client.post(&url).json(&call).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(tool = %call.name, url = %url, error = %e, "external tool call failed");
+                return Ok(Json(McpToolResult::error(format!(
+                    "external tool unreachable: {e}"
+                ))));
+            }
+        };
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Ok(Json(McpToolResult::error(format!(
+                "external tool returned HTTP {status}: {body}"
+            ))));
+        }
+
+        let result: McpToolResult = resp.json().await.map_err(|e| {
+            DaimonError::ApiError(format!("failed to parse external tool response: {e}"))
+        })?;
+        return Ok(Json(result));
     }
+
+    // Built-in tools: look up handler in the builtin dispatch table.
+    if let Some(handler) = state.mcp_handlers.get(call.name.as_str()) {
+        drop(reg);
+        tracing::debug!(tool = %call.name, "dispatching built-in MCP tool");
+        let result = handler(call.arguments).await;
+        return Ok(Json(result));
+    }
+
+    Ok(Json(McpToolResult::error(format!(
+        "no handler registered for built-in tool '{}'",
+        call.name
+    ))))
 }
 
 /// POST /v1/rag/ingest — ingest text
@@ -611,7 +676,8 @@ mod tests {
     fn test_state() -> Arc<AppState> {
         Arc::new(AppState {
             config: Config::default(),
-            mcp: RwLock::new(McpToolRegistry::new()),
+            mcp: RwLock::new(McpHostRegistry::new()),
+            mcp_handlers: HashMap::new(),
             rag: RwLock::new(RagPipeline::new(RagConfig::default())),
             edge: RwLock::new(EdgeFleetManager::default()),
             scheduler: RwLock::new(TaskScheduler::new()),

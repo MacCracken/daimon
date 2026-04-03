@@ -23,6 +23,9 @@ pub mod screen;
 pub mod supervisor;
 pub mod vector_store;
 
+#[cfg(feature = "firewall")]
+pub mod firewall;
+
 #[cfg(feature = "logging")]
 pub mod logging;
 

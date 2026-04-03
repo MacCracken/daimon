@@ -6,6 +6,7 @@ _(empty — all extraction and scaffolding work is complete)_
 
 ## Future
 
+- [ ] jnana integration — grounded knowledge queries backed by verified AGNOS science data
 - [ ] gRPC transport option alongside HTTP
 - [ ] WebSocket streaming for real-time agent events
 - [ ] Distributed tracing integration (OpenTelemetry)
