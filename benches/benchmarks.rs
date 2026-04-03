@@ -57,7 +57,7 @@ fn make_tool(name: &str) -> daimon::mcp::McpToolDescription {
     serde_json::from_value(json!({
         "name": name,
         "description": format!("Tool: {name}"),
-        "input_schema": {"type": "object"},
+        "inputSchema": {"type": "object"},
     }))
     .unwrap()
 }
