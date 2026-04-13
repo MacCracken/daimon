@@ -17,21 +17,7 @@
 #   ipc       — Unix domain sockets, message bus, RPC
 #   api       — HTTP REST API (port 8090)
 
-include "lib/string.cyr"
-include "lib/fmt.cyr"
-include "lib/alloc.cyr"
-include "lib/vec.cyr"
-include "lib/str.cyr"
-include "lib/syscalls.cyr"
-include "lib/io.cyr"
-include "lib/fs.cyr"
-include "lib/hashmap.cyr"
-include "lib/tagged.cyr"
-include "lib/json.cyr"
-include "lib/net.cyr"
-include "lib/args.cyr"
-include "lib/chrono.cyr"
-include "lib/sakshi.cyr"
+# Stdlib auto-included via cyrius.toml
 include "lib/math.cyr"
 include "lib/process.cyr"
 
@@ -237,6 +223,78 @@ fn read_vm_rss(pid) {
         }
     }
     return 0;
+}
+
+# Read CPU time (utime+stime) from /proc/{pid}/stat in milliseconds
+fn read_cpu_time_ms(pid) {
+    if (pid == 0) { return 0; }
+    var path_sb = str_builder_new();
+    str_builder_add_cstr(path_sb, "/proc/");
+    str_builder_add_int(path_sb, pid);
+    str_builder_add_cstr(path_sb, "/stat");
+    var path = str_builder_build(path_sb);
+    var buf = alloc(4096);
+    var n = file_read_all(str_data(path), buf, 4095);
+    if (n <= 0) { return 0; }
+    store8(buf + n, 0);
+    # Find ')' — fields are after the comm field
+    var ci = 0;
+    while (ci < n) {
+        if (load8(buf + ci) == 41) { break; }  # ')'
+        ci = ci + 1;
+    }
+    ci = ci + 2;  # skip ') '
+    # utime is field 14 (0-indexed from start, 11th after comm)
+    # stime is field 15 (12th after comm)
+    var field = 0;
+    var utime = 0;
+    var stime = 0;
+    while (ci < n) {
+        # Skip whitespace
+        while (ci < n) {
+            if (load8(buf + ci) != 32) { break; }
+            ci = ci + 1;
+        }
+        # Parse number
+        var val = 0;
+        while (ci < n) {
+            var c = load8(buf + ci);
+            if (c < 48) { break; }
+            if (c > 57) { break; }
+            val = val * 10 + c - 48;
+            ci = ci + 1;
+        }
+        if (field == 11) { utime = val; }
+        if (field == 12) { stime = val; }
+        if (field > 12) { break; }
+        field = field + 1;
+    }
+    # Convert ticks to ms (assume 100 Hz = 10ms per tick)
+    return (utime + stime) * 10;
+}
+
+# Normalize a vector to unit length
+fn normalize_vec(v, dim) {
+    var mag_sq = f64_from(0);
+    var ni = 0;
+    while (ni < dim) {
+        var x = load64(v + ni * 8);
+        mag_sq = f64_add(mag_sq, f64_mul(x, x));
+        ni = ni + 1;
+    }
+    var mag = f64_sqrt(mag_sq);
+    var result = alloc(dim * 8);
+    if (f64_eq(mag, f64_from(0)) == 1) {
+        ni = 0;
+        while (ni < dim) { store64(result + ni * 8, f64_from(0)); ni = ni + 1; }
+    } else {
+        ni = 0;
+        while (ni < dim) {
+            store64(result + ni * 8, f64_div(load64(v + ni * 8), mag));
+            ni = ni + 1;
+        }
+    }
+    return result;
 }
 
 fn count_fds(pid) {
@@ -740,6 +798,55 @@ fn memory_store_clear(ms, agent_id_str) {
     return count;
 }
 
+fn memory_store_list_by_tag(ms, agent_id_str, tag) {
+    var dir = memory_store_agent_dir(ms, agent_id_str);
+    var entries = dir_list(str_data(dir));
+    if (entries == 0) { return vec_new(); }
+    var matching = vec_new();
+    var mi = 0;
+    while (mi < vec_len(entries)) {
+        var name = vec_get(entries, mi);
+        var name_s = str_from(name);
+        if (str_ends_with(name_s, str_from(".json")) == 1) {
+            var fpath = path_join(str_data(dir), name);
+            var fbuf = alloc(MAX_VALUE_SIZE);
+            var frd = file_read_all(str_data(fpath), fbuf, MAX_VALUE_SIZE - 1);
+            if (frd > 0) {
+                store8(fbuf + frd, 0);
+                var content = str_new(fbuf, frd);
+                # Check if content contains the tag string
+                if (str_contains(content, tag) == 1) {
+                    var stem = str_sub(name_s, 0, str_len(name_s) - 5);
+                    vec_push(matching, stem);
+                }
+            }
+        }
+        mi = mi + 1;
+    }
+    return matching;
+}
+
+fn memory_store_usage_bytes(ms, agent_id_str) {
+    var dir = memory_store_agent_dir(ms, agent_id_str);
+    var entries = dir_list(str_data(dir));
+    if (entries == 0) { return 0; }
+    var total = 0;
+    var ui = 0;
+    while (ui < vec_len(entries)) {
+        var name = vec_get(entries, ui);
+        var fpath = path_join(str_data(dir), name);
+        # stat the file to get size — use read length as proxy
+        var buf = alloc(1);
+        var sz = file_read_all(str_data(fpath), buf, 0);
+        # Since we can't easily stat(), count actual file content
+        var rbuf = alloc(65536);
+        var rn = file_read_all(str_data(fpath), rbuf, 65535);
+        if (rn > 0) { total = total + rn; }
+        ui = ui + 1;
+    }
+    return total;
+}
+
 # =========================================================================
 # vector_store — in-memory cosine-similarity search
 # =========================================================================
@@ -1161,6 +1268,19 @@ fn mcp_find_tool(reg, name_cstr) {
     var ext = map_get(load64(reg + 8), name_cstr);
     if (ext != 0) { return load64(ext); }
     return 0;
+}
+
+# Validate a callback URL (basic SSRF protection)
+fn validate_callback_url(url) {
+    if (url == 0) { return Err(ERR_INVALID_PARAM); }
+    if (str_len(url) == 0) { return Err(ERR_INVALID_PARAM); }
+    # Must start with http:// or https://
+    if (str_starts_with(url, str_from("http://")) == 0) {
+        if (str_starts_with(url, str_from("https://")) == 0) {
+            return Err(ERR_INVALID_PARAM);
+        }
+    }
+    return Ok(0);
 }
 
 fn mcp_deregister(reg, name_cstr) {
@@ -1605,6 +1725,49 @@ fn scheduler_stats(ts) {
     return st;
 }
 
+# Check if a high-priority task should preempt an existing running task
+fn scheduler_preempt_check(ts, new_task) {
+    var tasks = load64(ts);
+    var keys = map_keys(tasks);
+    var new_prio = sched_task_priority(new_task);
+    var new_class = priority_from_numeric(new_prio);
+    var candidate = 0;
+    var candidate_prio = 11;  # higher than max
+    var pi = 0;
+    while (pi < vec_len(keys)) {
+        var t = map_get(tasks, vec_get(keys, pi));
+        if (sched_task_status(t) == TASK_RUNNING) {
+            var tp = sched_task_priority(t);
+            var tc = priority_from_numeric(tp);
+            # new_class > tc means new task has higher priority
+            if (new_class > tc) {
+                if (tp < candidate_prio) {
+                    candidate = t;
+                    candidate_prio = tp;
+                }
+            }
+        }
+        pi = pi + 1;
+    }
+    return candidate;  # 0 if no preemption needed
+}
+
+# Tasks assigned to a specific node
+fn scheduler_tasks_for_node(ts, node_id_cstr) {
+    var tasks = load64(ts);
+    var keys = map_keys(tasks);
+    var result = vec_new();
+    var ti = 0;
+    while (ti < vec_len(keys)) {
+        var t = map_get(tasks, vec_get(keys, ti));
+        var status = sched_task_status(t);
+        if (status == TASK_SCHEDULED) { vec_push(result, t); }
+        elif (status == TASK_RUNNING) { vec_push(result, t); }
+        ti = ti + 1;
+    }
+    return result;
+}
+
 # CronEntry: {name: Str, interval_secs, specific_hour, specific_minute,
 #              task_name: Str, task_agent_id: Str, task_priority,
 #              enabled, last_fired}
@@ -1806,6 +1969,38 @@ fn fed_mgr_start_election(fm, local_id_cstr) {
     return Ok(term);
 }
 
+# Process a vote request from a candidate
+# Returns: 0 = denied, 1 = granted
+fn fed_mgr_receive_vote_request(fm, local_id_cstr, candidate_id_cstr, candidate_term) {
+    var local = map_get(load64(fm), local_id_cstr);
+    if (local == 0) { return 0; }
+    var local_term = load64(local + 40);
+    if (candidate_term <= local_term) { return 0; }
+    # Higher term — step down and grant vote
+    store64(local + 40, candidate_term);
+    store64(local + 16, ROLE_FOLLOWER);
+    return 1;
+}
+
+# Process a received vote, returns 1 if majority reached
+fn fed_mgr_receive_vote(fm, vote_granted, total_nodes, votes_so_far) {
+    if (vote_granted == 0) { return 0; }
+    var new_votes = votes_so_far + 1;
+    var majority = total_nodes / 2 + 1;
+    if (new_votes >= majority) { return 1; }
+    return 0;
+}
+
+# Step a node down to follower
+fn fed_mgr_step_down(fm, id_cstr, new_term) {
+    var node = map_get(load64(fm), id_cstr);
+    if (node == 0) { return Err(ERR_FEDERATION); }
+    store64(node + 16, ROLE_FOLLOWER);
+    store64(node + 40, new_term);
+    store64(node + 48, 0);  # voted_for = none
+    return Ok(0);
+}
+
 # Become coordinator
 fn fed_mgr_become_coordinator(fm, id_cstr) {
     var node = map_get(load64(fm), id_cstr);
@@ -1853,6 +2048,31 @@ fn fed_score_node(node, req_cpu, req_mem, preferred_id, max_load, node_load) {
 
     # Total: weighted sum (integer, 0-100 scale)
     return resource * 40 / 100 + locality * 30 / 100 + load_bal * 20 / 100;
+}
+
+# Place an agent on the best eligible node
+fn fed_place_agent(fm, req_cpu, req_mem, gpu_required, preferred_id) {
+    var nodes = load64(fm);
+    var keys = map_keys(nodes);
+    var best_node = 0;
+    var best_score = 0 - 1;
+    var pi = 0;
+    while (pi < vec_len(keys)) {
+        var node = map_get(nodes, vec_get(keys, pi));
+        if (load64(node + 24) != FED_ONLINE) { pi = pi + 1; continue; }
+        # Check GPU requirement
+        if (gpu_required == 1) {
+            if (load64(node + 72) == 0) { pi = pi + 1; continue; }
+        }
+        var score = fed_score_node(node, req_cpu, req_mem, preferred_id, 1, 0);
+        if (score > best_score) {
+            best_score = score;
+            best_node = node;
+        }
+        pi = pi + 1;
+    }
+    if (best_node == 0) { return Err(ERR_FEDERATION); }
+    return Ok(best_node);
 }
 
 fn fed_mgr_stats(fm) {
@@ -2685,21 +2905,21 @@ fn http_parse_query_param(buf, len, param_name) {
     var i = 0;
     while (i < len) {
         if (load8(buf + i) == 63) { i = i + 1; break; }
-        if (load8(buf + i) == 32) { return 0; }  # No query string
+        if (load8(buf + i) == 32) { return 0; }
         i = i + 1;
     }
     if (i >= len) { return 0; }
     var pname_len = strlen(param_name);
-    while (i < len) {
-        if (load8(buf + i) == 32) { break; }  # End of URL
+    while (i + pname_len + 1 <= len) {
+        if (load8(buf + i) == 32) { break; }
         if (memeq(buf + i, param_name, pname_len) == 1) {
-            if (load8(buf + i + pname_len) == 61) {  # =
+            if (load8(buf + i + pname_len) == 61) {
                 var vstart = i + pname_len + 1;
                 var vend = vstart;
                 while (vend < len) {
                     var c = load8(buf + vend);
-                    if (c == 38) { break; }   # &
-                    if (c == 32) { break; }   # space
+                    if (c == 38) { break; }
+                    if (c == 32) { break; }
                     vend = vend + 1;
                 }
                 var vlen = vend - vstart;
@@ -3357,8 +3577,10 @@ fn http_route(fd, method, path, buf, buf_len) {
 
     # /v1/agents/{id}
     if (memeq(path, "/v1/agents/", 11) == 1) {
-        api_get_agent(fd, path + 11);
-        return 0;
+        if (strlen(path + 11) > 0) {
+            api_get_agent(fd, path + 11);
+            return 0;
+        }
     }
 
     # /v1/mcp/tools

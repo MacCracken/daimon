@@ -3,8 +3,12 @@ name = "daimon"
 version = "0.7.0"
 description = "daimon — AGNOS agent orchestrator"
 license = "GPL-3.0-only"
-repository = "https://github.com/MacCracken/daimon"
+language = "cyrius"
+cyrius = "4.2.0"
 
 [build]
-src = "src/main.cyr"
-output = "build/daimon"
+entry = "src/main.cyr"
+output = "daimon"
+
+[deps]
+stdlib = ["string", "fmt", "alloc", "vec", "str", "syscalls", "io", "fs", "hashmap", "tagged", "json", "net", "args", "chrono", "sakshi", "fnptr", "process", "assert", "bench", "freelist"]

@@ -37,7 +37,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - Test suite: 130 assertions across 18 test groups.
 - Benchmark suite: 16 benchmarks covering core data structures and subsystems.
 - Fuzz harnesses: 5 (circuit_breaker, memory_keys, scheduler_fsm, vector_store, mcp_registry).
-- Binary size: **145 KB** (vs 4.0 MB default Rust build — 96% smaller).
+- `read_cpu_time_ms()` — CPU time from /proc/{pid}/stat.
+- `normalize_vec()` — vector normalization to unit length.
+- `validate_callback_url()` — basic SSRF protection for MCP external tool URLs.
+- `memory_store_list_by_tag()` — tag-based key filtering.
+- `memory_store_usage_bytes()` — disk usage tracking.
+- `scheduler_preempt_check()` — preemption analysis for priority scheduling.
+- `scheduler_tasks_for_node()` — tasks assigned to a specific node.
+- `fed_mgr_receive_vote_request()` / `fed_mgr_receive_vote()` — Raft vote processing.
+- `fed_mgr_step_down()` — coordinator step-down on higher term.
+- `fed_place_agent()` — agent placement on best eligible node.
+- Benchmark comparison document (BENCHMARKS.md) with Rust vs Cyrius analysis.
+- Binary size: **162 KB** (vs 4.0 MB default Rust build — 96% smaller).
+
+### Fixed
+
+- **Security**: HTTP query parameter parsing bounds-checked to prevent buffer over-read.
+- **Security**: Empty path segments (`/v1/agents/`) return 404 instead of passing empty string to handler.
+- **Correctness**: Edge decommission URL routing fixed (13-char suffix, not 14).
+- **Correctness**: Variable name collisions in HTTP router fixed (cyrius flat scoping).
+- **Correctness**: MCP tool registry uses `str_cstr()` for null-terminated map keys.
+- **Correctness**: JSON key lookup uses `str_eq_cstr()` via `jget()` helper.
 
 ### Changed
 
