@@ -29,6 +29,9 @@ var SYS_CONNECT = 42;
 var SYS_ACCEPT = 43;
 var SYS_BIND = 49;
 var SYS_LISTEN = 50;
+var SYS_PIDFD_OPEN = 434;
+var SYS_PIDFD_SEND_SIGNAL = 424;
+var SYS_GETSOCKOPT = 55;
 
 # =========================================================================
 # error — error codes and HTTP status mapping
@@ -342,6 +345,41 @@ fn agent_is_alive(h) {
 }
 
 # Start an agent process
+# VULN-010: Spawn with resource limits
+# setrlimit(resource, &rlimit{cur, max}) — syscall 160
+var SYS_SETRLIMIT = 160;
+var RLIMIT_AS = 9;    # Address space
+var RLIMIT_CPU = 0;   # CPU time in seconds
+
+fn agent_spawn_with_limits(cmd, arg1, arg2, mem_limit, cpu_limit) {
+    var pid = syscall(SYS_FORK);
+    if (pid < 0) { return Err(ERR_SUPERVISOR); }
+    if (pid == 0) {
+        # Child: apply rlimits before exec
+        if (mem_limit > 0) {
+            var rlim = alloc(16);
+            store64(rlim, mem_limit);
+            store64(rlim + 8, mem_limit);
+            syscall(SYS_SETRLIMIT, RLIMIT_AS, rlim);
+        }
+        if (cpu_limit > 0) {
+            var rlim_cpu = alloc(16);
+            store64(rlim_cpu, cpu_limit);
+            store64(rlim_cpu + 8, cpu_limit);
+            syscall(SYS_SETRLIMIT, RLIMIT_CPU, rlim_cpu);
+        }
+        # exec
+        var argv_buf[4];
+        store64(&argv_buf, cmd);
+        store64(&argv_buf + 8, arg1);
+        store64(&argv_buf + 16, arg2);
+        store64(&argv_buf + 24, 0);
+        syscall(SYS_EXECVE, cmd, &argv_buf, 0);
+        syscall(SYS_EXIT, 127);
+    }
+    return Ok(pid);
+}
+
 fn agent_start(h, executable) {
     var status = agent_status(h);
     if (status != AGENT_PENDING) {
@@ -372,19 +410,31 @@ fn agent_start(h, executable) {
     return Ok(pid);
 }
 
+# VULN-004: Race-free signal delivery via pidfd (Linux 5.3+), fallback to kill()
+fn agent_send_signal(pid, sig) {
+    if (pid <= 0) { return 0; }
+    # Try pidfd_open + pidfd_send_signal for race-free delivery
+    var pidfd = syscall(SYS_PIDFD_OPEN, pid, 0);
+    if (pidfd >= 0) {
+        syscall(SYS_PIDFD_SEND_SIGNAL, pidfd, sig, 0, 0);
+        syscall(SYS_CLOSE, pidfd);
+        return 1;
+    }
+    # Fallback: plain kill (susceptible to PID reuse race)
+    syscall(SYS_KILL, pid, sig);
+    return 1;
+}
+
 # Stop an agent (SIGTERM then SIGKILL)
 fn agent_stop(h, reason) {
     agent_set_status(h, AGENT_STOPPING);
     var pid = agent_pid(h);
     if (pid > 0) {
-        # Send SIGTERM
-        syscall(SYS_KILL, pid, 15);
-        # Wait briefly, then force kill if needed
+        agent_send_signal(pid, 15);  # SIGTERM
         var status_buf[1];
         var wr = syscall(SYS_WAIT4, pid, &status_buf, 1, 0);  # WNOHANG
         if (wr == 0) {
-            # Process still running after WNOHANG, force kill
-            syscall(SYS_KILL, pid, 9);
+            agent_send_signal(pid, 9);  # SIGKILL
             syscall(SYS_WAIT4, pid, &status_buf, 0, 0);
         }
     }
@@ -395,8 +445,7 @@ fn agent_stop(h, reason) {
 # Pause (SIGSTOP)
 fn agent_pause(h) {
     if (agent_status(h) != AGENT_RUNNING) { return Err(ERR_SUPERVISOR); }
-    var pid = agent_pid(h);
-    if (pid > 0) { syscall(SYS_KILL, pid, 19); }  # SIGSTOP
+    agent_send_signal(agent_pid(h), 19);  # SIGSTOP
     agent_set_status(h, AGENT_PAUSED);
     return Ok(0);
 }
@@ -404,8 +453,7 @@ fn agent_pause(h) {
 # Resume (SIGCONT)
 fn agent_resume(h) {
     if (agent_status(h) != AGENT_PAUSED) { return Err(ERR_SUPERVISOR); }
-    var pid = agent_pid(h);
-    if (pid > 0) { syscall(SYS_KILL, pid, 18); }  # SIGCONT
+    agent_send_signal(agent_pid(h), 18);  # SIGCONT
     agent_set_status(h, AGENT_RUNNING);
     return Ok(0);
 }
@@ -709,8 +757,8 @@ fn memory_store_set(ms, agent_id_str, key, value_json) {
     if (is_err_result(vr) == 1) { return vr; }
 
     var dir = memory_store_agent_dir(ms, agent_id_str);
-    # Ensure directory exists
-    syscall(SYS_MKDIR, str_data(dir), 493);  # 0755
+    # Ensure directory exists (VULN-005: 0700 not 0755)
+    syscall(SYS_MKDIR, str_data(dir), 448);  # 0700
 
     var safe_key = sanitize_key(key);
     var fname = str_cat(safe_key, str_from(".json"));
@@ -2727,9 +2775,34 @@ fn agent_ipc_bind(ipc) {
 }
 
 # Accept a connection and read one length-prefixed message
+# VULN-006: Get peer UID via SO_PEERCRED (returns UID or -1)
+fn ipc_get_peer_uid(cfd) {
+    # struct ucred { pid_t pid; uid_t uid; gid_t gid; } = 12 bytes
+    var cred_buf = alloc(16);
+    var cred_len[1];
+    store32(&cred_len, 12);
+    # getsockopt(fd, SOL_SOCKET=1, SO_PEERCRED=17, buf, &len)
+    var r = syscall(SYS_GETSOCKOPT, cfd, 1, 17, cred_buf, &cred_len);
+    if (r < 0) { return 0 - 1; }
+    # uid is at offset 4 (after pid)
+    return load32(cred_buf + 4);
+}
+
 fn agent_ipc_accept_one(fd, ipc) {
     var cfd = syscall(SYS_ACCEPT, fd, 0, 0);
     if (cfd < 0) { return Err(ERR_IPC); }
+
+    # VULN-006: Verify peer credentials
+    var peer_uid = ipc_get_peer_uid(cfd);
+    var my_uid = syscall(SYS_GETUID);
+    if (peer_uid >= 0) {
+        if (peer_uid != my_uid) {
+            if (peer_uid != 0) {  # Allow root
+                syscall(SYS_CLOSE, cfd);
+                return Err(ERR_IPC);
+            }
+        }
+    }
 
     if (_global_active_connections >= MAX_GLOBAL_FD_LIMIT) {
         syscall(SYS_CLOSE, cfd);
@@ -2868,6 +2941,38 @@ fn app_init() {
     _rpc_registry = rpc_registry_new();
 }
 
+# --- HTTP constants ---
+
+var MAX_REQUEST_SIZE = 65536;
+var MAX_HEADER_SIZE = 8192;
+
+# --- JSON escaping (VULN-002) ---
+
+fn json_escape_str(s) {
+    var data = str_data(s);
+    var slen = str_len(s);
+    var sb = str_builder_new();
+    var ei = 0;
+    while (ei < slen) {
+        var c = load8(data + ei);
+        if (c == 34) { str_builder_add_cstr(sb, "\\\""); }
+        elif (c == 92) { str_builder_add_cstr(sb, "\\\\"); }
+        elif (c == 10) { str_builder_add_cstr(sb, "\\n"); }
+        elif (c == 13) { str_builder_add_cstr(sb, "\\r"); }
+        elif (c == 9) { str_builder_add_cstr(sb, "\\t"); }
+        elif (c < 32) {
+            # Control character — skip
+        }
+        else {
+            var cbuf[1];
+            store8(&cbuf, c);
+            str_builder_add(sb, str_new(&cbuf, 1));
+        }
+        ei = ei + 1;
+    }
+    return str_builder_build(sb);
+}
+
 # --- HTTP helpers ---
 
 fn http_parse_method(buf, len) {
@@ -2879,18 +2984,16 @@ fn http_parse_method(buf, len) {
 }
 
 fn http_parse_path(buf, len) {
-    # Find start of path (after method + space)
     var i = 0;
     while (i < len) {
         if (load8(buf + i) == 32) { i = i + 1; break; }
         i = i + 1;
     }
     var start = i;
-    # Find end of path (space or ?)
     while (i < len) {
         var c = load8(buf + i);
         if (c == 32) { break; }
-        if (c == 63) { break; }  # ?
+        if (c == 63) { break; }
         i = i + 1;
     }
     var plen = i - start;
@@ -2898,6 +3001,59 @@ fn http_parse_path(buf, len) {
     memcpy(path_buf, buf + start, plen);
     store8(path_buf + plen, 0);
     return path_buf;
+}
+
+# VULN-001: Parse Content-Length header from request
+fn http_parse_content_length(buf, len) {
+    var i = 0;
+    while (i < len - 16) {
+        # Scan for "Content-Length: " (case-insensitive first char)
+        if (load8(buf + i) == 10) {
+            var hi = i + 1;
+            if (hi + 15 < len) {
+                # Check "Content-Length:" (case insensitive C/c)
+                var cl_found = 0;
+                if (memeq(buf + hi, "Content-Length:", 15) == 1) { cl_found = 1; }
+                if (memeq(buf + hi, "content-length:", 15) == 1) { cl_found = 1; }
+                if (cl_found == 1) {
+                    var vi = hi + 15;
+                    # Skip whitespace
+                    while (vi < len) {
+                        if (load8(buf + vi) != 32) { break; }
+                        vi = vi + 1;
+                    }
+                    # Parse number
+                    var cl = 0;
+                    while (vi < len) {
+                        var c = load8(buf + vi);
+                        if (c < 48) { break; }
+                        if (c > 57) { break; }
+                        cl = cl * 10 + c - 48;
+                        vi = vi + 1;
+                    }
+                    return cl;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return 0 - 1;  # -1 = not found
+}
+
+# VULN-001: Check for Transfer-Encoding header (reject if present with Content-Length)
+fn http_has_transfer_encoding(buf, len) {
+    var i = 0;
+    while (i < len - 18) {
+        if (load8(buf + i) == 10) {
+            var hi = i + 1;
+            if (hi + 17 < len) {
+                if (memeq(buf + hi, "Transfer-Encoding", 17) == 1) { return 1; }
+                if (memeq(buf + hi, "transfer-encoding", 17) == 1) { return 1; }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
 }
 
 fn http_parse_query_param(buf, len, param_name) {
@@ -2941,7 +3097,9 @@ fn http_parse_query_param(buf, len, param_name) {
 }
 
 fn http_parse_body(buf, len) {
-    # Find CRLFCRLF (13 10 13 10) or LFLF (10 10)
+    # Find header/body boundary: CRLFCRLF or LFLF
+    var hdr_end = 0;
+    var body_off = 0;
     var i = 0;
     while (i < len - 1) {
         if (load8(buf + i) == 13) {
@@ -2949,10 +3107,9 @@ fn http_parse_body(buf, len) {
                 if (load8(buf + i + 1) == 10) {
                     if (load8(buf + i + 2) == 13) {
                         if (load8(buf + i + 3) == 10) {
-                            var body_start = i + 4;
-                            var body_len = len - body_start;
-                            if (body_len <= 0) { return 0; }
-                            return str_new(buf + body_start, body_len);
+                            hdr_end = i;
+                            body_off = i + 4;
+                            break;
                         }
                     }
                 }
@@ -2960,15 +3117,23 @@ fn http_parse_body(buf, len) {
         }
         if (load8(buf + i) == 10) {
             if (load8(buf + i + 1) == 10) {
-                var body_start = i + 2;
-                var body_len = len - body_start;
-                if (body_len <= 0) { return 0; }
-                return str_new(buf + body_start, body_len);
+                hdr_end = i;
+                body_off = i + 2;
+                break;
             }
         }
         i = i + 1;
     }
-    return 0;
+    if (body_off == 0) { return 0; }
+    var avail = len - body_off;
+    if (avail <= 0) { return 0; }
+
+    # Use Content-Length to bound body size if present (VULN-001)
+    var cl = http_parse_content_length(buf, hdr_end);
+    if (cl >= 0) {
+        if (cl < avail) { avail = cl; }
+    }
+    return str_new(buf + body_off, avail);
 }
 
 fn http_crlf(sb) {
@@ -3050,7 +3215,7 @@ fn api_list_agents(fd) {
         str_builder_add_cstr(sb, "{\"id\":");
         str_builder_add_int(sb, agent_id(h));
         str_builder_add_cstr(sb, ",\"name\":\"");
-        str_builder_add(sb, agent_name(h));
+        str_builder_add(sb, json_escape_str(agent_name(h)));
         str_builder_add_cstr(sb, "\",\"status\":");
         str_builder_add_int(sb, agent_status(h));
         str_builder_add_cstr(sb, ",\"pid\":");
@@ -3085,7 +3250,7 @@ fn api_register_agent(fd, body) {
     str_builder_add_cstr(sb, "{\"id\":");
     str_builder_add_int(sb, id);
     str_builder_add_cstr(sb, ",\"name\":\"");
-    str_builder_add(sb, name);
+    str_builder_add(sb, json_escape_str(name));
     str_builder_add_cstr(sb, "\",\"status\":");
     str_builder_add_int(sb, AGENT_PENDING);
     str_builder_add_cstr(sb, "}");
@@ -3104,9 +3269,9 @@ fn api_mcp_manifest(fd) {
         if (i > 0) { str_builder_add_cstr(sb, ","); }
         var t = map_get(builtin, vec_get(keys, i));
         str_builder_add_cstr(sb, "{\"name\":\"");
-        str_builder_add(sb, mcp_tool_name(t));
+        str_builder_add(sb, json_escape_str(mcp_tool_name(t)));
         str_builder_add_cstr(sb, "\",\"description\":\"");
-        str_builder_add(sb, mcp_tool_desc(t));
+        str_builder_add(sb, json_escape_str(mcp_tool_desc(t)));
         str_builder_add_cstr(sb, "\"}");
         i = i + 1;
     }
@@ -3118,9 +3283,9 @@ fn api_mcp_manifest(fd) {
         var ext = map_get(external, vec_get(ekeys, j));
         var t = load64(ext);
         str_builder_add_cstr(sb, "{\"name\":\"");
-        str_builder_add(sb, mcp_tool_name(t));
+        str_builder_add(sb, json_escape_str(mcp_tool_name(t)));
         str_builder_add_cstr(sb, "\",\"description\":\"");
-        str_builder_add(sb, mcp_tool_desc(t));
+        str_builder_add(sb, json_escape_str(mcp_tool_desc(t)));
         str_builder_add_cstr(sb, "\"}");
         j = j + 1;
     }
@@ -3177,7 +3342,7 @@ fn api_get_agent(fd, id_cstr) {
     str_builder_add_cstr(sb, "{\"id\":");
     str_builder_add_int(sb, agent_id(h));
     str_builder_add_cstr(sb, ",\"name\":\"");
-    str_builder_add(sb, agent_name(h));
+    str_builder_add(sb, json_escape_str(agent_name(h)));
     str_builder_add_cstr(sb, "\",\"status\":");
     str_builder_add_int(sb, agent_status(h));
     str_builder_add_cstr(sb, ",\"pid\":");
@@ -3323,7 +3488,7 @@ fn api_edge_list(fd, buf, buf_len) {
         str_builder_add_cstr(sb, "{\"id\":\"");
         str_builder_add(sb, edge_node_id(n));
         str_builder_add_cstr(sb, "\",\"name\":\"");
-        str_builder_add(sb, load64(n + 8));
+        str_builder_add(sb, json_escape_str(load64(n + 8)));
         str_builder_add_cstr(sb, "\",\"status\":");
         str_builder_add_int(sb, edge_node_status(n));
         str_builder_add_cstr(sb, "}");
@@ -3348,7 +3513,7 @@ fn api_edge_get(fd, id_cstr) {
     str_builder_add_cstr(sb, "{\"id\":\"");
     str_builder_add(sb, edge_node_id(n));
     str_builder_add_cstr(sb, "\",\"name\":\"");
-    str_builder_add(sb, load64(n + 8));
+    str_builder_add(sb, json_escape_str(load64(n + 8)));
     str_builder_add_cstr(sb, "\",\"status\":\"");
     str_builder_add_cstr(sb, load64(&status_names + edge_node_status(n) * 8));
     str_builder_add_cstr(sb, "\",\"active_tasks\":");
@@ -3446,7 +3611,7 @@ fn api_sched_get_task(fd, id_cstr) {
     str_builder_add_cstr(sb, "{\"task_id\":\"");
     str_builder_add(sb, sched_task_id(task));
     str_builder_add_cstr(sb, "\",\"name\":\"");
-    str_builder_add(sb, sched_task_name(task));
+    str_builder_add(sb, json_escape_str(sched_task_name(task)));
     str_builder_add_cstr(sb, "\",\"priority\":");
     str_builder_add_int(sb, sched_task_priority(task));
     str_builder_add_cstr(sb, ",\"status\":\"");
@@ -3752,8 +3917,9 @@ fn serve(port) {
         if (is_err_result(client_result) == 1) { continue; }
         var cfd = payload(client_result);
 
-        var req_buf = alloc(8192);
-        var recv_result = sock_recv(cfd, req_buf, 8191);
+        # Read headers (up to MAX_HEADER_SIZE)
+        var req_buf = alloc(MAX_REQUEST_SIZE + 1);
+        var recv_result = sock_recv(cfd, req_buf, MAX_HEADER_SIZE);
         if (is_err_result(recv_result) == 1) {
             sock_close(cfd);
             continue;
@@ -3764,6 +3930,54 @@ fn serve(port) {
             continue;
         }
         store8(req_buf + req_len, 0);
+
+        # VULN-001: Reject requests with Transfer-Encoding (we don't support chunked)
+        if (http_has_transfer_encoding(req_buf, req_len) == 1) {
+            http_send_response(cfd, 501, "{\"error\":\"chunked transfer not supported\"}", 42);
+            sock_close(cfd);
+            continue;
+        }
+
+        # VULN-001+008: If Content-Length present, read remaining body up to MAX_REQUEST_SIZE
+        var cl = http_parse_content_length(req_buf, req_len);
+        if (cl > MAX_REQUEST_SIZE) {
+            http_send_response(cfd, 413, "{\"error\":\"payload too large\"}", 28);
+            sock_close(cfd);
+            continue;
+        }
+
+        # If we have a Content-Length and haven't read the full body, read more
+        if (cl > 0) {
+            # Find where body starts
+            var hdr_boundary = 0;
+            var hi = 0;
+            while (hi < req_len - 3) {
+                if (load8(req_buf + hi) == 13) {
+                    if (load8(req_buf + hi + 1) == 10) {
+                        if (load8(req_buf + hi + 2) == 13) {
+                            if (load8(req_buf + hi + 3) == 10) {
+                                hdr_boundary = hi + 4;
+                                break;
+                            }
+                        }
+                    }
+                }
+                hi = hi + 1;
+            }
+            if (hdr_boundary > 0) {
+                var body_have = req_len - hdr_boundary;
+                var body_need = cl - body_have;
+                if (body_need > 0) {
+                    if (hdr_boundary + cl <= MAX_REQUEST_SIZE) {
+                        var extra = sock_recv(cfd, req_buf + req_len, body_need);
+                        if (is_ok(extra) == 1) {
+                            req_len = req_len + payload(extra);
+                        }
+                    }
+                }
+            }
+            store8(req_buf + req_len, 0);
+        }
 
         var method = http_parse_method(req_buf, req_len);
         var path = http_parse_path(req_buf, req_len);

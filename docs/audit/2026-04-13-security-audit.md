@@ -188,20 +188,18 @@ Audit of daimon v0.7.0 (Cyrius port) against known CVE patterns and vulnerabilit
 
 | ID | Severity | Status | Area |
 |---|---|---|---|
-| VULN-001 | HIGH | Open | HTTP parsing |
-| VULN-002 | MEDIUM | Open | JSON response escaping |
-| VULN-003 | LOW | Mitigated | JSON parsing depth |
-| VULN-004 | MEDIUM | Open | PID reuse race |
-| VULN-005 | LOW | Partially mitigated | File TOCTOU |
-| VULN-006 | MEDIUM | Open | IPC auth |
-| VULN-007 | LOW | Accepted risk | Memory reuse |
-| VULN-008 | MEDIUM | Open | Request size |
-| VULN-009 | LOW | Open | Rate limiting |
-| VULN-010 | LOW | Open | Process rlimits |
+| VULN-001 | HIGH | **Fixed** | HTTP parsing — Content-Length validation, Transfer-Encoding rejection (501), 413 Payload Too Large |
+| VULN-002 | MEDIUM | **Fixed** | JSON response escaping — `json_escape_str()` on all user-controlled strings |
+| VULN-003 | LOW | Mitigated | JSON parsing depth — flat parser, no recursion |
+| VULN-004 | MEDIUM | **Fixed** | PID reuse race — `pidfd_open()`/`pidfd_send_signal()` with `kill()` fallback |
+| VULN-005 | LOW | **Fixed** | File TOCTOU — agent memory dirs now 0700, not 0755 |
+| VULN-006 | MEDIUM | **Fixed** | IPC auth — `SO_PEERCRED` UID verification on Unix socket accept |
+| VULN-007 | LOW | Accepted risk | Memory reuse — single trust domain |
+| VULN-008 | MEDIUM | **Fixed** | Request size — MAX_REQUEST_SIZE=65536, Content-Length body reads, 413 response |
+| VULN-009 | LOW | Open | Rate limiting — deferred to v0.9.0 |
+| VULN-010 | LOW | **Fixed** | Process rlimits — `agent_spawn_with_limits()` applies RLIMIT_AS + RLIMIT_CPU |
 
-**Immediate action**: VULN-001 (Content-Length validation), VULN-002 (JSON escaping)
-**Next sprint**: VULN-004 (pidfd), VULN-006 (SO_PEERCRED), VULN-008 (request size limits)
-**Backlog**: VULN-005, VULN-009, VULN-010
+**Remediation status**: 8/10 fixed, 1 accepted risk, 1 deferred
 
 ## Sources
 

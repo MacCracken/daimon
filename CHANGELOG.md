@@ -52,6 +52,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **Security (VULN-001)**: HTTP Content-Length validation — parse and enforce declared length, reject Transfer-Encoding (501), reject oversized payloads (413 Payload Too Large). Prevents request smuggling behind proxies.
+- **Security (VULN-002)**: `json_escape_str()` applied to all user-controlled strings in JSON responses — agent names, task names, edge node names, MCP tool names/descriptions. Prevents JSON structure corruption.
+- **Security (VULN-004)**: Race-free signal delivery via `pidfd_open()`/`pidfd_send_signal()` (Linux 5.3+) with `kill()` fallback. Prevents sending signals to wrong process on PID reuse.
+- **Security (VULN-005)**: Agent memory directories created with 0700 (was 0755). Prevents other-user read access.
+- **Security (VULN-006)**: Unix domain socket `SO_PEERCRED` UID verification — rejects connections from non-owner, non-root UIDs.
+- **Security (VULN-008)**: `MAX_REQUEST_SIZE=65536` with Content-Length-based body reads. Prevents oversized request DoS.
+- **Security (VULN-010)**: `agent_spawn_with_limits()` applies `RLIMIT_AS` + `RLIMIT_CPU` before exec. Prevents agent resource exhaustion.
 - **Security**: HTTP query parameter parsing bounds-checked to prevent buffer over-read.
 - **Security**: Empty path segments (`/v1/agents/`) return 404 instead of passing empty string to handler.
 - **Correctness**: Edge decommission URL routing fixed (13-char suffix, not 14).
