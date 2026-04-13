@@ -1,33 +1,70 @@
-# ADR-002: Synchronous HTTP Server
+# ADR-002: HTTP Server — Synchronous with Async Option
 
-**Status**: Accepted
+**Status**: Amended (2026-04-13)
 **Date**: 2026-04-13
-**Context**: Rust daimon used tokio + axum for async HTTP. Cyrius does not have an async runtime.
+**Amendment**: Original assumed Cyrius had no async runtime. `lib/async.cyr` provides epoll-based cooperative async. Both sync and async modes should be supported.
 
 ## Decision
 
-Implement a synchronous, single-threaded TCP accept loop for the HTTP API.
+Ship v1.0 with the synchronous HTTP server. Add async HTTP as a near-term roadmap item using `lib/async.cyr`.
 
-## Rationale
+## Current: Synchronous Mode
 
-1. **Simplicity** — No async runtime complexity, no task scheduling, no waker machinery. The server is ~100 lines of straightforward socket code.
-2. **Correctness** — No race conditions on shared state. All globals are accessed sequentially. No need for RwLock/Mutex.
-3. **Sufficient for workload** — Agent orchestration is control-plane traffic, not data-plane. Typical request rates are 10-100 req/s, well within single-threaded capacity.
-4. **Connection: close** — Every response includes `Connection: close`. No keep-alive, no connection pooling. Eliminates HTTP/1.1 pipelining complexity and request smuggling surface area.
+Single-threaded TCP accept loop. One request at a time. `Connection: close` on every response.
+
+**Advantages**:
+- Simple, correct — no race conditions on shared state
+- No async runtime overhead for low-traffic control plane
+- 181 KB binary
+
+**Limitations**:
+- A slow handler blocks all clients
+- No concurrent request handling
+- No WebSocket push
+
+## Planned: Async Mode
+
+Use `lib/async.cyr` epoll-based cooperative runtime to handle multiple connections concurrently:
+
+```cyrius
+fn handle_client(cfd) {
+    async_await_readable(cfd);
+    var buf = alloc(MAX_REQUEST_SIZE);
+    var n = async_read(cfd, buf, MAX_REQUEST_SIZE);
+    # ... parse + route + respond ...
+    sock_close(cfd);
+}
+
+fn serve_async(port) {
+    var sfd = bind_and_listen(port);
+    var rt = async_new();
+    while (1 == 1) {
+        var cfd = accept(sfd);
+        async_spawn(rt, &handle_client, cfd);
+        if (pending_tasks > threshold) { async_run(rt); }
+    }
+}
+```
+
+Available stdlib functions:
+- `async_new()` — create epoll-backed runtime
+- `async_spawn(rt, &fn, arg)` — schedule a task
+- `async_run(rt)` — run all tasks to completion
+- `async_sleep_ms(ms)` — timerfd-based sleep
+- `async_await_readable(fd)` — epoll wait for fd readability
+- `async_read(fd, buf, len)` — non-blocking read (O_NONBLOCK + fcntl)
+- `async_timeout(fp, arg, ms)` — fork-based timeout
 
 ## Trade-offs
 
-- **No concurrent requests** — One request at a time. A slow handler blocks all other clients.
-- **No WebSocket** — Streaming events require polling, not push.
-- **No HTTP/2** — Single-stream only.
+The cooperative runtime runs each spawned task to completion before checking the next. True concurrency within a single accept iteration requires either:
+1. Tasks that yield (call `async_await_readable` to return control), or
+2. Batched accept: collect N clients, spawn N tasks, `async_run` the batch
 
-## Mitigation
-
-- Rate limiting (120 req/min per IP) prevents single-client DoS.
-- Handlers are fast (sub-millisecond for most endpoints).
-- Future: async HTTP when Cyrius async patterns mature (roadmap item).
+This is sufficient for the orchestrator workload pattern (many short requests) but not for long-lived WebSocket connections.
 
 ## Consequences
 
-- API latency benchmarks not directly comparable to Rust (in-process axum vs network TCP).
-- Clients should use short timeouts and retry on connection refusal.
+- CLI flag or config option: `serve --async` vs default sync
+- Shared state (globals) needs no locking — cooperative tasks don't preempt
+- Both modes share the same route handlers and JSON escaping

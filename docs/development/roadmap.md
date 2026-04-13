@@ -17,9 +17,13 @@
 - [ ] MCP tool hosting (bote re-exports) — blocked on [bote](https://github.com/MacCracken/bote) Cyrius port
 - [ ] MCP tool call forwarding — blocked on bote + HTTP client library
 
-## Future
+## Completed (v1.1.0)
 
-- [ ] Async HTTP API — when Cyrius async service patterns mature
+- [x] Async HTTP mode — `serve --async` using `lib/async.cyr` epoll runtime (ADR-002)
+- [x] Documentation: architecture overview, API guide, quickstart, 3 ADRs
+- [x] Removed `rust-old/`, vendored async/http/thread/callback stdlib modules
+
+## Future (v1.2.0+)
 - [ ] jnana integration — grounded knowledge queries backed by verified AGNOS science data
 - [ ] gRPC transport option alongside HTTP
 - [ ] WebSocket streaming for real-time agent events

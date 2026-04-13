@@ -3956,15 +3956,87 @@ fn rate_check(cfd) {
     return 1;
 }
 
-fn serve(port) {
+# --- Per-request handler (shared by sync + async modes) ---
+
+fn handle_request(cfd) {
+    # Rate limiting
+    if (rate_check(cfd) == 0) {
+        http_send_response(cfd, 429, "{\"error\":\"too many requests\"}", 28);
+        sock_close(cfd);
+        return 0;
+    }
+
+    # Read headers
+    var req_buf = alloc(MAX_REQUEST_SIZE + 1);
+    var recv_result = sock_recv(cfd, req_buf, MAX_HEADER_SIZE);
+    if (is_err_result(recv_result) == 1) { sock_close(cfd); return 0; }
+    var req_len = payload(recv_result);
+    if (req_len <= 0) { sock_close(cfd); return 0; }
+    store8(req_buf + req_len, 0);
+
+    # Reject Transfer-Encoding
+    if (http_has_transfer_encoding(req_buf, req_len) == 1) {
+        http_send_response(cfd, 501, "{\"error\":\"chunked transfer not supported\"}", 42);
+        sock_close(cfd);
+        return 0;
+    }
+
+    # Content-Length validation + body read
+    var cl = http_parse_content_length(req_buf, req_len);
+    if (cl > MAX_REQUEST_SIZE) {
+        http_send_response(cfd, 413, "{\"error\":\"payload too large\"}", 28);
+        sock_close(cfd);
+        return 0;
+    }
+
+    if (cl > 0) {
+        var hdr_boundary = 0;
+        var hbi = 0;
+        while (hbi < req_len - 3) {
+            if (load8(req_buf + hbi) == 13) {
+                if (load8(req_buf + hbi + 1) == 10) {
+                    if (load8(req_buf + hbi + 2) == 13) {
+                        if (load8(req_buf + hbi + 3) == 10) {
+                            hdr_boundary = hbi + 4;
+                            break;
+                        }
+                    }
+                }
+            }
+            hbi = hbi + 1;
+        }
+        if (hdr_boundary > 0) {
+            var body_have = req_len - hdr_boundary;
+            var body_need = cl - body_have;
+            if (body_need > 0) {
+                if (hdr_boundary + cl <= MAX_REQUEST_SIZE) {
+                    var extra = sock_recv(cfd, req_buf + req_len, body_need);
+                    if (is_ok(extra) == 1) {
+                        req_len = req_len + payload(extra);
+                    }
+                }
+            }
+        }
+        store8(req_buf + req_len, 0);
+    }
+
+    var method = http_parse_method(req_buf, req_len);
+    var path = http_parse_path(req_buf, req_len);
+    http_route(cfd, method, path, req_buf, req_len);
+    sock_close(cfd);
+    return 0;
+}
+
+# --- Server setup (shared by sync + async) ---
+
+fn server_bind(port) {
     var sfd_result = tcp_socket();
     if (is_err_result(sfd_result) == 1) {
         sakshi_error("failed to create socket");
-        return 1;
+        return 0 - 1;
     }
     var sfd = payload(sfd_result);
 
-    # SO_REUSEADDR
     var optval[1];
     store32(&optval, 1);
     syscall(SYS_SETSOCKOPT, sfd, 1, 2, &optval, 4);
@@ -3972,115 +4044,104 @@ fn serve(port) {
     var bind_result = sock_bind(sfd, INADDR_ANY(), port);
     if (is_err_result(bind_result) == 1) {
         sakshi_error("failed to bind");
-        return 1;
+        return 0 - 1;
     }
 
     var listen_result = sock_listen(sfd, 128);
     if (is_err_result(listen_result) == 1) {
         sakshi_error("failed to listen");
-        return 1;
+        return 0 - 1;
     }
 
+    return sfd;
+}
+
+fn server_banner(port, mode) {
     sakshi_info("daimon listening");
     var sb = str_builder_new();
     str_builder_add_cstr(sb, "daimon v");
     var ver_buf = alloc(16);
     var ver_n = file_read_all("VERSION", ver_buf, 15);
     if (ver_n > 0) {
-        # Trim trailing newline
         if (load8(ver_buf + ver_n - 1) == 10) { ver_n = ver_n - 1; }
         store8(ver_buf + ver_n, 0);
         str_builder_add_cstr(sb, ver_buf);
     }
-    else { str_builder_add_cstr(sb, "0.7.0"); }
+    else { str_builder_add_cstr(sb, "1.1.0"); }
     str_builder_add_cstr(sb, " listening on port ");
     str_builder_add_int(sb, port);
-    str_builder_add_cstr(sb, "\n");
+    str_builder_add_cstr(sb, " (");
+    str_builder_add_cstr(sb, mode);
+    str_builder_add_cstr(sb, ")\n");
     var banner = str_builder_build(sb);
     print(str_data(banner), str_len(banner));
+}
 
-    # Accept loop
+# --- Synchronous server ---
+
+fn serve(port) {
+    var sfd = server_bind(port);
+    if (sfd < 0) { return 1; }
+    server_banner(port, "sync");
+
     while (1 == 1) {
         var client_result = sock_accept(sfd);
         if (is_err_result(client_result) == 1) { continue; }
-        var cfd = payload(client_result);
-
-        # VULN-009: Rate limiting
-        if (rate_check(cfd) == 0) {
-            http_send_response(cfd, 429, "{\"error\":\"too many requests\"}", 28);
-            sock_close(cfd);
-            continue;
-        }
-
-        # Read headers (up to MAX_HEADER_SIZE)
-        var req_buf = alloc(MAX_REQUEST_SIZE + 1);
-        var recv_result = sock_recv(cfd, req_buf, MAX_HEADER_SIZE);
-        if (is_err_result(recv_result) == 1) {
-            sock_close(cfd);
-            continue;
-        }
-        var req_len = payload(recv_result);
-        if (req_len <= 0) {
-            sock_close(cfd);
-            continue;
-        }
-        store8(req_buf + req_len, 0);
-
-        # VULN-001: Reject requests with Transfer-Encoding (we don't support chunked)
-        if (http_has_transfer_encoding(req_buf, req_len) == 1) {
-            http_send_response(cfd, 501, "{\"error\":\"chunked transfer not supported\"}", 42);
-            sock_close(cfd);
-            continue;
-        }
-
-        # VULN-001+008: If Content-Length present, read remaining body up to MAX_REQUEST_SIZE
-        var cl = http_parse_content_length(req_buf, req_len);
-        if (cl > MAX_REQUEST_SIZE) {
-            http_send_response(cfd, 413, "{\"error\":\"payload too large\"}", 28);
-            sock_close(cfd);
-            continue;
-        }
-
-        # If we have a Content-Length and haven't read the full body, read more
-        if (cl > 0) {
-            # Find where body starts
-            var hdr_boundary = 0;
-            var hi = 0;
-            while (hi < req_len - 3) {
-                if (load8(req_buf + hi) == 13) {
-                    if (load8(req_buf + hi + 1) == 10) {
-                        if (load8(req_buf + hi + 2) == 13) {
-                            if (load8(req_buf + hi + 3) == 10) {
-                                hdr_boundary = hi + 4;
-                                break;
-                            }
-                        }
-                    }
-                }
-                hi = hi + 1;
-            }
-            if (hdr_boundary > 0) {
-                var body_have = req_len - hdr_boundary;
-                var body_need = cl - body_have;
-                if (body_need > 0) {
-                    if (hdr_boundary + cl <= MAX_REQUEST_SIZE) {
-                        var extra = sock_recv(cfd, req_buf + req_len, body_need);
-                        if (is_ok(extra) == 1) {
-                            req_len = req_len + payload(extra);
-                        }
-                    }
-                }
-            }
-            store8(req_buf + req_len, 0);
-        }
-
-        var method = http_parse_method(req_buf, req_len);
-        var path = http_parse_path(req_buf, req_len);
-
-        http_route(cfd, method, path, req_buf, req_len);
-        sock_close(cfd);
+        handle_request(payload(client_result));
     }
+    return 0;
+}
 
+# --- Async server (epoll-based cooperative concurrency) ---
+
+# Async handler wrapper — called by async_run for each spawned client
+fn async_handle_client(cfd) {
+    # Wait for the client fd to be readable before processing
+    async_await_readable(cfd);
+    handle_request(cfd);
+    return 0;
+}
+
+fn serve_async(port) {
+    var sfd = server_bind(port);
+    if (sfd < 0) { return 1; }
+    server_banner(port, "async");
+
+    # Set server socket non-blocking for cooperative accept
+    var flags = syscall(72, sfd, 3, 0);  # F_GETFL
+    syscall(72, sfd, 4, flags | 2048);   # F_SETFL O_NONBLOCK
+
+    var rt = async_new();
+    var batch_size = 0;
+    var max_batch = 64;
+
+    while (1 == 1) {
+        # Accept as many pending connections as available (non-blocking)
+        var accepting = 1;
+        while (accepting == 1) {
+            var cfd = syscall(SYS_ACCEPT, sfd, 0, 0);
+            if (cfd < 0) {
+                accepting = 0;
+            } else {
+                async_spawn(rt, &async_handle_client, cfd);
+                batch_size = batch_size + 1;
+            }
+            if (batch_size >= max_batch) { accepting = 0; }
+        }
+
+        # Run all spawned handlers to completion
+        if (batch_size > 0) {
+            async_run(rt);
+            batch_size = 0;
+            # Reset runtime for next batch
+            rt = async_new();
+        }
+
+        # If no connections were pending, wait for the server socket to be readable
+        if (batch_size == 0) {
+            async_await_readable(sfd);
+        }
+    }
     return 0;
 }
 
@@ -4099,16 +4160,24 @@ fn main() {
         var cmd = argv(1);
         if (streq(cmd, "serve") == 1) {
             var port = config_port(_config);
-            if (argc() >= 3) {
-                # Parse port from argv(2)
-                var port_str = argv(2);
-                port = 0;
-                var pi = 0;
-                while (load8(port_str + pi) != 0) {
-                    port = port * 10 + load8(port_str + pi) - 48;
-                    pi = pi + 1;
+            var use_async = 0;
+            # Parse remaining args: port number or --async
+            var argi = 2;
+            while (argi < argc()) {
+                var arg = argv(argi);
+                if (streq(arg, "--async") == 1) { use_async = 1; }
+                else {
+                    # Parse as port number
+                    port = 0;
+                    var pi = 0;
+                    while (load8(arg + pi) != 0) {
+                        port = port * 10 + load8(arg + pi) - 48;
+                        pi = pi + 1;
+                    }
                 }
+                argi = argi + 1;
             }
+            if (use_async == 1) { return serve_async(port); }
             return serve(port);
         }
         if (streq(cmd, "version") == 1) {
@@ -4118,7 +4187,7 @@ fn main() {
                 store8(ver_buf + ver_n, 0);
                 println(ver_buf);
             }
-            else { println("0.7.0"); }
+            else { println("1.1.0"); }
             return 0;
         }
         if (streq(cmd, "help") == 1) {
@@ -4126,9 +4195,9 @@ fn main() {
             println("Usage: daimon <command> [options]");
             println("");
             println("Commands:");
-            println("  serve [port]  Start HTTP API server (default: 8090)");
-            println("  version       Print version");
-            println("  help          Show this help");
+            println("  serve [port] [--async]  Start HTTP API server (default: 8090)");
+            println("  version                 Print version");
+            println("  help                    Show this help");
             return 0;
         }
     }

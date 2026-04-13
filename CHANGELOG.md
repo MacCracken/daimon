@@ -6,12 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
-## [1.0.1] - 2026-04-13
+## [1.1.0] - 2026-04-13
+
+### Added
+
+- **Async HTTP server** — `serve --async` flag enables epoll-based cooperative concurrency via `lib/async.cyr`. Handles multiple connections per accept cycle with batched async_run. Both sync and async modes share the same request handler and security controls.
+- Documentation: architecture overview, API guide with all 24 endpoints, quickstart guide, 3 ADRs (port rationale, HTTP mode, security process).
+- Vendored `lib/async.cyr` (epoll cooperative runtime), `lib/http.cyr` (HTTP client), `lib/thread.cyr`, `lib/callback.cyr` via updated `cyrius.toml` deps.
 
 ### Changed
 
-- Removed `rust-old/` directory (16 GB, 9,724 LOC Rust source + build cache). Port complete — Rust history available in git pre-v0.7.0 tags.
-- Version bump to 1.0.1 — all v1.0 criteria met.
+- Removed `rust-old/` directory (16 GB, 9,724 LOC Rust source + build cache). Rust history available in git pre-v0.7.0 tags.
+- Refactored serve loop: request handling extracted to `handle_request(cfd)`, server setup to `server_bind(port)` — shared by both sync and async modes.
+- SECURITY.md updated for v1.x supported versions, Cyrius-specific scope.
+- CLI: `serve [port] [--async]` — async mode optional, sync remains default.
 
 ## [0.7.0] - 2026-04-13
 
