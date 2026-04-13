@@ -6,6 +6,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-04-13
+
+### Added
+
+- **Cyrius port**: Full rewrite from Rust to Cyrius (9,724 LOC Rust → 1,993 LOC Cyrius).
+- All 14 core modules ported: error, config, agent, supervisor, memory, vector_store, rag, mcp, screen, scheduler, federation, edge, ipc, api.
+- Synchronous HTTP API server on port 8090 with JSON responses.
+- API endpoints: `/v1/health`, `/v1/agents` (GET/POST), `/v1/mcp/manifest`, `/v1/edge/stats`, `/v1/metrics`.
+- CLI: `serve [port]`, `version`, `help` commands.
+- Circuit breaker with Closed → Open → HalfOpen state machine.
+- Output capture ring buffer for agent stdout/stderr.
+- Per-agent key-value memory store with atomic writes (tmp+rename).
+- In-memory cosine-similarity vector index with brute-force search.
+- RAG pipeline: text chunking, bag-of-words embedding, context formatting.
+- MCP tool registry (builtin + external) with manifest generation.
+- Screen capture permission manager with rate limiting.
+- Priority-aware task scheduler with state machine transitions.
+- Federation node management with Raft-like role tracking.
+- Edge fleet manager with heartbeat tracking and stats aggregation.
+- Message bus for agent IPC with named routing and broadcast.
+- `/proc` helpers for agent resource monitoring (VmRSS, fd count, thread count).
+- Binary size: **113 KB** (vs 4.0 MB default Rust build — 97% smaller).
+
+### Changed
+
+- **Language**: Rust → Cyrius. Rust source preserved in `rust-old/`.
+- **HTTP**: Async (tokio/axum) → synchronous (raw TCP sockets via epoll).
+- **Build**: `cargo build` → `cat src/main.cyr | cc3 > build/daimon`.
+- **Dependencies**: 193 crate dependencies → 17 Cyrius stdlib modules + 0 external deps.
+
 ## [0.6.0] - 2026-04-03
 
 ### Added
