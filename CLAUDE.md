@@ -30,12 +30,14 @@ Every AGNOS agent, every consumer app, hoosh, agnoshi, aethersafha.
 2. Cleanliness check: `cyrius check` (fmt + lint + test + build)
 3. Get baseline benchmarks (`./scripts/bench-history.sh`)
 4. Internal deep review — gaps, optimizations, security, logging/errors, docs
-5. External research — domain completeness, missing capabilities, best practices, world-class accuracy
-6. Cleanliness check — must be clean after review
-7. Additional tests/benchmarks from findings
-8. Post-review benchmarks — prove the wins
-9. Documentation audit — ADRs, source citations, guides, examples (see Documentation Standards in first-party-standards.md)
-10. Repeat if heavy
+5. External security research — search for CVEs, 0-days, and vulnerability patterns relevant to daimon's attack surface (HTTP servers, Unix sockets, process supervisors, JSON parsers, file-based stores, bump allocators). Cross-reference against our code.
+6. Security audit report — write findings to `docs/audit/{date}-security-audit.md` with severity, CVE references, affected code, and remediation steps. Roadmap any repair work found.
+7. External research — domain completeness, missing capabilities, best practices, world-class accuracy
+8. Cleanliness check — must be clean after review
+9. Additional tests/benchmarks from findings
+10. Post-review benchmarks — prove the wins
+11. Documentation audit — ADRs, source citations, guides, examples (see Documentation Standards in first-party-standards.md)
+12. Repeat if heavy
 
 ### Work Loop / Working Loop (continuous)
 
@@ -44,13 +46,14 @@ Every AGNOS agent, every consumer app, hoosh, agnoshi, aethersafha.
 3. Test + benchmark additions for new code
 4. Run benchmarks (`./scripts/bench-history.sh`)
 5. Internal review — performance, memory, security, throughput, correctness
-6. Cleanliness check — must be clean after review
-7. Deeper tests/benchmarks from review observations
-8. Run benchmarks again — prove the wins
-9. If review heavy → return to step 5
-10. Documentation — update CHANGELOG, roadmap, docs, ADRs for design decisions, source citations for algorithms/formulas, update docs/sources.md, guides and examples for new API surface, verify recipe version in zugot
-11. Version check — VERSION, cyrius.toml, recipe (in zugot) all in sync
-12. Return to step 1
+6. External security research — if security-touching changes were made, search for relevant CVEs/0-days affecting the changed subsystems. Write findings to `docs/audit/` and roadmap any repair work.
+7. Cleanliness check — must be clean after review
+8. Deeper tests/benchmarks from review observations
+9. Run benchmarks again — prove the wins
+10. If review heavy → return to step 5
+11. Documentation — update CHANGELOG, roadmap, docs, ADRs for design decisions, source citations for algorithms/formulas, update docs/sources.md, guides and examples for new API surface, verify recipe version in zugot
+12. Version check — VERSION, cyrius.toml, recipe (in zugot) all in sync
+13. Return to step 1
 
 ### Task Sizing
 

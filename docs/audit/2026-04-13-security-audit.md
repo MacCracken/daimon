@@ -196,10 +196,10 @@ Audit of daimon v0.7.0 (Cyrius port) against known CVE patterns and vulnerabilit
 | VULN-006 | MEDIUM | **Fixed** | IPC auth — `SO_PEERCRED` UID verification on Unix socket accept |
 | VULN-007 | LOW | Accepted risk | Memory reuse — single trust domain |
 | VULN-008 | MEDIUM | **Fixed** | Request size — MAX_REQUEST_SIZE=65536, Content-Length body reads, 413 response |
-| VULN-009 | LOW | Open | Rate limiting — deferred to v0.9.0 |
+| VULN-009 | LOW | **Fixed** | Rate limiting — per-IP 120 req/min sliding window, 429 Too Many Requests |
 | VULN-010 | LOW | **Fixed** | Process rlimits — `agent_spawn_with_limits()` applies RLIMIT_AS + RLIMIT_CPU |
 
-**Remediation status**: 8/10 fixed, 1 accepted risk, 1 deferred
+**Remediation status**: 9/10 fixed, 1 accepted risk (VULN-007 bump allocator — single trust domain)
 
 ## Sources
 

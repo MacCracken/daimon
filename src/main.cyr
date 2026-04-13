@@ -2939,6 +2939,7 @@ fn app_init() {
     _cap_mgr = cap_mgr_new();
     _rag_pipeline = rag_pipeline_new(rag_config_default());
     _rpc_registry = rpc_registry_new();
+    rate_limiter_init();
 }
 
 # --- HTTP constants ---
@@ -3154,6 +3155,10 @@ fn http_send_response(fd, status, body_data, body_len) {
     elif (status == 400) { str_builder_add_cstr(sb, " Bad Request"); }
     elif (status == 404) { str_builder_add_cstr(sb, " Not Found"); }
     elif (status == 409) { str_builder_add_cstr(sb, " Conflict"); }
+    elif (status == 413) { str_builder_add_cstr(sb, " Payload Too Large"); }
+    elif (status == 422) { str_builder_add_cstr(sb, " Unprocessable Entity"); }
+    elif (status == 429) { str_builder_add_cstr(sb, " Too Many Requests"); }
+    elif (status == 501) { str_builder_add_cstr(sb, " Not Implemented"); }
     else { str_builder_add_cstr(sb, " Error"); }
     http_crlf(sb);
     str_builder_add_cstr(sb, "Content-Type: application/json");
@@ -3868,6 +3873,89 @@ fn http_route(fd, method, path, buf, buf_len) {
 
 # --- HTTP server ---
 
+# --- VULN-009: Per-IP rate limiting ---
+
+var RATE_LIMIT_WINDOW = 60;     # seconds
+var RATE_LIMIT_MAX = 120;       # max requests per window per IP
+var SYS_GETPEERNAME = 52;
+
+# Rate limiter: {buckets: map<ip_cstr, {count, window_start}>}
+var _rate_limiter = 0;
+
+fn rate_limiter_init() {
+    _rate_limiter = map_new();
+}
+
+# Get peer IPv4 address as integer from a connected socket fd
+fn get_peer_ip(cfd) {
+    var addr_buf = alloc(32);   # sockaddr_in = 16 bytes, pad
+    var addr_len = alloc(8);
+    store32(addr_len, 16);
+    var r = syscall(SYS_GETPEERNAME, cfd, addr_buf, addr_len);
+    if (r < 0) { return 0; }
+    # sockaddr_in: family(2) + port(2) + addr(4)
+    # IP address is at offset 4, 4 bytes
+    return load32(addr_buf + 4);
+}
+
+# Format IPv4 integer as "a.b.c.d" cstr for map key
+fn ip_to_cstr(ip) {
+    var ib = alloc(20);
+    var a = ip & 255;
+    var b = (ip >> 8) & 255;
+    var c = (ip >> 16) & 255;
+    var d = (ip >> 24) & 255;
+    var off = 0;
+    # Write a.b.c.d manually
+    var parts[4];
+    store64(&parts, a);
+    store64(&parts + 8, b);
+    store64(&parts + 16, c);
+    store64(&parts + 24, d);
+    var pi = 0;
+    while (pi < 4) {
+        var val = load64(&parts + pi * 8);
+        if (val >= 100) { store8(ib + off, 48 + val / 100); off = off + 1; val = val % 100; store8(ib + off, 48 + val / 10); off = off + 1; store8(ib + off, 48 + val % 10); off = off + 1; }
+        elif (val >= 10) { store8(ib + off, 48 + val / 10); off = off + 1; store8(ib + off, 48 + val % 10); off = off + 1; }
+        else { store8(ib + off, 48 + val); off = off + 1; }
+        if (pi < 3) { store8(ib + off, 46); off = off + 1; }
+        pi = pi + 1;
+    }
+    store8(ib + off, 0);
+    return ib;
+}
+
+# Check rate limit for an IP. Returns 1 if allowed, 0 if rate-limited.
+fn rate_check(cfd) {
+    var ip = get_peer_ip(cfd);
+    if (ip == 0) { return 1; }  # Can't determine IP, allow
+    var ip_key = ip_to_cstr(ip);
+    var now = clock_epoch_secs();
+
+    var bucket = map_get(_rate_limiter, ip_key);
+    if (bucket == 0) {
+        # New bucket: {count, window_start}
+        bucket = alloc(16);
+        store64(bucket, 1);
+        store64(bucket + 8, now);
+        map_set(_rate_limiter, ip_key, bucket);
+        return 1;
+    }
+
+    var window_start = load64(bucket + 8);
+    if (now - window_start >= RATE_LIMIT_WINDOW) {
+        # Window expired, reset
+        store64(bucket, 1);
+        store64(bucket + 8, now);
+        return 1;
+    }
+
+    var count = load64(bucket) + 1;
+    store64(bucket, count);
+    if (count > RATE_LIMIT_MAX) { return 0; }
+    return 1;
+}
+
 fn serve(port) {
     var sfd_result = tcp_socket();
     if (is_err_result(sfd_result) == 1) {
@@ -3916,6 +4004,13 @@ fn serve(port) {
         var client_result = sock_accept(sfd);
         if (is_err_result(client_result) == 1) { continue; }
         var cfd = payload(client_result);
+
+        # VULN-009: Rate limiting
+        if (rate_check(cfd) == 0) {
+            http_send_response(cfd, 429, "{\"error\":\"too many requests\"}", 28);
+            sock_close(cfd);
+            continue;
+        }
 
         # Read headers (up to MAX_HEADER_SIZE)
         var req_buf = alloc(MAX_REQUEST_SIZE + 1);

@@ -24,7 +24,7 @@
 - [x] VULN-006: `SO_PEERCRED` UID verification on Unix socket accept
 - [x] VULN-008: `MAX_REQUEST_SIZE=65536`, Content-Length body reads, 413 response
 - [x] VULN-010: `agent_spawn_with_limits()` with `setrlimit(RLIMIT_AS, RLIMIT_CPU)`
-- [ ] VULN-009: Per-IP rate limiting with sliding window, 429 responses (deferred to v0.9.0)
+- [x] VULN-009: Per-IP rate limiting — 120 req/min sliding window, 429 Too Many Requests
 
 ## Blocked on Upstream Ports
 
