@@ -1,0 +1,881 @@
+# daimon.tcyr — daimon unit + integration tests
+# Parity with rust-old/tests/integration.rs + rust-old/src/*/tests
+#
+# Run: cyrius test tests/daimon.tcyr
+#   or: cat tests/daimon.tcyr | cc3 > /tmp/daimon_test && chmod +x /tmp/daimon_test && /tmp/daimon_test
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/io.cyr"
+include "lib/fs.cyr"
+include "lib/hashmap.cyr"
+include "lib/tagged.cyr"
+include "lib/json.cyr"
+include "lib/chrono.cyr"
+include "lib/syscalls.cyr"
+include "lib/assert.cyr"
+include "lib/math.cyr"
+include "lib/net.cyr"
+include "lib/process.cyr"
+
+var SYS_RENAME = 82;
+
+# ================================================================
+# Inline daimon types + functions needed for testing
+# (mirrors src/main.cyr — test file is independently compiled)
+# ================================================================
+
+# --- error ---
+
+enum DaimonError {
+    ERR_NONE = 0;
+    ERR_INVALID_PARAM = 1;
+    ERR_AGENT_NOT_FOUND = 2;
+    ERR_AGENT_EXISTS = 3;
+    ERR_SUPERVISOR = 4;
+    ERR_IPC = 5;
+    ERR_SCHEDULER = 6;
+    ERR_FEDERATION = 7;
+    ERR_API = 8;
+    ERR_STORAGE = 9;
+    ERR_IO = 10;
+}
+
+fn error_to_status(err) {
+    if (err == ERR_INVALID_PARAM) { return 400; }
+    if (err == ERR_AGENT_NOT_FOUND) { return 404; }
+    if (err == ERR_AGENT_EXISTS) { return 409; }
+    return 500;
+}
+
+# --- config ---
+
+fn config_new() {
+    var c = alloc(32);
+    store64(c, str_from("127.0.0.1"));
+    store64(c + 8, 8090);
+    store64(c + 16, str_from("/var/lib/agnos"));
+    store64(c + 24, 1000);
+    return c;
+}
+
+fn config_listen_addr(c) { return load64(c); }
+fn config_port(c) { return load64(c + 8); }
+fn config_data_dir(c) { return load64(c + 16); }
+fn config_max_agents(c) { return load64(c + 24); }
+fn config_set_port(c, port) { store64(c + 8, port); }
+
+# --- agent ---
+
+enum AgentStatus {
+    AGENT_PENDING = 0;
+    AGENT_STARTING = 1;
+    AGENT_RUNNING = 2;
+    AGENT_PAUSED = 3;
+    AGENT_STOPPING = 4;
+    AGENT_STOPPED = 5;
+    AGENT_FAILED = 6;
+}
+
+var _next_agent_id = 1;
+fn agent_next_id() {
+    var id = _next_agent_id;
+    _next_agent_id = _next_agent_id + 1;
+    return id;
+}
+
+fn agent_handle_new(id, name) {
+    var h = alloc(80);
+    store64(h, id);
+    store64(h + 8, name);
+    store64(h + 16, AGENT_PENDING);
+    store64(h + 24, clock_epoch_secs());
+    store64(h + 32, 0);
+    store64(h + 40, 0);
+    store64(h + 48, 0);
+    store64(h + 56, 0);
+    store64(h + 64, 0);
+    store64(h + 72, 0);
+    return h;
+}
+
+fn agent_id(h) { return load64(h); }
+fn agent_name(h) { return load64(h + 8); }
+fn agent_status(h) { return load64(h + 16); }
+fn agent_pid(h) { return load64(h + 40); }
+fn agent_set_status(h, s) { store64(h + 16, s); }
+
+fn read_vm_rss(pid) {
+    if (pid == 0) { return 0; }
+    var path_sb = str_builder_new();
+    str_builder_add_cstr(path_sb, "/proc/");
+    str_builder_add_int(path_sb, pid);
+    str_builder_add_cstr(path_sb, "/status");
+    var path = str_builder_build(path_sb);
+    var buf = alloc(8192);
+    var n = file_read_all(str_data(path), buf, 8191);
+    if (n <= 0) { return 0; }
+    return 0;
+}
+
+fn count_fds(pid) {
+    if (pid == 0) { return 0; }
+    var path_sb = str_builder_new();
+    str_builder_add_cstr(path_sb, "/proc/");
+    str_builder_add_int(path_sb, pid);
+    str_builder_add_cstr(path_sb, "/fd");
+    var path = str_builder_build(path_sb);
+    var entries = dir_list(str_data(path));
+    if (entries == 0) { return 0; }
+    return vec_len(entries);
+}
+
+fn count_threads(pid) {
+    if (pid == 0) { return 1; }
+    var path_sb = str_builder_new();
+    str_builder_add_cstr(path_sb, "/proc/");
+    str_builder_add_int(path_sb, pid);
+    str_builder_add_cstr(path_sb, "/task");
+    var path = str_builder_build(path_sb);
+    var entries = dir_list(str_data(path));
+    if (entries == 0) { return 1; }
+    var n = vec_len(entries);
+    if (n == 0) { return 1; }
+    return n;
+}
+
+# --- circuit breaker ---
+
+enum CircuitState { CB_CLOSED = 0; CB_OPEN = 1; CB_HALF_OPEN = 2; }
+
+fn cb_new(threshold, timeout_ms, half_open_max) {
+    var cb = alloc(56);
+    store64(cb, CB_CLOSED);
+    store64(cb + 8, 0);
+    store64(cb + 16, 0);
+    store64(cb + 24, threshold);
+    store64(cb + 32, timeout_ms);
+    store64(cb + 40, half_open_max);
+    store64(cb + 48, 0);
+    return cb;
+}
+
+fn cb_state(cb) { return load64(cb); }
+fn cb_failure_count(cb) { return load64(cb + 8); }
+
+fn cb_record_success(cb) {
+    var state = load64(cb);
+    if (state == CB_HALF_OPEN) {
+        var sc = load64(cb + 16) + 1;
+        store64(cb + 16, sc);
+        if (sc >= load64(cb + 40)) {
+            store64(cb, CB_CLOSED);
+            store64(cb + 8, 0);
+            store64(cb + 16, 0);
+        }
+    }
+    elif (state == CB_CLOSED) { store64(cb + 8, 0); }
+}
+
+fn cb_record_failure(cb) {
+    var fc = load64(cb + 8) + 1;
+    store64(cb + 8, fc);
+    store64(cb + 48, clock_epoch_secs());
+    var state = load64(cb);
+    if (state == CB_CLOSED) {
+        if (fc >= load64(cb + 24)) { store64(cb, CB_OPEN); }
+    }
+    elif (state == CB_HALF_OPEN) {
+        store64(cb, CB_OPEN);
+        store64(cb + 16, 0);
+    }
+}
+
+fn cb_can_execute(cb) {
+    var state = load64(cb);
+    if (state == CB_CLOSED) { return 1; }
+    if (state == CB_HALF_OPEN) { return 1; }
+    var last = load64(cb + 48);
+    if (last > 0) {
+        var elapsed_ms = (clock_epoch_secs() - last) * 1000;
+        if (elapsed_ms >= load64(cb + 32)) {
+            store64(cb, CB_HALF_OPEN);
+            store64(cb + 16, 0);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+fn cb_reset(cb) {
+    store64(cb, CB_CLOSED);
+    store64(cb + 8, 0);
+    store64(cb + 16, 0);
+    store64(cb + 48, 0);
+}
+
+# --- output capture ---
+
+enum OutputStream { OUT_STDOUT = 0; OUT_STDERR = 1; }
+
+fn output_line_new(stream, content) {
+    var ol = alloc(24);
+    store64(ol, str_from_int(clock_epoch_secs()));
+    store64(ol + 8, stream);
+    store64(ol + 16, content);
+    return ol;
+}
+
+fn output_capture_new(max_lines) {
+    var oc = alloc(16);
+    store64(oc, vec_new());
+    store64(oc + 8, max_lines);
+    return oc;
+}
+
+fn output_capture_push(oc, stream, content) {
+    var lines = load64(oc);
+    var max = load64(oc + 8);
+    if (vec_len(lines) >= max) { vec_remove(lines, 0); }
+    vec_push(lines, output_line_new(stream, content));
+}
+
+fn output_capture_len(oc) { return vec_len(load64(oc)); }
+
+# --- memory ---
+
+var MAX_KEY_LENGTH = 256;
+
+fn validate_key(key) {
+    var klen = str_len(key);
+    if (klen == 0) { return Err(ERR_INVALID_PARAM); }
+    if (klen > MAX_KEY_LENGTH) { return Err(ERR_INVALID_PARAM); }
+    if (str_contains(key, str_from("..")) == 1) { return Err(ERR_INVALID_PARAM); }
+    if (str_contains(key, str_from("/")) == 1) { return Err(ERR_INVALID_PARAM); }
+    if (str_contains(key, str_from("\\")) == 1) { return Err(ERR_INVALID_PARAM); }
+    return Ok(0);
+}
+
+fn sanitize_key(key) {
+    var data = str_data(key);
+    var klen = str_len(key);
+    var buf = alloc(klen + 1);
+    var i = 0;
+    while (i < klen) {
+        var c = load8(data + i);
+        if (c >= 97) { if (c <= 122) { store8(buf + i, c); i = i + 1; continue; } }
+        if (c >= 65) { if (c <= 90) { store8(buf + i, c); i = i + 1; continue; } }
+        if (c >= 48) { if (c <= 57) { store8(buf + i, c); i = i + 1; continue; } }
+        if (c == 45) { store8(buf + i, c); i = i + 1; continue; }
+        if (c == 95) { store8(buf + i, c); i = i + 1; continue; }
+        if (c == 46) { store8(buf + i, c); i = i + 1; continue; }
+        store8(buf + i, 95);
+        i = i + 1;
+    }
+    store8(buf + klen, 0);
+    return str_new(buf, klen);
+}
+
+# --- vector store ---
+
+fn cosine_similarity(a, b, dim) {
+    if (dim == 0) { return 0; }
+    var dot = f64_from(0);
+    var norm_a = f64_from(0);
+    var norm_b = f64_from(0);
+    var i = 0;
+    while (i < dim) {
+        var x = load64(a + i * 8);
+        var y = load64(b + i * 8);
+        dot = f64_add(dot, f64_mul(x, y));
+        norm_a = f64_add(norm_a, f64_mul(x, x));
+        norm_b = f64_add(norm_b, f64_mul(y, y));
+        i = i + 1;
+    }
+    var denom = f64_mul(f64_sqrt(norm_a), f64_sqrt(norm_b));
+    if (f64_eq(denom, f64_from(0)) == 1) { return f64_from(0); }
+    return f64_div(dot, denom);
+}
+
+# --- RAG ---
+
+fn chunk_text(text, chunk_size, overlap) {
+    var chunks = vec_new();
+    var tlen = str_len(text);
+    if (tlen == 0) { return chunks; }
+    if (chunk_size == 0) { return chunks; }
+    if (overlap >= chunk_size) { overlap = chunk_size - 1; }
+    var step = chunk_size - overlap;
+    if (step == 0) { step = 1; }
+    var pos = 0;
+    while (pos < tlen) {
+        var end = pos + chunk_size;
+        if (end > tlen) { end = tlen; }
+        var chunk = str_sub(text, pos, end - pos);
+        vec_push(chunks, chunk);
+        pos = pos + step;
+    }
+    return chunks;
+}
+
+# --- tokenizer ---
+
+fn tokenize(text) {
+    var tokens = vec_new();
+    var data = str_data(text);
+    var tlen = str_len(text);
+    var start = 0;
+    var i = 0;
+    while (i <= tlen) {
+        var c = 0;
+        if (i < tlen) { c = load8(data + i); }
+        var is_alnum = 0;
+        if (c >= 97) { if (c <= 122) { is_alnum = 1; } }
+        if (c >= 65) { if (c <= 90) { is_alnum = 1; } }
+        if (c >= 48) { if (c <= 57) { is_alnum = 1; } }
+        if (is_alnum == 0) {
+            if (i > start) {
+                var tok_len = i - start;
+                var tok_buf = alloc(tok_len + 1);
+                var j = 0;
+                while (j < tok_len) {
+                    var tc = load8(data + start + j);
+                    if (tc >= 65) { if (tc <= 90) { tc = tc + 32; } }
+                    store8(tok_buf + j, tc);
+                    j = j + 1;
+                }
+                store8(tok_buf + tok_len, 0);
+                vec_push(tokens, str_new(tok_buf, tok_len));
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return tokens;
+}
+
+# --- scheduler ---
+
+enum TaskStatus {
+    TASK_QUEUED = 0; TASK_SCHEDULED = 1; TASK_RUNNING = 2;
+    TASK_COMPLETED = 3; TASK_FAILED = 4; TASK_CANCELLED = 5;
+    TASK_PREEMPTED = 6;
+}
+
+fn sched_task_transition(t, new_status) {
+    var from = load64(t + 40);
+    var valid = 0;
+    if (from == TASK_QUEUED) {
+        if (new_status == TASK_SCHEDULED) { valid = 1; }
+        if (new_status == TASK_CANCELLED) { valid = 1; }
+    }
+    if (from == TASK_SCHEDULED) {
+        if (new_status == TASK_RUNNING) { valid = 1; }
+        if (new_status == TASK_CANCELLED) { valid = 1; }
+        if (new_status == TASK_QUEUED) { valid = 1; }
+    }
+    if (from == TASK_RUNNING) {
+        if (new_status == TASK_COMPLETED) { valid = 1; }
+        if (new_status == TASK_FAILED) { valid = 1; }
+        if (new_status == TASK_CANCELLED) { valid = 1; }
+        if (new_status == TASK_PREEMPTED) { valid = 1; }
+    }
+    if (from == TASK_PREEMPTED) {
+        if (new_status == TASK_QUEUED) { valid = 1; }
+    }
+    if (valid == 0) { return Err(ERR_SCHEDULER); }
+    store64(t + 40, new_status);
+    return Ok(0);
+}
+
+# --- MCP registry ---
+
+fn mcp_tool_new(name, desc, schema) {
+    var t = alloc(24);
+    store64(t, name);
+    store64(t + 8, desc);
+    store64(t + 16, schema);
+    return t;
+}
+
+fn mcp_registry_new() {
+    var reg = alloc(16);
+    store64(reg, map_new());
+    store64(reg + 8, map_new());
+    return reg;
+}
+
+fn mcp_register_builtin(reg, tool) {
+    map_set(load64(reg), str_data(load64(tool)), tool);
+}
+
+fn mcp_tool_count(reg) {
+    return map_count(load64(reg)) + map_count(load64(reg + 8));
+}
+
+fn mcp_find_tool(reg, name_cstr) {
+    var t = map_get(load64(reg), name_cstr);
+    if (t != 0) { return t; }
+    var ext = map_get(load64(reg + 8), name_cstr);
+    if (ext != 0) { return load64(ext); }
+    return 0;
+}
+
+fn mcp_deregister(reg, name_cstr) {
+    return map_delete(load64(reg + 8), name_cstr);
+}
+
+# --- edge fleet ---
+
+enum EdgeStatus {
+    EDGE_ONLINE = 0; EDGE_SUSPECT = 1; EDGE_OFFLINE = 2;
+    EDGE_UPDATING = 3; EDGE_DECOMMISSIONED = 4;
+}
+
+fn edge_node_new(name, arch, cpu_cores, memory_mb) {
+    var n = alloc(96);
+    var nid = str_from_int(agent_next_id());
+    store64(n, nid);
+    store64(n + 8, name);
+    store64(n + 16, EDGE_ONLINE);
+    store64(n + 24, arch);
+    store64(n + 32, cpu_cores);
+    store64(n + 40, memory_mb);
+    store64(n + 48, 32768);
+    store64(n + 56, 0);
+    store64(n + 64, clock_epoch_secs());
+    store64(n + 72, 0);
+    store64(n + 80, 0);
+    store64(n + 88, str_from("0.0.0"));
+    return n;
+}
+
+fn edge_node_id(n) { return load64(n); }
+fn edge_node_status(n) { return load64(n + 16); }
+fn edge_node_set_status(n, s) { store64(n + 16, s); }
+
+# --- recording ---
+
+enum RecordingStatus { REC_ACTIVE = 0; REC_PAUSED = 1; REC_STOPPED = 2; }
+
+fn recording_session_new(agent_id) {
+    var s = alloc(40);
+    store64(s, str_from_int(agent_next_id()));
+    store64(s + 8, REC_ACTIVE);
+    store64(s + 16, 0);
+    store64(s + 24, clock_epoch_secs());
+    store64(s + 32, agent_id);
+    return s;
+}
+
+fn recording_add_frame(s) {
+    if (load64(s + 8) != REC_ACTIVE) { return Err(ERR_INVALID_PARAM); }
+    var fc = load64(s + 16) + 1;
+    store64(s + 16, fc);
+    return Ok(fc);
+}
+
+fn recording_pause(s) {
+    if (load64(s + 8) != REC_ACTIVE) { return Err(ERR_INVALID_PARAM); }
+    store64(s + 8, REC_PAUSED);
+    return Ok(0);
+}
+
+fn recording_resume(s) {
+    if (load64(s + 8) != REC_PAUSED) { return Err(ERR_INVALID_PARAM); }
+    store64(s + 8, REC_ACTIVE);
+    return Ok(0);
+}
+
+fn recording_stop(s) {
+    store64(s + 8, REC_STOPPED);
+    return Ok(0);
+}
+
+# ================================================================
+# Tests
+# ================================================================
+
+fn main() {
+    alloc_init();
+
+    # =============================================================
+    # error — status mapping
+    # =============================================================
+    test_group("error");
+    assert_eq(error_to_status(ERR_INVALID_PARAM), 400, "invalid_param -> 400");
+    assert_eq(error_to_status(ERR_AGENT_NOT_FOUND), 404, "not_found -> 404");
+    assert_eq(error_to_status(ERR_AGENT_EXISTS), 409, "exists -> 409");
+    assert_eq(error_to_status(ERR_SUPERVISOR), 500, "supervisor -> 500");
+    assert_eq(error_to_status(ERR_IPC), 500, "ipc -> 500");
+    assert_eq(error_to_status(ERR_SCHEDULER), 500, "scheduler -> 500");
+    assert_eq(error_to_status(ERR_FEDERATION), 500, "federation -> 500");
+    assert_eq(error_to_status(ERR_API), 500, "api -> 500");
+    assert_eq(error_to_status(ERR_STORAGE), 500, "storage -> 500");
+
+    # =============================================================
+    # config — defaults and modification
+    # =============================================================
+    test_group("config");
+    var cfg = config_new();
+    assert_eq(config_port(cfg), 8090, "default port");
+    assert_eq(config_max_agents(cfg), 1000, "default max_agents");
+    assert(str_eq(config_listen_addr(cfg), str_from("127.0.0.1")) == 1, "default listen_addr");
+    assert(str_eq(config_data_dir(cfg), str_from("/var/lib/agnos")) == 1, "default data_dir");
+
+    config_set_port(cfg, 9090);
+    assert_eq(config_port(cfg), 9090, "modified port");
+
+    # =============================================================
+    # agent — creation and state
+    # =============================================================
+    test_group("agent");
+    var a1 = agent_handle_new(1, str_from("test-agent"));
+    assert_eq(agent_id(a1), 1, "agent id");
+    assert(str_eq(agent_name(a1), str_from("test-agent")) == 1, "agent name");
+    assert_eq(agent_status(a1), AGENT_PENDING, "initial status pending");
+    assert_eq(agent_pid(a1), 0, "no pid initially");
+
+    # Unique IDs
+    var a2 = agent_handle_new(agent_next_id(), str_from("agent-2"));
+    var a3 = agent_handle_new(agent_next_id(), str_from("agent-3"));
+    assert(agent_id(a2) != agent_id(a3), "unique agent ids");
+
+    # Status transitions
+    agent_set_status(a1, AGENT_RUNNING);
+    assert_eq(agent_status(a1), AGENT_RUNNING, "set running");
+    agent_set_status(a1, AGENT_STOPPED);
+    assert_eq(agent_status(a1), AGENT_STOPPED, "set stopped");
+
+    # All status values representable
+    var si = 0;
+    while (si <= 6) {
+        agent_set_status(a1, si);
+        assert_eq(agent_status(a1), si, "status value");
+        si = si + 1;
+    }
+
+    # =============================================================
+    # /proc helpers — edge cases
+    # =============================================================
+    test_group("proc_helpers");
+
+    # Nonexistent/zero PID returns safe defaults
+    assert_eq(read_vm_rss(0), 0, "rss pid 0");
+    assert_eq(count_fds(0), 0, "fds pid 0");
+    assert_eq(count_threads(0), 1, "threads pid 0 default 1");
+
+    # Bogus PID returns safe defaults
+    assert_eq(read_vm_rss(999999999), 0, "rss bogus pid");
+    assert_eq(count_fds(999999999), 0, "fds bogus pid");
+    assert_eq(count_threads(999999999), 1, "threads bogus pid");
+
+    # =============================================================
+    # circuit breaker
+    # =============================================================
+    test_group("circuit_breaker");
+
+    # Starts closed
+    var cb = cb_new(3, 10000, 2);
+    assert_eq(cb_state(cb), CB_CLOSED, "starts closed");
+    assert_eq(cb_failure_count(cb), 0, "no failures");
+    assert_eq(cb_can_execute(cb), 1, "can execute when closed");
+
+    # Opens after threshold
+    cb_record_failure(cb);
+    cb_record_failure(cb);
+    assert_eq(cb_state(cb), CB_CLOSED, "still closed at 2");
+    cb_record_failure(cb);
+    assert_eq(cb_state(cb), CB_OPEN, "opens at 3");
+    assert_eq(cb_can_execute(cb), 0, "blocked when open");
+
+    # Success resets failure count
+    var cb2 = cb_new(5, 10000, 1);
+    cb_record_failure(cb2);
+    cb_record_failure(cb2);
+    assert_eq(cb_failure_count(cb2), 2, "failure count 2");
+    cb_record_success(cb2);
+    assert_eq(cb_failure_count(cb2), 0, "reset on success");
+
+    # Half-open transition (0ms timeout = immediate)
+    var cb3 = cb_new(1, 0, 1);
+    cb_record_failure(cb3);
+    assert_eq(cb_state(cb3), CB_OPEN, "open after 1 failure");
+    assert_eq(cb_can_execute(cb3), 1, "transitions to half-open");
+    assert_eq(cb_state(cb3), CB_HALF_OPEN, "now half-open");
+
+    # Closes after half-open successes
+    var cb4 = cb_new(1, 0, 2);
+    cb_record_failure(cb4);
+    cb_can_execute(cb4);  # -> half-open
+    cb_record_success(cb4);
+    assert_eq(cb_state(cb4), CB_HALF_OPEN, "still half-open at 1 success");
+    cb_record_success(cb4);
+    assert_eq(cb_state(cb4), CB_CLOSED, "closed after 2 successes");
+
+    # Re-opens on half-open failure
+    var cb5 = cb_new(1, 0, 3);
+    cb_record_failure(cb5);
+    cb_can_execute(cb5);  # -> half-open
+    cb_record_failure(cb5);
+    assert_eq(cb_state(cb5), CB_OPEN, "re-opened from half-open");
+
+    # Reset
+    cb_reset(cb);
+    assert_eq(cb_state(cb), CB_CLOSED, "reset to closed");
+    assert_eq(cb_failure_count(cb), 0, "reset failure count");
+
+    # =============================================================
+    # output capture — ring buffer
+    # =============================================================
+    test_group("output_capture");
+
+    var oc = output_capture_new(3);
+    assert_eq(output_capture_len(oc), 0, "empty initially");
+
+    output_capture_push(oc, OUT_STDOUT, str_from("line1"));
+    output_capture_push(oc, OUT_STDERR, str_from("line2"));
+    output_capture_push(oc, OUT_STDOUT, str_from("line3"));
+    assert_eq(output_capture_len(oc), 3, "3 lines");
+
+    # Ring buffer eviction
+    output_capture_push(oc, OUT_STDOUT, str_from("line4"));
+    output_capture_push(oc, OUT_STDOUT, str_from("line5"));
+    assert_eq(output_capture_len(oc), 3, "ring at capacity");
+    # First line should be line3 now
+    var lines = load64(oc);
+    var first = vec_get(lines, 0);
+    assert(str_eq(load64(first + 16), str_from("line3")) == 1, "oldest is line3");
+
+    # =============================================================
+    # memory — key validation and sanitization
+    # =============================================================
+    test_group("memory_key_validation");
+
+    assert(is_ok(validate_key(str_from("my-key"))) == 1, "valid key");
+    assert(is_ok(validate_key(str_from("key_123"))) == 1, "valid key_123");
+    assert(is_ok(validate_key(str_from("a"))) == 1, "valid single char");
+    assert(is_err_result(validate_key(str_from(""))) == 1, "empty key rejected");
+    assert(is_err_result(validate_key(str_from("../etc/passwd"))) == 1, "traversal rejected");
+    assert(is_err_result(validate_key(str_from("foo/bar"))) == 1, "slash rejected");
+    assert(is_err_result(validate_key(str_from("foo\\bar"))) == 1, "backslash rejected");
+    assert(is_err_result(validate_key(str_from(".."))) == 1, "dotdot rejected");
+
+    # Key too long
+    var long_sb = str_builder_new();
+    var li = 0;
+    while (li < 260) { str_builder_add_cstr(long_sb, "x"); li = li + 1; }
+    assert(is_err_result(validate_key(str_builder_build(long_sb))) == 1, "too-long rejected");
+
+    test_group("memory_key_sanitization");
+    assert(str_eq(sanitize_key(str_from("hello-world")), str_from("hello-world")) == 1, "hyphen preserved");
+    assert(str_eq(sanitize_key(str_from("key_123")), str_from("key_123")) == 1, "underscore preserved");
+    assert(str_eq(sanitize_key(str_from("has spaces")), str_from("has_spaces")) == 1, "spaces replaced");
+    assert(str_eq(sanitize_key(str_from("path/traversal")), str_from("path_traversal")) == 1, "slash replaced");
+
+    # =============================================================
+    # vector store — cosine similarity
+    # =============================================================
+    test_group("cosine_similarity");
+
+    # Identical vectors → similarity 1.0
+    var v1 = alloc(24);
+    store64(v1, f64_from(1));
+    store64(v1 + 8, f64_from(2));
+    store64(v1 + 16, f64_from(3));
+    var sim = cosine_similarity(v1, v1, 3);
+    var diff = f64_sub(sim, f64_from(1));
+    if (f64_lt(diff, f64_from(0)) == 1) { diff = f64_sub(f64_from(0), diff); }
+    assert(f64_lt(diff, f64_div(f64_from(1), f64_from(1000000))) == 1, "identical vectors ~1.0");
+
+    # Orthogonal vectors → similarity 0.0
+    var orth_a = alloc(16);
+    var orth_b = alloc(16);
+    store64(orth_a, f64_from(1));
+    store64(orth_a + 8, f64_from(0));
+    store64(orth_b, f64_from(0));
+    store64(orth_b + 8, f64_from(1));
+    var sim_orth = cosine_similarity(orth_a, orth_b, 2);
+    var abs_orth = sim_orth;
+    if (f64_lt(abs_orth, f64_from(0)) == 1) { abs_orth = f64_sub(f64_from(0), abs_orth); }
+    assert(f64_lt(abs_orth, f64_div(f64_from(1), f64_from(1000000))) == 1, "orthogonal ~0.0");
+
+    # Zero dimension → 0.0
+    assert_eq(cosine_similarity(v1, v1, 0), f64_from(0), "dim 0 -> 0");
+
+    # Zero vector → 0.0
+    var zero = alloc(16);
+    store64(zero, f64_from(0));
+    store64(zero + 8, f64_from(0));
+    assert_eq(cosine_similarity(zero, orth_a, 2), f64_from(0), "zero vec -> 0");
+
+    # =============================================================
+    # RAG — text chunking
+    # =============================================================
+    test_group("chunk_text");
+
+    var chunks = chunk_text(str_from("abcdefgh"), 4, 0);
+    assert_eq(vec_len(chunks), 2, "no overlap: 2 chunks");
+    assert(str_eq(vec_get(chunks, 0), str_from("abcd")) == 1, "chunk 0 = abcd");
+    assert(str_eq(vec_get(chunks, 1), str_from("efgh")) == 1, "chunk 1 = efgh");
+
+    var chunks2 = chunk_text(str_from("abcdefgh"), 4, 2);
+    assert_eq(vec_len(chunks2), 4, "overlap 2: 4 chunks");
+    assert(str_eq(vec_get(chunks2, 0), str_from("abcd")) == 1, "overlap chunk 0");
+    assert(str_eq(vec_get(chunks2, 1), str_from("cdef")) == 1, "overlap chunk 1");
+
+    assert_eq(vec_len(chunk_text(str_from(""), 10, 0)), 0, "empty text");
+    assert_eq(vec_len(chunk_text(str_from("hello"), 0, 0)), 0, "zero chunk size");
+    assert_eq(vec_len(chunk_text(str_from("hi"), 100, 0)), 1, "chunk > text");
+
+    # =============================================================
+    # tokenizer
+    # =============================================================
+    test_group("tokenize");
+
+    var toks = tokenize(str_from("Hello, World! Test-123."));
+    assert_eq(vec_len(toks), 4, "4 tokens");
+    assert(str_eq(vec_get(toks, 0), str_from("hello")) == 1, "lowercased hello");
+    assert(str_eq(vec_get(toks, 1), str_from("world")) == 1, "lowercased world");
+    assert(str_eq(vec_get(toks, 2), str_from("test")) == 1, "test");
+    assert(str_eq(vec_get(toks, 3), str_from("123")) == 1, "123");
+
+    assert_eq(vec_len(tokenize(str_from(""))), 0, "empty tokens");
+
+    # =============================================================
+    # scheduler — state machine transitions
+    # =============================================================
+    test_group("scheduler_transitions");
+
+    # Build a minimal task (72 bytes, status at offset 40)
+    var task = alloc(72);
+    store64(task + 40, TASK_QUEUED);
+
+    # Valid transitions
+    assert(is_ok(sched_task_transition(task, TASK_SCHEDULED)) == 1, "queued -> scheduled");
+    assert(is_ok(sched_task_transition(task, TASK_RUNNING)) == 1, "scheduled -> running");
+    assert(is_ok(sched_task_transition(task, TASK_COMPLETED)) == 1, "running -> completed");
+
+    # Invalid transition
+    store64(task + 40, TASK_COMPLETED);
+    assert(is_err_result(sched_task_transition(task, TASK_RUNNING)) == 1, "completed -> running invalid");
+
+    # Preemption path
+    store64(task + 40, TASK_RUNNING);
+    assert(is_ok(sched_task_transition(task, TASK_PREEMPTED)) == 1, "running -> preempted");
+    assert(is_ok(sched_task_transition(task, TASK_QUEUED)) == 1, "preempted -> queued");
+
+    # Cancel from any active state
+    store64(task + 40, TASK_QUEUED);
+    assert(is_ok(sched_task_transition(task, TASK_CANCELLED)) == 1, "queued -> cancelled");
+
+    # =============================================================
+    # MCP registry
+    # =============================================================
+    test_group("mcp_registry");
+
+    var reg = mcp_registry_new();
+    assert_eq(mcp_tool_count(reg), 0, "empty registry");
+
+    var t1 = mcp_tool_new(str_from("scan"), str_from("scanner"), str_from("{}"));
+    mcp_register_builtin(reg, t1);
+    assert_eq(mcp_tool_count(reg), 1, "one tool");
+    assert(mcp_find_tool(reg, "scan") != 0, "find scan");
+    assert(mcp_find_tool(reg, "nonexistent") == 0, "find missing");
+
+    var t2 = mcp_tool_new(str_from("deploy"), str_from("deployer"), str_from("{}"));
+    mcp_register_builtin(reg, t2);
+    assert_eq(mcp_tool_count(reg), 2, "two tools");
+
+    # =============================================================
+    # edge fleet
+    # =============================================================
+    test_group("edge_fleet");
+
+    var n1 = edge_node_new(str_from("edge-1"), str_from("x86_64"), 4, 4096);
+    assert(str_eq(load64(n1 + 8), str_from("edge-1")) == 1, "node name");
+    assert_eq(edge_node_status(n1), EDGE_ONLINE, "initial online");
+
+    edge_node_set_status(n1, EDGE_SUSPECT);
+    assert_eq(edge_node_status(n1), EDGE_SUSPECT, "set suspect");
+
+    edge_node_set_status(n1, EDGE_DECOMMISSIONED);
+    assert_eq(edge_node_status(n1), EDGE_DECOMMISSIONED, "set decommissioned");
+
+    # =============================================================
+    # recording manager
+    # =============================================================
+    test_group("recording");
+
+    var rec = recording_session_new(str_from("agent-1"));
+    assert_eq(load64(rec + 8), REC_ACTIVE, "starts active");
+    assert_eq(load64(rec + 16), 0, "0 frames initially");
+
+    assert(is_ok(recording_add_frame(rec)) == 1, "add frame 1");
+    assert_eq(payload(recording_add_frame(rec)), 2, "add frame 2");
+
+    assert(is_ok(recording_pause(rec)) == 1, "pause ok");
+    assert(is_err_result(recording_add_frame(rec)) == 1, "add frame while paused fails");
+
+    assert(is_ok(recording_resume(rec)) == 1, "resume ok");
+    assert(is_ok(recording_add_frame(rec)) == 1, "add frame after resume");
+    assert_eq(load64(rec + 16), 3, "3 frames total");
+
+    assert(is_ok(recording_stop(rec)) == 1, "stop ok");
+    assert_eq(load64(rec + 8), REC_STOPPED, "stopped status");
+    assert(is_err_result(recording_add_frame(rec)) == 1, "add frame after stop fails");
+
+    # Wrong state transitions
+    var rec2 = recording_session_new(str_from("agent-2"));
+    assert(is_err_result(recording_resume(rec2)) == 1, "resume active fails");
+    recording_pause(rec2);
+    assert(is_err_result(recording_pause(rec2)) == 1, "double pause fails");
+
+    # =============================================================
+    # hashmap — core operations (parity with rust HashMap usage)
+    # =============================================================
+    test_group("hashmap");
+
+    var m = map_new();
+    map_set(m, "alpha", 1);
+    map_set(m, "beta", 2);
+    map_set(m, "gamma", 3);
+    assert_eq(map_count(m), 3, "count 3");
+    assert_eq(map_get(m, "alpha"), 1, "get alpha");
+    assert_eq(map_get(m, "beta"), 2, "get beta");
+    assert_eq(map_get(m, "gamma"), 3, "get gamma");
+    assert_eq(map_get(m, "missing"), 0, "get missing");
+
+    map_delete(m, "beta");
+    assert_eq(map_count(m), 2, "count after delete");
+    assert_eq(map_get(m, "beta"), 0, "beta gone");
+    assert_eq(map_get(m, "alpha"), 1, "alpha still there");
+
+    # Overwrite
+    map_set(m, "alpha", 100);
+    assert_eq(map_get(m, "alpha"), 100, "overwrite alpha");
+    assert_eq(map_count(m), 2, "count unchanged after overwrite");
+
+    # =============================================================
+    # JSON parse/build
+    # =============================================================
+    test_group("json");
+
+    var jpairs = json_parse(str_from("{\"name\":\"test\",\"port\":\"8090\"}"));
+    assert(jpairs != 0, "parse ok");
+    var jname = json_get(jpairs, str_from("name"));
+    assert(jname != 0, "got name");
+    assert(str_eq(jname, str_from("test")) == 1, "name is test");
+    assert_eq(json_get_int(jpairs, str_from("port")), 8090, "port is 8090");
+
+    # =============================================================
+    # Summary
+    # =============================================================
+    return assert_summary();
+}
+
+var r = main();
+syscall(SYS_EXIT, r);

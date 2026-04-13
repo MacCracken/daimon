@@ -1,0 +1,121 @@
+# Fuzz: scheduler task state machine
+# Exercises all valid and invalid transitions
+include "lib/alloc.cyr"
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/str.cyr"
+include "lib/vec.cyr"
+include "lib/tagged.cyr"
+include "lib/syscalls.cyr"
+
+enum TaskStatus {
+    TASK_QUEUED = 0;
+    TASK_SCHEDULED = 1;
+    TASK_RUNNING = 2;
+    TASK_COMPLETED = 3;
+    TASK_FAILED = 4;
+    TASK_CANCELLED = 5;
+    TASK_PREEMPTED = 6;
+}
+
+fn transition(t, new_status) {
+    var from = load64(t + 40);
+    var valid = 0;
+    if (from == TASK_QUEUED) {
+        if (new_status == TASK_SCHEDULED) { valid = 1; }
+        if (new_status == TASK_CANCELLED) { valid = 1; }
+    }
+    if (from == TASK_SCHEDULED) {
+        if (new_status == TASK_RUNNING) { valid = 1; }
+        if (new_status == TASK_CANCELLED) { valid = 1; }
+        if (new_status == TASK_QUEUED) { valid = 1; }
+    }
+    if (from == TASK_RUNNING) {
+        if (new_status == TASK_COMPLETED) { valid = 1; }
+        if (new_status == TASK_FAILED) { valid = 1; }
+        if (new_status == TASK_CANCELLED) { valid = 1; }
+        if (new_status == TASK_PREEMPTED) { valid = 1; }
+    }
+    if (from == TASK_PREEMPTED) {
+        if (new_status == TASK_QUEUED) { valid = 1; }
+    }
+    if (valid == 0) { return Err(1); }
+    store64(t + 40, new_status);
+    return Ok(0);
+}
+
+alloc_init();
+
+# Valid path: QUEUED -> SCHEDULED -> RUNNING -> COMPLETED
+var t1 = alloc(72);
+store64(t1 + 40, TASK_QUEUED);
+if (is_err_result(transition(t1, TASK_SCHEDULED)) == 1) { syscall(60, 1); }
+if (is_err_result(transition(t1, TASK_RUNNING)) == 1) { syscall(60, 2); }
+if (is_err_result(transition(t1, TASK_COMPLETED)) == 1) { syscall(60, 3); }
+
+# Valid path: QUEUED -> CANCELLED
+var t2 = alloc(72);
+store64(t2 + 40, TASK_QUEUED);
+if (is_err_result(transition(t2, TASK_CANCELLED)) == 1) { syscall(60, 4); }
+
+# Valid path: preemption cycle
+var t3 = alloc(72);
+store64(t3 + 40, TASK_QUEUED);
+transition(t3, TASK_SCHEDULED);
+transition(t3, TASK_RUNNING);
+if (is_err_result(transition(t3, TASK_PREEMPTED)) == 1) { syscall(60, 5); }
+if (is_err_result(transition(t3, TASK_QUEUED)) == 1) { syscall(60, 6); }
+
+# Valid path: RUNNING -> FAILED
+var t4 = alloc(72);
+store64(t4 + 40, TASK_RUNNING);
+if (is_err_result(transition(t4, TASK_FAILED)) == 1) { syscall(60, 7); }
+
+# Valid path: SCHEDULED -> QUEUED (descheduling)
+var t5 = alloc(72);
+store64(t5 + 40, TASK_SCHEDULED);
+if (is_err_result(transition(t5, TASK_QUEUED)) == 1) { syscall(60, 8); }
+
+# Invalid transitions (must all fail)
+var invalid_pairs = vec_new();
+# (from, to) pairs that should be rejected
+var p0 = alloc(16); store64(p0, TASK_COMPLETED); store64(p0 + 8, TASK_RUNNING); vec_push(invalid_pairs, p0);
+var p1 = alloc(16); store64(p1, TASK_COMPLETED); store64(p1 + 8, TASK_QUEUED); vec_push(invalid_pairs, p1);
+var p2 = alloc(16); store64(p2, TASK_FAILED); store64(p2 + 8, TASK_QUEUED); vec_push(invalid_pairs, p2);
+var p3 = alloc(16); store64(p3, TASK_CANCELLED); store64(p3 + 8, TASK_QUEUED); vec_push(invalid_pairs, p3);
+var p4 = alloc(16); store64(p4, TASK_QUEUED); store64(p4 + 8, TASK_RUNNING); vec_push(invalid_pairs, p4);
+var p5 = alloc(16); store64(p5, TASK_QUEUED); store64(p5 + 8, TASK_COMPLETED); vec_push(invalid_pairs, p5);
+var p6 = alloc(16); store64(p6, TASK_PREEMPTED); store64(p6 + 8, TASK_RUNNING); vec_push(invalid_pairs, p6);
+var p7 = alloc(16); store64(p7, TASK_PREEMPTED); store64(p7 + 8, TASK_COMPLETED); vec_push(invalid_pairs, p7);
+
+var pi = 0;
+while (pi < vec_len(invalid_pairs)) {
+    var pair = vec_get(invalid_pairs, pi);
+    var t = alloc(72);
+    store64(t + 40, load64(pair));
+    if (is_ok(transition(t, load64(pair + 8))) == 1) {
+        # Should have been rejected
+        syscall(60, 10 + pi);
+    }
+    pi = pi + 1;
+}
+
+# Exhaustive: try all 7x7 = 49 transitions, verify only valid ones succeed
+var from_state = 0;
+while (from_state <= 6) {
+    var to_state = 0;
+    while (to_state <= 6) {
+        var tex = alloc(72);
+        store64(tex + 40, from_state);
+        var result = transition(tex, to_state);
+        # Just verify no crash — result is Ok or Err
+        if (is_ok(result) == 1) {
+            # State should have changed
+            if (load64(tex + 40) != to_state) { syscall(60, 50); }
+        }
+        to_state = to_state + 1;
+    }
+    from_state = from_state + 1;
+}
+
+syscall(60, 0);

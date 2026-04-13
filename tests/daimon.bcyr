@@ -1,0 +1,516 @@
+# daimon.bcyr — daimon benchmarks
+# Parity with rust-old/benches/benchmarks.rs (19 benchmarks)
+#
+# Run: cyrius bench tests/daimon.bcyr
+#   or: cat tests/daimon.bcyr | cc3 > /tmp/daimon_bench && chmod +x /tmp/daimon_bench && /tmp/daimon_bench
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/io.cyr"
+include "lib/hashmap.cyr"
+include "lib/tagged.cyr"
+include "lib/json.cyr"
+include "lib/chrono.cyr"
+include "lib/fnptr.cyr"
+include "lib/bench.cyr"
+include "lib/syscalls.cyr"
+include "lib/math.cyr"
+
+# ================================================================
+# Inline types needed for benchmarking
+# ================================================================
+
+var _bid = 1;
+fn bid() { var id = _bid; _bid = _bid + 1; return id; }
+
+# --- config ---
+
+fn config_new() {
+    var c = alloc(32);
+    store64(c, str_from("127.0.0.1"));
+    store64(c + 8, 8090);
+    store64(c + 16, str_from("/var/lib/agnos"));
+    store64(c + 24, 1000);
+    return c;
+}
+
+# --- circuit breaker ---
+
+fn cb_new(threshold, timeout_ms, half_open_max) {
+    var cb = alloc(56);
+    store64(cb, 0);  # CLOSED
+    store64(cb + 8, 0);
+    store64(cb + 16, 0);
+    store64(cb + 24, threshold);
+    store64(cb + 32, timeout_ms);
+    store64(cb + 40, half_open_max);
+    store64(cb + 48, 0);
+    return cb;
+}
+
+fn cb_record_success(cb) {
+    var state = load64(cb);
+    if (state == 2) {
+        var sc = load64(cb + 16) + 1;
+        store64(cb + 16, sc);
+        if (sc >= load64(cb + 40)) { store64(cb, 0); store64(cb + 8, 0); store64(cb + 16, 0); }
+    }
+    elif (state == 0) { store64(cb + 8, 0); }
+}
+
+fn cb_record_failure(cb) {
+    var fc = load64(cb + 8) + 1;
+    store64(cb + 8, fc);
+    store64(cb + 48, clock_epoch_secs());
+    if (load64(cb) == 0) { if (fc >= load64(cb + 24)) { store64(cb, 1); } }
+    elif (load64(cb) == 2) { store64(cb, 1); store64(cb + 16, 0); }
+}
+
+# --- cosine similarity ---
+
+fn cosine_similarity(a, b, dim) {
+    if (dim == 0) { return 0; }
+    var dot = f64_from(0);
+    var norm_a = f64_from(0);
+    var norm_b = f64_from(0);
+    var i = 0;
+    while (i < dim) {
+        var x = load64(a + i * 8);
+        var y = load64(b + i * 8);
+        dot = f64_add(dot, f64_mul(x, y));
+        norm_a = f64_add(norm_a, f64_mul(x, x));
+        norm_b = f64_add(norm_b, f64_mul(y, y));
+        i = i + 1;
+    }
+    var denom = f64_mul(f64_sqrt(norm_a), f64_sqrt(norm_b));
+    if (f64_eq(denom, f64_from(0)) == 1) { return f64_from(0); }
+    return f64_div(dot, denom);
+}
+
+# --- MCP registry ---
+
+fn mcp_tool_new(name, desc) {
+    var t = alloc(24);
+    store64(t, name);
+    store64(t + 8, desc);
+    store64(t + 16, str_from("{}"));
+    return t;
+}
+
+fn mcp_registry_new() {
+    var reg = alloc(16);
+    store64(reg, map_new());
+    store64(reg + 8, map_new());
+    return reg;
+}
+
+fn mcp_register_builtin(reg, tool) {
+    map_set(load64(reg), str_data(load64(tool)), tool);
+}
+
+fn mcp_find_tool(reg, name_cstr) {
+    return map_get(load64(reg), name_cstr);
+}
+
+fn mcp_tool_count(reg) { return map_count(load64(reg)) + map_count(load64(reg + 8)); }
+
+# --- chunk text ---
+
+fn chunk_text(text, chunk_size, overlap) {
+    var chunks = vec_new();
+    var tlen = str_len(text);
+    if (tlen == 0) { return chunks; }
+    if (chunk_size == 0) { return chunks; }
+    if (overlap >= chunk_size) { overlap = chunk_size - 1; }
+    var step = chunk_size - overlap;
+    if (step == 0) { step = 1; }
+    var pos = 0;
+    while (pos < tlen) {
+        var end = pos + chunk_size;
+        if (end > tlen) { end = tlen; }
+        vec_push(chunks, str_sub(text, pos, end - pos));
+        pos = pos + step;
+    }
+    return chunks;
+}
+
+# --- edge fleet stats ---
+
+fn edge_fleet_stats(nodes_map) {
+    var keys = map_keys(nodes_map);
+    var total = vec_len(keys);
+    var online = 0;
+    var i = 0;
+    while (i < total) {
+        var n = map_get(nodes_map, vec_get(keys, i));
+        if (load64(n + 16) == 0) { online = online + 1; }
+        i = i + 1;
+    }
+    return online;
+}
+
+# ================================================================
+# Benchmark globals
+# ================================================================
+
+var _cos_a = 0;
+var _cos_b = 0;
+var _vec_entries = 0;
+var _cos_query = 0;
+var _mcp_reg = 0;
+var _edge_map = 0;
+var _rag_text = 0;
+
+# ================================================================
+# Benchmark functions (each called by bench_run)
+# ================================================================
+
+fn bench_config_default() { config_new(); return 0; }
+
+fn bench_cosine_128d() {
+    cosine_similarity(_cos_a, _cos_b, 128);
+    return 0;
+}
+
+fn bench_vector_insert_100() {
+    var entries = vec_new();
+    var i = 0;
+    while (i < 100) {
+        var emb = alloc(128 * 8);
+        var j = 0;
+        while (j < 128) {
+            store64(emb + j * 8, f64_from(i * 128 + j));
+            j = j + 1;
+        }
+        vec_push(entries, emb);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn bench_vector_search_1k() {
+    var n = vec_len(_vec_entries);
+    var best_score = f64_from(0);
+    var i = 0;
+    while (i < n) {
+        var emb = vec_get(_vec_entries, i);
+        var score = cosine_similarity(_cos_query, emb, 64);
+        if (f64_gt(score, best_score) == 1) { best_score = score; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn bench_rag_ingest_5k() {
+    chunk_text(_rag_text, 50, 10);
+    return 0;
+}
+
+fn bench_scheduler_100() {
+    var tasks = map_new();
+    var i = 0;
+    while (i < 100) {
+        var t = alloc(72);
+        var tid = str_from_int(i);
+        store64(t, tid);
+        store64(t + 8, str_from("task"));
+        store64(t + 32, (i % 10) + 1);
+        store64(t + 40, 0);  # QUEUED
+        store64(t + 48, clock_epoch_secs());
+        map_set(tasks, str_data(tid), t);
+        i = i + 1;
+    }
+    # Sort pending by priority (count queued)
+    var keys = map_keys(tasks);
+    var queued = 0;
+    i = 0;
+    while (i < vec_len(keys)) {
+        var t = map_get(tasks, vec_get(keys, i));
+        if (load64(t + 40) == 0) { queued = queued + 1; }
+        i = i + 1;
+    }
+    return queued;
+}
+
+fn bench_supervisor_register_1000() {
+    var health = map_new();
+    var i = 0;
+    while (i < 1000) {
+        var id_str = str_from_int(i);
+        var ah = alloc(80);
+        store64(ah, i);
+        store64(ah + 8, 1);
+        map_set(health, str_data(id_str), ah);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn bench_mcp_register_100() {
+    var reg = mcp_registry_new();
+    var i = 0;
+    while (i < 100) {
+        var name = str_cat(str_from("tool-"), str_from_int(i));
+        mcp_register_builtin(reg, mcp_tool_new(name, str_from("desc")));
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn bench_mcp_manifest_100() {
+    # Collect all tool keys (manifest = sorted list)
+    var keys = map_keys(load64(_mcp_reg));
+    var n = vec_len(keys);
+    # Sort keys (insertion sort)
+    var i = 1;
+    while (i < n) {
+        var key = vec_get(keys, i);
+        var j = i - 1;
+        while (j >= 0) {
+            if (strcmp(vec_get(keys, j), key) <= 0) { break; }
+            vec_set(keys, j + 1, vec_get(keys, j));
+            j = j - 1;
+        }
+        vec_set(keys, j + 1, key);
+        i = i + 1;
+    }
+    return n;
+}
+
+fn bench_mcp_find_tool() {
+    mcp_find_tool(_mcp_reg, "tool-50");
+    return 0;
+}
+
+fn bench_edge_register_100() {
+    var nodes = map_new();
+    var i = 0;
+    while (i < 100) {
+        var n = alloc(96);
+        var nid = str_from_int(i);
+        store64(n, nid);
+        store64(n + 8, str_cat(str_from("node-"), nid));
+        store64(n + 16, 0);  # ONLINE
+        store64(n + 64, clock_epoch_secs());
+        map_set(nodes, str_data(nid), n);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn bench_edge_heartbeat_100() {
+    var keys = map_keys(_edge_map);
+    var i = 0;
+    while (i < vec_len(keys)) {
+        var n = map_get(_edge_map, vec_get(keys, i));
+        store64(n + 64, clock_epoch_secs());
+        store64(n + 72, 2);
+        store64(n + 80, 50);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn bench_edge_stats_500() {
+    edge_fleet_stats(_edge_map);
+    return 0;
+}
+
+fn bench_cb_cycle() {
+    var cb = cb_new(3, 0, 2);
+    cb_record_failure(cb);
+    cb_record_failure(cb);
+    cb_record_failure(cb);
+    cb_record_success(cb);
+    cb_record_success(cb);
+    return 0;
+}
+
+fn bench_hashmap_1000() {
+    var m = map_new();
+    var i = 0;
+    while (i < 1000) {
+        var key = str_from_int(i);
+        map_set(m, str_data(key), i);
+        i = i + 1;
+    }
+    # Lookup all
+    i = 0;
+    while (i < 1000) {
+        var key = str_from_int(i);
+        map_get(m, str_data(key));
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn bench_json_parse() {
+    json_parse(str_from("{\"name\":\"test\",\"port\":\"8090\",\"host\":\"localhost\"}"));
+    return 0;
+}
+
+# Helper for strcmp
+fn strcmp(a, b) {
+    var i = 0;
+    while (1 == 1) {
+        var ca = load8(a + i);
+        var cb = load8(b + i);
+        if (ca != cb) { return ca - cb; }
+        if (ca == 0) { return 0; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# ================================================================
+# Main
+# ================================================================
+
+fn main() {
+    alloc_init();
+
+    # Setup: build cosine vectors (128d)
+    _cos_a = alloc(128 * 8);
+    _cos_b = alloc(128 * 8);
+    var i = 0;
+    while (i < 128) {
+        store64(_cos_a + i * 8, f64_from(i));
+        store64(_cos_b + i * 8, f64_from(128 - i));
+        i = i + 1;
+    }
+
+    # Setup: build 1000 vectors (64d) for search bench
+    _vec_entries = vec_new();
+    i = 0;
+    while (i < 1000) {
+        var emb = alloc(64 * 8);
+        var j = 0;
+        while (j < 64) {
+            store64(emb + j * 8, f64_from(i * 64 + j));
+            j = j + 1;
+        }
+        vec_push(_vec_entries, emb);
+        i = i + 1;
+    }
+    _cos_query = alloc(64 * 8);
+    i = 0;
+    while (i < 64) {
+        store64(_cos_query + i * 8, f64_from(64 - i));
+        i = i + 1;
+    }
+
+    # Setup: MCP registry with 100 tools
+    _mcp_reg = mcp_registry_new();
+    i = 0;
+    while (i < 100) {
+        var name = str_cat(str_from("tool-"), str_from_int(i));
+        mcp_register_builtin(_mcp_reg, mcp_tool_new(name, str_from("desc")));
+        i = i + 1;
+    }
+
+    # Setup: edge fleet with 500 nodes
+    _edge_map = map_new();
+    i = 0;
+    while (i < 500) {
+        var n = alloc(96);
+        var nid = str_from_int(i);
+        store64(n, nid);
+        store64(n + 8, str_cat(str_from("node-"), nid));
+        store64(n + 16, 0);
+        store64(n + 64, clock_epoch_secs());
+        store64(n + 72, 0);
+        store64(n + 80, 0);
+        map_set(_edge_map, str_data(nid), n);
+        i = i + 1;
+    }
+
+    # Setup: RAG text (~5k chars)
+    var rag_sb = str_builder_new();
+    i = 0;
+    while (i < 100) {
+        str_builder_add_cstr(rag_sb, "The quick brown fox jumps over the lazy dog. ");
+        i = i + 1;
+    }
+    _rag_text = str_builder_build(rag_sb);
+
+    # Run benchmarks
+    var benches = vec_new();
+
+    # Core (parity with Rust suite)
+    var b1 = bench_new("config_default");
+    bench_run(b1, &bench_config_default, 10000);
+    vec_push(benches, b1);
+
+    var b2 = bench_new("cosine_128d");
+    bench_run(b2, &bench_cosine_128d, 10000);
+    vec_push(benches, b2);
+
+    var b3 = bench_new("vector_insert_100x128d");
+    bench_run(b3, &bench_vector_insert_100, 100);
+    vec_push(benches, b3);
+
+    var b4 = bench_new("vector_search_1k_64d");
+    bench_run(b4, &bench_vector_search_1k, 100);
+    vec_push(benches, b4);
+
+    var b5 = bench_new("rag_ingest_5k_chars");
+    bench_run(b5, &bench_rag_ingest_5k, 1000);
+    vec_push(benches, b5);
+
+    var b6 = bench_new("scheduler_100_tasks");
+    bench_run(b6, &bench_scheduler_100, 100);
+    vec_push(benches, b6);
+
+    # Agent registration
+    var b7 = bench_new("supervisor_register_1000");
+    bench_run(b7, &bench_supervisor_register_1000, 10);
+    vec_push(benches, b7);
+
+    # MCP dispatch
+    var b8 = bench_new("mcp_register_100_tools");
+    bench_run(b8, &bench_mcp_register_100, 100);
+    vec_push(benches, b8);
+
+    var b9 = bench_new("mcp_manifest_100_tools");
+    bench_run(b9, &bench_mcp_manifest_100, 1000);
+    vec_push(benches, b9);
+
+    var b10 = bench_new("mcp_find_tool_in_100");
+    bench_run(b10, &bench_mcp_find_tool, 100000);
+    vec_push(benches, b10);
+
+    # Edge fleet
+    var b11 = bench_new("edge_register_100");
+    bench_run(b11, &bench_edge_register_100, 100);
+    vec_push(benches, b11);
+
+    var b12 = bench_new("edge_heartbeat_100");
+    bench_run(b12, &bench_edge_heartbeat_100, 1000);
+    vec_push(benches, b12);
+
+    var b13 = bench_new("edge_stats_500");
+    bench_run(b13, &bench_edge_stats_500, 1000);
+    vec_push(benches, b13);
+
+    # Additional
+    var b14 = bench_new("circuit_breaker_cycle");
+    bench_run(b14, &bench_cb_cycle, 100000);
+    vec_push(benches, b14);
+
+    var b15 = bench_new("hashmap_1000_insert_lookup");
+    bench_run(b15, &bench_hashmap_1000, 100);
+    vec_push(benches, b15);
+
+    var b16 = bench_new("json_parse");
+    bench_run(b16, &bench_json_parse, 10000);
+    vec_push(benches, b16);
+
+    bench_report_all(benches);
+    return 0;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);

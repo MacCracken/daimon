@@ -1,0 +1,113 @@
+# Fuzz: memory key validation and sanitization
+# Exercises edge cases in key validation and sanitization
+include "lib/alloc.cyr"
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/str.cyr"
+include "lib/vec.cyr"
+include "lib/tagged.cyr"
+include "lib/syscalls.cyr"
+
+alloc_init();
+
+var MAX_KEY_LENGTH = 256;
+
+fn validate_key(key) {
+    var klen = str_len(key);
+    if (klen == 0) { return Err(1); }
+    if (klen > MAX_KEY_LENGTH) { return Err(1); }
+    if (str_contains(key, str_from("..")) == 1) { return Err(1); }
+    if (str_contains(key, str_from("/")) == 1) { return Err(1); }
+    if (str_contains(key, str_from("\\")) == 1) { return Err(1); }
+    return Ok(0);
+}
+
+fn sanitize_key(key) {
+    var data = str_data(key);
+    var klen = str_len(key);
+    var buf = alloc(klen + 1);
+    var i = 0;
+    while (i < klen) {
+        var c = load8(data + i);
+        if (c >= 97) { if (c <= 122) { store8(buf + i, c); i = i + 1; continue; } }
+        if (c >= 65) { if (c <= 90) { store8(buf + i, c); i = i + 1; continue; } }
+        if (c >= 48) { if (c <= 57) { store8(buf + i, c); i = i + 1; continue; } }
+        if (c == 45) { store8(buf + i, c); i = i + 1; continue; }
+        if (c == 95) { store8(buf + i, c); i = i + 1; continue; }
+        if (c == 46) { store8(buf + i, c); i = i + 1; continue; }
+        store8(buf + i, 95);
+        i = i + 1;
+    }
+    store8(buf + klen, 0);
+    return str_new(buf, klen);
+}
+
+# Valid keys
+var valid_keys = vec_new();
+vec_push(valid_keys, str_from("simple"));
+vec_push(valid_keys, str_from("with-dash"));
+vec_push(valid_keys, str_from("with_underscore"));
+vec_push(valid_keys, str_from("with.dot"));
+vec_push(valid_keys, str_from("CamelCase"));
+vec_push(valid_keys, str_from("key123"));
+vec_push(valid_keys, str_from("a"));
+
+var vi = 0;
+while (vi < vec_len(valid_keys)) {
+    var k = vec_get(valid_keys, vi);
+    if (is_err_result(validate_key(k)) == 1) { syscall(60, 1); }
+    vi = vi + 1;
+}
+
+# Invalid keys
+var invalid_keys = vec_new();
+vec_push(invalid_keys, str_from(""));
+vec_push(invalid_keys, str_from(".."));
+vec_push(invalid_keys, str_from("../etc/passwd"));
+vec_push(invalid_keys, str_from("foo/bar"));
+vec_push(invalid_keys, str_from("foo\\bar"));
+vec_push(invalid_keys, str_from("a/b"));
+vec_push(invalid_keys, str_from("..hidden"));
+
+var ii = 0;
+while (ii < vec_len(invalid_keys)) {
+    var k = vec_get(invalid_keys, ii);
+    if (is_ok(validate_key(k)) == 1) { syscall(60, 2); }
+    ii = ii + 1;
+}
+
+# Too-long key
+var long_sb = str_builder_new();
+var li = 0;
+while (li < 260) { str_builder_add_cstr(long_sb, "x"); li = li + 1; }
+if (is_ok(validate_key(str_builder_build(long_sb))) == 1) { syscall(60, 3); }
+
+# Sanitization preserves length
+var si = 0;
+while (si < vec_len(valid_keys)) {
+    var k = vec_get(valid_keys, si);
+    var s = sanitize_key(k);
+    if (str_len(s) != str_len(k)) { syscall(60, 4); }
+    si = si + 1;
+}
+
+# Sanitization replaces special chars
+var special = sanitize_key(str_from("a b!c@d#e"));
+if (str_len(special) != 9) { syscall(60, 5); }
+# Only alnum, -, _, . should survive; rest become _
+var sdata = str_data(special);
+var sci = 0;
+while (sci < str_len(special)) {
+    var c = load8(sdata + sci);
+    var ok = 0;
+    if (c >= 97) { if (c <= 122) { ok = 1; } }
+    if (c >= 65) { if (c <= 90) { ok = 1; } }
+    if (c >= 48) { if (c <= 57) { ok = 1; } }
+    if (c == 45) { ok = 1; }
+    if (c == 95) { ok = 1; }
+    if (c == 46) { ok = 1; }
+    if (ok == 0) { syscall(60, 6); }
+    sci = sci + 1;
+}
+
+syscall(60, 0);

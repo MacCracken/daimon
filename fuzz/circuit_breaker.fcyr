@@ -1,0 +1,99 @@
+# Fuzz: circuit breaker state machine
+# Exercises all state transitions with random success/failure sequences
+include "lib/alloc.cyr"
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/chrono.cyr"
+include "lib/syscalls.cyr"
+
+alloc_init();
+
+fn cb_new(threshold, timeout_ms, half_open_max) {
+    var cb = alloc(56);
+    store64(cb, 0);  # CLOSED
+    store64(cb + 8, 0);
+    store64(cb + 16, 0);
+    store64(cb + 24, threshold);
+    store64(cb + 32, timeout_ms);
+    store64(cb + 40, half_open_max);
+    store64(cb + 48, 0);
+    return cb;
+}
+
+fn cb_record_success(cb) {
+    var state = load64(cb);
+    if (state == 2) {
+        var sc = load64(cb + 16) + 1;
+        store64(cb + 16, sc);
+        if (sc >= load64(cb + 40)) { store64(cb, 0); store64(cb + 8, 0); store64(cb + 16, 0); }
+    }
+    elif (state == 0) { store64(cb + 8, 0); }
+}
+
+fn cb_record_failure(cb) {
+    var fc = load64(cb + 8) + 1;
+    store64(cb + 8, fc);
+    store64(cb + 48, clock_epoch_secs());
+    if (load64(cb) == 0) { if (fc >= load64(cb + 24)) { store64(cb, 1); } }
+    elif (load64(cb) == 2) { store64(cb, 1); store64(cb + 16, 0); }
+}
+
+fn cb_can_execute(cb) {
+    var state = load64(cb);
+    if (state == 0) { return 1; }
+    if (state == 2) { return 1; }
+    var last = load64(cb + 48);
+    if (last > 0) {
+        var elapsed_ms = (clock_epoch_secs() - last) * 1000;
+        if (elapsed_ms >= load64(cb + 32)) { store64(cb, 2); store64(cb + 16, 0); return 1; }
+    }
+    return 0;
+}
+
+alloc_init();
+
+# Test threshold = 1
+var cb1 = cb_new(1, 0, 3);
+cb_record_failure(cb1);
+if (load64(cb1) != 1) { syscall(60, 1); }
+if (cb_can_execute(cb1) != 1) { syscall(60, 2); }
+if (load64(cb1) != 2) { syscall(60, 3); }
+cb_record_success(cb1);
+cb_record_success(cb1);
+cb_record_success(cb1);
+if (load64(cb1) != 0) { syscall(60, 4); }
+
+# Test threshold = 5
+var cb5 = cb_new(5, 0, 2);
+var fi = 0;
+while (fi < 5) { cb_record_failure(cb5); fi = fi + 1; }
+if (load64(cb5) != 1) { syscall(60, 11); }
+cb_can_execute(cb5);
+if (load64(cb5) != 2) { syscall(60, 12); }
+cb_record_success(cb5);
+cb_record_success(cb5);
+if (load64(cb5) != 0) { syscall(60, 13); }
+
+# Test threshold = 10
+var cb10 = cb_new(10, 0, 1);
+fi = 0;
+while (fi < 10) { cb_record_failure(cb10); fi = fi + 1; }
+if (load64(cb10) != 1) { syscall(60, 21); }
+cb_can_execute(cb10);
+cb_record_success(cb10);
+if (load64(cb10) != 0) { syscall(60, 22); }
+
+# Rapid alternation
+var cb_alt = cb_new(3, 0, 1);
+var ai = 0;
+while (ai < 200) {
+    if (ai % 3 == 0) { cb_record_failure(cb_alt); }
+    else { cb_record_success(cb_alt); }
+    var s = load64(cb_alt);
+    if (s > 2) { syscall(60, 30); }
+    ai = ai + 1;
+}
+
+syscall(60, 0);

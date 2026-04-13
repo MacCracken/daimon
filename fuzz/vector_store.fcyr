@@ -1,0 +1,121 @@
+# Fuzz: vector store cosine similarity + search
+# Exercises edge cases in vector math and search
+include "lib/alloc.cyr"
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/vec.cyr"
+include "lib/math.cyr"
+include "lib/syscalls.cyr"
+
+alloc_init();
+
+fn cosine_similarity(a, b, dim) {
+    if (dim == 0) { return 0; }
+    var dot = f64_from(0);
+    var norm_a = f64_from(0);
+    var norm_b = f64_from(0);
+    var i = 0;
+    while (i < dim) {
+        var x = load64(a + i * 8);
+        var y = load64(b + i * 8);
+        dot = f64_add(dot, f64_mul(x, y));
+        norm_a = f64_add(norm_a, f64_mul(x, x));
+        norm_b = f64_add(norm_b, f64_mul(y, y));
+        i = i + 1;
+    }
+    var denom = f64_mul(f64_sqrt(norm_a), f64_sqrt(norm_b));
+    if (f64_eq(denom, f64_from(0)) == 1) { return f64_from(0); }
+    return f64_div(dot, denom);
+}
+
+# Test 1: identical vectors → ~1.0
+var dim = 64;
+var v = alloc(dim * 8);
+var i = 0;
+while (i < dim) {
+    store64(v + i * 8, f64_from(i + 1));
+    i = i + 1;
+}
+var sim = cosine_similarity(v, v, dim);
+var diff = f64_sub(sim, f64_from(1));
+if (f64_lt(diff, f64_from(0)) == 1) { diff = f64_sub(f64_from(0), diff); }
+if (f64_gt(diff, f64_div(f64_from(1), f64_from(1000))) == 1) { syscall(60, 1); }
+
+# Test 2: orthogonal 2D → ~0.0
+var a = alloc(16);
+var b = alloc(16);
+store64(a, f64_from(1));
+store64(a + 8, f64_from(0));
+store64(b, f64_from(0));
+store64(b + 8, f64_from(1));
+sim = cosine_similarity(a, b, 2);
+var abs_sim = sim;
+if (f64_lt(abs_sim, f64_from(0)) == 1) { abs_sim = f64_sub(f64_from(0), abs_sim); }
+if (f64_gt(abs_sim, f64_div(f64_from(1), f64_from(1000))) == 1) { syscall(60, 2); }
+
+# Test 3: opposite vectors → ~-1.0
+store64(b, f64_sub(f64_from(0), f64_from(1)));
+store64(b + 8, f64_from(0));
+sim = cosine_similarity(a, b, 2);
+diff = f64_add(sim, f64_from(1));
+if (f64_lt(diff, f64_from(0)) == 1) { diff = f64_sub(f64_from(0), diff); }
+if (f64_gt(diff, f64_div(f64_from(1), f64_from(1000))) == 1) { syscall(60, 3); }
+
+# Test 4: zero dimension → 0
+if (cosine_similarity(a, b, 0) != 0) { syscall(60, 4); }
+
+# Test 5: zero vector → 0
+var z = alloc(16);
+store64(z, f64_from(0));
+store64(z + 8, f64_from(0));
+if (cosine_similarity(z, a, 2) != f64_from(0)) { syscall(60, 5); }
+
+# Test 6: large dimension (256d) — no crash
+var big_a = alloc(256 * 8);
+var big_b = alloc(256 * 8);
+i = 0;
+while (i < 256) {
+    store64(big_a + i * 8, f64_from(i));
+    store64(big_b + i * 8, f64_from(256 - i));
+    i = i + 1;
+}
+sim = cosine_similarity(big_a, big_b, 256);
+# Result should be finite (between -1 and 1)
+if (f64_gt(sim, f64_from(1)) == 1) { syscall(60, 6); }
+if (f64_lt(sim, f64_sub(f64_from(0), f64_from(1))) == 1) { syscall(60, 7); }
+
+# Test 7: search ranking — closest vector should rank first
+var entries = vec_new();
+var query = alloc(8);
+store64(query, f64_from(1));
+
+# Entry at angle 0 (identical direction)
+var e1 = alloc(8);
+store64(e1, f64_from(1));
+vec_push(entries, e1);
+
+# Entry at angle 90 (orthogonal)
+var e2 = alloc(8);
+store64(e2, f64_from(0));
+vec_push(entries, e2);
+
+# Entry at angle 180 (opposite)
+var e3 = alloc(8);
+store64(e3, f64_sub(f64_from(0), f64_from(1)));
+vec_push(entries, e3);
+
+# Score all entries
+var best_idx = 0;
+var best_score = f64_sub(f64_from(0), f64_from(2));
+i = 0;
+while (i < vec_len(entries)) {
+    var score = cosine_similarity(query, vec_get(entries, i), 1);
+    if (f64_gt(score, best_score) == 1) {
+        best_score = score;
+        best_idx = i;
+    }
+    i = i + 1;
+}
+if (best_idx != 0) { syscall(60, 8); }  # Entry 0 should be closest
+
+syscall(60, 0);

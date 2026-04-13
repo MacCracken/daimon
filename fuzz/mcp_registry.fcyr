@@ -1,0 +1,100 @@
+# Fuzz: MCP registry operations
+# Exercises register, find, deregister with edge cases
+include "lib/alloc.cyr"
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/str.cyr"
+include "lib/vec.cyr"
+include "lib/hashmap.cyr"
+include "lib/syscalls.cyr"
+
+alloc_init();
+
+fn mcp_tool_new(name, desc) {
+    var t = alloc(24);
+    store64(t, name);
+    store64(t + 8, desc);
+    store64(t + 16, str_from("{}"));
+    return t;
+}
+
+fn mcp_registry_new() {
+    var reg = alloc(16);
+    store64(reg, map_new());
+    store64(reg + 8, map_new());
+    return reg;
+}
+
+fn mcp_register_builtin(reg, tool) {
+    map_set(load64(reg), str_data(load64(tool)), tool);
+}
+
+fn mcp_register_external(reg, tool, url) {
+    var ext = alloc(16);
+    store64(ext, tool);
+    store64(ext + 8, url);
+    map_set(load64(reg + 8), str_data(load64(tool)), ext);
+}
+
+fn mcp_find_tool(reg, name_cstr) {
+    var t = map_get(load64(reg), name_cstr);
+    if (t != 0) { return t; }
+    var ext = map_get(load64(reg + 8), name_cstr);
+    if (ext != 0) { return load64(ext); }
+    return 0;
+}
+
+fn mcp_deregister_ext(reg, name_cstr) {
+    return map_delete(load64(reg + 8), name_cstr);
+}
+
+fn mcp_count(reg) { return map_count(load64(reg)) + map_count(load64(reg + 8)); }
+
+# Test 1: register + find
+var reg = mcp_registry_new();
+var t1 = mcp_tool_new(str_from("scan"), str_from("scanner"));
+mcp_register_builtin(reg, t1);
+if (mcp_find_tool(reg, "scan") == 0) { syscall(60, 1); }
+if (mcp_count(reg) != 1) { syscall(60, 2); }
+
+# Test 2: find missing
+if (mcp_find_tool(reg, "nonexistent") != 0) { syscall(60, 3); }
+
+# Test 3: register 100 tools, find all
+var i = 0;
+while (i < 100) {
+    var name = str_cat(str_from("tool-"), str_from_int(i));
+    mcp_register_builtin(reg, mcp_tool_new(name, str_from("desc")));
+    i = i + 1;
+}
+if (mcp_count(reg) != 101) { syscall(60, 4); }  # 100 + scan
+
+# Verify lookup for all 100
+i = 0;
+while (i < 100) {
+    var name = str_cat(str_from("tool-"), str_from_int(i));
+    if (mcp_find_tool(reg, str_data(name)) == 0) { syscall(60, 5); }
+    i = i + 1;
+}
+
+# Test 4: external tools
+var reg2 = mcp_registry_new();
+var ext1 = mcp_tool_new(str_from("ext-scan"), str_from("external scanner"));
+mcp_register_external(reg2, ext1, str_from("http://localhost:9000/callback"));
+if (mcp_find_tool(reg2, "ext-scan") == 0) { syscall(60, 6); }
+if (mcp_count(reg2) != 1) { syscall(60, 7); }
+
+# Test 5: deregister external
+mcp_deregister_ext(reg2, "ext-scan");
+if (mcp_find_tool(reg2, "ext-scan") != 0) { syscall(60, 8); }
+if (mcp_count(reg2) != 0) { syscall(60, 9); }
+
+# Test 6: overwrite builtin
+var reg3 = mcp_registry_new();
+mcp_register_builtin(reg3, mcp_tool_new(str_from("dup"), str_from("v1")));
+mcp_register_builtin(reg3, mcp_tool_new(str_from("dup"), str_from("v2")));
+if (mcp_count(reg3) != 1) { syscall(60, 10); }  # Should overwrite, not duplicate
+var found = mcp_find_tool(reg3, "dup");
+if (found == 0) { syscall(60, 11); }
+
+syscall(60, 0);
