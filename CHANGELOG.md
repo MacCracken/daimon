@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-04-13
+
+### Changed
+
+- Removed `rust-old/` directory (16 GB, 9,724 LOC Rust source + build cache). Port complete — Rust history available in git pre-v0.7.0 tags.
+- Version bump to 1.0.1 — all v1.0 criteria met.
+
 ## [0.7.0] - 2026-04-13
 
 Complete rewrite from Rust to Cyrius. 9,724 LOC Rust → 4,141 LOC Cyrius. Binary: 181 KB (was 4.0 MB). Zero external dependencies.
@@ -54,7 +61,7 @@ Complete rewrite from Rust to Cyrius. 9,724 LOC Rust → 4,141 LOC Cyrius. Binar
 
 ### Changed
 
-- **Language**: Rust → Cyrius. Rust source preserved in `rust-old/` (to be removed post-release).
+- **Language**: Rust → Cyrius. Rust source removed in v1.0.1.
 - **Toolchain**: Cyrius 4.2.0 (pinned in `.cyrius-toolchain`).
 - **Build**: `cargo build` → `cyrius build src/main.cyr build/daimon`.
 - **HTTP**: Async (tokio/axum) → synchronous (raw TCP sockets).

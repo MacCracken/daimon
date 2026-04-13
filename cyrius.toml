@@ -1,6 +1,6 @@
 [package]
 name = "daimon"
-version = "0.7.0"
+version = "1.0.1"
 description = "daimon — AGNOS agent orchestrator"
 license = "GPL-3.0-only"
 language = "cyrius"

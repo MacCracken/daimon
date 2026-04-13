@@ -1,6 +1,6 @@
 # Benchmarks — Rust v0.6.0 vs Cyrius v0.7.0
 
-- **Rust**: v0.6.0, rustc 1.89, criterion, x86_64. Last run from `rust-old/bench-history.csv`.
+- **Rust**: v0.6.0, rustc 1.89, criterion, x86_64. Final benchmark run before port.
 - **Cyrius**: v0.7.0, cyrius 4.2.0 (cc3 compiler, single-pass, no LLVM), lib/bench.cyr, `tests/daimon.bcyr`. Same machine.
 
 ## Core Operations

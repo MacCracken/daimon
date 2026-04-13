@@ -5,7 +5,7 @@
 **Daimon** (Greek: δαίμων — guiding spirit) — AGNOS agent orchestrator
 
 - **Type**: Service binary + library
-- **Language**: Cyrius (ported from Rust — 9,724 LOC preserved in `rust-old/`)
+- **Language**: Cyrius (ported from 9,724 LOC Rust)
 - **Purpose**: AGNOS agent orchestrator — HTTP API, supervisor, IPC, scheduler, federation, edge fleet, memory, MCP dispatch (port 8090)
 - **License**: GPL-3.0-only
 - **Cyrius**: 4.2.0 (pinned in `.cyrius-toolchain`)
@@ -78,7 +78,7 @@ Every AGNOS agent, every consumer app, hoosh, agnoshi, aethersafha.
 - Use `Result`/`Option` tagged unions for error handling
 - Zero-crash in library code — no unguarded aborts
 - Use accessor functions for struct fields
-- Refer to `rust-old/` for original Rust implementations when porting
+- Original Rust implementations available in git history (pre-v0.7.0 tags)
 
 ## DO NOT
 

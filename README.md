@@ -24,7 +24,7 @@ sh tests/test.sh                    # tests + fuzz harnesses
 
 ## Status
 
-Ported from Rust (9,724 LOC → 3,846 LOC Cyrius). 162 KB binary. Rust source preserved in `rust-old/`.
+Ported from Rust (9,724 LOC → 4,141 LOC Cyrius). 181 KB binary.
 
 ## License
 

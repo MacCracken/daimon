@@ -7,21 +7,6 @@
 - [x] Security audit + remediation (9/10 fixed, 1 accepted risk)
 - [x] Modern Cyrius 4.2.0 toolchain, CI/CD pipelines
 
-## Post-Release: Remove `rust-old/`
-
-After v0.7.0 is tagged and released, `rust-old/` should be removed from the repo. It contains:
-
-- `src/` — 18 Rust source files (9,724 LOC) — fully ported, no longer needed
-- `tests/` — integration tests — superseded by `tests/daimon.tcyr`
-- `benches/` — criterion benchmarks — superseded by `tests/daimon.bcyr`
-- `target/` — 16 GB build cache — should never have been committed
-- `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `deny.toml`, `codecov.yml`, `Makefile` — Rust build config, no longer applicable
-- `bench-history.csv` — Rust benchmark history — captured in `BENCHMARKS.md`
-- `LINES_OF_RUST.txt` — port metadata — captured in CHANGELOG
-- `examples/` — empty directory
-
-**Procedure**: `git rm -r rust-old/` in the first commit after the v0.7.0 tag. Update README.md and CLAUDE.md to remove `rust-old/` references.
-
 ## Security Gates (trigger-based)
 
 - [ ] VULN-007: Bump allocator memory zeroing — **MUST fix before enabling any of**: multi-tenant hosting, kavach sandboxing, untrusted federation, external MCP callbacks (bote). Remediation: per-agent arena allocators with zero-on-reset.
