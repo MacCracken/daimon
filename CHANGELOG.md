@@ -8,138 +8,100 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [0.7.0] - 2026-04-13
 
+Complete rewrite from Rust to Cyrius. 9,724 LOC Rust → 4,141 LOC Cyrius. Binary: 181 KB (was 4.0 MB). Zero external dependencies.
+
 ### Added
 
-- **Cyrius port**: Full rewrite from Rust to Cyrius (9,724 LOC Rust → 3,105 LOC Cyrius).
-- All 15 modules ported with full API parity: error, config, agent, supervisor, memory, vector_store, rag, mcp, screen, scheduler, federation, edge, ipc, api, logging.
-- Synchronous HTTP API server on port 8090 with JSON responses, 24 endpoints:
+- **15 modules ported** with full API parity: error, config, agent, supervisor, memory, vector_store, rag, mcp, screen, scheduler, federation, edge, ipc, api, logging.
+- **24 HTTP API endpoints** — synchronous TCP server on port 8090:
   - `/v1/health` — service health
-  - `/v1/agents` (GET/POST), `/v1/agents/{id}` — agent lifecycle
+  - `/v1/agents` (GET/POST), `/v1/agents/{id}` (GET) — agent lifecycle
   - `/v1/mcp/tools` (GET/POST), `/v1/mcp/tools/{name}` (DELETE), `/v1/mcp/call` (POST) — MCP tool dispatch
   - `/v1/rag/ingest` (POST), `/v1/rag/query` (POST) — RAG pipeline
-  - `/v1/edge/nodes` (GET/POST), `/v1/edge/nodes/{id}` (GET), `/v1/edge/nodes/{id}/heartbeat` (POST), `/v1/edge/nodes/{id}/decommission` (POST), `/v1/edge/stats` — edge fleet
-  - `/v1/scheduler/tasks` (GET/POST), `/v1/scheduler/tasks/{id}` (GET), `/v1/scheduler/tasks/{id}/cancel` (POST), `/v1/scheduler/nodes` (POST), `/v1/scheduler/schedule` (POST), `/v1/scheduler/stats` — task scheduling
+  - `/v1/edge/nodes` (GET/POST), `/v1/edge/nodes/{id}` (GET), `…/heartbeat` (POST), `…/decommission` (POST), `/v1/edge/stats` — edge fleet
+  - `/v1/scheduler/tasks` (GET/POST), `…/{id}` (GET), `…/{id}/cancel` (POST), `/v1/scheduler/nodes` (POST), `/v1/scheduler/schedule` (POST), `/v1/scheduler/stats` — task scheduling
   - `/v1/metrics` — aggregate metrics
-- CLI: `serve [port]`, `version`, `help` commands.
-- Scheduler: NodeCapacity with resource fitting, best-fit bin-packing, schedule_pending with assignment, stats aggregation, preemption-aware state machine.
-- Federation: cluster management, heartbeat health tracking (online/suspect/dead), Raft-like election (start_election, become_coordinator), 4-factor weighted node scoring (resource/locality/load/affinity), live node filtering, cluster stats.
-- Edge fleet: register with validation (empty name, duplicate, fleet-full), heartbeat processing, health check (suspect/offline thresholds), decommission, list with status filter.
-- IPC: message bus with named routing + broadcast + direct send, RPC registry with method registration/lookup/unregister.
-- Memory store: list_keys, clear, atomic write (tmp+rename).
-- RAG pipeline: ingest_text (chunk + embed + index), query_text (embed + search + format context).
-- Circuit breaker with Closed → Open → HalfOpen state machine.
-- Output capture ring buffer for agent stdout/stderr.
-- In-memory cosine-similarity vector index with brute-force search.
-- MCP tool registry (builtin + external) with manifest, register, deregister.
-- Screen capture permission manager with rate limiting and recording sessions.
-- `/proc` helpers for agent resource monitoring (VmRSS, fd count, thread count).
-- Input validation on all POST endpoints (empty names, zero resources, empty text/query).
-- Test suite: 130 assertions across 18 test groups.
-- Benchmark suite: 16 benchmarks covering core data structures and subsystems.
+- **Scheduler**: NodeCapacity with resource fitting + bin-packing, schedule_pending with assignment decisions, preempt_check, tasks_for_node, CronScheduler with interval-based entries + validation, stats aggregation.
+- **Federation**: cluster management, heartbeat health tracking (online/suspect/dead), Raft-like election (start_election, receive_vote_request, receive_vote, become_coordinator, step_down), 4-factor weighted node scoring (resource/locality/load/affinity), agent placement, cluster stats.
+- **Edge fleet**: register with validation (empty name, duplicate, fleet-full), heartbeat, health check (suspect/offline thresholds), decommission, list with status filter, stats.
+- **FederatedVectorStore**: collection/replica management, cross-node search merge with dedup + re-ranking, remove_node, stats.
+- **IPC**: Unix domain socket AgentIpc (bind/accept/send, length-prefixed wire protocol, ACK/NACK, connection limits), message bus (named routing + broadcast + direct send), RPC registry.
+- **Memory store**: CRUD with atomic write (tmp+rename), list_keys, list_by_tag, clear, usage_bytes, key validation + sanitization.
+- **RAG pipeline**: ingest_text (chunk + embed + index), query_text (embed + search + format context).
+- **Vector store**: cosine similarity, brute-force search with ranking, normalize_vec.
+- **Agent lifecycle**: start/stop/pause/resume with race-free pidfd signal delivery, /proc resource monitoring (VmRSS, CPU time, fd count, thread count), resource limits on spawned processes.
+- **Supervisor**: circuit breaker (Closed→Open→HalfOpen), output capture ring buffer, resource quotas, health tracking.
+- **MCP**: tool registry (builtin + external) with manifest, register, deregister, validate_callback_url.
+- **Screen capture**: permission manager with rate limiting, recording sessions (active/paused/stopped).
+- CLI: `serve [port]`, `version`, `help`.
+- Test suite: 200 assertions / 26 test groups.
+- Benchmark suite: 16 benchmarks with Rust comparison (BENCHMARKS.md).
 - Fuzz harnesses: 5 (circuit_breaker, memory_keys, scheduler_fsm, vector_store, mcp_registry).
-- `read_cpu_time_ms()` — CPU time from /proc/{pid}/stat.
-- `normalize_vec()` — vector normalization to unit length.
-- `validate_callback_url()` — basic SSRF protection for MCP external tool URLs.
-- `memory_store_list_by_tag()` — tag-based key filtering.
-- `memory_store_usage_bytes()` — disk usage tracking.
-- `scheduler_preempt_check()` — preemption analysis for priority scheduling.
-- `scheduler_tasks_for_node()` — tasks assigned to a specific node.
-- `fed_mgr_receive_vote_request()` / `fed_mgr_receive_vote()` — Raft vote processing.
-- `fed_mgr_step_down()` — coordinator step-down on higher term.
-- `fed_place_agent()` — agent placement on best eligible node.
-- Benchmark comparison document (BENCHMARKS.md) with Rust vs Cyrius analysis.
-- Binary size: **162 KB** (vs 4.0 MB default Rust build — 96% smaller).
+- Security audit: docs/audit/2026-04-13-security-audit.md — 10 findings, 9 fixed, 1 accepted risk.
 
-### Fixed
+### Security
 
-- **Security (VULN-001)**: HTTP Content-Length validation — parse and enforce declared length, reject Transfer-Encoding (501), reject oversized payloads (413 Payload Too Large). Prevents request smuggling behind proxies.
-- **Security (VULN-002)**: `json_escape_str()` applied to all user-controlled strings in JSON responses — agent names, task names, edge node names, MCP tool names/descriptions. Prevents JSON structure corruption.
-- **Security (VULN-004)**: Race-free signal delivery via `pidfd_open()`/`pidfd_send_signal()` (Linux 5.3+) with `kill()` fallback. Prevents sending signals to wrong process on PID reuse.
-- **Security (VULN-005)**: Agent memory directories created with 0700 (was 0755). Prevents other-user read access.
-- **Security (VULN-006)**: Unix domain socket `SO_PEERCRED` UID verification — rejects connections from non-owner, non-root UIDs.
-- **Security (VULN-008)**: `MAX_REQUEST_SIZE=65536` with Content-Length-based body reads. Prevents oversized request DoS.
-- **Security (VULN-010)**: `agent_spawn_with_limits()` applies `RLIMIT_AS` + `RLIMIT_CPU` before exec. Prevents agent resource exhaustion.
-- **Security**: HTTP query parameter parsing bounds-checked to prevent buffer over-read.
-- **Security**: Empty path segments (`/v1/agents/`) return 404 instead of passing empty string to handler.
-- **Correctness**: Edge decommission URL routing fixed (13-char suffix, not 14).
-- **Correctness**: Variable name collisions in HTTP router fixed (cyrius flat scoping).
-- **Correctness**: MCP tool registry uses `str_cstr()` for null-terminated map keys.
-- **Correctness**: JSON key lookup uses `str_eq_cstr()` via `jget()` helper.
+- **VULN-001**: Content-Length validation, Transfer-Encoding rejection (501), 413 Payload Too Large. Prevents request smuggling.
+- **VULN-002**: `json_escape_str()` on all user-controlled strings in JSON responses. Prevents JSON injection.
+- **VULN-004**: `pidfd_open()`/`pidfd_send_signal()` with `kill()` fallback. Prevents PID reuse race.
+- **VULN-005**: Agent memory directories 0700 (was 0755).
+- **VULN-006**: `SO_PEERCRED` UID verification on Unix socket accept. Prevents unauthorized IPC.
+- **VULN-008**: `MAX_REQUEST_SIZE=65536`, Content-Length body reads. Prevents oversized request DoS.
+- **VULN-009**: Per-IP rate limiting — 120 req/min sliding window, 429 Too Many Requests.
+- **VULN-010**: `agent_spawn_with_limits()` with `RLIMIT_AS` + `RLIMIT_CPU`. Prevents agent resource exhaustion.
+- HTTP query parameter bounds checking. Prevents buffer over-read.
+- Empty path segment handling (`/v1/agents/` → 404).
 
 ### Changed
 
-- **Language**: Rust → Cyrius. Rust source preserved in `rust-old/`.
-- **HTTP**: Async (tokio/axum) → synchronous (raw TCP sockets).
+- **Language**: Rust → Cyrius. Rust source preserved in `rust-old/` (to be removed post-release).
+- **Toolchain**: Cyrius 4.2.0 (pinned in `.cyrius-toolchain`).
 - **Build**: `cargo build` → `cyrius build src/main.cyr build/daimon`.
-- **Dependencies**: 193 crate dependencies → 17 Cyrius stdlib modules + 0 external deps.
+- **HTTP**: Async (tokio/axum) → synchronous (raw TCP sockets).
+- **Dependencies**: 193 crate dependencies → 17 Cyrius stdlib modules + 0 external.
+- **Binary**: 4.0 MB → 181 KB (96% smaller).
+
+### Breaking
+
+- Language changed from Rust to Cyrius. Consumers must use Cyrius 4.2.0+ to build.
+- HTTP server is synchronous (single-threaded). No concurrent request handling.
+- MCP tool call forwarding returns error stub — blocked on bote Cyrius port.
+- Firewall MCP tools not available — blocked on nein Cyrius port.
 
 ## [0.6.0] - 2026-04-03
 
 ### Added
 
-- `http-forward` feature gate — external MCP tool forwarding via reqwest is now opt-in, keeping the default binary lean.
-- `Serialize`/`Deserialize` on 8 previously non-serializable types: `RagPipeline`, `OutputCapture`, `EdgeFleetManager`, `McpHostRegistry` (fallback), `TaskScheduler`, `CronScheduler`, `RpcRegistry`, `VectorIndex`.
-- `#[must_use]` on `IpcMessage::new()`, `TaskScheduler::new()`, `CronScheduler::new()`.
-- `#[non_exhaustive]` on `VectorIndex` and `RagPipeline`.
-- Input validation: positive CPU/memory on scheduler node registration, cron entry hour (0–23) and minute (0–59) bounds.
-- 13 new tests (305 total): serde roundtrips for newly serializable types, cron validation, boundary validation integration tests.
-- 4 new benchmarks (19 total): `rag_query_50_docs` (30 µs), `edge_heartbeat_100_nodes` (8 µs), `edge_stats_500_nodes` (765 ns), `federation_score_100_nodes` (1.7 µs).
+- `http-forward` feature gate — external MCP tool forwarding via reqwest is now opt-in.
+- `Serialize`/`Deserialize` on 8 previously non-serializable types.
+- Input validation: positive CPU/memory on scheduler node registration, cron bounds.
+- 13 new tests (305 total), 4 new benchmarks (19 total).
 
 ### Fixed
 
-- **Security**: External MCP tool-not-found now returns 400 Bad Request (`InvalidParameter`) instead of leaking 404 (`AgentNotFound`).
-- **Security**: Firewall table filter used substring `.contains()` match — replaced with exact match to prevent unintended rule inclusion.
-- **Safety**: `setrlimit` return values in `apply_rlimits()` are now checked and logged on failure.
-- **Safety**: Scheduler `schedule_pending()` replaced direct HashMap indexing (`self.tasks[&id]`) with `.get()` to prevent potential panics.
-- **Safety**: `RpcRouter` mutex locks replaced `.expect()` with `map_err`/`match` — no more panics in library code on lock poisoning.
-- **Correctness**: `cargo fmt` and `cargo clippy` violations resolved (collapsible-if in firewall, benchmark type rename).
-- **Correctness**: Benchmark file updated for `McpHostRegistry` rename and missing `mcp_handlers` field.
+- **Security**: External MCP tool-not-found → 400 (was leaking 404).
+- **Security**: Firewall table filter exact match (was substring).
+- **Safety**: `setrlimit` return values checked, scheduler `.get()` instead of index, RpcRouter mutex handling.
 
 ### Changed
 
-- **Binary size**: Default binary 12 MB → **4.0 MB** (−64%) by feature-gating reqwest behind `http-forward`.
-- **Binary size**: With `http-forward`, 12 MB → **8.2 MB** (−32%) by switching TLS from aws-lc-rs to ring.
-- **Dependencies**: Dropped `anyhow` (replaced with crate's own `Result` in binary).
-- **Dependencies**: Dropped `async-trait` (native async traits, edition 2024).
-- **Dependencies**: `reqwest` moved to optional, default-features disabled, uses `rustls-no-provider` + ring.
-- **Dependencies**: Default dependency count 354 → 193 (−45%).
-- `Supervisor::check_health` now generic (`<A: AgentControl>`) instead of `dyn` dispatch.
-- `http-forward` included in the `full` feature set.
-
-### Breaking
-
-- `reqwest` is no longer a default dependency. Consumers calling external MCP tools must enable the `http-forward` feature. Without it, external tool calls return an error message indicating the feature is required.
-- `Supervisor::check_health` signature changed from `&dyn AgentControl` to generic `<A: AgentControl>`. Callers passing trait objects must switch to concrete types or generics.
+- Binary size: 12 MB → 4.0 MB (−64%) default, 8.2 MB (−32%) with http-forward.
+- Dependencies: 354 → 193 (−45%). Dropped anyhow, async-trait.
+- `Supervisor::check_health` now generic.
 
 ## [0.5.0] - 2026-03-26
 
 ### Added
 
-- Full axum HTTP API router (`api.rs`) with 20+ endpoints: health, agents, MCP tools, RAG ingest/query, edge fleet, scheduler, metrics.
-- Integration test suite — 28 HTTP round-trip tests covering all API subsystems.
-- Benchmark suite — 15 benchmarks covering agent registration throughput, MCP dispatch, API latency, vector search, RAG ingest, scheduler scheduling, and edge fleet registration.
+- Full axum HTTP API router with 20+ endpoints.
+- Integration test suite (28 tests), benchmark suite (15 benchmarks).
 
 ### Fixed
 
-- **Security**: Replaced permissive CORS (`CorsLayer::permissive()`) with restrictive default (`CorsLayer::new()`).
-- **Correctness**: `Agent::handle()` now returns actual `created_at` and `started_at` timestamps instead of always using `Utc::now()`.
-- **Correctness**: Scheduler cron time matching now uses `chrono::Timelike` instead of string formatting with `unwrap_or(0)`.
-- **Safety**: Removed `.parse().unwrap()` from `FederationConfig::Default` — uses `SocketAddr::from()` directly.
-- **Robustness**: IPC `RpcRouter` mutex locks use `.expect()` with descriptive messages instead of `.unwrap()`.
-- **Robustness**: IPC socket permission failures are now logged instead of silently ignored.
-- **Robustness**: IPC `MessageBus::publish()` logs warnings on dropped messages instead of silently discarding.
-- **Robustness**: API serialization failures in list endpoints now log warnings instead of silently dropping items.
-- **Robustness**: Logging initialization warns via stderr when `DAIMON_LOG` contains an invalid filter directive.
-
-### Changed
-
-- **Dependencies**: axum 0.7 → 0.8 (route params now use `{param}` syntax).
-- **Dependencies**: reqwest 0.12 → 0.13 (switched from native-tls to rustls).
-- **Dependencies**: nix 0.30 → 0.31.
-- Added `ISC`, `MIT-0`, `CDLA-Permissive-2.0` to allowed licenses in `deny.toml` (required by rustls/aws-lc chain).
+- Restrictive CORS, timestamp correctness, cron time matching, socket permission logging.
 
 ## [0.1.0] - 2026-03-25
 
 ### Added
 
-- Initial scaffold — api, agent, supervisor, ipc, scheduler, federation, edge, memory, vector_store, rag, mcp, screen, config modules.
+- Initial scaffold — all modules extracted from agnosticos monorepo.

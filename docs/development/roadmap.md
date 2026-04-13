@@ -2,29 +2,29 @@
 
 ## Completed (v0.7.0)
 
-- [x] Port all core modules from Rust to Cyrius (9,724 LOC → 3,846 LOC)
-  - [x] error, config, agent, supervisor, api, ipc, scheduler, memory, vector_store, rag, mcp, federation, edge, screen, logging
-- [x] 24 HTTP API endpoints with full Rust parity
-- [x] FederatedVectorStore — collection/replica management, cross-node search merge with dedup + re-ranking
-- [x] Unix domain socket IPC — AgentIpc with bind/accept/send, length-prefixed wire protocol, ACK/NACK
-- [x] CronScheduler — interval-based cron entries with validation
-- [x] NodeCapacity — resource fitting, reserve/release, bin-packing scheduler
-- [x] Federation cluster — Raft election (vote request/receive/step-down), agent placement scoring
-- [x] Test suite (200 assertions / 26 groups), benchmark suite (16), fuzz harnesses (5)
-- [x] P(-1) scaffold hardening + security audit (docs/audit/2026-04-13)
-- [x] Modern Cyrius 4.2.0 toolchain (`cyrius build`, `cyrius deps`, `.cyrius-toolchain`)
-- [x] CI/CD pipelines (GitHub Actions)
+- [x] Full Rust → Cyrius port (9,724 LOC → 4,141 LOC, 15 modules, 24 endpoints)
+- [x] Test suite (200 assertions / 26 groups), benchmarks (16), fuzz harnesses (5)
+- [x] Security audit + remediation (9/10 fixed, 1 accepted risk)
+- [x] Modern Cyrius 4.2.0 toolchain, CI/CD pipelines
 
-## Security Remediation (from audit 2026-04-13)
+## Post-Release: Remove `rust-old/`
 
-- [x] VULN-001: Content-Length parsing, Transfer-Encoding rejection (501), oversized payload (413)
-- [x] VULN-002: `json_escape_str()` on all user-controlled strings in JSON responses
-- [x] VULN-004: `pidfd_open()`/`pidfd_send_signal()` with `kill()` fallback (Linux 5.3+)
-- [x] VULN-005: Agent memory dirs 0700 (was 0755)
-- [x] VULN-006: `SO_PEERCRED` UID verification on Unix socket accept
-- [x] VULN-008: `MAX_REQUEST_SIZE=65536`, Content-Length body reads, 413 response
-- [x] VULN-010: `agent_spawn_with_limits()` with `setrlimit(RLIMIT_AS, RLIMIT_CPU)`
-- [x] VULN-009: Per-IP rate limiting — 120 req/min sliding window, 429 Too Many Requests
+After v0.7.0 is tagged and released, `rust-old/` should be removed from the repo. It contains:
+
+- `src/` — 18 Rust source files (9,724 LOC) — fully ported, no longer needed
+- `tests/` — integration tests — superseded by `tests/daimon.tcyr`
+- `benches/` — criterion benchmarks — superseded by `tests/daimon.bcyr`
+- `target/` — 16 GB build cache — should never have been committed
+- `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `deny.toml`, `codecov.yml`, `Makefile` — Rust build config, no longer applicable
+- `bench-history.csv` — Rust benchmark history — captured in `BENCHMARKS.md`
+- `LINES_OF_RUST.txt` — port metadata — captured in CHANGELOG
+- `examples/` — empty directory
+
+**Procedure**: `git rm -r rust-old/` in the first commit after the v0.7.0 tag. Update README.md and CLAUDE.md to remove `rust-old/` references.
+
+## Security Gates (trigger-based)
+
+- [ ] VULN-007: Bump allocator memory zeroing — **MUST fix before enabling any of**: multi-tenant hosting, kavach sandboxing, untrusted federation, external MCP callbacks (bote). Remediation: per-agent arena allocators with zero-on-reset.
 
 ## Blocked on Upstream Ports
 
@@ -47,5 +47,5 @@
 - [x] Full HTTP API parity with Rust (24/24 endpoints)
 - [x] Test coverage for all ported modules (200 assertions)
 - [x] Benchmark baselines established
-- [x] Security audit remediation (8/10 fixed, 1 accepted, 1 deferred)
+- [x] Security audit remediation complete (9/10 fixed, 1 gated)
 - [ ] Documentation complete (API reference, architecture guide)

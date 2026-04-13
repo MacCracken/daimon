@@ -134,12 +134,20 @@ Audit of daimon v0.7.0 (Cyrius port) against known CVE patterns and vulnerabilit
 
 **Current state**: Daimon is a single-purpose daemon — all allocations belong to the same trust domain. Cross-tenant information leaks (as in CVE-2026-34988/Wasmtime) do not apply because there is no multi-tenant isolation within a single daimon process.
 
-**Severity**: LOW — single trust domain, no sandboxing boundary.
+**Severity**: LOW today — escalates to HIGH under multi-tenant or sandboxed conditions.
 
-**Remediation**:
-1. Zero sensitive buffers before reuse (keys, auth tokens, IPC message payloads)
-2. Consider using `memset(buf, 0, len)` on security-critical allocations
-3. Document that bump allocator does not provide isolation between agents within the same process
+**When this becomes a real vulnerability**:
+- Multi-tenant agent hosting (different users/orgs share one daimon instance)
+- Agent sandboxing via kavach (sandbox isolation undermined by shared heap)
+- Federation with untrusted peers (remote data fragments in local allocations)
+- External MCP tool callbacks via bote (third-party response data in shared heap)
+
+**Trigger for remediation**: Any of the above conditions being implemented. Before enabling multi-tenant, kavach sandboxing, or untrusted federation, this MUST be fixed.
+
+**Remediation** (when triggered):
+1. Zero sensitive buffers on free — `memset(buf, 0, len)` on IPC message payloads, auth tokens, agent memory values, RAG document content, MCP tool responses
+2. Per-agent arena allocators — each agent gets an independent arena (`arena_new()` from stdlib) instead of sharing the global bump allocator. Arena reset zeros all memory.
+3. Alternatively, switch to `lib/freelist.cyr` which supports individual `free()` calls — zero on free for security-critical allocations
 
 ---
 
@@ -199,7 +207,7 @@ Audit of daimon v0.7.0 (Cyrius port) against known CVE patterns and vulnerabilit
 | VULN-009 | LOW | **Fixed** | Rate limiting — per-IP 120 req/min sliding window, 429 Too Many Requests |
 | VULN-010 | LOW | **Fixed** | Process rlimits — `agent_spawn_with_limits()` applies RLIMIT_AS + RLIMIT_CPU |
 
-**Remediation status**: 9/10 fixed, 1 accepted risk (VULN-007 bump allocator — single trust domain)
+**Remediation status**: 9/10 fixed, 1 accepted risk with documented trigger gate (VULN-007 bump allocator — safe under single trust domain, must fix before multi-tenant/sandboxing/untrusted federation)
 
 ## Sources
 
