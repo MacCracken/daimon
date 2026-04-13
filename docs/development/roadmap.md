@@ -2,31 +2,37 @@
 
 ## Completed (v0.7.0)
 
-- [x] Port core modules from Rust to Cyrius (9,724 LOC → 1,993 LOC)
-  - [x] error → error codes + HTTP status mapping
-  - [x] config → service configuration
-  - [x] agent → agent lifecycle, process spawning, /proc helpers
-  - [x] supervisor → circuit breaker, output capture, health monitoring, quotas
-  - [x] api → HTTP API (synchronous TCP, port 8090)
-  - [x] ipc → message bus, IPC message types
-  - [x] scheduler → priority-aware task scheduling, state machine
-  - [x] memory → per-agent key-value store (filesystem-backed)
-  - [x] vector_store → cosine-similarity vector index
-  - [x] rag → text chunking, bag-of-words embedding, retrieval pipeline
-  - [x] mcp → MCP tool registry (builtin + external)
-  - [x] federation → multi-node clustering, role tracking
-  - [x] edge → edge fleet management, heartbeats, stats
-  - [x] screen → capture permissions, rate limiting, recordings
-  - [x] logging → sakshi integration
+- [x] Port all core modules from Rust to Cyrius (9,724 LOC → 3,846 LOC)
+  - [x] error, config, agent, supervisor, api, ipc, scheduler, memory, vector_store, rag, mcp, federation, edge, screen, logging
+- [x] 24 HTTP API endpoints with full Rust parity
+- [x] FederatedVectorStore — collection/replica management, cross-node search merge with dedup + re-ranking
+- [x] Unix domain socket IPC — AgentIpc with bind/accept/send, length-prefixed wire protocol, ACK/NACK
+- [x] CronScheduler — interval-based cron entries with validation
+- [x] NodeCapacity — resource fitting, reserve/release, bin-packing scheduler
+- [x] Federation cluster — Raft election (vote request/receive/step-down), agent placement scoring
+- [x] Test suite (200 assertions / 26 groups), benchmark suite (16), fuzz harnesses (5)
+- [x] P(-1) scaffold hardening + security audit (docs/audit/2026-04-13)
+- [x] Modern Cyrius 4.2.0 toolchain (`cyrius build`, `cyrius deps`, `.cyrius-toolchain`)
+- [x] CI/CD pipelines (GitHub Actions)
 
-## Completed (v0.7.0 continued)
+## Security Remediation (from audit 2026-04-13)
 
-- [x] FederatedVectorStore — collection/replica management, cross-node search merge with dedup + re-ranking, stats
-- [x] Unix domain socket IPC — AgentIpc with bind/accept/send, length-prefixed wire protocol, ACK/NACK, connection limits
+### Immediate (before v0.8.0)
 
-## Backlog
+- [ ] VULN-001: Parse `Content-Length`, reject `Content-Length` + `Transfer-Encoding` conflicts, reject duplicates
+- [ ] VULN-002: Add `json_escape_str()` for all user-controlled strings in JSON responses
 
-_(empty — all portable features complete)_
+### Next Sprint
+
+- [ ] VULN-004: Use `pidfd_open()`/`pidfd_send_signal()` for race-free agent signal delivery (Linux 5.3+)
+- [ ] VULN-006: `SO_PEERCRED` verification on Unix socket accept
+- [ ] VULN-008: Explicit `MAX_REQUEST_SIZE`, `Content-Length`-based body reads, 413 responses, read timeout
+
+### Backlog
+
+- [ ] VULN-005: `O_NOFOLLOW | O_CREAT | O_EXCL` on tmp file writes, 0700 agent dirs
+- [ ] VULN-009: Per-IP rate limiting with sliding window, 429 responses
+- [ ] VULN-010: `setrlimit(RLIMIT_AS, RLIMIT_CPU)` on spawned agent processes
 
 ## Blocked on Upstream Ports
 
@@ -45,9 +51,9 @@ _(empty — all portable features complete)_
 
 ## v1.0 Criteria
 
-- [x] All modules extracted from monorepo and passing tests (Rust)
-- [ ] Core modules ported to Cyrius
-- [ ] Full HTTP API parity with Rust implementation
-- [ ] Test coverage for all ported modules
-- [ ] Benchmark baselines established (Cyrius)
+- [x] All modules ported to Cyrius
+- [x] Full HTTP API parity with Rust (24/24 endpoints)
+- [x] Test coverage for all ported modules (200 assertions)
+- [x] Benchmark baselines established
+- [ ] Security audit remediation complete (VULN-001 through VULN-010)
 - [ ] Documentation complete (API reference, architecture guide)
