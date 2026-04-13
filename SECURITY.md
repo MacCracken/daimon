@@ -4,7 +4,7 @@
 
 | Version | Supported |
 |---------|-----------|
-| 0.1.x   | Yes       |
+| 1.0.x   | Yes       |
 
 ## Reporting a Vulnerability
 
@@ -30,21 +30,17 @@ Include:
 
 ## Scope
 
-This policy covers the `daimon` crate and its published API. Vulnerabilities in
-upstream dependencies should be reported to the respective maintainers; we will
-track and update our dependency pins as fixes become available.
-
-Security concerns for this crate primarily involve:
+This policy covers the daimon binary and its HTTP API. Security concerns include:
 
 - **Authentication/authorization bypass**: Accessing agent operations without proper credentials
 - **Agent isolation**: Escaping sandbox or accessing other agents' data
 - **Input validation**: Malformed HTTP requests causing crashes or exploitation
 - **IPC security**: Unauthorized access to Unix domain sockets
 - **Denial of service**: Inputs that cause excessive computation or memory usage
-- **Dependency vulnerabilities**: Issues in upstream crates
+- **Request smuggling**: Ambiguous HTTP parsing behind reverse proxies
+- **Memory safety**: Buffer overflows, use-after-free, or information leaks via bump allocator
 
-We run `cargo audit` and `cargo deny` in CI to catch known dependency
-vulnerabilities.
+Security audit reports are published in `docs/audit/`.
 
 ## Disclosure
 

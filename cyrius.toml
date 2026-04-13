@@ -11,4 +11,4 @@ entry = "src/main.cyr"
 output = "daimon"
 
 [deps]
-stdlib = ["string", "fmt", "alloc", "vec", "str", "syscalls", "io", "fs", "hashmap", "tagged", "json", "net", "args", "chrono", "sakshi", "fnptr", "process", "assert", "bench", "freelist"]
+stdlib = ["string", "fmt", "alloc", "vec", "str", "syscalls", "io", "fs", "hashmap", "tagged", "json", "net", "http", "args", "chrono", "sakshi", "fnptr", "process", "async", "thread", "callback", "assert", "bench", "freelist"]

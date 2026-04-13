@@ -33,4 +33,4 @@
 - [x] Test coverage for all ported modules (200 assertions)
 - [x] Benchmark baselines established
 - [x] Security audit remediation complete (9/10 fixed, 1 gated)
-- [ ] Documentation complete (API reference, architecture guide)
+- [x] Documentation complete (architecture overview, API guide, quickstart, 3 ADRs, security audit)

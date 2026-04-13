@@ -17,6 +17,31 @@
 - **Language ref**: [cyrius](https://github.com/MacCracken/cyrius) — compiler, stdlib, docs
 - **Port reference**: [vidya](https://github.com/MacCracken/vidya) — first completed Rust→Cyrius port
 
+## Cyrius Stdlib — Available Modules
+
+The following stdlib modules are available via `cyrius.toml` deps. **Async IS available.**
+
+| Module | Purpose |
+|--------|---------|
+| `async` | **Cooperative async runtime — epoll event loop, spawn, sleep, await_readable, timeout** |
+| `thread` | Clone-based threads, mutex, MPSC channels |
+| `net` | TCP sockets (connect, listen, accept, read, write) |
+| `http` | HTTP client/server helpers |
+| `json` | JSON parse/emit |
+| `hashmap` | Hash map with string keys |
+| `process` | Fork, exec, waitpid |
+| `fs` | File operations |
+| `chrono` | Timestamps |
+| `sakshi` | Structured logging/tracing |
+
+**ADR-002 is invalid** — `lib/async.cyr` provides epoll-based cooperative async:
+```cyrius
+var rt = async_new();
+async_spawn(rt, &my_handler, client_fd);
+async_run(rt);  # event loop
+```
+Functions: `async_new`, `async_spawn`, `async_run`, `async_sleep_ms`, `async_read`, `async_await_readable`, `async_timeout`.
+
 ## Consumers
 
 Every AGNOS agent, every consumer app, hoosh, agnoshi, aethersafha.
