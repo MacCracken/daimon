@@ -4,15 +4,17 @@
 
 **Daimon** (Greek: δαίμων — guiding spirit) — AGNOS agent orchestrator
 
-- **Type**: Service binary + library crate
+- **Type**: Service binary + library
+- **Language**: Cyrius (ported from Rust — 9,724 LOC preserved in `rust-old/`)
 - **Purpose**: AGNOS agent orchestrator — HTTP API, supervisor, IPC, scheduler, federation, edge fleet, memory, MCP dispatch (port 8090)
 - **License**: GPL-3.0-only
-- **MSRV**: 1.89
 - **Version**: CalVer (see VERSION file)
 - **Genesis repo**: [agnosticos](https://github.com/MacCracken/agnosticos)
 - **Philosophy**: [AGNOS Philosophy & Intention](https://github.com/MacCracken/agnosticos/blob/main/docs/philosophy.md)
 - **Standards**: [First-Party Standards](https://github.com/MacCracken/agnosticos/blob/main/docs/development/applications/first-party-standards.md)
 - **Recipes**: [zugot](https://github.com/MacCracken/zugot) — takumi build recipes
+- **Language ref**: [cyrius](https://github.com/MacCracken/cyrius) — compiler, stdlib, docs
+- **Port reference**: [vidya](https://github.com/MacCracken/vidya) — first completed Rust→Cyrius port
 
 ## Consumers
 
@@ -24,7 +26,7 @@ Every AGNOS agent, every consumer app, hoosh, agnoshi, aethersafha.
 
 0. Read roadmap, CHANGELOG, and open issues — know what was intended before auditing what was built
 1. Test + benchmark sweep of existing code
-2. Cleanliness check: `cargo fmt --check`, `cargo clippy --all-features --all-targets -- -D warnings`, `cargo audit`, `cargo deny check`, `RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps`
+2. Cleanliness check: `cyrius check` (fmt + lint + test + build)
 3. Get baseline benchmarks (`./scripts/bench-history.sh`)
 4. Internal deep review — gaps, optimizations, security, logging/errors, docs
 5. External research — domain completeness, missing capabilities, best practices, world-class accuracy
@@ -37,7 +39,7 @@ Every AGNOS agent, every consumer app, hoosh, agnoshi, aethersafha.
 ### Work Loop / Working Loop (continuous)
 
 1. Work phase — new features, roadmap items, bug fixes
-2. Cleanliness check: `cargo fmt --check`, `cargo clippy --all-features --all-targets -- -D warnings`, `cargo audit`, `cargo deny check`, `RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps`
+2. Cleanliness check: `cyrius check`
 3. Test + benchmark additions for new code
 4. Run benchmarks (`./scripts/bench-history.sh`)
 5. Internal review — performance, memory, security, throughput, correctness
@@ -46,7 +48,7 @@ Every AGNOS agent, every consumer app, hoosh, agnoshi, aethersafha.
 8. Run benchmarks again — prove the wins
 9. If review heavy → return to step 5
 10. Documentation — update CHANGELOG, roadmap, docs, ADRs for design decisions, source citations for algorithms/formulas, update docs/sources.md, guides and examples for new API surface, verify recipe version in zugot
-11. Version check — VERSION, Cargo.toml, recipe (in zugot) all in sync
+11. Version check — VERSION, cyrius.toml, recipe (in zugot) all in sync
 12. Return to step 1
 
 ### Task Sizing
@@ -66,15 +68,13 @@ Every AGNOS agent, every consumer app, hoosh, agnoshi, aethersafha.
 
 - Never skip benchmarks
 - Own the domain — daimon IS the agent orchestration vocabulary
-- `#[non_exhaustive]` on ALL public enums (forward compatibility)
-- `#[must_use]` on all pure functions
-- Every type must be Serialize + Deserialize (serde)
-- Feature-gate optional modules — consumers pull only what they need
-- Zero unwrap/panic in library code
-- All types must have serde roundtrip tests
+- Every type should have serde roundtrip tests (JSON via lib/json.cyr)
 - All HTTP endpoints must validate input at the boundary
-- Use axum extractors for type-safe request handling
 - Agent operations require explicit approval for sensitive actions
+- Use `Result`/`Option` tagged unions for error handling
+- Zero-crash in library code — no unguarded aborts
+- Use accessor functions for struct fields
+- Refer to `rust-old/` for original Rust implementations when porting
 
 ## DO NOT
 

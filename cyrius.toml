@@ -1,0 +1,10 @@
+[package]
+name = "daimon"
+version = "0.7.0"
+description = "daimon — AGNOS agent orchestrator"
+license = "GPL-3.0-only"
+repository = "https://github.com/MacCracken/daimon"
+
+[build]
+src = "src/main.cyr"
+output = "build/daimon"

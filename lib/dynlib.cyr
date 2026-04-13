@@ -1,0 +1,396 @@
+# dynlib.cyr — pure Cyrius dynamic library loader (ELF .so)
+# Usage: include "lib/dynlib.cyr"
+# Requires: string.cyr, syscalls.cyr, mmap.cyr
+#
+# Loads ELF shared objects via mmap, parses ELF64 headers,
+# walks .dynsym + .dynstr to resolve exported symbols.
+# No libc. No dlopen. Pure syscalls.
+#
+# API:
+#   dynlib_open(path)         → handle (pointer to DynLib struct) or 0 on failure
+#   dynlib_sym(handle, name)  → function pointer (address) or 0 if not found
+#   dynlib_close(handle)      → 0
+#
+# DynLib struct layout (56 bytes):
+#   +0:  base       — mmap'd base address
+#   +8:  size       — mmap'd file size
+#   +16: dynsym     — pointer to .dynsym section
+#   +24: dynstr     — pointer to .dynstr section
+#   +32: nsyms      — number of symbols in .dynsym
+#   +40: load_bias  — difference between mmap'd base and ELF p_vaddr
+#   +48: gnu_hash   — pointer to .gnu.hash section (0 if not present)
+
+# ================================================================
+# ELF64 constants
+# ================================================================
+
+enum ElfMagic {
+    ELFMAG      = 0x464C457F;  # \x7FELF (little-endian u32)
+}
+
+enum ElfClass {
+    ELFCLASS64  = 2;
+}
+
+enum ElfType {
+    ET_DYN      = 3;           # Shared object
+}
+
+enum ElfPhdr {
+    PT_LOAD     = 1;
+    PT_DYNAMIC  = 2;
+}
+
+# Dynamic section tag types
+enum ElfDyn {
+    DT_NULL     = 0;
+    DT_STRTAB   = 5;           # Address of .dynstr
+    DT_SYMTAB   = 6;           # Address of .dynsym
+    DT_STRSZ    = 10;          # Size of .dynstr
+    DT_GNU_HASH = 0x6FFFFEF5;  # GNU hash table
+}
+
+# Symbol table entry binding/type extraction
+# st_info byte: binding = info >> 4, type = info & 0xF
+enum ElfStBind {
+    STB_GLOBAL  = 1;
+    STB_WEAK    = 2;
+}
+
+enum ElfStType {
+    STT_FUNC    = 2;
+    STT_OBJECT  = 1;
+}
+
+# ELF64 struct sizes
+enum ElfSizes {
+    EHDR_SIZE   = 64;          # ELF64 header
+    PHDR_SIZE   = 56;          # Program header entry
+    SYM_SIZE    = 24;          # Elf64_Sym entry
+    DYN_SIZE    = 16;          # Elf64_Dyn entry
+}
+
+# ================================================================
+# DynLib struct accessors
+# ================================================================
+
+fn _dynlib_base(h)     { return load64(h); }
+fn _dynlib_size(h)     { return load64(h + 8); }
+fn _dynlib_dynsym(h)   { return load64(h + 16); }
+fn _dynlib_dynstr(h)   { return load64(h + 24); }
+fn _dynlib_nsyms(h)    { return load64(h + 32); }
+fn _dynlib_bias(h)     { return load64(h + 40); }
+fn _dynlib_gnuhash(h)  { return load64(h + 48); }
+
+# ================================================================
+# ELF64 header field readers (from mmap'd base)
+# ================================================================
+
+# Check ELF magic bytes at base
+fn _elf_check_magic(base) {
+    var magic = load32(base);
+    if (magic != ELFMAG) { return 0; }
+    # Check class = 64-bit
+    if (load8(base + 4) != ELFCLASS64) { return 0; }
+    return 1;
+}
+
+# e_type at offset 16 (u16)
+fn _elf_type(base) { return load16(base + 16); }
+
+# e_phoff at offset 32 (u64)
+fn _elf_phoff(base) { return load64(base + 32); }
+
+# e_phentsize at offset 54 (u16)
+fn _elf_phentsize(base) { return load16(base + 54); }
+
+# e_phnum at offset 56 (u16)
+fn _elf_phnum(base) { return load16(base + 56); }
+
+# ================================================================
+# Program header field readers
+# ================================================================
+
+# p_type at +0 (u32)
+fn _phdr_type(p) { return load32(p); }
+
+# p_offset at +8 (u64)
+fn _phdr_offset(p) { return load64(p + 8); }
+
+# p_vaddr at +16 (u64)
+fn _phdr_vaddr(p) { return load64(p + 16); }
+
+# p_filesz at +32 (u64)
+fn _phdr_filesz(p) { return load64(p + 32); }
+
+# p_memsz at +40 (u64)
+fn _phdr_memsz(p) { return load64(p + 40); }
+
+# ================================================================
+# Dynamic section parsing
+# ================================================================
+
+# Walk PT_DYNAMIC entries to find DT_SYMTAB, DT_STRTAB, DT_GNU_HASH
+# Returns a scratch struct with: {symtab_vaddr, strtab_vaddr, strtab_size, gnuhash_vaddr}
+fn _parse_dynamic(base, dyn_offset, dyn_size) {
+    var result = alloc(32);
+    store64(result, 0);       # symtab vaddr
+    store64(result + 8, 0);   # strtab vaddr
+    store64(result + 16, 0);  # strtab size
+    store64(result + 24, 0);  # gnu_hash vaddr
+
+    var pos = base + dyn_offset;
+    var end = pos + dyn_size;
+
+    while (pos < end) {
+        var d_tag = load64(pos);
+        var d_val = load64(pos + 8);
+
+        if (d_tag == DT_NULL) { pos = end; }
+        elif (d_tag == DT_SYMTAB) { store64(result, d_val); }
+        elif (d_tag == DT_STRTAB) { store64(result + 8, d_val); }
+        elif (d_tag == DT_STRSZ)  { store64(result + 16, d_val); }
+        elif (d_tag == DT_GNU_HASH) { store64(result + 24, d_val); }
+
+        pos = pos + DYN_SIZE;
+    }
+    return result;
+}
+
+# ================================================================
+# GNU hash lookup (fast O(1) average)
+# ================================================================
+
+# GNU hash function
+fn _gnu_hash(name) {
+    var h = 5381;
+    var i = 0;
+    var c = load8(name + i);
+    while (c != 0) {
+        h = ((h << 5) + h) + c;
+        # Keep to 32-bit range
+        h = h & 0xFFFFFFFF;
+        i = i + 1;
+        c = load8(name + i);
+    }
+    return h;
+}
+
+# GNU hash table layout:
+#   +0:  nbuckets (u32)
+#   +4:  symoffset (u32) — first symbol index in hash chains
+#   +8:  bloom_size (u32)
+#   +12: bloom_shift (u32)
+#   +16: bloom[bloom_size] (u64 each)
+#   +16+bloom_size*8: buckets[nbuckets] (u32 each)
+#   after buckets: chains[] (u32 each, one per symbol starting from symoffset)
+
+fn _gnu_hash_lookup(gnuhash, dynsym, dynstr, bias, name) {
+    var nbuckets    = load32(gnuhash);
+    var symoffset   = load32(gnuhash + 4);
+    var bloom_size  = load32(gnuhash + 8);
+    var bloom_shift = load32(gnuhash + 12);
+
+    var h1 = _gnu_hash(name);
+
+    # Bloom filter check
+    var bloom_base = gnuhash + 16;
+    var bloom_word = load64(bloom_base + ((h1 / 64) % bloom_size) * 8);
+    var mask = (1 << (h1 % 64)) | (1 << ((h1 >> bloom_shift) % 64));
+    if ((bloom_word & mask) != mask) { return 0; }
+
+    # Bucket lookup
+    var buckets_base = bloom_base + bloom_size * 8;
+    var bucket_idx = h1 % nbuckets;
+    var sym_idx = load32(buckets_base + bucket_idx * 4);
+    if (sym_idx == 0) { return 0; }
+
+    # Chain walk
+    var chains_base = buckets_base + nbuckets * 4;
+    var h1_masked = h1 | 1;  # Set bottom bit for comparison
+
+    while (1 == 1) {
+        var chain_val = load32(chains_base + (sym_idx - symoffset) * 4);
+
+        # Compare hash (ignoring bottom bit which marks chain end)
+        if ((chain_val | 1) == h1_masked) {
+            # Hash matches — verify string
+            var sym_entry = dynsym + sym_idx * SYM_SIZE;
+            var st_name_off = load32(sym_entry);  # st_name (u32 offset into dynstr)
+            var sym_name = dynstr + st_name_off;
+            if (streq(sym_name, name) == 1) {
+                # Found it — return address
+                var st_value = load64(sym_entry + 8);  # st_value at +8
+                if (st_value == 0) { return 0; }       # Undefined symbol
+                return bias + st_value;
+            }
+        }
+
+        # Check chain end (bottom bit of chain_val)
+        if ((chain_val & 1) == 1) { return 0; }
+
+        sym_idx = sym_idx + 1;
+    }
+    return 0;
+}
+
+# ================================================================
+# Linear symbol search fallback (no GNU hash)
+# ================================================================
+
+fn _linear_sym_lookup(dynsym, dynstr, nsyms, bias, name) {
+    # Skip symbol 0 (null entry)
+    for (var i = 1; i < nsyms; i = i + 1) {
+        var sym = dynsym + i * SYM_SIZE;
+        var st_name_off = load32(sym);           # st_name (u32)
+        var st_info     = load8(sym + 4);        # st_info (u8)
+        var st_value    = load64(sym + 8);       # st_value (u64)
+
+        # Skip undefined symbols
+        if (st_value == 0) { continue; }
+
+        # Check binding: must be GLOBAL or WEAK
+        var binding = st_info >> 4;
+        if (binding != STB_GLOBAL) {
+            if (binding != STB_WEAK) { continue; }
+        }
+
+        # Compare name
+        var sym_name = dynstr + st_name_off;
+        if (streq(sym_name, name) == 1) {
+            return bias + st_value;
+        }
+    }
+    return 0;
+}
+
+# ================================================================
+# Estimate symbol count from dynstr/dynsym gap
+# ================================================================
+# When no hash table is present, estimate nsyms from section layout.
+# .dynsym immediately precedes .dynstr in most ELF .so files.
+
+fn _estimate_nsyms(symtab_vaddr, strtab_vaddr) {
+    if (strtab_vaddr <= symtab_vaddr) { return 256; }  # fallback guess
+    var gap = strtab_vaddr - symtab_vaddr;
+    return gap / SYM_SIZE;
+}
+
+# ================================================================
+# Public API
+# ================================================================
+
+# Open a shared library (.so file)
+# Returns handle pointer or 0 on failure
+fn dynlib_open(path) {
+    # Open the file
+    var fd = syscall(2, path, 0, 0);  # open(path, O_RDONLY, 0)
+    if (fd < 0) { return 0; }
+
+    # Get file size via fstat
+    var statbuf[144];  # struct stat = 144 bytes on x86_64
+    var r = syscall(5, fd, &statbuf);  # fstat(fd, statbuf)
+    if (r < 0) { syscall(3, fd); return 0; }
+    var file_size = load64(&statbuf + 48);  # st_size at offset 48
+
+    if (file_size < EHDR_SIZE) { syscall(3, fd); return 0; }
+
+    # mmap the entire file read + exec (code sections need PROT_EXEC)
+    var base = cyr_mmap(0, file_size, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
+    syscall(3, fd);  # close fd — mmap keeps the mapping
+    if (base < 0) { return 0; }
+
+    # Validate ELF header
+    if (_elf_check_magic(base) == 0) { cyr_munmap(base, file_size); return 0; }
+    if (_elf_type(base) != ET_DYN)   { cyr_munmap(base, file_size); return 0; }
+
+    # Walk program headers to find PT_DYNAMIC and first PT_LOAD
+    var phoff = _elf_phoff(base);
+    var phnum = _elf_phnum(base);
+    var phentsz = _elf_phentsize(base);
+
+    var dyn_offset = 0;
+    var dyn_size   = 0;
+    var first_load_vaddr = 0;
+    var found_load = 0;
+
+    for (var i = 0; i < phnum; i = i + 1) {
+        var ph = base + phoff + i * phentsz;
+        var ptype = _phdr_type(ph);
+
+        if (ptype == PT_DYNAMIC) {
+            dyn_offset = _phdr_offset(ph);
+            dyn_size   = _phdr_filesz(ph);
+        }
+        elif (ptype == PT_LOAD) {
+            if (found_load == 0) {
+                first_load_vaddr = _phdr_vaddr(ph);
+                found_load = 1;
+            }
+        }
+    }
+
+    if (dyn_offset == 0) { cyr_munmap(base, file_size); return 0; }
+
+    # Parse dynamic section
+    var dinfo = _parse_dynamic(base, dyn_offset, dyn_size);
+    var symtab_vaddr  = load64(dinfo);
+    var strtab_vaddr  = load64(dinfo + 8);
+    var strtab_size   = load64(dinfo + 16);
+    var gnuhash_vaddr = load64(dinfo + 24);
+
+    if (symtab_vaddr == 0) { cyr_munmap(base, file_size); return 0; }
+    if (strtab_vaddr == 0) { cyr_munmap(base, file_size); return 0; }
+
+    # Compute load bias: base - first_load_vaddr
+    # For position-independent .so files, p_vaddr of first PT_LOAD is typically 0
+    var bias = base - first_load_vaddr;
+
+    # Resolve virtual addresses to mmap'd addresses
+    var dynsym = bias + symtab_vaddr;
+    var dynstr = bias + strtab_vaddr;
+    var gnuhash = 0;
+    if (gnuhash_vaddr != 0) { gnuhash = bias + gnuhash_vaddr; }
+
+    # Estimate symbol count
+    var nsyms = _estimate_nsyms(symtab_vaddr, strtab_vaddr);
+
+    # Allocate DynLib handle
+    var h = alloc(56);
+    store64(h,      base);
+    store64(h + 8,  file_size);
+    store64(h + 16, dynsym);
+    store64(h + 24, dynstr);
+    store64(h + 32, nsyms);
+    store64(h + 40, bias);
+    store64(h + 48, gnuhash);
+
+    return h;
+}
+
+# Look up a symbol by name in a loaded library
+# Returns the symbol's absolute address (function pointer) or 0
+fn dynlib_sym(handle, name) {
+    if (handle == 0) { return 0; }
+
+    var dynsym  = _dynlib_dynsym(handle);
+    var dynstr  = _dynlib_dynstr(handle);
+    var nsyms   = _dynlib_nsyms(handle);
+    var bias    = _dynlib_bias(handle);
+    var gnuhash = _dynlib_gnuhash(handle);
+
+    # Use GNU hash if available (fast O(1) average), else linear scan
+    if (gnuhash != 0) {
+        return _gnu_hash_lookup(gnuhash, dynsym, dynstr, bias, name);
+    }
+    return _linear_sym_lookup(dynsym, dynstr, nsyms, bias, name);
+}
+
+# Close a loaded library (unmap)
+fn dynlib_close(handle) {
+    if (handle == 0) { return 0; }
+    var base = _dynlib_base(handle);
+    var size = _dynlib_size(handle);
+    cyr_munmap(base, size);
+    return 0;
+}

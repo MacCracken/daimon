@@ -1,5 +1,5 @@
-/target/
-Cargo.lock
+/build/
+/rust-old/target/
 *.swp
 *.swo
 *~
@@ -13,9 +13,7 @@ core
 core.*
 lcov.info
 coverage/
-criterion/
 bench-history.csv
-benchmarks.md
 .claude/
 .env
 .env.*
