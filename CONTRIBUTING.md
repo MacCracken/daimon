@@ -6,16 +6,19 @@ to get involved.
 ## Getting Started
 
 1. Fork the repository and clone your fork
-2. Install [Cyrius](https://github.com/MacCracken/cyrius) (v4.1.0+)
+2. Install [Cyrius](https://github.com/MacCracken/cyrius) 4.2.0+ (see `.cyrius-toolchain`)
 3. Run `cyrius check` to verify your environment
 
 ## Development Workflow
 
 ```bash
-cyrius build src/main.cyr build/daimon   # Build
-cyrius check                              # Format + lint + test + build
-cyrius test tests/test.sh                 # Run tests
-cyrius bench benches/bench.bcyr           # Run benchmarks
+cyrius deps                          # Resolve dependencies
+cyrius build                         # Build (reads cyrius.toml)
+cyrius check                         # Format + lint + test + build
+cyrius test tests/daimon.tcyr        # Run test suite
+cyrius bench tests/daimon.bcyr       # Run benchmarks
+sh tests/test.sh                     # Tests + fuzz harnesses
+./scripts/bench-history.sh           # Append benchmark baseline
 ```
 
 ## Pull Requests
@@ -28,15 +31,17 @@ cyrius bench benches/bench.bcyr           # Run benchmarks
 ## Code Style
 
 - Follow existing patterns in the codebase
-- Use `Result`/`Option` tagged unions for error handling — avoid panics
+- Use `Result`/`Option` tagged unions for error handling — avoid crashing
 - Use accessor functions for struct fields
 - Keep functions focused and small
+- Use unique variable names within a function (cyrius has no block scoping)
 
 ## Adding a New Module
 
-1. Add the module code to `src/main.cyr` (or a separate file included from it)
-2. Add tests in `tests/`
-3. Add benchmarks in `benches/`
+1. Add the module code to `src/main.cyr`
+2. Add tests in `tests/daimon.tcyr`
+3. Add benchmarks in `tests/daimon.bcyr` if performance-relevant
+4. Add fuzz harnesses in `fuzz/` for security-critical code
 
 ## Reporting Issues
 

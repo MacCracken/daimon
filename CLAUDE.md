@@ -8,6 +8,7 @@
 - **Language**: Cyrius (ported from Rust — 9,724 LOC preserved in `rust-old/`)
 - **Purpose**: AGNOS agent orchestrator — HTTP API, supervisor, IPC, scheduler, federation, edge fleet, memory, MCP dispatch (port 8090)
 - **License**: GPL-3.0-only
+- **Cyrius**: 4.2.0 (pinned in `.cyrius-toolchain`)
 - **Version**: CalVer (see VERSION file)
 - **Genesis repo**: [agnosticos](https://github.com/MacCracken/agnosticos)
 - **Philosophy**: [AGNOS Philosophy & Intention](https://github.com/MacCracken/agnosticos/blob/main/docs/philosophy.md)

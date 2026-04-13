@@ -1,21 +1,22 @@
 #!/bin/sh
 # daimon test runner
-# Usage: sh tests/test.sh [cc3-path]
+# Usage: sh tests/test.sh
 set -e
-CC="${1:-cc3}"
 
 echo "=== daimon tests ==="
-"$CC" < tests/daimon.tcyr > /tmp/daimon_test && chmod +x /tmp/daimon_test && /tmp/daimon_test
+mkdir -p build
+cyrius build tests/daimon.tcyr build/daimon_test
+build/daimon_test
 TEST_EXIT=$?
-rm -f /tmp/daimon_test
+rm -f build/daimon_test
 
 echo ""
 echo "=== fuzz harnesses ==="
 for f in fuzz/*.fcyr; do
     name=$(basename "$f" .fcyr)
     printf "  %s: " "$name"
-    "$CC" < "$f" > "/tmp/fz_$name" 2>/dev/null && chmod +x "/tmp/fz_$name" && "/tmp/fz_$name" && echo "PASS" || echo "FAIL"
-    rm -f "/tmp/fz_$name"
+    cyrius build "$f" "build/fz_$name" 2>/dev/null && timeout 5 "build/fz_$name" && echo "PASS" || echo "FAIL"
+    rm -f "build/fz_$name"
 done
 
 exit $TEST_EXIT

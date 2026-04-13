@@ -63,7 +63,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 - **Language**: Rust → Cyrius. Rust source preserved in `rust-old/`.
 - **HTTP**: Async (tokio/axum) → synchronous (raw TCP sockets).
-- **Build**: `cargo build` → `cat src/main.cyr | cc3 > build/daimon`.
+- **Build**: `cargo build` → `cyrius build src/main.cyr build/daimon`.
 - **Dependencies**: 193 crate dependencies → 17 Cyrius stdlib modules + 0 external deps.
 
 ## [0.6.0] - 2026-04-03
