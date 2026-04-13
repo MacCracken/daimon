@@ -1,7 +1,7 @@
-# Benchmarks — Rust v0.6.0 vs Cyrius v0.7.0
+# Benchmarks — Rust v0.6.0 vs Cyrius v1.0.1
 
 - **Rust**: v0.6.0, rustc 1.89, criterion, x86_64. Final benchmark run before port.
-- **Cyrius**: v0.7.0, cyrius 4.2.0 (cc3 compiler, single-pass, no LLVM), lib/bench.cyr, `tests/daimon.bcyr`. Same machine.
+- **Cyrius**: v1.0.1, cyrius 4.2.0 (cc3 compiler, single-pass, no LLVM), lib/bench.cyr, `tests/daimon.bcyr`. Same machine.
 
 ## Core Operations
 
@@ -81,7 +81,7 @@ Scheduler scheduling (1.5x), supervisor registration (2.5x), MCP registration (1
 
 ### Size
 
-| Metric | Rust v0.6.0 | Cyrius v0.7.0 | Change |
+| Metric | Rust v0.6.0 | Cyrius v1.0.1 | Change |
 |---|---:|---:|---|
 | Language | rustc 1.89 | cyrius 4.2.0 | — |
 | Source LOC | 9,724 | 4,141 | −57% |
