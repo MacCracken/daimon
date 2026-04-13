@@ -987,6 +987,180 @@ fn rpc_register_method(rr, method_cstr, agent_id_cstr) { map_set(load64(rr), met
 fn rpc_find_handler(rr, method_cstr) { return map_get(load64(rr), method_cstr); }
 fn rpc_list_methods(rr) { return map_keys(load64(rr)); }
 
+# --- Federated vector store ---
+
+enum VectorReplication { REPL_FULL = 0; REPL_PARTIAL = 1; REPL_SHARDED = 2; }
+
+fn collection_replica_new(node_id, address, vector_count) {
+    var cr = alloc(32);
+    store64(cr, node_id);
+    store64(cr + 8, address);
+    store64(cr + 16, vector_count);
+    store64(cr + 24, clock_epoch_secs());
+    return cr;
+}
+
+fn replica_node_id(cr) { return load64(cr); }
+fn replica_vector_count(cr) { return load64(cr + 16); }
+
+fn fed_vstore_new(local_node_id, strategy) {
+    var fvs = alloc(32);
+    store64(fvs, local_node_id);
+    store64(fvs + 8, map_new());
+    store64(fvs + 16, strategy);
+    store64(fvs + 24, 100);
+    return fvs;
+}
+
+fn fed_vstore_local_id(fvs) { return load64(fvs); }
+fn fed_vstore_strategy(fvs) { return load64(fvs + 16); }
+
+fn fed_vstore_register_replica(fvs, collection_cstr, node_id, address, vector_count) {
+    var colls = load64(fvs + 8);
+    var replicas = map_get(colls, collection_cstr);
+    if (replicas == 0) { replicas = vec_new(); map_set(colls, collection_cstr, replicas); }
+    vec_push(replicas, collection_replica_new(node_id, address, vector_count));
+}
+
+fn fed_vstore_remove_node(fvs, node_id) {
+    var colls = load64(fvs + 8);
+    var fvk = map_keys(colls);
+    var fvi = 0;
+    while (fvi < vec_len(fvk)) {
+        var replicas = map_get(colls, vec_get(fvk, fvi));
+        if (replicas != 0) {
+            var kept = vec_new();
+            var fvri = 0;
+            while (fvri < vec_len(replicas)) {
+                var fvr = vec_get(replicas, fvri);
+                if (str_eq(replica_node_id(fvr), node_id) == 0) { vec_push(kept, fvr); }
+                fvri = fvri + 1;
+            }
+            map_set(colls, vec_get(fvk, fvi), kept);
+        }
+        fvi = fvi + 1;
+    }
+}
+
+fn fed_vstore_remote_replicas(fvs, collection_cstr) {
+    var replicas = map_get(load64(fvs + 8), collection_cstr);
+    if (replicas == 0) { return vec_new(); }
+    var local_id = load64(fvs);
+    var remote = vec_new();
+    var fvri = 0;
+    while (fvri < vec_len(replicas)) {
+        var fvr = vec_get(replicas, fvri);
+        if (str_eq(replica_node_id(fvr), local_id) == 0) { vec_push(remote, fvr); }
+        fvri = fvri + 1;
+    }
+    return remote;
+}
+
+fn fed_vstore_all_replicas(fvs, collection_cstr) {
+    var replicas = map_get(load64(fvs + 8), collection_cstr);
+    if (replicas == 0) { return vec_new(); }
+    return replicas;
+}
+
+fn fed_vstore_collections(fvs) { return map_keys(load64(fvs + 8)); }
+fn fed_vstore_collection_count(fvs) { return map_count(load64(fvs + 8)); }
+
+fn remote_result_new(id, score, content, source_node) {
+    var rr = alloc(32);
+    store64(rr, id);
+    store64(rr + 8, score);
+    store64(rr + 16, content);
+    store64(rr + 24, source_node);
+    return rr;
+}
+
+fn remote_result_id(rr) { return load64(rr); }
+fn remote_result_score(rr) { return load64(rr + 8); }
+
+fn fed_vstore_merge_results(fvs, local_results, remote_batches, top_k) {
+    var max_remote = load64(fvs + 24);
+    var fv_all = vec_new();
+    var fvli = 0;
+    while (fvli < vec_len(local_results)) { vec_push(fv_all, vec_get(local_results, fvli)); fvli = fvli + 1; }
+    var fvbi = 0;
+    while (fvbi < vec_len(remote_batches)) {
+        var fvbatch = vec_get(remote_batches, fvbi);
+        var fvbri = 0;
+        while (fvbri < vec_len(fvbatch)) {
+            if (fvbri >= max_remote) { break; }
+            vec_push(fv_all, vec_get(fvbatch, fvbri));
+            fvbri = fvbri + 1;
+        }
+        fvbi = fvbi + 1;
+    }
+    var fv_dedup = map_new();
+    var fvdi = 0;
+    while (fvdi < vec_len(fv_all)) {
+        var fvdr = vec_get(fv_all, fvdi);
+        var fvdid = str_cstr(remote_result_id(fvdr));
+        var fvde = map_get(fv_dedup, fvdid);
+        if (fvde == 0) { map_set(fv_dedup, fvdid, fvdr); }
+        else { if (f64_gt(remote_result_score(fvdr), remote_result_score(fvde)) == 1) { map_set(fv_dedup, fvdid, fvdr); } }
+        fvdi = fvdi + 1;
+    }
+    var fv_dk = map_keys(fv_dedup);
+    var fv_res = vec_new();
+    var fvdki = 0;
+    while (fvdki < vec_len(fv_dk)) { vec_push(fv_res, map_get(fv_dedup, vec_get(fv_dk, fvdki))); fvdki = fvdki + 1; }
+    # Sort by score descending
+    var fv_rn = vec_len(fv_res);
+    var fvsi = 1;
+    while (fvsi < fv_rn) {
+        var fvsk = vec_get(fv_res, fvsi);
+        var fvss = remote_result_score(fvsk);
+        var fvsj = fvsi - 1;
+        while (fvsj >= 0) {
+            if (f64_gt(remote_result_score(vec_get(fv_res, fvsj)), fvss) == 1) { break; }
+            vec_set(fv_res, fvsj + 1, vec_get(fv_res, fvsj));
+            fvsj = fvsj - 1;
+        }
+        vec_set(fv_res, fvsj + 1, fvsk);
+        fvsi = fvsi + 1;
+    }
+    var fv_final = vec_new();
+    var fvfi = 0;
+    while (fvfi < top_k) {
+        if (fvfi >= vec_len(fv_res)) { break; }
+        vec_push(fv_final, vec_get(fv_res, fvfi));
+        fvfi = fvfi + 1;
+    }
+    return fv_final;
+}
+
+fn fed_vstore_stats(fvs) {
+    var fvsk = map_keys(load64(fvs + 8));
+    var fvs_tr = 0;
+    var fvs_tv = 0;
+    var fvs_ns = map_new();
+    var fvski = 0;
+    while (fvski < vec_len(fvsk)) {
+        var fvsr = map_get(load64(fvs + 8), vec_get(fvsk, fvski));
+        if (fvsr != 0) {
+            var fvsri = 0;
+            while (fvsri < vec_len(fvsr)) {
+                var fvsrr = vec_get(fvsr, fvsri);
+                fvs_tr = fvs_tr + 1;
+                fvs_tv = fvs_tv + replica_vector_count(fvsrr);
+                map_set(fvs_ns, str_cstr(replica_node_id(fvsrr)), 1);
+                fvsri = fvsri + 1;
+            }
+        }
+        fvski = fvski + 1;
+    }
+    var fvst = alloc(40);
+    store64(fvst, vec_len(fvsk));
+    store64(fvst + 8, fvs_tr);
+    store64(fvst + 16, fvs_tv);
+    store64(fvst + 24, map_count(fvs_ns));
+    store64(fvst + 32, load64(fvs + 16));
+    return fvst;
+}
+
 # --- RAG pipeline ---
 
 fn rag_config_default() {
@@ -1595,6 +1769,63 @@ fn main() {
     # Empty ingest
     var empty_ids = rag_ingest_text(rpipe, str_from(""), str_from("x"));
     assert_eq(vec_len(empty_ids), 0, "empty ingest = 0 chunks");
+
+    # =============================================================
+    # FederatedVectorStore
+    # =============================================================
+    test_group("fed_vector_store");
+
+    var fvs = fed_vstore_new(str_from("local-1"), REPL_FULL);
+    assert_eq(fed_vstore_collection_count(fvs), 0, "empty store");
+    assert(str_eq(fed_vstore_local_id(fvs), str_from("local-1")) == 1, "local id");
+    assert_eq(fed_vstore_strategy(fvs), REPL_FULL, "strategy full");
+
+    # Register replicas
+    fed_vstore_register_replica(fvs, "docs", str_from("local-1"), str_from("127.0.0.1:8090"), 100);
+    fed_vstore_register_replica(fvs, "docs", str_from("node-2"), str_from("10.0.0.2:8090"), 95);
+    fed_vstore_register_replica(fvs, "logs", str_from("node-3"), str_from("10.0.0.3:8090"), 50);
+    assert_eq(fed_vstore_collection_count(fvs), 2, "2 collections");
+
+    # All replicas for docs
+    var docs_all = fed_vstore_all_replicas(fvs, "docs");
+    assert_eq(vec_len(docs_all), 2, "docs has 2 replicas");
+
+    # Remote replicas (excludes local)
+    var docs_remote = fed_vstore_remote_replicas(fvs, "docs");
+    assert_eq(vec_len(docs_remote), 1, "docs has 1 remote");
+    assert(str_eq(replica_node_id(vec_get(docs_remote, 0)), str_from("node-2")) == 1, "remote is node-2");
+
+    # Collections list
+    var fv_colls = fed_vstore_collections(fvs);
+    assert_eq(vec_len(fv_colls), 2, "2 collection names");
+
+    # Remove node
+    fed_vstore_remove_node(fvs, str_from("node-2"));
+    var docs_after = fed_vstore_all_replicas(fvs, "docs");
+    assert_eq(vec_len(docs_after), 1, "docs down to 1 replica");
+    var docs_remote2 = fed_vstore_remote_replicas(fvs, "docs");
+    assert_eq(vec_len(docs_remote2), 0, "no remote replicas for docs");
+
+    # Stats
+    var fv_st = fed_vstore_stats(fvs);
+    assert_eq(load64(fv_st), 2, "2 collections in stats");
+    assert_eq(load64(fv_st + 8), 2, "2 total replicas");  # local-1 docs + node-3 logs
+
+    # Merge results
+    var local_res = vec_new();
+    vec_push(local_res, remote_result_new(str_from("v1"), f64_from(90), str_from("doc1"), str_from("local")));
+    vec_push(local_res, remote_result_new(str_from("v2"), f64_from(70), str_from("doc2"), str_from("local")));
+    var remote_batch = vec_new();
+    var rbatch1 = vec_new();
+    vec_push(rbatch1, remote_result_new(str_from("v3"), f64_from(85), str_from("doc3"), str_from("node-2")));
+    vec_push(rbatch1, remote_result_new(str_from("v1"), f64_from(80), str_from("doc1-dup"), str_from("node-2")));  # dup, lower score
+    vec_push(remote_batch, rbatch1);
+
+    var merged = fed_vstore_merge_results(fvs, local_res, remote_batch, 3);
+    assert_eq(vec_len(merged), 3, "3 merged results");
+    # First should be highest score (v1=90)
+    assert(str_eq(remote_result_id(vec_get(merged, 0)), str_from("v1")) == 1, "top result is v1");
+    # v1 should have score 90 (kept higher), not 80
 
     # =============================================================
     # Summary

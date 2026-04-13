@@ -19,10 +19,14 @@
   - [x] screen → capture permissions, rate limiting, recordings
   - [x] logging → sakshi integration
 
+## Completed (v0.7.0 continued)
+
+- [x] FederatedVectorStore — collection/replica management, cross-node search merge with dedup + re-ranking, stats
+- [x] Unix domain socket IPC — AgentIpc with bind/accept/send, length-prefixed wire protocol, ACK/NACK, connection limits
+
 ## Backlog
 
-- [ ] FederatedVectorStore — distributed vector search across nodes
-- [ ] Unix domain socket IPC — actual socket server for AgentIpc (currently message bus only)
+_(empty — all portable features complete)_
 
 ## Blocked on Upstream Ports
 

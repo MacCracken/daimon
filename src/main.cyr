@@ -38,6 +38,11 @@ include "lib/process.cyr"
 # Syscall numbers not in stdlib
 var SYS_RENAME = 82;
 var SYS_SETSOCKOPT = 54;
+var SYS_SOCKET = 41;
+var SYS_CONNECT = 42;
+var SYS_ACCEPT = 43;
+var SYS_BIND = 49;
+var SYS_LISTEN = 50;
 
 # =========================================================================
 # error — error codes and HTTP status mapping
@@ -1874,6 +1879,232 @@ fn fed_mgr_stats(fm) {
     return st;
 }
 
+# --- Federated vector store ---
+
+enum VectorReplication {
+    REPL_FULL = 0;
+    REPL_PARTIAL = 1;
+    REPL_SHARDED = 2;
+}
+
+# CollectionReplica: {node_id: Str, address: Str, vector_count, last_synced}
+# 4 fields x 8 = 32 bytes
+
+fn collection_replica_new(node_id, address, vector_count) {
+    var cr = alloc(32);
+    store64(cr, node_id);
+    store64(cr + 8, address);
+    store64(cr + 16, vector_count);
+    store64(cr + 24, clock_epoch_secs());
+    return cr;
+}
+
+fn replica_node_id(cr) { return load64(cr); }
+fn replica_vector_count(cr) { return load64(cr + 16); }
+
+# FederatedVectorStore: {local_node_id: Str, collections: map<name_cstr, vec<Replica>>,
+#                         strategy, max_remote_results}
+# 4 fields x 8 = 32 bytes
+
+fn fed_vstore_new(local_node_id, strategy) {
+    var fvs = alloc(32);
+    store64(fvs, local_node_id);
+    store64(fvs + 8, map_new());     # collections map
+    store64(fvs + 16, strategy);
+    store64(fvs + 24, 100);           # max_remote_results
+    return fvs;
+}
+
+fn fed_vstore_local_id(fvs) { return load64(fvs); }
+fn fed_vstore_strategy(fvs) { return load64(fvs + 16); }
+
+fn fed_vstore_register_replica(fvs, collection_cstr, node_id, address, vector_count) {
+    var colls = load64(fvs + 8);
+    var replicas = map_get(colls, collection_cstr);
+    if (replicas == 0) {
+        replicas = vec_new();
+        map_set(colls, collection_cstr, replicas);
+    }
+    vec_push(replicas, collection_replica_new(node_id, address, vector_count));
+}
+
+fn fed_vstore_remove_node(fvs, node_id) {
+    var colls = load64(fvs + 8);
+    var keys = map_keys(colls);
+    var ki = 0;
+    while (ki < vec_len(keys)) {
+        var replicas = map_get(colls, vec_get(keys, ki));
+        if (replicas != 0) {
+            # Filter out replicas from this node
+            var kept = vec_new();
+            var ri = 0;
+            while (ri < vec_len(replicas)) {
+                var r = vec_get(replicas, ri);
+                if (str_eq(replica_node_id(r), node_id) == 0) {
+                    vec_push(kept, r);
+                }
+                ri = ri + 1;
+            }
+            map_set(colls, vec_get(keys, ki), kept);
+        }
+        ki = ki + 1;
+    }
+}
+
+fn fed_vstore_remote_replicas(fvs, collection_cstr) {
+    var colls = load64(fvs + 8);
+    var replicas = map_get(colls, collection_cstr);
+    if (replicas == 0) { return vec_new(); }
+    var local_id = load64(fvs);
+    var remote = vec_new();
+    var ri = 0;
+    while (ri < vec_len(replicas)) {
+        var r = vec_get(replicas, ri);
+        if (str_eq(replica_node_id(r), local_id) == 0) {
+            vec_push(remote, r);
+        }
+        ri = ri + 1;
+    }
+    return remote;
+}
+
+fn fed_vstore_all_replicas(fvs, collection_cstr) {
+    var colls = load64(fvs + 8);
+    var replicas = map_get(colls, collection_cstr);
+    if (replicas == 0) { return vec_new(); }
+    return replicas;
+}
+
+fn fed_vstore_collections(fvs) {
+    return map_keys(load64(fvs + 8));
+}
+
+fn fed_vstore_collection_count(fvs) {
+    return map_count(load64(fvs + 8));
+}
+
+# Merge local + remote search results, dedup by ID (keep highest score), re-rank
+# Results are packed as: {id: Str, score (f64), content: Str, source_node: Str}
+# 4 fields x 8 = 32 bytes
+
+fn remote_result_new(id, score, content, source_node) {
+    var rr = alloc(32);
+    store64(rr, id);
+    store64(rr + 8, score);
+    store64(rr + 16, content);
+    store64(rr + 24, source_node);
+    return rr;
+}
+
+fn remote_result_id(rr) { return load64(rr); }
+fn remote_result_score(rr) { return load64(rr + 8); }
+fn remote_result_content(rr) { return load64(rr + 16); }
+
+fn fed_vstore_merge_results(fvs, local_results, remote_batches, top_k) {
+    var max_remote = load64(fvs + 24);
+    # Collect all results
+    var all = vec_new();
+    var li = 0;
+    while (li < vec_len(local_results)) {
+        vec_push(all, vec_get(local_results, li));
+        li = li + 1;
+    }
+    var bi = 0;
+    while (bi < vec_len(remote_batches)) {
+        var batch = vec_get(remote_batches, bi);
+        var ri = 0;
+        while (ri < vec_len(batch)) {
+            if (ri >= max_remote) { break; }
+            vec_push(all, vec_get(batch, ri));
+            ri = ri + 1;
+        }
+        bi = bi + 1;
+    }
+
+    # Dedup by id (keep highest score) using a map
+    var dedup = map_new();
+    var di = 0;
+    while (di < vec_len(all)) {
+        var r = vec_get(all, di);
+        var id_cstr = str_cstr(remote_result_id(r));
+        var existing = map_get(dedup, id_cstr);
+        if (existing == 0) {
+            map_set(dedup, id_cstr, r);
+        } else {
+            if (f64_gt(remote_result_score(r), remote_result_score(existing)) == 1) {
+                map_set(dedup, id_cstr, r);
+            }
+        }
+        di = di + 1;
+    }
+
+    # Collect deduped results
+    var dedup_keys = map_keys(dedup);
+    var results = vec_new();
+    var dk = 0;
+    while (dk < vec_len(dedup_keys)) {
+        vec_push(results, map_get(dedup, vec_get(dedup_keys, dk)));
+        dk = dk + 1;
+    }
+
+    # Sort by score descending (insertion sort)
+    var rn = vec_len(results);
+    var si = 1;
+    while (si < rn) {
+        var key = vec_get(results, si);
+        var ks = remote_result_score(key);
+        var sj = si - 1;
+        while (sj >= 0) {
+            if (f64_gt(remote_result_score(vec_get(results, sj)), ks) == 1) { break; }
+            vec_set(results, sj + 1, vec_get(results, sj));
+            sj = sj - 1;
+        }
+        vec_set(results, sj + 1, key);
+        si = si + 1;
+    }
+
+    # Truncate to top_k
+    var final_results = vec_new();
+    var fi = 0;
+    while (fi < top_k) {
+        if (fi >= vec_len(results)) { break; }
+        vec_push(final_results, vec_get(results, fi));
+        fi = fi + 1;
+    }
+    return final_results;
+}
+
+fn fed_vstore_stats(fvs) {
+    var colls = load64(fvs + 8);
+    var keys = map_keys(colls);
+    var total_replicas = 0;
+    var total_vectors = 0;
+    var node_set = map_new();
+    var ki = 0;
+    while (ki < vec_len(keys)) {
+        var replicas = map_get(colls, vec_get(keys, ki));
+        if (replicas != 0) {
+            var ri = 0;
+            while (ri < vec_len(replicas)) {
+                var r = vec_get(replicas, ri);
+                total_replicas = total_replicas + 1;
+                total_vectors = total_vectors + replica_vector_count(r);
+                map_set(node_set, str_cstr(replica_node_id(r)), 1);
+                ri = ri + 1;
+            }
+        }
+        ki = ki + 1;
+    }
+    # Return: {collection_count, total_replicas, total_vectors, nodes_with_vectors, strategy}
+    var st = alloc(40);
+    store64(st, vec_len(keys));
+    store64(st + 8, total_replicas);
+    store64(st + 16, total_vectors);
+    store64(st + 24, map_count(node_set));
+    store64(st + 32, load64(fvs + 16));
+    return st;
+}
+
 # =========================================================================
 # edge — edge fleet management
 # =========================================================================
@@ -2200,6 +2431,184 @@ fn rpc_unregister_agent(rr, agent_id_cstr) {
 
 fn rpc_list_methods(rr) {
     return map_keys(load64(rr));
+}
+
+# --- AgentIpc — per-agent Unix domain socket endpoint ---
+
+var MAX_CONCURRENT_CONNECTIONS = 64;
+var MAX_GLOBAL_FD_LIMIT = 1024;
+var _global_active_connections = 0;
+
+# Wire protocol response codes
+var ACK = 1;
+var NACK_QUEUE_FULL = 2;
+var NACK_INVALID = 3;
+
+fn active_connection_count() { return _global_active_connections; }
+
+# AgentIpc: {agent_id: Str, socket_path: Str, queue: vec<IpcMessage>}
+# 3 fields x 8 = 24 bytes
+
+fn agent_ipc_new(agent_id_str, socket_dir) {
+    var ipc = alloc(24);
+    store64(ipc, agent_id_str);
+    var sock_name = str_cat(agent_id_str, str_from(".sock"));
+    var spath = path_join(str_data(socket_dir), str_data(sock_name));
+    store64(ipc + 8, spath);
+    store64(ipc + 16, vec_new());    # message queue
+    return ipc;
+}
+
+fn agent_ipc_id(ipc) { return load64(ipc); }
+fn agent_ipc_socket_path(ipc) { return load64(ipc + 8); }
+fn agent_ipc_queue(ipc) { return load64(ipc + 16); }
+
+# Bind a Unix domain socket at the agent's path
+fn agent_ipc_bind(ipc) {
+    var spath = load64(ipc + 8);
+    var path_cstr = str_data(spath);
+
+    # Ensure parent directory exists
+    var dir = path_dirname(spath);
+    syscall(SYS_MKDIR, str_data(dir), 493);  # 0755
+
+    # Remove stale socket if it exists
+    syscall(SYS_UNLINK, path_cstr);
+
+    # Create Unix domain socket (AF_UNIX=1, SOCK_STREAM=1)
+    var fd = syscall(SYS_SOCKET, 1, 1, 0);
+    if (fd < 0) { return Err(ERR_IPC); }
+
+    # Build sockaddr_un: {sa_family=1, sun_path=...}
+    var addr_buf = alloc(112);  # sizeof(sockaddr_un) = 110
+    store16(addr_buf, 1);        # AF_UNIX
+    var plen = str_len(spath);
+    if (plen > 107) { plen = 107; }
+    memcpy(addr_buf + 2, path_cstr, plen);
+    store8(addr_buf + 2 + plen, 0);
+
+    var br = syscall(SYS_BIND, fd, addr_buf, 2 + plen + 1);
+    if (br < 0) {
+        syscall(SYS_CLOSE, fd);
+        return Err(ERR_IPC);
+    }
+
+    # Set socket permissions (owner only: 0700)
+    syscall(SYS_CHMOD, path_cstr, 448);  # 0700
+
+    # Listen
+    var lr = syscall(SYS_LISTEN, fd, MAX_CONCURRENT_CONNECTIONS);
+    if (lr < 0) {
+        syscall(SYS_CLOSE, fd);
+        return Err(ERR_IPC);
+    }
+
+    return Ok(fd);
+}
+
+# Accept a connection and read one length-prefixed message
+fn agent_ipc_accept_one(fd, ipc) {
+    var cfd = syscall(SYS_ACCEPT, fd, 0, 0);
+    if (cfd < 0) { return Err(ERR_IPC); }
+
+    if (_global_active_connections >= MAX_GLOBAL_FD_LIMIT) {
+        syscall(SYS_CLOSE, cfd);
+        return Err(ERR_IPC);
+    }
+    _global_active_connections = _global_active_connections + 1;
+
+    # Read 4-byte big-endian length prefix
+    var len_buf[1];
+    var nr = syscall(SYS_READ, cfd, &len_buf, 4);
+    if (nr != 4) {
+        syscall(SYS_CLOSE, cfd);
+        _global_active_connections = _global_active_connections - 1;
+        return Err(ERR_IPC);
+    }
+
+    # Parse big-endian u32
+    var msg_len = load8(&len_buf) * 16777216 + load8(&len_buf + 1) * 65536 + load8(&len_buf + 2) * 256 + load8(&len_buf + 3);
+
+    if (msg_len > MAX_MESSAGE_SIZE) {
+        # Send NACK
+        store8(&len_buf, NACK_INVALID);
+        syscall(SYS_WRITE, cfd, &len_buf, 1);
+        syscall(SYS_CLOSE, cfd);
+        _global_active_connections = _global_active_connections - 1;
+        return Err(ERR_IPC);
+    }
+
+    # Read message body
+    var msg_buf = alloc(msg_len + 1);
+    var total_read = 0;
+    while (total_read < msg_len) {
+        var chunk = syscall(SYS_READ, cfd, msg_buf + total_read, msg_len - total_read);
+        if (chunk <= 0) { break; }
+        total_read = total_read + chunk;
+    }
+    store8(msg_buf + total_read, 0);
+
+    # Parse JSON message and enqueue
+    var msg_str = str_new(msg_buf, total_read);
+    var queue = load64(ipc + 16);
+    vec_push(queue, msg_str);
+
+    # Send ACK
+    store8(&len_buf, ACK);
+    syscall(SYS_WRITE, cfd, &len_buf, 1);
+
+    syscall(SYS_CLOSE, cfd);
+    _global_active_connections = _global_active_connections - 1;
+    return Ok(total_read);
+}
+
+# Send a message to another agent's socket
+fn agent_ipc_send(target_socket_path, message_str) {
+    var path_cstr = str_data(target_socket_path);
+
+    # Connect to Unix socket
+    var fd = syscall(SYS_SOCKET, 1, 1, 0);
+    if (fd < 0) { return Err(ERR_IPC); }
+
+    var addr_buf = alloc(112);
+    store16(addr_buf, 1);  # AF_UNIX
+    var plen = str_len(target_socket_path);
+    if (plen > 107) { plen = 107; }
+    memcpy(addr_buf + 2, path_cstr, plen);
+    store8(addr_buf + 2 + plen, 0);
+
+    var cr = syscall(SYS_CONNECT, fd, addr_buf, 2 + plen + 1);
+    if (cr < 0) {
+        syscall(SYS_CLOSE, fd);
+        return Err(ERR_IPC);
+    }
+
+    # Write length prefix (big-endian u32) + message
+    var msg_len = str_len(message_str);
+    var hdr[1];
+    store8(&hdr, (msg_len >> 24) & 255);
+    store8(&hdr + 1, (msg_len >> 16) & 255);
+    store8(&hdr + 2, (msg_len >> 8) & 255);
+    store8(&hdr + 3, msg_len & 255);
+    syscall(SYS_WRITE, fd, &hdr, 4);
+    syscall(SYS_WRITE, fd, str_data(message_str), msg_len);
+
+    # Read ACK
+    var ack_buf[1];
+    syscall(SYS_READ, fd, &ack_buf, 1);
+    var ack = load8(&ack_buf);
+
+    syscall(SYS_CLOSE, fd);
+
+    if (ack == ACK) { return Ok(0); }
+    if (ack == NACK_QUEUE_FULL) { return Err(ERR_IPC); }
+    return Err(ERR_IPC);
+}
+
+# Cleanup: remove socket file
+fn agent_ipc_cleanup(ipc) {
+    var spath = load64(ipc + 8);
+    syscall(SYS_UNLINK, str_data(spath));
 }
 
 # =========================================================================
