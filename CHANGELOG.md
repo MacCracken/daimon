@@ -10,29 +10,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
-- **Cyrius port**: Full rewrite from Rust to Cyrius (9,724 LOC Rust → 1,993 LOC Cyrius).
-- All 14 core modules ported: error, config, agent, supervisor, memory, vector_store, rag, mcp, screen, scheduler, federation, edge, ipc, api.
-- Synchronous HTTP API server on port 8090 with JSON responses.
-- API endpoints: `/v1/health`, `/v1/agents` (GET/POST), `/v1/mcp/manifest`, `/v1/edge/stats`, `/v1/metrics`.
+- **Cyrius port**: Full rewrite from Rust to Cyrius (9,724 LOC Rust → 3,105 LOC Cyrius).
+- All 15 modules ported with full API parity: error, config, agent, supervisor, memory, vector_store, rag, mcp, screen, scheduler, federation, edge, ipc, api, logging.
+- Synchronous HTTP API server on port 8090 with JSON responses, 24 endpoints:
+  - `/v1/health` — service health
+  - `/v1/agents` (GET/POST), `/v1/agents/{id}` — agent lifecycle
+  - `/v1/mcp/tools` (GET/POST), `/v1/mcp/tools/{name}` (DELETE), `/v1/mcp/call` (POST) — MCP tool dispatch
+  - `/v1/rag/ingest` (POST), `/v1/rag/query` (POST) — RAG pipeline
+  - `/v1/edge/nodes` (GET/POST), `/v1/edge/nodes/{id}` (GET), `/v1/edge/nodes/{id}/heartbeat` (POST), `/v1/edge/nodes/{id}/decommission` (POST), `/v1/edge/stats` — edge fleet
+  - `/v1/scheduler/tasks` (GET/POST), `/v1/scheduler/tasks/{id}` (GET), `/v1/scheduler/tasks/{id}/cancel` (POST), `/v1/scheduler/nodes` (POST), `/v1/scheduler/schedule` (POST), `/v1/scheduler/stats` — task scheduling
+  - `/v1/metrics` — aggregate metrics
 - CLI: `serve [port]`, `version`, `help` commands.
+- Scheduler: NodeCapacity with resource fitting, best-fit bin-packing, schedule_pending with assignment, stats aggregation, preemption-aware state machine.
+- Federation: cluster management, heartbeat health tracking (online/suspect/dead), Raft-like election (start_election, become_coordinator), 4-factor weighted node scoring (resource/locality/load/affinity), live node filtering, cluster stats.
+- Edge fleet: register with validation (empty name, duplicate, fleet-full), heartbeat processing, health check (suspect/offline thresholds), decommission, list with status filter.
+- IPC: message bus with named routing + broadcast + direct send, RPC registry with method registration/lookup/unregister.
+- Memory store: list_keys, clear, atomic write (tmp+rename).
+- RAG pipeline: ingest_text (chunk + embed + index), query_text (embed + search + format context).
 - Circuit breaker with Closed → Open → HalfOpen state machine.
 - Output capture ring buffer for agent stdout/stderr.
-- Per-agent key-value memory store with atomic writes (tmp+rename).
 - In-memory cosine-similarity vector index with brute-force search.
-- RAG pipeline: text chunking, bag-of-words embedding, context formatting.
-- MCP tool registry (builtin + external) with manifest generation.
-- Screen capture permission manager with rate limiting.
-- Priority-aware task scheduler with state machine transitions.
-- Federation node management with Raft-like role tracking.
-- Edge fleet manager with heartbeat tracking and stats aggregation.
-- Message bus for agent IPC with named routing and broadcast.
+- MCP tool registry (builtin + external) with manifest, register, deregister.
+- Screen capture permission manager with rate limiting and recording sessions.
 - `/proc` helpers for agent resource monitoring (VmRSS, fd count, thread count).
-- Binary size: **113 KB** (vs 4.0 MB default Rust build — 97% smaller).
+- Input validation on all POST endpoints (empty names, zero resources, empty text/query).
+- Test suite: 130 assertions across 18 test groups.
+- Benchmark suite: 16 benchmarks covering core data structures and subsystems.
+- Fuzz harnesses: 5 (circuit_breaker, memory_keys, scheduler_fsm, vector_store, mcp_registry).
+- Binary size: **145 KB** (vs 4.0 MB default Rust build — 96% smaller).
 
 ### Changed
 
 - **Language**: Rust → Cyrius. Rust source preserved in `rust-old/`.
-- **HTTP**: Async (tokio/axum) → synchronous (raw TCP sockets via epoll).
+- **HTTP**: Async (tokio/axum) → synchronous (raw TCP sockets).
 - **Build**: `cargo build` → `cat src/main.cyr | cc3 > build/daimon`.
 - **Dependencies**: 193 crate dependencies → 17 Cyrius stdlib modules + 0 external deps.
 

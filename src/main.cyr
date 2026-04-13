@@ -674,6 +674,45 @@ fn memory_store_delete(ms, agent_id_str, key) {
     return Ok(0);
 }
 
+fn memory_store_list_keys(ms, agent_id_str) {
+    var dir = memory_store_agent_dir(ms, agent_id_str);
+    var entries = dir_list(str_data(dir));
+    if (entries == 0) { return vec_new(); }
+    var keys = vec_new();
+    var i = 0;
+    while (i < vec_len(entries)) {
+        var name = vec_get(entries, i);
+        # Check .json extension
+        var name_s = str_from(name);
+        if (str_ends_with(name_s, str_from(".json")) == 1) {
+            # Strip .json suffix (5 chars)
+            var stem = str_sub(name_s, 0, str_len(name_s) - 5);
+            vec_push(keys, stem);
+        }
+        i = i + 1;
+    }
+    return keys;
+}
+
+fn memory_store_clear(ms, agent_id_str) {
+    var dir = memory_store_agent_dir(ms, agent_id_str);
+    var entries = dir_list(str_data(dir));
+    if (entries == 0) { return 0; }
+    var count = 0;
+    var i = 0;
+    while (i < vec_len(entries)) {
+        var name = vec_get(entries, i);
+        var name_s = str_from(name);
+        if (str_ends_with(name_s, str_from(".json")) == 1) {
+            var fpath = path_join(str_data(dir), name);
+            syscall(SYS_UNLINK, str_data(fpath));
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    return count;
+}
+
 # =========================================================================
 # vector_store — in-memory cosine-similarity search
 # =========================================================================
@@ -916,6 +955,119 @@ fn tokenize(text) {
         i = i + 1;
     }
     return tokens;
+}
+
+# RagPipeline: {index: VectorIndex, config: RagConfig, next_id}
+# 3 fields x 8 = 24 bytes
+
+fn rag_pipeline_new(config) {
+    var rp = alloc(24);
+    store64(rp, vindex_new());
+    store64(rp + 8, config);
+    store64(rp + 16, 1);  # next_id counter
+    return rp;
+}
+
+fn rag_pipeline_index(rp) { return load64(rp); }
+fn rag_pipeline_config(rp) { return load64(rp + 8); }
+
+# Ingest text: chunk, create simple embeddings, insert into index
+fn rag_ingest_text(rp, text, metadata) {
+    var config = load64(rp + 8);
+    var cs = load64(config + 8);   # chunk_size
+    var ov = load64(config + 16);  # overlap
+    var chunks = chunk_text(text, cs, ov);
+    if (vec_len(chunks) == 0) { return vec_new(); }
+
+    var ids = vec_new();
+    var ci = 0;
+    while (ci < vec_len(chunks)) {
+        var chunk = vec_get(chunks, ci);
+        # Simple bag-of-words embedding: tokenize + count
+        var toks = tokenize(chunk);
+        var ntoks = vec_len(toks);
+        if (ntoks == 0) { ci = ci + 1; continue; }
+
+        # Create a simple embedding based on token hashes
+        var dim = 32;
+        var emb = alloc(dim * 8);
+        var ei = 0;
+        while (ei < dim) { store64(emb + ei * 8, f64_from(0)); ei = ei + 1; }
+
+        var ti = 0;
+        while (ti < ntoks) {
+            var tok = vec_get(toks, ti);
+            # Simple hash: sum of char values mod dim
+            var hash = 0;
+            var td = str_data(tok);
+            var tl = str_len(tok);
+            var hi = 0;
+            while (hi < tl) {
+                hash = hash + load8(td + hi);
+                hi = hi + 1;
+            }
+            var slot = hash % dim;
+            var cur = load64(emb + slot * 8);
+            store64(emb + slot * 8, f64_add(cur, f64_from(1)));
+            ti = ti + 1;
+        }
+
+        var id = load64(rp + 16);
+        store64(rp + 16, id + 1);
+        var entry = vec_entry_new(id, emb, dim, chunk, metadata);
+        vindex_insert(load64(rp), entry);
+        vec_push(ids, id);
+        ci = ci + 1;
+    }
+    return ids;
+}
+
+# Query the pipeline: embed query, search, format context
+fn rag_query_text(rp, query) {
+    var config = load64(rp + 8);
+    var top_k = load64(config);
+    var idx = load64(rp);
+
+    # Embed query same way as ingest
+    var toks = tokenize(query);
+    var ntoks = vec_len(toks);
+    var dim = 32;
+    var qemb = alloc(dim * 8);
+    var ei = 0;
+    while (ei < dim) { store64(qemb + ei * 8, f64_from(0)); ei = ei + 1; }
+
+    var ti = 0;
+    while (ti < ntoks) {
+        var tok = vec_get(toks, ti);
+        var hash = 0;
+        var td = str_data(tok);
+        var tl = str_len(tok);
+        var hi = 0;
+        while (hi < tl) { hash = hash + load8(td + hi); hi = hi + 1; }
+        var slot = hash % dim;
+        var cur = load64(qemb + slot * 8);
+        store64(qemb + slot * 8, f64_add(cur, f64_from(1)));
+        ti = ti + 1;
+    }
+
+    var results = vindex_search(idx, qemb, dim, top_k);
+
+    # Format context
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "Use the following context to answer the question.\n\n---\n");
+    var ri = 0;
+    while (ri < vec_len(results)) {
+        var sr = vec_get(results, ri);
+        str_builder_add_cstr(sb, "[");
+        str_builder_add_int(sb, ri + 1);
+        str_builder_add_cstr(sb, "] ");
+        str_builder_add(sb, search_result_content(sr));
+        str_builder_add_cstr(sb, "\n\n");
+        ri = ri + 1;
+    }
+    str_builder_add_cstr(sb, "---\n\nQuestion: ");
+    str_builder_add(sb, query);
+    return str_builder_build(sb);
 }
 
 # =========================================================================
@@ -1208,11 +1360,94 @@ fn sched_task_transition(t, new_status) {
     return Ok(0);
 }
 
-# TaskScheduler: {tasks: map<id_cstr, ScheduledTask>}
+# NodeCapacity: {node_id: Str, total_cpu, avail_cpu, total_mem, avail_mem,
+#                 total_disk, avail_disk, gpu_available, tpu_available,
+#                 tpu_chips, running_tasks}
+# 11 fields x 8 = 88 bytes
+
+fn node_cap_new(node_id, total_cpu, total_mem, total_disk, gpu) {
+    var nc = alloc(88);
+    store64(nc, node_id);
+    store64(nc + 8, total_cpu);
+    store64(nc + 16, total_cpu);      # avail_cpu = total initially
+    store64(nc + 24, total_mem);
+    store64(nc + 32, total_mem);      # avail_mem = total
+    store64(nc + 40, total_disk);
+    store64(nc + 48, total_disk);     # avail_disk = total
+    store64(nc + 56, gpu);
+    store64(nc + 64, 0);              # tpu_available
+    store64(nc + 72, 0);              # tpu_chips
+    store64(nc + 80, 0);              # running_tasks
+    return nc;
+}
+
+fn node_cap_id(nc) { return load64(nc); }
+fn node_cap_avail_cpu(nc) { return load64(nc + 16); }
+fn node_cap_avail_mem(nc) { return load64(nc + 32); }
+
+fn node_cap_can_fit(nc, cpu, mem, disk) {
+    if (load64(nc + 16) < cpu) { return 0; }
+    if (load64(nc + 32) < mem) { return 0; }
+    if (load64(nc + 48) < disk) { return 0; }
+    return 1;
+}
+
+fn node_cap_utilization(nc) {
+    var total_cpu = load64(nc + 8);
+    var total_mem = load64(nc + 24);
+    if (total_cpu == 0) {
+        if (total_mem == 0) { return 0; }
+    }
+    var cpu_util = 0;
+    if (total_cpu > 0) {
+        cpu_util = 100 - (load64(nc + 16) * 100 / total_cpu);
+    }
+    var mem_util = 0;
+    if (total_mem > 0) {
+        mem_util = 100 - (load64(nc + 32) * 100 / total_mem);
+    }
+    return (cpu_util + mem_util) / 2;
+}
+
+fn node_cap_reserve(nc, cpu, mem, disk) {
+    var ac = load64(nc + 16) - cpu;
+    if (ac < 0) { ac = 0; }
+    store64(nc + 16, ac);
+    var am = load64(nc + 32) - mem;
+    if (am < 0) { am = 0; }
+    store64(nc + 32, am);
+    var ad = load64(nc + 48) - disk;
+    if (ad < 0) { ad = 0; }
+    store64(nc + 48, ad);
+    store64(nc + 80, load64(nc + 80) + 1);
+}
+
+fn node_cap_release(nc, cpu, mem, disk) {
+    var ac = load64(nc + 16) + cpu;
+    if (ac > load64(nc + 8)) { ac = load64(nc + 8); }
+    store64(nc + 16, ac);
+    var am = load64(nc + 32) + mem;
+    if (am > load64(nc + 24)) { am = load64(nc + 24); }
+    store64(nc + 32, am);
+    var ad = load64(nc + 48) + disk;
+    if (ad > load64(nc + 40)) { ad = load64(nc + 40); }
+    store64(nc + 48, ad);
+    var rt = load64(nc + 80) - 1;
+    if (rt < 0) { rt = 0; }
+    store64(nc + 80, rt);
+}
+
+# TaskScheduler: {tasks: map, nodes: map}
+# 2 fields x 8 = 16 bytes
 fn task_scheduler_new() {
-    var ts = alloc(8);
-    store64(ts, map_new());
+    var ts = alloc(16);
+    store64(ts, map_new());       # tasks: id_cstr -> ScheduledTask
+    store64(ts + 8, map_new());   # nodes: id_cstr -> NodeCapacity
     return ts;
+}
+
+fn scheduler_register_node(ts, nc) {
+    map_set(load64(ts + 8), str_data(node_cap_id(nc)), nc);
 }
 
 fn scheduler_submit(ts, task) {
@@ -1229,6 +1464,119 @@ fn scheduler_cancel(ts, id_cstr) {
     var task = map_get(load64(ts), id_cstr);
     if (task == 0) { return Err(ERR_SCHEDULER); }
     return sched_task_transition(task, TASK_CANCELLED);
+}
+
+# Get pending tasks sorted by priority desc, created_at asc
+fn scheduler_pending_tasks(ts) {
+    var tasks = load64(ts);
+    var keys = map_keys(tasks);
+    var pending = vec_new();
+    var i = 0;
+    while (i < vec_len(keys)) {
+        var t = map_get(tasks, vec_get(keys, i));
+        if (sched_task_status(t) == TASK_QUEUED) { vec_push(pending, t); }
+        i = i + 1;
+    }
+    # Sort by priority desc (insertion sort)
+    var n = vec_len(pending);
+    i = 1;
+    while (i < n) {
+        var key = vec_get(pending, i);
+        var kp = sched_task_priority(key);
+        var j = i - 1;
+        while (j >= 0) {
+            var jp = sched_task_priority(vec_get(pending, j));
+            if (jp >= kp) { break; }
+            vec_set(pending, j + 1, vec_get(pending, j));
+            j = j - 1;
+        }
+        vec_set(pending, j + 1, key);
+        i = i + 1;
+    }
+    return pending;
+}
+
+# Find the best-fit node (lowest utilization that can fit the resource req)
+fn scheduler_best_fit(ts, cpu, mem, disk) {
+    var nodes = load64(ts + 8);
+    var keys = map_keys(nodes);
+    var best_id = 0;
+    var best_util = 101;  # Higher than max (100)
+    var i = 0;
+    while (i < vec_len(keys)) {
+        var nc = map_get(nodes, vec_get(keys, i));
+        if (node_cap_can_fit(nc, cpu, mem, disk) == 1) {
+            var util = node_cap_utilization(nc);
+            if (util < best_util) {
+                best_util = util;
+                best_id = node_cap_id(nc);
+            }
+        }
+        i = i + 1;
+    }
+    return best_id;
+}
+
+# Schedule all pending tasks — returns vec of decisions (as JSON strings)
+fn scheduler_schedule_pending(ts) {
+    var pending = scheduler_pending_tasks(ts);
+    var decisions = vec_new();
+    var nodes = load64(ts + 8);
+    var tasks = load64(ts);
+    var i = 0;
+    while (i < vec_len(pending)) {
+        var task = vec_get(pending, i);
+        var cpu = load64(task + 56);
+        var mem = load64(task + 64);
+        var node_id = scheduler_best_fit(ts, cpu, mem, 0);
+        if (node_id != 0) {
+            var nc = map_get(nodes, str_data(node_id));
+            if (nc != 0) { node_cap_reserve(nc, cpu, mem, 0); }
+            sched_task_transition(task, TASK_SCHEDULED);
+            # Build decision JSON
+            var sb = str_builder_new();
+            str_builder_add_cstr(sb, "{\"task_id\":\"");
+            str_builder_add(sb, sched_task_id(task));
+            str_builder_add_cstr(sb, "\",\"assigned_node\":\"");
+            str_builder_add(sb, node_id);
+            str_builder_add_cstr(sb, "\",\"reason\":\"best-fit\"}");
+            vec_push(decisions, str_builder_build(sb));
+        }
+        i = i + 1;
+    }
+    return decisions;
+}
+
+# Compute scheduler statistics
+fn scheduler_stats(ts) {
+    var tasks = load64(ts);
+    var keys = map_keys(tasks);
+    var total = vec_len(keys);
+    var queued = 0;
+    var running = 0;
+    var completed = 0;
+    var failed = 0;
+    var i = 0;
+    while (i < total) {
+        var t = map_get(tasks, vec_get(keys, i));
+        var s = sched_task_status(t);
+        if (s == TASK_QUEUED) { queued = queued + 1; }
+        elif (s == TASK_SCHEDULED) { queued = queued + 1; }
+        elif (s == TASK_PREEMPTED) { queued = queued + 1; }
+        elif (s == TASK_RUNNING) { running = running + 1; }
+        elif (s == TASK_COMPLETED) { completed = completed + 1; }
+        elif (s == TASK_CANCELLED) { completed = completed + 1; }
+        elif (s == TASK_FAILED) { failed = failed + 1; }
+        i = i + 1;
+    }
+    # Return packed stats: {total, queued, running, completed, failed}
+    var st = alloc(40);
+    store64(st, total);
+    store64(st + 8, queued);
+    store64(st + 16, running);
+    store64(st + 24, completed);
+    store64(st + 32, failed);
+    return st;
 }
 
 # =========================================================================
@@ -1295,7 +1643,140 @@ fn fed_mgr_add_node(fm, node) {
     map_set(load64(fm), str_data(fed_node_id(node)), node);
 }
 
+fn fed_mgr_remove_node(fm, id_cstr) {
+    return map_delete(load64(fm), id_cstr);
+}
+
+fn fed_mgr_get_node(fm, id_cstr) {
+    return map_get(load64(fm), id_cstr);
+}
+
 fn fed_mgr_node_count(fm) { return map_count(load64(fm)); }
+
+fn fed_mgr_record_heartbeat(fm, id_cstr) {
+    var node = map_get(load64(fm), id_cstr);
+    if (node == 0) { return Err(ERR_FEDERATION); }
+    store64(node + 32, clock_epoch_secs());
+    store64(node + 24, FED_ONLINE);
+    return Ok(0);
+}
+
+# Check health of all nodes based on heartbeat age
+fn fed_mgr_check_health(fm, suspect_secs, dead_secs) {
+    var nodes = load64(fm);
+    var keys = map_keys(nodes);
+    var now = clock_epoch_secs();
+    var i = 0;
+    while (i < vec_len(keys)) {
+        var node = map_get(nodes, vec_get(keys, i));
+        var age = now - load64(node + 32);
+        if (age > dead_secs) {
+            if (load64(node + 24) != FED_DEAD) { store64(node + 24, FED_DEAD); }
+        }
+        elif (age > suspect_secs) {
+            if (load64(node + 24) == FED_ONLINE) { store64(node + 24, FED_SUSPECT); }
+        }
+        i = i + 1;
+    }
+}
+
+# Get nodes with ONLINE status
+fn fed_mgr_live_nodes(fm) {
+    var nodes = load64(fm);
+    var keys = map_keys(nodes);
+    var live = vec_new();
+    var i = 0;
+    while (i < vec_len(keys)) {
+        var node = map_get(nodes, vec_get(keys, i));
+        if (load64(node + 24) == FED_ONLINE) { vec_push(live, node); }
+        i = i + 1;
+    }
+    return live;
+}
+
+# Start election — local node becomes candidate, increments term
+fn fed_mgr_start_election(fm, local_id_cstr) {
+    var node = map_get(load64(fm), local_id_cstr);
+    if (node == 0) { return Err(ERR_FEDERATION); }
+    store64(node + 16, ROLE_CANDIDATE);
+    var term = load64(node + 40) + 1;
+    store64(node + 40, term);
+    store64(node + 48, fed_node_id(node));  # voted_for = self
+    return Ok(term);
+}
+
+# Become coordinator
+fn fed_mgr_become_coordinator(fm, id_cstr) {
+    var node = map_get(load64(fm), id_cstr);
+    if (node == 0) { return Err(ERR_FEDERATION); }
+    store64(node + 16, ROLE_COORDINATOR);
+    return Ok(0);
+}
+
+# Node scorer — weighted 4-factor placement scoring
+# Score = 0.4*resource_headroom + 0.3*locality + 0.2*load_balance + 0.1*affinity
+fn fed_score_node(node, req_cpu, req_mem, preferred_id, max_load, node_load) {
+    var cpu_cores = load64(node + 56);
+    var memory_mb = load64(node + 64);
+
+    # Resource headroom (40%)
+    var cpu_head = 100;
+    if (req_cpu > 0) {
+        if (cpu_cores > 0) {
+            cpu_head = (cpu_cores - req_cpu) * 100 / cpu_cores;
+            if (cpu_head < 0) { cpu_head = 0; }
+        }
+        else { cpu_head = 0; }
+    }
+    var mem_head = 100;
+    if (req_mem > 0) {
+        if (memory_mb > 0) {
+            mem_head = (memory_mb - req_mem) * 100 / memory_mb;
+            if (mem_head < 0) { mem_head = 0; }
+        }
+        else { mem_head = 0; }
+    }
+    var resource = (cpu_head + mem_head) / 2;
+
+    # Locality (30%)
+    var locality = 0;
+    if (preferred_id != 0) {
+        if (str_eq(fed_node_id(node), preferred_id) == 1) { locality = 100; }
+    }
+
+    # Load balance (20%)
+    var load_bal = 100;
+    if (max_load > 0) {
+        load_bal = 100 - (node_load * 100 / max_load);
+    }
+
+    # Total: weighted sum (integer, 0-100 scale)
+    return resource * 40 / 100 + locality * 30 / 100 + load_bal * 20 / 100;
+}
+
+fn fed_mgr_stats(fm) {
+    var nodes = load64(fm);
+    var keys = map_keys(nodes);
+    var total = vec_len(keys);
+    var live = 0;
+    var suspect = 0;
+    var dead = 0;
+    var i = 0;
+    while (i < total) {
+        var n = map_get(nodes, vec_get(keys, i));
+        var s = load64(n + 24);
+        if (s == FED_ONLINE) { live = live + 1; }
+        elif (s == FED_SUSPECT) { suspect = suspect + 1; }
+        elif (s == FED_DEAD) { dead = dead + 1; }
+        i = i + 1;
+    }
+    var st = alloc(32);
+    store64(st, total);
+    store64(st + 8, live);
+    store64(st + 16, suspect);
+    store64(st + 24, dead);
+    return st;
+}
 
 # =========================================================================
 # edge — edge fleet management
@@ -1369,6 +1850,20 @@ fn edge_fleet_register(ef, node) {
     var config = load64(ef);
     var max_nodes = load64(config + 16);
     if (map_count(nodes) >= max_nodes) { return Err(ERR_INVALID_PARAM); }
+
+    # Check for empty name
+    var name = load64(node + 8);
+    if (str_len(name) == 0) { return Err(ERR_INVALID_PARAM); }
+
+    # Check for duplicate name
+    var keys = map_keys(nodes);
+    var di = 0;
+    while (di < vec_len(keys)) {
+        var existing = map_get(nodes, vec_get(keys, di));
+        if (str_eq(load64(existing + 8), name) == 1) { return Err(ERR_INVALID_PARAM); }
+        di = di + 1;
+    }
+
     map_set(nodes, str_data(edge_node_id(node)), node);
     return Ok(edge_node_id(node));
 }
@@ -1378,6 +1873,66 @@ fn edge_fleet_get(ef, id_cstr) {
 }
 
 fn edge_fleet_node_count(ef) { return map_count(load64(ef + 8)); }
+
+fn edge_fleet_heartbeat(ef, id_cstr, active_tasks, tasks_completed) {
+    var node = map_get(load64(ef + 8), id_cstr);
+    if (node == 0) { return Err(ERR_AGENT_NOT_FOUND); }
+    if (edge_node_status(node) == EDGE_DECOMMISSIONED) { return Err(ERR_INVALID_PARAM); }
+    store64(node + 64, clock_epoch_secs());
+    edge_node_set_status(node, EDGE_ONLINE);
+    store64(node + 72, active_tasks);
+    store64(node + 80, tasks_completed);
+    return Ok(0);
+}
+
+fn edge_fleet_check_health(ef) {
+    var nodes = load64(ef + 8);
+    var config = load64(ef);
+    var suspect_secs = load64(config);
+    var offline_secs = load64(config + 8);
+    var now = clock_epoch_secs();
+    var keys = map_keys(nodes);
+    var i = 0;
+    while (i < vec_len(keys)) {
+        var node = map_get(nodes, vec_get(keys, i));
+        var s = edge_node_status(node);
+        if (s == EDGE_DECOMMISSIONED) { i = i + 1; continue; }
+        if (s == EDGE_UPDATING) { i = i + 1; continue; }
+        var age = now - load64(node + 64);
+        if (age > offline_secs) {
+            if (s != EDGE_OFFLINE) { edge_node_set_status(node, EDGE_OFFLINE); }
+        }
+        elif (age > suspect_secs) {
+            if (s == EDGE_ONLINE) { edge_node_set_status(node, EDGE_SUSPECT); }
+        }
+        i = i + 1;
+    }
+}
+
+fn edge_fleet_decommission(ef, id_cstr) {
+    var node = map_get(load64(ef + 8), id_cstr);
+    if (node == 0) { return Err(ERR_AGENT_NOT_FOUND); }
+    edge_node_set_status(node, EDGE_DECOMMISSIONED);
+    return Ok(0);
+}
+
+fn edge_fleet_list(ef, status_filter) {
+    var nodes = load64(ef + 8);
+    var keys = map_keys(nodes);
+    var result = vec_new();
+    var i = 0;
+    while (i < vec_len(keys)) {
+        var node = map_get(nodes, vec_get(keys, i));
+        if (status_filter < 0) {
+            vec_push(result, node);
+        }
+        elif (edge_node_status(node) == status_filter) {
+            vec_push(result, node);
+        }
+        i = i + 1;
+    }
+    return result;
+}
 
 fn edge_fleet_stats(ef) {
     var nodes = load64(ef + 8);
@@ -1504,6 +2059,53 @@ fn msg_bus_publish(mb, msg) {
     return Ok(0);
 }
 
+fn msg_bus_send_to(mb, agent_id_cstr, msg) {
+    var queue = map_get(load64(mb), agent_id_cstr);
+    if (queue == 0) { return Err(ERR_AGENT_NOT_FOUND); }
+    vec_push(queue, msg);
+    return Ok(0);
+}
+
+fn msg_bus_send_to_name(mb, name_cstr, msg) {
+    var id = map_get(load64(mb + 8), name_cstr);
+    if (id == 0) { return Err(ERR_AGENT_NOT_FOUND); }
+    return msg_bus_send_to(mb, id, msg);
+}
+
+fn msg_bus_get_agent_id(mb, name_cstr) {
+    return map_get(load64(mb + 8), name_cstr);
+}
+
+# RpcRegistry: {methods: map<method_name_cstr, agent_id_cstr>}
+fn rpc_registry_new() {
+    var rr = alloc(8);
+    store64(rr, map_new());
+    return rr;
+}
+
+fn rpc_register_method(rr, method_cstr, agent_id_cstr) {
+    map_set(load64(rr), method_cstr, agent_id_cstr);
+}
+
+fn rpc_find_handler(rr, method_cstr) {
+    return map_get(load64(rr), method_cstr);
+}
+
+fn rpc_unregister_agent(rr, agent_id_cstr) {
+    var methods = load64(rr);
+    var keys = map_keys(methods);
+    var i = 0;
+    while (i < vec_len(keys)) {
+        var handler = map_get(methods, vec_get(keys, i));
+        if (handler == agent_id_cstr) { map_delete(methods, vec_get(keys, i)); }
+        i = i + 1;
+    }
+}
+
+fn rpc_list_methods(rr) {
+    return map_keys(load64(rr));
+}
+
 # =========================================================================
 # api — HTTP REST API (synchronous, port 8090)
 # =========================================================================
@@ -1521,6 +2123,8 @@ var _edge_fleet = 0;
 var _msg_bus = 0;
 var _rec_mgr = 0;
 var _cap_mgr = 0;
+var _rag_pipeline = 0;
+var _rpc_registry = 0;
 
 fn app_init() {
     _config = config_new();
@@ -1535,6 +2139,8 @@ fn app_init() {
     _msg_bus = msg_bus_new();
     _rec_mgr = rec_mgr_new();
     _cap_mgr = cap_mgr_new();
+    _rag_pipeline = rag_pipeline_new(rag_config_default());
+    _rpc_registry = rpc_registry_new();
 }
 
 # --- HTTP helpers ---
@@ -1836,25 +2442,531 @@ fn api_metrics(fd) {
 
 # --- Main HTTP router ---
 
+# --- Additional API handlers ---
+
+# GET /v1/agents/{id}
+fn api_get_agent(fd, id_cstr) {
+    var h = map_get(_agents, id_cstr);
+    if (h == 0) { http_error(fd, 404, str_from("agent not found")); return 0; }
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"id\":");
+    str_builder_add_int(sb, agent_id(h));
+    str_builder_add_cstr(sb, ",\"name\":\"");
+    str_builder_add(sb, agent_name(h));
+    str_builder_add_cstr(sb, "\",\"status\":");
+    str_builder_add_int(sb, agent_status(h));
+    str_builder_add_cstr(sb, ",\"pid\":");
+    str_builder_add_int(sb, agent_pid(h));
+    str_builder_add_cstr(sb, "}");
+    http_ok(fd, str_builder_build(sb));
+    return 0;
+}
+
+# POST /v1/mcp/tools — register external tool
+fn api_mcp_register(fd, body) {
+    if (body == 0) { http_bad_request(fd, str_from("missing body")); return 0; }
+    var pairs = json_parse(body);
+    var name = json_get(pairs, str_from("name"));
+    if (name == 0) { http_bad_request(fd, str_from("missing name")); return 0; }
+    var desc = json_get(pairs, str_from("description"));
+    if (desc == 0) { desc = str_from(""); }
+    var url = json_get(pairs, str_from("callback_url"));
+    if (url == 0) { url = str_from(""); }
+    var tool = mcp_tool_new(name, desc, str_from("{}"));
+    mcp_register_external(_mcp_registry, tool, url);
+    http_send_response(fd, 201, "{\"ok\":true}", 11);
+    return 0;
+}
+
+# DELETE /v1/mcp/tools/{name}
+fn api_mcp_deregister(fd, name_cstr) {
+    mcp_deregister(_mcp_registry, name_cstr);
+    http_ok(fd, str_from("{\"ok\":true}"));
+    return 0;
+}
+
+# POST /v1/mcp/call
+fn api_mcp_call(fd, body) {
+    if (body == 0) { http_bad_request(fd, str_from("missing body")); return 0; }
+    var pairs = json_parse(body);
+    var name = json_get(pairs, str_from("name"));
+    if (name == 0) { http_bad_request(fd, str_from("missing tool name")); return 0; }
+    var tool = mcp_find_tool(_mcp_registry, str_data(name));
+    if (tool == 0) { http_bad_request(fd, str_from("tool not found")); return 0; }
+    # No external forwarding in sync mode — return error
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"content\":[{\"type\":\"text/plain\",\"text\":\"tool dispatch not available in sync mode\"}],\"isError\":true}");
+    http_ok(fd, str_builder_build(sb));
+    return 0;
+}
+
+# POST /v1/rag/ingest
+fn api_rag_ingest(fd, body) {
+    if (body == 0) { http_bad_request(fd, str_from("missing body")); return 0; }
+    var pairs = json_parse(body);
+    var text = json_get(pairs, str_from("text"));
+    if (text == 0) { http_bad_request(fd, str_from("text cannot be empty")); return 0; }
+    if (str_len(text) == 0) { http_bad_request(fd, str_from("text cannot be empty")); return 0; }
+    var metadata = json_get(pairs, str_from("metadata"));
+    if (metadata == 0) { metadata = str_from("null"); }
+    var ids = rag_ingest_text(_rag_pipeline, text, metadata);
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"chunk_ids\":[");
+    var ri = 0;
+    while (ri < vec_len(ids)) {
+        if (ri > 0) { str_builder_add_cstr(sb, ","); }
+        str_builder_add_int(sb, vec_get(ids, ri));
+        ri = ri + 1;
+    }
+    str_builder_add_cstr(sb, "]}");
+    http_send_response(fd, 201, str_data(str_builder_build(sb)), str_len(str_builder_build(sb)));
+    return 0;
+}
+
+# POST /v1/rag/query
+fn api_rag_query(fd, body) {
+    if (body == 0) { http_bad_request(fd, str_from("missing body")); return 0; }
+    var pairs = json_parse(body);
+    var query = json_get(pairs, str_from("query"));
+    if (query == 0) { http_bad_request(fd, str_from("query cannot be empty")); return 0; }
+    if (str_len(query) == 0) { http_bad_request(fd, str_from("query cannot be empty")); return 0; }
+    var ctx = rag_query_text(_rag_pipeline, query);
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"formatted_context\":\"");
+    # Escape the context for JSON
+    var cd = str_data(ctx);
+    var cl = str_len(ctx);
+    var ci = 0;
+    while (ci < cl) {
+        var c = load8(cd + ci);
+        if (c == 34) { str_builder_add_cstr(sb, "\\\""); }
+        elif (c == 10) { str_builder_add_cstr(sb, "\\n"); }
+        elif (c == 13) { str_builder_add_cstr(sb, "\\r"); }
+        elif (c == 92) { str_builder_add_cstr(sb, "\\\\"); }
+        else {
+            var cbuf[1];
+            store8(&cbuf, c);
+            str_builder_add(sb, str_new(&cbuf, 1));
+        }
+        ci = ci + 1;
+    }
+    str_builder_add_cstr(sb, "\"}");
+    http_ok(fd, str_builder_build(sb));
+    return 0;
+}
+
+# POST /v1/edge/nodes — register edge node
+fn api_edge_register(fd, body) {
+    if (body == 0) { http_bad_request(fd, str_from("missing body")); return 0; }
+    var pairs = json_parse(body);
+    var name = json_get(pairs, str_from("name"));
+    if (name == 0) { http_error(fd, 422, str_from("name required")); return 0; }
+    if (str_len(name) == 0) { http_error(fd, 422, str_from("name cannot be empty")); return 0; }
+    var node = edge_node_new(name, str_from("x86_64"), 4, 4096);
+    var result = edge_fleet_register(_edge_fleet, node);
+    if (is_err_result(result) == 1) {
+        http_bad_request(fd, str_from("registration failed (duplicate or full)"));
+        return 0;
+    }
+    var id = payload(result);
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"id\":\"");
+    str_builder_add(sb, id);
+    str_builder_add_cstr(sb, "\"}");
+    http_send_response(fd, 201, str_data(str_builder_build(sb)), str_len(str_builder_build(sb)));
+    return 0;
+}
+
+# GET /v1/edge/nodes — list nodes
+fn api_edge_list(fd, buf, buf_len) {
+    var status_filter = 0 - 1;  # -1 = all
+    var qp = http_parse_query_param(buf, buf_len, "status");
+    if (qp != 0) {
+        if (streq(qp, "online") == 1) { status_filter = EDGE_ONLINE; }
+        elif (streq(qp, "suspect") == 1) { status_filter = EDGE_SUSPECT; }
+        elif (streq(qp, "offline") == 1) { status_filter = EDGE_OFFLINE; }
+        elif (streq(qp, "updating") == 1) { status_filter = EDGE_UPDATING; }
+        elif (streq(qp, "decommissioned") == 1) { status_filter = EDGE_DECOMMISSIONED; }
+    }
+    var nodes = edge_fleet_list(_edge_fleet, status_filter);
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"nodes\":[");
+    var ni = 0;
+    while (ni < vec_len(nodes)) {
+        if (ni > 0) { str_builder_add_cstr(sb, ","); }
+        var n = vec_get(nodes, ni);
+        str_builder_add_cstr(sb, "{\"id\":\"");
+        str_builder_add(sb, edge_node_id(n));
+        str_builder_add_cstr(sb, "\",\"name\":\"");
+        str_builder_add(sb, load64(n + 8));
+        str_builder_add_cstr(sb, "\",\"status\":");
+        str_builder_add_int(sb, edge_node_status(n));
+        str_builder_add_cstr(sb, "}");
+        ni = ni + 1;
+    }
+    str_builder_add_cstr(sb, "]}");
+    http_ok(fd, str_builder_build(sb));
+    return 0;
+}
+
+# GET /v1/edge/nodes/{id}
+fn api_edge_get(fd, id_cstr) {
+    var n = edge_fleet_get(_edge_fleet, id_cstr);
+    if (n == 0) { http_error(fd, 404, str_from("edge node not found")); return 0; }
+    var status_names[5];
+    store64(&status_names, "Online");
+    store64(&status_names + 8, "Suspect");
+    store64(&status_names + 16, "Offline");
+    store64(&status_names + 24, "Updating");
+    store64(&status_names + 32, "Decommissioned");
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"id\":\"");
+    str_builder_add(sb, edge_node_id(n));
+    str_builder_add_cstr(sb, "\",\"name\":\"");
+    str_builder_add(sb, load64(n + 8));
+    str_builder_add_cstr(sb, "\",\"status\":\"");
+    str_builder_add_cstr(sb, load64(&status_names + edge_node_status(n) * 8));
+    str_builder_add_cstr(sb, "\",\"active_tasks\":");
+    str_builder_add_int(sb, edge_node_active_tasks(n));
+    str_builder_add_cstr(sb, "}");
+    http_ok(fd, str_builder_build(sb));
+    return 0;
+}
+
+# POST /v1/edge/nodes/{id}/heartbeat
+fn api_edge_heartbeat(fd, id_cstr, body) {
+    var active = 0;
+    var completed = 0;
+    if (body != 0) {
+        var pairs = json_parse(body);
+        active = json_get_int(pairs, str_from("active_tasks"));
+        completed = json_get_int(pairs, str_from("tasks_completed"));
+    }
+    var result = edge_fleet_heartbeat(_edge_fleet, id_cstr, active, completed);
+    if (is_err_result(result) == 1) {
+        http_error(fd, 404, str_from("node not found"));
+        return 0;
+    }
+    http_ok(fd, str_from("{\"ok\":true}"));
+    return 0;
+}
+
+# POST /v1/edge/nodes/{id}/decommission
+fn api_edge_decommission(fd, id_cstr) {
+    var result = edge_fleet_decommission(_edge_fleet, id_cstr);
+    if (is_err_result(result) == 1) {
+        http_error(fd, 404, str_from("node not found"));
+        return 0;
+    }
+    http_ok(fd, str_from("{\"ok\":true}"));
+    return 0;
+}
+
+# POST /v1/scheduler/tasks — submit task
+fn api_sched_submit(fd, body) {
+    if (body == 0) { http_bad_request(fd, str_from("missing body")); return 0; }
+    var pairs = json_parse(body);
+    var name = json_get(pairs, str_from("name"));
+    if (name == 0) { http_bad_request(fd, str_from("task name required")); return 0; }
+    if (str_len(name) == 0) { http_bad_request(fd, str_from("task name cannot be empty")); return 0; }
+    var agent_id = json_get(pairs, str_from("agent_id"));
+    if (agent_id == 0) { agent_id = str_from("unknown"); }
+    var desc = json_get(pairs, str_from("description"));
+    if (desc == 0) { desc = str_from(""); }
+    var priority = json_get_int(pairs, str_from("priority"));
+    if (priority == 0) { priority = 5; }
+    var task = sched_task_new(name, desc, agent_id, priority);
+    var result = scheduler_submit(_scheduler, task);
+    var tid = payload(result);
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"task_id\":\"");
+    str_builder_add(sb, tid);
+    str_builder_add_cstr(sb, "\"}");
+    http_send_response(fd, 201, str_data(str_builder_build(sb)), str_len(str_builder_build(sb)));
+    return 0;
+}
+
+# GET /v1/scheduler/tasks
+fn api_sched_list(fd) {
+    var st = scheduler_stats(_scheduler);
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"stats\":{\"total_tasks\":");
+    str_builder_add_int(sb, load64(st));
+    str_builder_add_cstr(sb, ",\"queued\":");
+    str_builder_add_int(sb, load64(st + 8));
+    str_builder_add_cstr(sb, ",\"running\":");
+    str_builder_add_int(sb, load64(st + 16));
+    str_builder_add_cstr(sb, ",\"completed\":");
+    str_builder_add_int(sb, load64(st + 24));
+    str_builder_add_cstr(sb, ",\"failed\":");
+    str_builder_add_int(sb, load64(st + 32));
+    str_builder_add_cstr(sb, "}}");
+    http_ok(fd, str_builder_build(sb));
+    return 0;
+}
+
+# GET /v1/scheduler/tasks/{id}
+fn api_sched_get_task(fd, id_cstr) {
+    var task = scheduler_get(_scheduler, id_cstr);
+    if (task == 0) { http_error(fd, 404, str_from("task not found")); return 0; }
+    var status_names[7];
+    store64(&status_names, "Queued");
+    store64(&status_names + 8, "Scheduled");
+    store64(&status_names + 16, "Running");
+    store64(&status_names + 24, "Completed");
+    store64(&status_names + 32, "Failed");
+    store64(&status_names + 40, "Cancelled");
+    store64(&status_names + 48, "Preempted");
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"task_id\":\"");
+    str_builder_add(sb, sched_task_id(task));
+    str_builder_add_cstr(sb, "\",\"name\":\"");
+    str_builder_add(sb, sched_task_name(task));
+    str_builder_add_cstr(sb, "\",\"priority\":");
+    str_builder_add_int(sb, sched_task_priority(task));
+    str_builder_add_cstr(sb, ",\"status\":\"");
+    str_builder_add_cstr(sb, load64(&status_names + sched_task_status(task) * 8));
+    str_builder_add_cstr(sb, "\"}");
+    http_ok(fd, str_builder_build(sb));
+    return 0;
+}
+
+# POST /v1/scheduler/tasks/{id}/cancel
+fn api_sched_cancel(fd, id_cstr) {
+    var result = scheduler_cancel(_scheduler, id_cstr);
+    if (is_err_result(result) == 1) {
+        http_error(fd, 404, str_from("task not found or invalid state"));
+        return 0;
+    }
+    http_ok(fd, str_from("{\"ok\":true}"));
+    return 0;
+}
+
+# POST /v1/scheduler/nodes — register scheduler node
+fn api_sched_register_node(fd, body) {
+    if (body == 0) { http_bad_request(fd, str_from("missing body")); return 0; }
+    var pairs = json_parse(body);
+    var node_id = json_get(pairs, str_from("node_id"));
+    if (node_id == 0) { http_bad_request(fd, str_from("node_id required")); return 0; }
+    if (str_len(node_id) == 0) { http_bad_request(fd, str_from("node_id cannot be empty")); return 0; }
+    var total_cpu = json_get_int(pairs, str_from("total_cpu"));
+    if (total_cpu <= 0) { http_bad_request(fd, str_from("total_cpu must be positive")); return 0; }
+    var total_mem = json_get_int(pairs, str_from("total_memory_mb"));
+    if (total_mem <= 0) { http_bad_request(fd, str_from("total_memory_mb must be positive")); return 0; }
+    var total_disk = json_get_int(pairs, str_from("total_disk_mb"));
+    if (total_disk == 0) { total_disk = 102400; }
+    var gpu = json_get_int(pairs, str_from("gpu_available"));
+    var nc = node_cap_new(node_id, total_cpu, total_mem, total_disk, gpu);
+    scheduler_register_node(_scheduler, nc);
+    http_send_response(fd, 201, "{\"ok\":true}", 11);
+    return 0;
+}
+
+# POST /v1/scheduler/schedule — trigger scheduling
+fn api_sched_schedule(fd) {
+    var decisions = scheduler_schedule_pending(_scheduler);
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"decisions\":[");
+    var di = 0;
+    while (di < vec_len(decisions)) {
+        if (di > 0) { str_builder_add_cstr(sb, ","); }
+        str_builder_add(sb, vec_get(decisions, di));
+        di = di + 1;
+    }
+    str_builder_add_cstr(sb, "]}");
+    http_ok(fd, str_builder_build(sb));
+    return 0;
+}
+
+# GET /v1/scheduler/stats
+fn api_sched_stats(fd) {
+    var st = scheduler_stats(_scheduler);
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"total_tasks\":");
+    str_builder_add_int(sb, load64(st));
+    str_builder_add_cstr(sb, ",\"queued\":");
+    str_builder_add_int(sb, load64(st + 8));
+    str_builder_add_cstr(sb, ",\"running\":");
+    str_builder_add_int(sb, load64(st + 16));
+    str_builder_add_cstr(sb, ",\"completed\":");
+    str_builder_add_int(sb, load64(st + 24));
+    str_builder_add_cstr(sb, ",\"failed\":");
+    str_builder_add_int(sb, load64(st + 32));
+    str_builder_add_cstr(sb, "}");
+    http_ok(fd, str_builder_build(sb));
+    return 0;
+}
+
+# --- Path segment extractor (for /v1/edge/nodes/{id}) ---
+fn http_path_segment(path, n) {
+    var pi = 0;
+    var seg = 0;
+    var seg_start = 0;
+    while (load8(path + pi) != 0) {
+        if (load8(path + pi) == 47) {  # /
+            seg = seg + 1;
+            seg_start = pi + 1;
+        }
+        pi = pi + 1;
+    }
+    if (seg < n) { return 0; }
+    # Return pointer to the nth segment
+    var ci = 0;
+    var current_seg = 0;
+    while (load8(path + ci) != 0) {
+        if (load8(path + ci) == 47) {
+            current_seg = current_seg + 1;
+            if (current_seg == n) {
+                var start = ci + 1;
+                var end = start;
+                while (load8(path + end) != 0) {
+                    if (load8(path + end) == 47) { break; }
+                    end = end + 1;
+                }
+                var slen = end - start;
+                var sbuf = alloc(slen + 1);
+                memcpy(sbuf, path + start, slen);
+                store8(sbuf + slen, 0);
+                return sbuf;
+            }
+        }
+        ci = ci + 1;
+    }
+    return 0;
+}
+
+# --- Main HTTP router ---
+
 fn http_route(fd, method, path, buf, buf_len) {
     # GET /v1/health
     if (streq(path, "/v1/health") == 1) { api_health(fd); return 0; }
 
-    # GET /v1/agents
+    # /v1/agents
     if (streq(path, "/v1/agents") == 1) {
         if (method == 0) { api_list_agents(fd); return 0; }
         if (method == 1) {
-            var body = http_parse_body(buf, buf_len);
-            api_register_agent(fd, body);
+            api_register_agent(fd, http_parse_body(buf, buf_len));
             return 0;
         }
     }
 
-    # GET /v1/mcp/manifest
+    # /v1/agents/{id}
+    if (memeq(path, "/v1/agents/", 11) == 1) {
+        api_get_agent(fd, path + 11);
+        return 0;
+    }
+
+    # /v1/mcp/tools
+    if (streq(path, "/v1/mcp/tools") == 1) {
+        if (method == 0) { api_mcp_manifest(fd); return 0; }
+        if (method == 1) { api_mcp_register(fd, http_parse_body(buf, buf_len)); return 0; }
+    }
     if (streq(path, "/v1/mcp/manifest") == 1) { api_mcp_manifest(fd); return 0; }
+
+    # DELETE /v1/mcp/tools/{name}
+    if (memeq(path, "/v1/mcp/tools/", 14) == 1) {
+        if (method == 3) { api_mcp_deregister(fd, path + 14); return 0; }
+    }
+
+    # POST /v1/mcp/call
+    if (streq(path, "/v1/mcp/call") == 1) {
+        api_mcp_call(fd, http_parse_body(buf, buf_len));
+        return 0;
+    }
+
+    # POST /v1/rag/ingest
+    if (streq(path, "/v1/rag/ingest") == 1) {
+        api_rag_ingest(fd, http_parse_body(buf, buf_len));
+        return 0;
+    }
+
+    # POST /v1/rag/query
+    if (streq(path, "/v1/rag/query") == 1) {
+        api_rag_query(fd, http_parse_body(buf, buf_len));
+        return 0;
+    }
+
+    # /v1/edge/nodes
+    if (streq(path, "/v1/edge/nodes") == 1) {
+        if (method == 0) { api_edge_list(fd, buf, buf_len); return 0; }
+        if (method == 1) { api_edge_register(fd, http_parse_body(buf, buf_len)); return 0; }
+    }
 
     # GET /v1/edge/stats
     if (streq(path, "/v1/edge/stats") == 1) { api_edge_stats(fd); return 0; }
+
+    # /v1/edge/nodes/{id}/heartbeat
+    if (memeq(path, "/v1/edge/nodes/", 15) == 1) {
+        var sub = path + 15;
+        # Check for /heartbeat suffix
+        var sublen = strlen(sub);
+        if (sublen > 10) {
+            if (memeq(sub + sublen - 10, "/heartbeat", 10) == 1) {
+                var id_len = sublen - 10;
+                var id_buf = alloc(id_len + 1);
+                memcpy(id_buf, sub, id_len);
+                store8(id_buf + id_len, 0);
+                api_edge_heartbeat(fd, id_buf, http_parse_body(buf, buf_len));
+                return 0;
+            }
+        }
+        # Check for /decommission suffix
+        if (sublen > 14) {
+            if (memeq(sub + sublen - 14, "/decommission", 13) == 1) {
+                var id_len = sublen - 14;
+                var id_buf = alloc(id_len + 1);
+                memcpy(id_buf, sub, id_len);
+                store8(id_buf + id_len, 0);
+                api_edge_decommission(fd, id_buf);
+                return 0;
+            }
+        }
+        # Plain /v1/edge/nodes/{id}
+        api_edge_get(fd, sub);
+        return 0;
+    }
+
+    # /v1/scheduler/tasks
+    if (streq(path, "/v1/scheduler/tasks") == 1) {
+        if (method == 0) { api_sched_list(fd); return 0; }
+        if (method == 1) { api_sched_submit(fd, http_parse_body(buf, buf_len)); return 0; }
+    }
+
+    # POST /v1/scheduler/nodes
+    if (streq(path, "/v1/scheduler/nodes") == 1) {
+        api_sched_register_node(fd, http_parse_body(buf, buf_len));
+        return 0;
+    }
+
+    # POST /v1/scheduler/schedule
+    if (streq(path, "/v1/scheduler/schedule") == 1) {
+        api_sched_schedule(fd);
+        return 0;
+    }
+
+    # GET /v1/scheduler/stats
+    if (streq(path, "/v1/scheduler/stats") == 1) {
+        api_sched_stats(fd);
+        return 0;
+    }
+
+    # /v1/scheduler/tasks/{id} or /v1/scheduler/tasks/{id}/cancel
+    if (memeq(path, "/v1/scheduler/tasks/", 20) == 1) {
+        var sub = path + 20;
+        var sublen = strlen(sub);
+        if (sublen > 7) {
+            if (memeq(sub + sublen - 7, "/cancel", 7) == 1) {
+                var id_len = sublen - 7;
+                var id_buf = alloc(id_len + 1);
+                memcpy(id_buf, sub, id_len);
+                store8(id_buf + id_len, 0);
+                api_sched_cancel(fd, id_buf);
+                return 0;
+            }
+        }
+        api_sched_get_task(fd, sub);
+        return 0;
+    }
 
     # GET /v1/metrics
     if (streq(path, "/v1/metrics") == 1) { api_metrics(fd); return 0; }

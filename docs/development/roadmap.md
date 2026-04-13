@@ -21,12 +21,12 @@
 
 ## Backlog
 
-- [ ] Port Rust integration tests to Cyrius test suite
-- [ ] Port Rust benchmarks to Cyrius bench suite
-- [ ] Cron scheduler (CronScheduler from scheduler.rs)
-- [ ] Firewall MCP tools (nein integration)
-- [ ] JSON body parsing for all POST endpoints (agent name, MCP registration)
-- [ ] Additional API endpoints: agent details, agent control, RAG ingest/query, scheduler submit
+- [ ] CronScheduler — cron-like recurring task triggers (port from scheduler.rs)
+- [ ] Firewall MCP tools — nein integration (feature-gated in Rust)
+- [ ] FederatedVectorStore — distributed vector search across nodes
+- [ ] Unix domain socket IPC — actual socket server for AgentIpc (currently message bus only)
+- [ ] Agent name parsing from JSON body (json_get key matching)
+- [ ] HTTP API integration tests (in-process, no network)
 
 ## Future
 
