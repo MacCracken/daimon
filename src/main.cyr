@@ -66,6 +66,28 @@ fn error_to_status(err) {
 }
 
 # Format an error as JSON response body
+# JSON key lookup using cstr comparison (avoids str_eq Str layout issues)
+fn jget(pairs, key_cstr) {
+    if (pairs == 0) { return 0; }
+    var len = vec_len(pairs);
+    var gi = 0;
+    while (gi < len) {
+        var p = vec_get(pairs, gi);
+        var k = load64(p);  # key Str
+        if (str_eq_cstr(k, key_cstr) == 1) {
+            return load64(p + 8);  # value Str
+        }
+        gi = gi + 1;
+    }
+    return 0;
+}
+
+fn jget_int(pairs, key_cstr) {
+    var v = jget(pairs, key_cstr);
+    if (v == 0) { return 0; }
+    return str_to_int(v);
+}
+
 fn error_json(code, msg) {
     var sb = str_builder_new();
     str_builder_add_cstr(sb, "{\"error\":\"");
@@ -1113,16 +1135,15 @@ fn mcp_registry_new() {
 
 fn mcp_register_builtin(reg, tool) {
     var name = mcp_tool_name(tool);
-    map_set(load64(reg), str_data(name), tool);
+    map_set(load64(reg), str_cstr(name), tool);
 }
 
 fn mcp_register_external(reg, tool, callback_url) {
     var name = mcp_tool_name(tool);
-    # Store tool + callback_url together: 16 bytes
     var ext = alloc(16);
     store64(ext, tool);
     store64(ext + 8, callback_url);
-    map_set(load64(reg + 8), str_data(name), ext);
+    map_set(load64(reg + 8), str_cstr(name), ext);
 }
 
 fn mcp_tool_count(reg) {
@@ -1579,6 +1600,81 @@ fn scheduler_stats(ts) {
     return st;
 }
 
+# CronEntry: {name: Str, interval_secs, specific_hour, specific_minute,
+#              task_name: Str, task_agent_id: Str, task_priority,
+#              enabled, last_fired}
+# 9 fields x 8 = 72 bytes
+
+fn cron_entry_new(name, interval_secs, task_name, task_agent_id, task_priority) {
+    var ce = alloc(72);
+    store64(ce, name);
+    store64(ce + 8, interval_secs);
+    store64(ce + 16, 0 - 1);          # specific_hour (-1 = any)
+    store64(ce + 24, 0 - 1);          # specific_minute (-1 = any)
+    store64(ce + 32, task_name);
+    store64(ce + 40, task_agent_id);
+    store64(ce + 48, task_priority);
+    store64(ce + 56, 1);              # enabled
+    store64(ce + 64, 0);              # last_fired
+    return ce;
+}
+
+fn cron_entry_name(ce) { return load64(ce); }
+fn cron_entry_enabled(ce) { return load64(ce + 56); }
+fn cron_entry_set_enabled(ce, e) { store64(ce + 56, e); }
+
+# CronScheduler: {entries: map<name_cstr, CronEntry>}
+fn cron_scheduler_new() {
+    var cs = alloc(8);
+    store64(cs, map_new());
+    return cs;
+}
+
+fn cron_add_entry(cs, entry) {
+    var name = cron_entry_name(entry);
+    if (str_len(name) == 0) { return Err(ERR_SCHEDULER); }
+    # Validate hour/minute if specified
+    var hour = load64(entry + 16);
+    if (hour >= 0) {
+        if (hour > 23) { return Err(ERR_SCHEDULER); }
+    }
+    var minute = load64(entry + 24);
+    if (minute >= 0) {
+        if (minute > 59) { return Err(ERR_SCHEDULER); }
+    }
+    map_set(load64(cs), str_data(name), entry);
+    return Ok(0);
+}
+
+fn cron_remove_entry(cs, name_cstr) {
+    return map_delete(load64(cs), name_cstr);
+}
+
+# Check which entries should fire now, return vec of task templates
+fn cron_check_fires(cs) {
+    var entries = load64(cs);
+    var keys = map_keys(entries);
+    var now = clock_epoch_secs();
+    var fired = vec_new();
+    var i = 0;
+    while (i < vec_len(keys)) {
+        var entry = map_get(entries, vec_get(keys, i));
+        if (load64(entry + 56) == 0) { i = i + 1; continue; }  # disabled
+        var last = load64(entry + 64);
+        var interval = load64(entry + 8);
+        if (interval > 0) {
+            if (now - last >= interval) {
+                store64(entry + 64, now);  # update last_fired
+                vec_push(fired, entry);
+            }
+        }
+        i = i + 1;
+    }
+    return fired;
+}
+
+fn cron_entry_count(cs) { return map_count(load64(cs)); }
+
 # =========================================================================
 # federation — multi-node clustering (types + placement scoring)
 # =========================================================================
@@ -1864,7 +1960,7 @@ fn edge_fleet_register(ef, node) {
         di = di + 1;
     }
 
-    map_set(nodes, str_data(edge_node_id(node)), node);
+    map_set(nodes, str_cstr(edge_node_id(node)), node);
     return Ok(edge_node_id(node));
 }
 
@@ -2346,7 +2442,7 @@ fn api_register_agent(fd, body) {
     }
     # Parse name from JSON body
     var pairs = json_parse(body);
-    var name = json_get(pairs, "name");
+    var name = jget(pairs, "name");
     if (name == 0) { name = str_from("unnamed"); }
 
     var id = agent_next_id();
@@ -2466,11 +2562,11 @@ fn api_get_agent(fd, id_cstr) {
 fn api_mcp_register(fd, body) {
     if (body == 0) { http_bad_request(fd, str_from("missing body")); return 0; }
     var pairs = json_parse(body);
-    var name = json_get(pairs, str_from("name"));
+    var name = jget(pairs, "name");
     if (name == 0) { http_bad_request(fd, str_from("missing name")); return 0; }
-    var desc = json_get(pairs, str_from("description"));
+    var desc = jget(pairs, "description");
     if (desc == 0) { desc = str_from(""); }
-    var url = json_get(pairs, str_from("callback_url"));
+    var url = jget(pairs, "callback_url");
     if (url == 0) { url = str_from(""); }
     var tool = mcp_tool_new(name, desc, str_from("{}"));
     mcp_register_external(_mcp_registry, tool, url);
@@ -2489,9 +2585,9 @@ fn api_mcp_deregister(fd, name_cstr) {
 fn api_mcp_call(fd, body) {
     if (body == 0) { http_bad_request(fd, str_from("missing body")); return 0; }
     var pairs = json_parse(body);
-    var name = json_get(pairs, str_from("name"));
+    var name = jget(pairs, "name");
     if (name == 0) { http_bad_request(fd, str_from("missing tool name")); return 0; }
-    var tool = mcp_find_tool(_mcp_registry, str_data(name));
+    var tool = mcp_find_tool(_mcp_registry, str_cstr(name));
     if (tool == 0) { http_bad_request(fd, str_from("tool not found")); return 0; }
     # No external forwarding in sync mode — return error
     var sb = str_builder_new();
@@ -2504,10 +2600,10 @@ fn api_mcp_call(fd, body) {
 fn api_rag_ingest(fd, body) {
     if (body == 0) { http_bad_request(fd, str_from("missing body")); return 0; }
     var pairs = json_parse(body);
-    var text = json_get(pairs, str_from("text"));
+    var text = jget(pairs, "text");
     if (text == 0) { http_bad_request(fd, str_from("text cannot be empty")); return 0; }
     if (str_len(text) == 0) { http_bad_request(fd, str_from("text cannot be empty")); return 0; }
-    var metadata = json_get(pairs, str_from("metadata"));
+    var metadata = jget(pairs, "metadata");
     if (metadata == 0) { metadata = str_from("null"); }
     var ids = rag_ingest_text(_rag_pipeline, text, metadata);
     var sb = str_builder_new();
@@ -2527,7 +2623,7 @@ fn api_rag_ingest(fd, body) {
 fn api_rag_query(fd, body) {
     if (body == 0) { http_bad_request(fd, str_from("missing body")); return 0; }
     var pairs = json_parse(body);
-    var query = json_get(pairs, str_from("query"));
+    var query = jget(pairs, "query");
     if (query == 0) { http_bad_request(fd, str_from("query cannot be empty")); return 0; }
     if (str_len(query) == 0) { http_bad_request(fd, str_from("query cannot be empty")); return 0; }
     var ctx = rag_query_text(_rag_pipeline, query);
@@ -2559,7 +2655,7 @@ fn api_rag_query(fd, body) {
 fn api_edge_register(fd, body) {
     if (body == 0) { http_bad_request(fd, str_from("missing body")); return 0; }
     var pairs = json_parse(body);
-    var name = json_get(pairs, str_from("name"));
+    var name = jget(pairs, "name");
     if (name == 0) { http_error(fd, 422, str_from("name required")); return 0; }
     if (str_len(name) == 0) { http_error(fd, 422, str_from("name cannot be empty")); return 0; }
     var node = edge_node_new(name, str_from("x86_64"), 4, 4096);
@@ -2639,8 +2735,8 @@ fn api_edge_heartbeat(fd, id_cstr, body) {
     var completed = 0;
     if (body != 0) {
         var pairs = json_parse(body);
-        active = json_get_int(pairs, str_from("active_tasks"));
-        completed = json_get_int(pairs, str_from("tasks_completed"));
+        active = jget_int(pairs, "active_tasks");
+        completed = jget_int(pairs, "tasks_completed");
     }
     var result = edge_fleet_heartbeat(_edge_fleet, id_cstr, active, completed);
     if (is_err_result(result) == 1) {
@@ -2666,14 +2762,14 @@ fn api_edge_decommission(fd, id_cstr) {
 fn api_sched_submit(fd, body) {
     if (body == 0) { http_bad_request(fd, str_from("missing body")); return 0; }
     var pairs = json_parse(body);
-    var name = json_get(pairs, str_from("name"));
+    var name = jget(pairs, "name");
     if (name == 0) { http_bad_request(fd, str_from("task name required")); return 0; }
     if (str_len(name) == 0) { http_bad_request(fd, str_from("task name cannot be empty")); return 0; }
-    var agent_id = json_get(pairs, str_from("agent_id"));
+    var agent_id = jget(pairs, "agent_id");
     if (agent_id == 0) { agent_id = str_from("unknown"); }
-    var desc = json_get(pairs, str_from("description"));
+    var desc = jget(pairs, "description");
     if (desc == 0) { desc = str_from(""); }
-    var priority = json_get_int(pairs, str_from("priority"));
+    var priority = jget_int(pairs, "priority");
     if (priority == 0) { priority = 5; }
     var task = sched_task_new(name, desc, agent_id, priority);
     var result = scheduler_submit(_scheduler, task);
@@ -2746,16 +2842,16 @@ fn api_sched_cancel(fd, id_cstr) {
 fn api_sched_register_node(fd, body) {
     if (body == 0) { http_bad_request(fd, str_from("missing body")); return 0; }
     var pairs = json_parse(body);
-    var node_id = json_get(pairs, str_from("node_id"));
+    var node_id = jget(pairs, "node_id");
     if (node_id == 0) { http_bad_request(fd, str_from("node_id required")); return 0; }
     if (str_len(node_id) == 0) { http_bad_request(fd, str_from("node_id cannot be empty")); return 0; }
-    var total_cpu = json_get_int(pairs, str_from("total_cpu"));
+    var total_cpu = jget_int(pairs, "total_cpu");
     if (total_cpu <= 0) { http_bad_request(fd, str_from("total_cpu must be positive")); return 0; }
-    var total_mem = json_get_int(pairs, str_from("total_memory_mb"));
+    var total_mem = jget_int(pairs, "total_memory_mb");
     if (total_mem <= 0) { http_bad_request(fd, str_from("total_memory_mb must be positive")); return 0; }
-    var total_disk = json_get_int(pairs, str_from("total_disk_mb"));
+    var total_disk = jget_int(pairs, "total_disk_mb");
     if (total_disk == 0) { total_disk = 102400; }
-    var gpu = json_get_int(pairs, str_from("gpu_available"));
+    var gpu = jget_int(pairs, "gpu_available");
     var nc = node_cap_new(node_id, total_cpu, total_mem, total_disk, gpu);
     scheduler_register_node(_scheduler, nc);
     http_send_response(fd, 201, "{\"ok\":true}", 11);
@@ -2910,14 +3006,14 @@ fn http_route(fd, method, path, buf, buf_len) {
                 return 0;
             }
         }
-        # Check for /decommission suffix
-        if (sublen > 14) {
-            if (memeq(sub + sublen - 14, "/decommission", 13) == 1) {
-                var id_len = sublen - 14;
-                var id_buf = alloc(id_len + 1);
-                memcpy(id_buf, sub, id_len);
-                store8(id_buf + id_len, 0);
-                api_edge_decommission(fd, id_buf);
+        # Check for /decommission suffix (13 chars)
+        if (sublen > 13) {
+            if (memeq(sub + sublen - 13, "/decommission", 13) == 1) {
+                var dc_len = sublen - 13;
+                var dc_buf = alloc(dc_len + 1);
+                memcpy(dc_buf, sub, dc_len);
+                store8(dc_buf + dc_len, 0);
+                api_edge_decommission(fd, dc_buf);
                 return 0;
             }
         }
@@ -2956,11 +3052,11 @@ fn http_route(fd, method, path, buf, buf_len) {
         var sublen = strlen(sub);
         if (sublen > 7) {
             if (memeq(sub + sublen - 7, "/cancel", 7) == 1) {
-                var id_len = sublen - 7;
-                var id_buf = alloc(id_len + 1);
-                memcpy(id_buf, sub, id_len);
-                store8(id_buf + id_len, 0);
-                api_sched_cancel(fd, id_buf);
+                var cn_len = sublen - 7;
+                var cn_buf = alloc(cn_len + 1);
+                memcpy(cn_buf, sub, cn_len);
+                store8(cn_buf + cn_len, 0);
+                api_sched_cancel(fd, cn_buf);
                 return 0;
             }
         }

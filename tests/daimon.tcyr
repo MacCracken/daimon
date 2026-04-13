@@ -499,6 +499,541 @@ fn recording_stop(s) {
 # Tests
 # ================================================================
 
+# --- jget (cstr-based JSON lookup) ---
+
+fn jget(pairs, key_cstr) {
+    if (pairs == 0) { return 0; }
+    var len = vec_len(pairs);
+    var gi = 0;
+    while (gi < len) {
+        var p = vec_get(pairs, gi);
+        var k = load64(p);
+        if (str_eq_cstr(k, key_cstr) == 1) { return load64(p + 8); }
+        gi = gi + 1;
+    }
+    return 0;
+}
+
+fn jget_int(pairs, key_cstr) {
+    var v = jget(pairs, key_cstr);
+    if (v == 0) { return 0; }
+    return str_to_int(v);
+}
+
+# --- node capacity ---
+
+fn node_cap_new(node_id, total_cpu, total_mem, total_disk, gpu) {
+    var nc = alloc(88);
+    store64(nc, node_id);
+    store64(nc + 8, total_cpu);
+    store64(nc + 16, total_cpu);
+    store64(nc + 24, total_mem);
+    store64(nc + 32, total_mem);
+    store64(nc + 40, total_disk);
+    store64(nc + 48, total_disk);
+    store64(nc + 56, gpu);
+    store64(nc + 64, 0);
+    store64(nc + 72, 0);
+    store64(nc + 80, 0);
+    return nc;
+}
+
+fn node_cap_id(nc) { return load64(nc); }
+fn node_cap_avail_cpu(nc) { return load64(nc + 16); }
+fn node_cap_avail_mem(nc) { return load64(nc + 32); }
+
+fn node_cap_can_fit(nc, cpu, mem, disk) {
+    if (load64(nc + 16) < cpu) { return 0; }
+    if (load64(nc + 32) < mem) { return 0; }
+    if (load64(nc + 48) < disk) { return 0; }
+    return 1;
+}
+
+fn node_cap_utilization(nc) {
+    var total_cpu = load64(nc + 8);
+    var total_mem = load64(nc + 24);
+    if (total_cpu == 0) { if (total_mem == 0) { return 0; } }
+    var cpu_util = 0;
+    if (total_cpu > 0) { cpu_util = 100 - (load64(nc + 16) * 100 / total_cpu); }
+    var mem_util = 0;
+    if (total_mem > 0) { mem_util = 100 - (load64(nc + 32) * 100 / total_mem); }
+    return (cpu_util + mem_util) / 2;
+}
+
+fn node_cap_reserve(nc, cpu, mem, disk) {
+    var ac = load64(nc + 16) - cpu;
+    if (ac < 0) { ac = 0; }
+    store64(nc + 16, ac);
+    var am = load64(nc + 32) - mem;
+    if (am < 0) { am = 0; }
+    store64(nc + 32, am);
+    store64(nc + 80, load64(nc + 80) + 1);
+}
+
+fn node_cap_release(nc, cpu, mem, disk) {
+    var ac = load64(nc + 16) + cpu;
+    if (ac > load64(nc + 8)) { ac = load64(nc + 8); }
+    store64(nc + 16, ac);
+    var am = load64(nc + 32) + mem;
+    if (am > load64(nc + 24)) { am = load64(nc + 24); }
+    store64(nc + 32, am);
+}
+
+# --- scheduler task accessors ---
+
+fn sched_task_new(name, desc, agent_id, priority) {
+    var t = alloc(72);
+    var tid = str_from_int(agent_next_id());
+    store64(t, tid);
+    store64(t + 8, name);
+    store64(t + 16, desc);
+    store64(t + 24, agent_id);
+    if (priority < 1) { priority = 1; }
+    if (priority > 10) { priority = 10; }
+    store64(t + 32, priority);
+    store64(t + 40, TASK_QUEUED);
+    store64(t + 48, clock_epoch_secs());
+    store64(t + 56, 1);
+    store64(t + 64, 256);
+    return t;
+}
+
+fn sched_task_id(t) { return load64(t); }
+fn sched_task_name(t) { return load64(t + 8); }
+fn sched_task_priority(t) { return load64(t + 32); }
+fn sched_task_status(t) { return load64(t + 40); }
+fn sched_task_set_status(t, s) { store64(t + 40, s); }
+
+# --- scheduler (extended) ---
+
+fn task_scheduler_new() {
+    var ts = alloc(16);
+    store64(ts, map_new());
+    store64(ts + 8, map_new());
+    return ts;
+}
+
+fn scheduler_register_node(ts, nc) {
+    map_set(load64(ts + 8), str_cstr(node_cap_id(nc)), nc);
+}
+
+fn scheduler_submit(ts, task) {
+    var id = sched_task_id(task);
+    map_set(load64(ts), str_cstr(id), task);
+    return Ok(id);
+}
+
+fn scheduler_pending_tasks(ts) {
+    var tasks = load64(ts);
+    var keys = map_keys(tasks);
+    var pending = vec_new();
+    var i = 0;
+    while (i < vec_len(keys)) {
+        var t = map_get(tasks, vec_get(keys, i));
+        if (sched_task_status(t) == TASK_QUEUED) { vec_push(pending, t); }
+        i = i + 1;
+    }
+    var n = vec_len(pending);
+    i = 1;
+    while (i < n) {
+        var key = vec_get(pending, i);
+        var kp = sched_task_priority(key);
+        var j = i - 1;
+        while (j >= 0) {
+            var jp = sched_task_priority(vec_get(pending, j));
+            if (jp >= kp) { break; }
+            vec_set(pending, j + 1, vec_get(pending, j));
+            j = j - 1;
+        }
+        vec_set(pending, j + 1, key);
+        i = i + 1;
+    }
+    return pending;
+}
+
+fn scheduler_best_fit(ts, cpu, mem, disk) {
+    var nodes = load64(ts + 8);
+    var keys = map_keys(nodes);
+    var best_id = 0;
+    var best_util = 101;
+    var i = 0;
+    while (i < vec_len(keys)) {
+        var nc = map_get(nodes, vec_get(keys, i));
+        if (node_cap_can_fit(nc, cpu, mem, disk) == 1) {
+            var util = node_cap_utilization(nc);
+            if (util < best_util) { best_util = util; best_id = node_cap_id(nc); }
+        }
+        i = i + 1;
+    }
+    return best_id;
+}
+
+fn scheduler_schedule_pending(ts) {
+    var pending = scheduler_pending_tasks(ts);
+    var decisions = vec_new();
+    var nodes = load64(ts + 8);
+    var i = 0;
+    while (i < vec_len(pending)) {
+        var task = vec_get(pending, i);
+        var cpu = load64(task + 56);
+        var mem = load64(task + 64);
+        var node_id = scheduler_best_fit(ts, cpu, mem, 0);
+        if (node_id != 0) {
+            var nc = map_get(nodes, str_cstr(node_id));
+            if (nc != 0) { node_cap_reserve(nc, cpu, mem, 0); }
+            sched_task_transition(task, TASK_SCHEDULED);
+            vec_push(decisions, node_id);
+        }
+        i = i + 1;
+    }
+    return decisions;
+}
+
+fn scheduler_stats(ts) {
+    var tasks = load64(ts);
+    var keys = map_keys(tasks);
+    var total = vec_len(keys);
+    var queued = 0;
+    var running = 0;
+    var completed = 0;
+    var failed = 0;
+    var i = 0;
+    while (i < total) {
+        var t = map_get(tasks, vec_get(keys, i));
+        var s = sched_task_status(t);
+        if (s == TASK_QUEUED) { queued = queued + 1; }
+        elif (s == TASK_SCHEDULED) { queued = queued + 1; }
+        elif (s == TASK_RUNNING) { running = running + 1; }
+        elif (s == TASK_COMPLETED) { completed = completed + 1; }
+        elif (s == TASK_CANCELLED) { completed = completed + 1; }
+        elif (s == TASK_FAILED) { failed = failed + 1; }
+        i = i + 1;
+    }
+    var st = alloc(40);
+    store64(st, total);
+    store64(st + 8, queued);
+    store64(st + 16, running);
+    store64(st + 24, completed);
+    store64(st + 32, failed);
+    return st;
+}
+
+fn scheduler_get(ts, id_cstr) { return map_get(load64(ts), id_cstr); }
+fn scheduler_cancel(ts, id_cstr) {
+    var task = map_get(load64(ts), id_cstr);
+    if (task == 0) { return Err(ERR_SCHEDULER); }
+    return sched_task_transition(task, TASK_CANCELLED);
+}
+
+# --- cron scheduler ---
+
+fn cron_entry_new(name, interval_secs, task_name, task_agent_id, task_priority) {
+    var ce = alloc(72);
+    store64(ce, name);
+    store64(ce + 8, interval_secs);
+    store64(ce + 16, 0 - 1);
+    store64(ce + 24, 0 - 1);
+    store64(ce + 32, task_name);
+    store64(ce + 40, task_agent_id);
+    store64(ce + 48, task_priority);
+    store64(ce + 56, 1);
+    store64(ce + 64, 0);
+    return ce;
+}
+
+fn cron_scheduler_new() {
+    var cs = alloc(8);
+    store64(cs, map_new());
+    return cs;
+}
+
+fn cron_add_entry(cs, entry) {
+    var name = load64(entry);
+    if (str_len(name) == 0) { return Err(ERR_SCHEDULER); }
+    var hour = load64(entry + 16);
+    if (hour >= 0) { if (hour > 23) { return Err(ERR_SCHEDULER); } }
+    var minute = load64(entry + 24);
+    if (minute >= 0) { if (minute > 59) { return Err(ERR_SCHEDULER); } }
+    map_set(load64(cs), str_cstr(name), entry);
+    return Ok(0);
+}
+
+fn cron_remove_entry(cs, name_cstr) { return map_delete(load64(cs), name_cstr); }
+fn cron_entry_count(cs) { return map_count(load64(cs)); }
+
+# --- federation enums + types ---
+
+enum NodeRole { ROLE_COORDINATOR = 0; ROLE_FOLLOWER = 1; ROLE_CANDIDATE = 2; }
+enum FedNodeStatus { FED_ONLINE = 0; FED_SUSPECT = 1; FED_DEAD = 2; }
+enum SchedulingStrategy { SCHED_BALANCED = 0; SCHED_PACKED = 1; SCHED_SPREAD = 2; }
+
+fn fed_node_new(name, cpu_cores, memory_mb, gpu_count) {
+    var n = alloc(80);
+    var nid = str_from_int(agent_next_id());
+    store64(n, nid);
+    store64(n + 8, name);
+    store64(n + 16, ROLE_FOLLOWER);
+    store64(n + 24, FED_ONLINE);
+    store64(n + 32, clock_epoch_secs());
+    store64(n + 40, 0);
+    store64(n + 48, 0);
+    store64(n + 56, cpu_cores);
+    store64(n + 64, memory_mb);
+    store64(n + 72, gpu_count);
+    return n;
+}
+
+fn fed_node_id(n) { return load64(n); }
+fn fed_node_role(n) { return load64(n + 16); }
+
+fn fed_mgr_new(strategy) {
+    var fm = alloc(16);
+    store64(fm, map_new());
+    store64(fm + 8, strategy);
+    return fm;
+}
+
+fn fed_mgr_add_node(fm, node) { map_set(load64(fm), str_cstr(fed_node_id(node)), node); }
+fn fed_mgr_node_count(fm) { return map_count(load64(fm)); }
+
+fn fed_mgr_live_nodes(fm) {
+    var nodes = load64(fm);
+    var keys = map_keys(nodes);
+    var live = vec_new();
+    var i = 0;
+    while (i < vec_len(keys)) {
+        var node = map_get(nodes, vec_get(keys, i));
+        if (load64(node + 24) == FED_ONLINE) { vec_push(live, node); }
+        i = i + 1;
+    }
+    return live;
+}
+
+fn fed_mgr_start_election(fm, local_id_cstr) {
+    var node = map_get(load64(fm), local_id_cstr);
+    if (node == 0) { return Err(ERR_FEDERATION); }
+    store64(node + 16, ROLE_CANDIDATE);
+    var term = load64(node + 40) + 1;
+    store64(node + 40, term);
+    return Ok(term);
+}
+
+fn fed_mgr_become_coordinator(fm, id_cstr) {
+    var node = map_get(load64(fm), id_cstr);
+    if (node == 0) { return Err(ERR_FEDERATION); }
+    store64(node + 16, ROLE_COORDINATOR);
+    return Ok(0);
+}
+
+fn fed_score_node(node, req_cpu, req_mem, preferred_id, max_load, node_load) {
+    var cpu_cores = load64(node + 56);
+    var memory_mb = load64(node + 64);
+    var cpu_head = 100;
+    if (req_cpu > 0) {
+        if (cpu_cores > 0) { cpu_head = (cpu_cores - req_cpu) * 100 / cpu_cores; if (cpu_head < 0) { cpu_head = 0; } }
+        else { cpu_head = 0; }
+    }
+    var mem_head = 100;
+    if (req_mem > 0) {
+        if (memory_mb > 0) { mem_head = (memory_mb - req_mem) * 100 / memory_mb; if (mem_head < 0) { mem_head = 0; } }
+        else { mem_head = 0; }
+    }
+    var resource = (cpu_head + mem_head) / 2;
+    var load_bal = 100;
+    if (max_load > 0) { load_bal = 100 - (node_load * 100 / max_load); }
+    return resource * 40 / 100 + load_bal * 20 / 100;
+}
+
+# --- edge fleet (extended) ---
+
+fn edge_fleet_new(config) {
+    var ef = alloc(16);
+    store64(ef, config);
+    store64(ef + 8, map_new());
+    return ef;
+}
+
+fn edge_fleet_config_default() {
+    var c = alloc(32);
+    store64(c, 30);
+    store64(c + 8, 90);
+    store64(c + 16, 1000);
+    store64(c + 24, 0);
+    return c;
+}
+
+fn edge_fleet_register(ef, node) {
+    var nodes = load64(ef + 8);
+    var config = load64(ef);
+    var max_nodes = load64(config + 16);
+    if (map_count(nodes) >= max_nodes) { return Err(ERR_INVALID_PARAM); }
+    var name = load64(node + 8);
+    if (str_len(name) == 0) { return Err(ERR_INVALID_PARAM); }
+    var keys = map_keys(nodes);
+    var di = 0;
+    while (di < vec_len(keys)) {
+        var existing = map_get(nodes, vec_get(keys, di));
+        if (str_eq(load64(existing + 8), name) == 1) { return Err(ERR_INVALID_PARAM); }
+        di = di + 1;
+    }
+    map_set(nodes, str_cstr(edge_node_id(node)), node);
+    return Ok(edge_node_id(node));
+}
+
+fn edge_fleet_get(ef, id_cstr) { return map_get(load64(ef + 8), id_cstr); }
+fn edge_fleet_node_count(ef) { return map_count(load64(ef + 8)); }
+
+fn edge_fleet_heartbeat(ef, id_cstr, active_tasks, tasks_completed) {
+    var node = map_get(load64(ef + 8), id_cstr);
+    if (node == 0) { return Err(ERR_AGENT_NOT_FOUND); }
+    if (edge_node_status(node) == EDGE_DECOMMISSIONED) { return Err(ERR_INVALID_PARAM); }
+    store64(node + 64, clock_epoch_secs());
+    edge_node_set_status(node, EDGE_ONLINE);
+    store64(node + 72, active_tasks);
+    store64(node + 80, tasks_completed);
+    return Ok(0);
+}
+
+fn edge_fleet_decommission(ef, id_cstr) {
+    var node = map_get(load64(ef + 8), id_cstr);
+    if (node == 0) { return Err(ERR_AGENT_NOT_FOUND); }
+    edge_node_set_status(node, EDGE_DECOMMISSIONED);
+    return Ok(0);
+}
+
+fn edge_fleet_list(ef, status_filter) {
+    var nodes = load64(ef + 8);
+    var keys = map_keys(nodes);
+    var result = vec_new();
+    var i = 0;
+    while (i < vec_len(keys)) {
+        var node = map_get(nodes, vec_get(keys, i));
+        if (status_filter < 0) { vec_push(result, node); }
+        elif (edge_node_status(node) == status_filter) { vec_push(result, node); }
+        i = i + 1;
+    }
+    return result;
+}
+
+fn edge_node_active_tasks(n) { return load64(n + 72); }
+
+# --- IPC / message bus ---
+
+enum MessageType { MSG_REQUEST = 0; MSG_RESPONSE = 1; MSG_EVENT = 2; MSG_HEARTBEAT = 3; MSG_COMMAND = 4; }
+
+fn ipc_msg_new(source, target, msg_type, payload) {
+    var m = alloc(48);
+    store64(m, str_from_int(agent_next_id()));
+    store64(m + 8, source);
+    store64(m + 16, target);
+    store64(m + 24, msg_type);
+    store64(m + 32, payload);
+    store64(m + 40, clock_epoch_secs());
+    return m;
+}
+
+fn msg_bus_new() {
+    var mb = alloc(16);
+    store64(mb, map_new());
+    store64(mb + 8, map_new());
+    return mb;
+}
+
+fn msg_bus_subscribe(mb, agent_id_cstr) { map_set(load64(mb), agent_id_cstr, vec_new()); }
+fn msg_bus_register_name(mb, name_cstr, agent_id_cstr) { map_set(load64(mb + 8), name_cstr, agent_id_cstr); }
+
+fn msg_bus_publish(mb, msg) {
+    var target = load64(msg + 16);
+    var target_cstr = str_cstr(target);
+    var subs = load64(mb);
+    if (streq(target_cstr, "*") == 1) {
+        var keys = map_keys(subs);
+        var i = 0;
+        while (i < vec_len(keys)) {
+            var queue = map_get(subs, vec_get(keys, i));
+            if (queue != 0) { vec_push(queue, msg); }
+            i = i + 1;
+        }
+        return Ok(0);
+    }
+    var names = load64(mb + 8);
+    var resolved = map_get(names, target_cstr);
+    if (resolved != 0) {
+        var queue = map_get(subs, resolved);
+        if (queue != 0) { vec_push(queue, msg); }
+        return Ok(0);
+    }
+    var queue = map_get(subs, target_cstr);
+    if (queue != 0) { vec_push(queue, msg); }
+    return Ok(0);
+}
+
+fn msg_bus_send_to_name(mb, name_cstr, msg) {
+    var id = map_get(load64(mb + 8), name_cstr);
+    if (id == 0) { return Err(ERR_AGENT_NOT_FOUND); }
+    var queue = map_get(load64(mb), id);
+    if (queue == 0) { return Err(ERR_AGENT_NOT_FOUND); }
+    vec_push(queue, msg);
+    return Ok(0);
+}
+
+fn rpc_registry_new() {
+    var rr = alloc(8);
+    store64(rr, map_new());
+    return rr;
+}
+
+fn rpc_register_method(rr, method_cstr, agent_id_cstr) { map_set(load64(rr), method_cstr, agent_id_cstr); }
+fn rpc_find_handler(rr, method_cstr) { return map_get(load64(rr), method_cstr); }
+fn rpc_list_methods(rr) { return map_keys(load64(rr)); }
+
+# --- RAG pipeline ---
+
+fn rag_config_default() {
+    var rc = alloc(40);
+    store64(rc, 5);
+    store64(rc + 8, 512);
+    store64(rc + 16, 64);
+    store64(rc + 24, f64_from(0));
+    store64(rc + 32, str_from("template"));
+    return rc;
+}
+
+fn rag_pipeline_new(config) {
+    var rp = alloc(24);
+    var vi = alloc(16);
+    store64(vi, vec_new());
+    store64(vi + 8, 0);
+    store64(rp, vi);
+    store64(rp + 8, config);
+    store64(rp + 16, 1);
+    return rp;
+}
+
+fn rag_ingest_text(rp, text, metadata) {
+    var config = load64(rp + 8);
+    var cs = load64(config + 8);
+    var ov = load64(config + 16);
+    var chunks = chunk_text(text, cs, ov);
+    if (vec_len(chunks) == 0) { return vec_new(); }
+    var ids = vec_new();
+    var ci = 0;
+    while (ci < vec_len(chunks)) {
+        var id = load64(rp + 16);
+        store64(rp + 16, id + 1);
+        vec_push(ids, id);
+        ci = ci + 1;
+    }
+    return ids;
+}
+
+fn rag_query_text(rp, query) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "Context for: ");
+    str_builder_add(sb, query);
+    return str_builder_build(sb);
+}
+
 fn main() {
     alloc_init();
 
@@ -870,6 +1405,196 @@ fn main() {
     assert(jname != 0, "got name");
     assert(str_eq(jname, str_from("test")) == 1, "name is test");
     assert_eq(json_get_int(jpairs, str_from("port")), 8090, "port is 8090");
+
+    # =============================================================
+    # jget — cstr-based JSON lookup
+    # =============================================================
+    test_group("jget");
+
+    var jg_pairs = json_parse(str_from("{\"host\":\"localhost\",\"port\":\"9090\"}"));
+    var jg_host = jget(jg_pairs, "host");
+    assert(jg_host != 0, "jget host found");
+    assert(str_eq(jg_host, str_from("localhost")) == 1, "jget host value");
+    var jg_port = jget_int(jg_pairs, "port");
+    assert_eq(jg_port, 9090, "jget_int port");
+    assert_eq(jget(jg_pairs, "missing"), 0, "jget missing returns 0");
+
+    # =============================================================
+    # node capacity — resource fitting
+    # =============================================================
+    test_group("node_capacity");
+
+    var nc1 = node_cap_new(str_from("n1"), 8, 16384, 102400, 0);
+    assert(str_eq(node_cap_id(nc1), str_from("n1")) == 1, "node id");
+    assert_eq(node_cap_can_fit(nc1, 4, 8192, 0), 1, "fits under capacity");
+    assert_eq(node_cap_can_fit(nc1, 16, 8192, 0), 0, "rejects over cpu");
+    assert_eq(node_cap_can_fit(nc1, 4, 32768, 0), 0, "rejects over mem");
+    assert_eq(node_cap_utilization(nc1), 0, "zero utilization initially");
+
+    node_cap_reserve(nc1, 4, 8192, 0);
+    assert_eq(node_cap_avail_cpu(nc1), 4, "avail cpu after reserve");
+    assert_eq(node_cap_avail_mem(nc1), 8192, "avail mem after reserve");
+    assert_eq(node_cap_utilization(nc1), 50, "50% utilization");
+
+    node_cap_release(nc1, 4, 8192, 0);
+    assert_eq(node_cap_avail_cpu(nc1), 8, "restored cpu");
+    assert_eq(node_cap_avail_mem(nc1), 16384, "restored mem");
+
+    # =============================================================
+    # scheduler — submit + schedule_pending
+    # =============================================================
+    test_group("scheduler_scheduling");
+
+    var sched = task_scheduler_new();
+    scheduler_register_node(sched, node_cap_new(str_from("w1"), 8, 16384, 102400, 0));
+
+    var st1 = sched_task_new(str_from("task-a"), str_from(""), str_from("a1"), 7);
+    var st2 = sched_task_new(str_from("task-b"), str_from(""), str_from("a1"), 3);
+    scheduler_submit(sched, st1);
+    scheduler_submit(sched, st2);
+
+    var pend = scheduler_pending_tasks(sched);
+    assert_eq(vec_len(pend), 2, "2 pending tasks");
+    assert_eq(sched_task_priority(vec_get(pend, 0)), 7, "high prio first");
+    assert_eq(sched_task_priority(vec_get(pend, 1)), 3, "low prio second");
+
+    var sdec = scheduler_schedule_pending(sched);
+    assert_eq(vec_len(sdec), 2, "2 decisions");
+
+    var sst = scheduler_stats(sched);
+    assert_eq(load64(sst), 2, "2 total tasks");
+    assert_eq(load64(sst + 8), 2, "2 queued/scheduled");
+
+    # =============================================================
+    # cron scheduler
+    # =============================================================
+    test_group("cron_scheduler");
+
+    var cron = cron_scheduler_new();
+    assert_eq(cron_entry_count(cron), 0, "empty cron");
+
+    var ce1 = cron_entry_new(str_from("hourly"), 3600, str_from("backup"), str_from("a1"), 5);
+    assert(is_ok(cron_add_entry(cron, ce1)) == 1, "add cron entry");
+    assert_eq(cron_entry_count(cron), 1, "1 cron entry");
+
+    var ce_bad = cron_entry_new(str_from(""), 60, str_from("t"), str_from("a"), 1);
+    assert(is_err_result(cron_add_entry(cron, ce_bad)) == 1, "empty name rejected");
+
+    var ce_bad_h = cron_entry_new(str_from("bad"), 60, str_from("t"), str_from("a"), 1);
+    store64(ce_bad_h + 16, 25);
+    assert(is_err_result(cron_add_entry(cron, ce_bad_h)) == 1, "hour > 23 rejected");
+
+    cron_remove_entry(cron, "hourly");
+    assert_eq(cron_entry_count(cron), 0, "removed cron entry");
+
+    # =============================================================
+    # federation — heartbeat + health + scoring
+    # =============================================================
+    test_group("federation");
+
+    var fm = fed_mgr_new(SCHED_BALANCED);
+    var fnode = fed_node_new(str_from("node-a"), 8, 16384, 1);
+    fed_mgr_add_node(fm, fnode);
+    assert_eq(fed_mgr_node_count(fm), 1, "1 fed node");
+
+    var flive = fed_mgr_live_nodes(fm);
+    assert_eq(vec_len(flive), 1, "1 live node");
+
+    var fscore = fed_score_node(fnode, 2, 4096, 0, 1, 0);
+    assert(fscore > 0, "positive score");
+    assert(fscore <= 100, "score <= 100");
+
+    var fid_cstr = str_cstr(fed_node_id(fnode));
+    var fterm = fed_mgr_start_election(fm, fid_cstr);
+    assert(is_ok(fterm) == 1, "election started");
+    assert_eq(fed_node_role(fnode), ROLE_CANDIDATE, "became candidate");
+
+    fed_mgr_become_coordinator(fm, fid_cstr);
+    assert_eq(fed_node_role(fnode), ROLE_COORDINATOR, "became coordinator");
+
+    # =============================================================
+    # edge fleet — full lifecycle
+    # =============================================================
+    test_group("edge_lifecycle");
+
+    var efleet = edge_fleet_new(edge_fleet_config_default());
+    var enode = edge_node_new(str_from("edge-a"), str_from("x86_64"), 4, 4096);
+    var ereg = edge_fleet_register(efleet, enode);
+    assert(is_ok(ereg) == 1, "register ok");
+    assert_eq(edge_fleet_node_count(efleet), 1, "1 edge node");
+
+    var en_bad = edge_node_new(str_from(""), str_from("x86_64"), 4, 4096);
+    assert(is_err_result(edge_fleet_register(efleet, en_bad)) == 1, "empty name rejected");
+
+    var en_dup = edge_node_new(str_from("edge-a"), str_from("x86_64"), 4, 4096);
+    assert(is_err_result(edge_fleet_register(efleet, en_dup)) == 1, "duplicate rejected");
+
+    var eid_cstr = str_cstr(payload(ereg));
+    var ehb = edge_fleet_heartbeat(efleet, eid_cstr, 5, 20);
+    assert(is_ok(ehb) == 1, "heartbeat ok");
+
+    var edc = edge_fleet_decommission(efleet, eid_cstr);
+    assert(is_ok(edc) == 1, "decommission ok");
+    var enode_after = edge_fleet_get(efleet, eid_cstr);
+    assert_eq(edge_node_status(enode_after), EDGE_DECOMMISSIONED, "decommissioned status");
+
+    assert(is_err_result(edge_fleet_heartbeat(efleet, eid_cstr, 0, 0)) == 1, "heartbeat after decomm fails");
+
+    var eall = edge_fleet_list(efleet, 0 - 1);
+    assert_eq(vec_len(eall), 1, "list all = 1");
+    var eonline = edge_fleet_list(efleet, EDGE_ONLINE);
+    assert_eq(vec_len(eonline), 0, "no online nodes");
+    var edecomm = edge_fleet_list(efleet, EDGE_DECOMMISSIONED);
+    assert_eq(vec_len(edecomm), 1, "1 decommissioned");
+
+    # =============================================================
+    # IPC — message bus + RPC registry
+    # =============================================================
+    test_group("ipc");
+
+    var bus = msg_bus_new();
+    msg_bus_subscribe(bus, "agent-1");
+    msg_bus_subscribe(bus, "agent-2");
+    msg_bus_register_name(bus, "worker", "agent-1");
+
+    var imsg = ipc_msg_new(str_from("sys"), str_from("*"), MSG_EVENT, str_from("hello"));
+    msg_bus_publish(bus, imsg);
+    var iq1 = map_get(load64(bus), "agent-1");
+    var iq2 = map_get(load64(bus), "agent-2");
+    assert_eq(vec_len(iq1), 1, "agent-1 got broadcast");
+    assert_eq(vec_len(iq2), 1, "agent-2 got broadcast");
+
+    var imsg2 = ipc_msg_new(str_from("sys"), str_from("x"), MSG_COMMAND, str_from("cmd"));
+    msg_bus_send_to_name(bus, "worker", imsg2);
+    assert_eq(vec_len(iq1), 2, "agent-1 got named msg");
+    assert_eq(vec_len(iq2), 1, "agent-2 unchanged");
+
+    var rpc = rpc_registry_new();
+    rpc_register_method(rpc, "calculate", "agent-1");
+    rpc_register_method(rpc, "fetch", "agent-2");
+    assert(rpc_find_handler(rpc, "calculate") != 0, "find calculate");
+    assert(rpc_find_handler(rpc, "fetch") != 0, "find fetch");
+    assert_eq(rpc_find_handler(rpc, "missing"), 0, "missing method");
+
+    var rpc_methods = rpc_list_methods(rpc);
+    assert_eq(vec_len(rpc_methods), 2, "2 methods");
+
+    # =============================================================
+    # RAG pipeline — ingest + query
+    # =============================================================
+    test_group("rag_pipeline");
+
+    var rpipe = rag_pipeline_new(rag_config_default());
+    var rids = rag_ingest_text(rpipe, str_from("Rust is a systems programming language focused on safety and performance"), str_from("test"));
+    assert(vec_len(rids) > 0, "ingested chunks");
+
+    var rctx = rag_query_text(rpipe, str_from("rust safety"));
+    assert(str_len(rctx) > 0, "query returned context");
+    assert(str_contains(rctx, str_from("rust safety")) == 1, "context contains query");
+
+    # Empty ingest
+    var empty_ids = rag_ingest_text(rpipe, str_from(""), str_from("x"));
+    assert_eq(vec_len(empty_ids), 0, "empty ingest = 0 chunks");
 
     # =============================================================
     # Summary
