@@ -13,7 +13,7 @@
 
 ## Blocked on Upstream Ports
 
-- [ ] Firewall MCP tools — blocked on [nein](https://github.com/MacCracken/nein) Cyrius port
+- [ ] Firewall MCP tools — [nein](https://github.com/MacCracken/nein) core port complete (v0.1.0, 13 modules); MCP tool wiring still pending nein's own `mcp` module which is blocked on bote
 - [ ] MCP tool hosting (bote re-exports) — blocked on [bote](https://github.com/MacCracken/bote) Cyrius port
 - [ ] MCP tool call forwarding — blocked on bote + HTTP client library
 
