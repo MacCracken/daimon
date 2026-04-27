@@ -4,7 +4,7 @@ version = "1.1.1"
 description = "daimon — AGNOS agent orchestrator"
 license = "GPL-3.0-only"
 language = "cyrius"
-cyrius = "4.3.0"
+cyrius = "4.5.0"
 
 [build]
 entry = "src/main.cyr"
