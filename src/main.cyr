@@ -3915,10 +3915,17 @@ fn serve(port) {
 
 # --- Async server (epoll-based cooperative concurrency) ---
 #
-# Sandhi's server is sync-only ("single-threaded until 0.8.0" per
-# sandhi/http/server.cyr), so daimon owns the async accept loop and
-# uses sandhi only for per-request recv + smuggling rejection +
-# parse + send. Same handle_request runs under both modes.
+# Sandhi's server is sync-only as of sandhi 1.0.0 (folded into
+# Cyrius 5.7.0 stdlib, sandhi repo in maintenance mode). The
+# `sandhi_server_options_max_conns(opts, n)` field exists but is
+# unenforced — "reserved for a future concurrent" model per
+# sandhi/docs/guides/server.md, no version target. The bundled
+# `lib/sandhi.cyr` carries a stale "single-threaded until 0.8.0"
+# comment that predates the 0.8.0 scope shift (which actually
+# shipped HTTP/2 + client connection pool, not server multi-conn).
+# Daimon owns the async accept loop and uses sandhi only for
+# per-request recv + smuggling rejection + parse + send. Same
+# handle_request runs under both modes.
 
 # Per-handler buffer — async runs handlers cooperatively (no preemption),
 # but multiple in-flight requests may overlap in scheduling. Allocate

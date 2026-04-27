@@ -189,7 +189,7 @@ intentionally (no information leak). Documented in API guide.
 | `lib/sandhi.cyr` | "sandhi cyrius CVE", "agnos sandhi vulnerability" | None — sandhi is in-tree to Cyrius, not externally tracked |
 | HTTP/1.1 server smuggling | "HTTP smuggling 2026 CL.TE", "HTTP request smuggling new vector" | All currently catalogued vectors (CL.TE, TE.CL, CL.CL, TE.TE, Host.Host, fragment-after-CR) are caught by sandhi 5.7.12 per the source — see `sandhi_server_request_has_*` |
 | TCP slowloris | n/a | sandhi default `SO_RCVTIMEO = 30 s` mitigates; daimon old path had no timeout |
-| Single-threaded HTTP DoS | n/a | sandhi single-threaded by design (0.7.x); daimon production must front with reverse proxy or use `--async` (which uses sandhi parsers under epoll cooperative scheduling) |
+| Single-threaded HTTP DoS | n/a | sandhi server is single-threaded through 1.0.0 / current stdlib (`max_conns` exists but is unenforced — see `sandhi/docs/guides/server.md`); daimon production must front with reverse proxy or use `--async` (which uses sandhi parsers under epoll cooperative scheduling) |
 
 ---
 
@@ -208,6 +208,10 @@ growth) — both documented in code or changelog, no action required.
 - Future: lower `sandhi_server_options_idle_ms` from default 30 s to
   ~5 s in production once a baseline of legitimate-client request
   durations is collected.
-- Future: monitor sandhi upstream for the 0.8.0 release (multi-conn
-  accept model) — at that point daimon's `--async` path could collapse
-  back to `sandhi_server_run_opts(...)` and shed `serve_async`.
+- Future: if a Cyrius stdlib patch lands concurrent server-accept
+  enforcement (no version target — sandhi 1.0.0 froze the public
+  surface and entered maintenance mode at the 5.7.0 fold; `max_conns`
+  exists but is unenforced per `sandhi/docs/guides/server.md`),
+  daimon's `--async` path could collapse back to
+  `sandhi_server_run_opts(...)` and shed `serve_async`. Until then
+  daimon's epoll loop is the only multi-conn path.

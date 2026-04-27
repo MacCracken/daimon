@@ -37,7 +37,7 @@ Re-audited all 10 VULN findings from `docs/audit/2026-04-13-security-audit.md` a
 
 - **External MCP forwarding** via `sandhi_rpc_mcp_call` — replaces the `"tool dispatch not available in sync mode"` stub. Needs `McpToolDescription.endpoint_url`.
 - **Lower sandhi `idle_ms`** below the 30 s default once a 1.1.4 production soak surfaces a baseline P99.
-- **`serve_async` collapse to `sandhi_server_run_opts`** when sandhi 0.8.0 ships its multi-conn accept model.
+- **`serve_async` collapse to `sandhi_server_run_opts`** once a Cyrius stdlib patch wires up `sandhi_server_options_max_conns` enforcement. The hook is already public — sandhi 1.0.0 (folded into Cyrius 5.7.0 stdlib, sandhi repo now in maintenance mode) deliberately landed HTTP/2 + client connection pool at 0.8.0 in favour of nailing single-server hardening first; the 0.9.x P0/P1 sweep validated that call. Wire-up is straightforward when scheduled.
 
 ## [1.1.3] - 2026-04-27
 
