@@ -26,7 +26,7 @@ stdlib = [
     "tagged",
     "json",
     "net",
-    "http",
+    "sandhi",
     "args",
     "chrono",
     "fnptr",

@@ -26,8 +26,7 @@ The following stdlib modules are available via `cyrius.cyml` deps. **Async IS av
 | `async` | **Cooperative async runtime — epoll event loop, spawn, sleep, await_readable, timeout** |
 | `thread` | Clone-based threads, mutex, MPSC channels |
 | `net` | TCP sockets (connect, listen, accept, read, write) |
-| `http` | HTTP client helpers (server use deprecated — see `sandhi` below) |
-| `sandhi` | **Recommended for new HTTP server work** — replaces `lib/http.cyr` server. HTTP/1.1 + HTTP/2, SSE/streaming, JSON-RPC + MCP-over-HTTP (`sandhi_rpc_mcp_call`), service discovery, mTLS. Adopt incrementally. |
+| `sandhi` | **In use as of 1.1.4** — drives both sync (`sandhi_server_run`) and async (`sandhi_server_recv_request` + smuggling checks inline) HTTP paths. `http_*` shims in `src/main.cyr` are sandhi-backed. Daimon does NOT use sandhi's HTTP/2 / SSE / TLS / RPC modules yet — `sandhi_rpc_mcp_call` is the planned hook for unstubbing external MCP forwarding (see `api_mcp_call`). |
 | `json` | JSON parse/emit |
 | `hashmap` | Hash map. `map_new()` = cstr keys; `map_new_str()` = `Str` struct keys; `map_u64_new()` = u64 inline keys (5.5.20). Pick at construction. |
 | `process` | Fork, exec, waitpid |

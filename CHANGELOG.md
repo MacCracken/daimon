@@ -6,6 +6,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.1.4] - 2026-04-27
+
+### Changed
+
+- **HTTP server migrated to `lib/sandhi.cyr`** (Cyrius 5.7.12 stdlib). The pre-1.1.4 hand-rolled HTTP layer in `src/main.cyr` (≈580 LOC of `http_*` parse + send fns + the body-recv loop in `handle_request`) is replaced. Endpoint handlers (`api_*`) are unchanged — daimon-named shims (`http_send_response`, `http_parse_method`, `http_parse_path`, `http_parse_content_length`, `http_has_transfer_encoding`, `http_parse_query_param`, `http_parse_body`) preserve the call surface and delegate to `sandhi_server_*`.
+- **Sync server (`serve`)** now delegates to `sandhi_server_run(INADDR_ANY(), port, &handle_request, 0)` — sandhi owns bind / listen / accept / recv / smuggling rejection (CL+TE conflict per RFC 7230 §3.3.3, Host.Host / CL.CL / TE.TE duplicates per §3.3.2 + §5.4) and closes the connection after the handler returns.
+- **Async server (`serve_async`)** keeps its epoll-cooperative accept loop but uses `sandhi_server_recv_request`, `sandhi_server_request_has_cl_te_conflict`, and `sandhi_server_request_has_dup_smuggling_header` inline before dispatching to the same shared `handle_request`. Fresh per-call buffer (sandhi's process-global `_hsv_req_buf` is safe under the sync single-threaded loop but the async path explicitly allocates per call to keep the no-interleave invariant explicit).
+- **`handle_request` is now sandhi-shape**: `(ctx, cfd, buf, blen)`. Sync caller is `sandhi_server_run`; async caller is `async_handle_client`. Same code runs under both modes.
+- **CLI banner fixed** (pre-existing bug surfaced by the migration's smoke test): six `sakshi_info` / `sakshi_warn` / `sakshi_error` call sites in `src/main.cyr` were missing the required `msg_len` argument since the sakshi 2.0.0 stdlib bump. The startup banner emitted random buffer contents under sakshi as a result. Fixed by passing explicit byte lengths; the banner now reads `daimon vX.Y.Z listening on port N (mode)` cleanly.
+- **`lib/http.cyr` dep dropped** from `cyrius.cyml` `[deps] stdlib`. Daimon never used the HTTP client; sandhi covers any future need.
+- **CLAUDE.md** sandhi note updated from "recommended for new HTTP server work" to "in use".
+
+### Security
+
+Re-audited all 10 VULN findings from `docs/audit/2026-04-13-security-audit.md` against the new code path. Full report at `docs/audit/2026-04-27-sandhi-migration.md`.
+
+- **VULN-001 (request smuggling): strengthened.** Two layers cover this end-to-end: sandhi's accept-loop rejection (CL+TE conflict, duplicate Host / CL / TE per RFC 7230) before the handler, plus daimon's continued `Transfer-Encoding` rejection inside the handler. Sandhi's `sandhi_server_content_length` is RFC 7230 §3.3.2 strict (rejects any non-digit in the value), closing the loose-digit CL.CL sub-vector that the old `http_parse_content_length` accepted (`"10, 20"` parsed as 10).
+- **VULN-008 (oversized request DoS): bounded with a different latency profile.** Sandhi caps the buffer at `HSV_REQ_BUF_SIZE = 65 536` regardless of declared `Content-Length` — memory bound is preserved. The pre-1.1.4 fast-413 (parse CL on first recv, reject before reading body) is no longer reachable; the worst case is now a 30 s `SO_RCVTIMEO` per malicious connection. Net trade-off is favourable: the old path had **no** SO_RCVTIMEO, so a slowloris attacker could tie up a worker indefinitely under 1.1.3.
+- **VULN-009 (per-IP rate limiting): unchanged.** `rate_check(cfd)` still runs at the top of `handle_request`, before any sandhi-side parsing.
+- **VULN-002, VULN-004, VULN-005, VULN-006, VULN-010: unchanged** — none touch the HTTP path.
+
+### Observed
+
+- Binary size **263 KB → 452 KB** (DCE on). The reachable subset of sandhi (server fns, request parsing, header checks, smuggling rejection) is what shipped; HTTP/2, SSE, TLS, and JSON-RPC modules ride along but don't bloat (no dead-fn warnings against them in `cyrius build` output).
+- 200 / 200 unit tests pass. End-to-end smoke (`/v1/health`, `/v1/agents` GET + POST, `/v1/missing`, `/v1/edge/nodes?status=online`, `/v1/metrics`) passes against both `serve` and `serve --async`. Smuggling tests via raw socket: dup-Host → 400, CL.CL with full body → 400, TE-only → 501.
+- Benchmarks (16 internal microbenchmarks) within noise of 1.1.3 — none of them exercise the HTTP server, so the migration shouldn't move them and didn't.
+
+### Deferred (tracked in `docs/development/roadmap.md` § v1.1.5)
+
+- **External MCP forwarding** via `sandhi_rpc_mcp_call` — replaces the `"tool dispatch not available in sync mode"` stub. Needs `McpToolDescription.endpoint_url`.
+- **Lower sandhi `idle_ms`** below the 30 s default once a 1.1.4 production soak surfaces a baseline P99.
+- **`serve_async` collapse to `sandhi_server_run_opts`** when sandhi 0.8.0 ships its multi-conn accept model.
+
 ## [1.1.3] - 2026-04-27
 
 ### Added

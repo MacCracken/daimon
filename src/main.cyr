@@ -396,7 +396,7 @@ fn agent_start(h, executable) {
     str_builder_add_int(id_str_sb, id);
     var id_str = str_builder_build(id_str_sb);
 
-    sakshi_info("starting agent");
+    sakshi_info("starting agent", 14);
 
     var pid_result = spawn(str_data(executable), str_data(id_str), str_data(name));
     if (is_err_result(pid_result) == 1) {
@@ -514,7 +514,7 @@ fn cb_record_failure(cb) {
     if (state == CB_CLOSED) {
         if (fc >= load64(cb + 24)) {
             store64(cb, CB_OPEN);
-            sakshi_warn("circuit breaker opened");
+            sakshi_warn("circuit breaker opened", 22);
         }
     }
     elif (state == CB_HALF_OPEN) {
@@ -2980,204 +2980,81 @@ fn json_escape_str(s) {
 
 # --- HTTP helpers ---
 
+# Sandhi-backed shims. Same signatures as the pre-1.1.4 hand-rolled
+# parsers so api_* / http_route call sites stay unchanged. Sandhi
+# brings hardening for free: case-insensitive header lookup, strict
+# RFC 7230 §3.3.2 Content-Length parsing (rejects "10, 20" CL.CL
+# smuggling vector that the old loose parser accepted), and tolerant
+# Transfer-Encoding token scan.
+
 fn http_parse_method(buf, len) {
-    if (memeq(buf, "GET", 3) == 1) { return 0; }
-    if (memeq(buf, "POST", 4) == 1) { return 1; }
-    if (memeq(buf, "PUT", 3) == 1) { return 2; }
-    if (memeq(buf, "DELETE", 6) == 1) { return 3; }
+    var m = sandhi_server_get_method(buf, len);
+    if (streq(m, "GET") == 1) { return 0; }
+    if (streq(m, "POST") == 1) { return 1; }
+    if (streq(m, "PUT") == 1) { return 2; }
+    if (streq(m, "DELETE") == 1) { return 3; }
     return 0;
 }
 
+# Returns path WITHOUT query string. sandhi_server_get_path returns
+# the full request-line path-and-query ("/foo?bar=baz");
+# sandhi_server_path_only strips at the first '?'.
 fn http_parse_path(buf, len) {
-    var i = 0;
-    while (i < len) {
-        if (load8(buf + i) == 32) { i = i + 1; break; }
-        i = i + 1;
-    }
-    var start = i;
-    while (i < len) {
-        var c = load8(buf + i);
-        if (c == 32) { break; }
-        if (c == 63) { break; }
-        i = i + 1;
-    }
-    var plen = i - start;
-    var path_buf = alloc(plen + 1);
-    memcpy(path_buf, buf + start, plen);
-    store8(path_buf + plen, 0);
-    return path_buf;
+    return sandhi_server_path_only(sandhi_server_get_path(buf, len));
 }
 
-# VULN-001: Parse Content-Length header from request
-fn http_parse_content_length(buf, len) {
-    var i = 0;
-    while (i < len - 16) {
-        # Scan for "Content-Length: " (case-insensitive first char)
-        if (load8(buf + i) == 10) {
-            var hi = i + 1;
-            if (hi + 15 < len) {
-                # Check "Content-Length:" (case insensitive C/c)
-                var cl_found = 0;
-                if (memeq(buf + hi, "Content-Length:", 15) == 1) { cl_found = 1; }
-                if (memeq(buf + hi, "content-length:", 15) == 1) { cl_found = 1; }
-                if (cl_found == 1) {
-                    var vi = hi + 15;
-                    # Skip whitespace
-                    while (vi < len) {
-                        if (load8(buf + vi) != 32) { break; }
-                        vi = vi + 1;
-                    }
-                    # Parse number
-                    var cl = 0;
-                    while (vi < len) {
-                        var c = load8(buf + vi);
-                        if (c < 48) { break; }
-                        if (c > 57) { break; }
-                        cl = cl * 10 + c - 48;
-                        vi = vi + 1;
-                    }
-                    return cl;
-                }
-            }
-        }
-        i = i + 1;
-    }
-    return 0 - 1;  # -1 = not found
-}
-
-# VULN-001: Check for Transfer-Encoding header (reject if present with Content-Length)
+# VULN-001: 1 if the request carries a Transfer-Encoding header at all
+# (daimon does not implement chunked decode and rejects with 501).
+# Sandhi additionally rejects CL+TE conflict in its accept-loop with
+# 400 before the handler runs (sandhi_server_request_has_cl_te_conflict).
 fn http_has_transfer_encoding(buf, len) {
-    var i = 0;
-    while (i < len - 18) {
-        if (load8(buf + i) == 10) {
-            var hi = i + 1;
-            if (hi + 17 < len) {
-                if (memeq(buf + hi, "Transfer-Encoding", 17) == 1) { return 1; }
-                if (memeq(buf + hi, "transfer-encoding", 17) == 1) { return 1; }
-            }
-        }
-        i = i + 1;
-    }
-    return 0;
+    if (sandhi_server_find_header(buf, len, "Transfer-Encoding") == 0) { return 0; }
+    return 1;
 }
 
+# Query param value, or 0 if absent. URL-decoded by sandhi.
 fn http_parse_query_param(buf, len, param_name) {
-    # Find ? in the request line
-    var i = 0;
-    while (i < len) {
-        if (load8(buf + i) == 63) { i = i + 1; break; }
-        if (load8(buf + i) == 32) { return 0; }
-        i = i + 1;
-    }
-    if (i >= len) { return 0; }
-    var pname_len = strlen(param_name);
-    while (i + pname_len + 1 <= len) {
-        if (load8(buf + i) == 32) { break; }
-        if (memeq(buf + i, param_name, pname_len) == 1) {
-            if (load8(buf + i + pname_len) == 61) {
-                var vstart = i + pname_len + 1;
-                var vend = vstart;
-                while (vend < len) {
-                    var c = load8(buf + vend);
-                    if (c == 38) { break; }
-                    if (c == 32) { break; }
-                    vend = vend + 1;
-                }
-                var vlen = vend - vstart;
-                var val = alloc(vlen + 1);
-                memcpy(val, buf + vstart, vlen);
-                store8(val + vlen, 0);
-                return val;
-            }
-        }
-        # Skip to next param
-        while (i < len) {
-            var c = load8(buf + i);
-            if (c == 38) { i = i + 1; break; }
-            if (c == 32) { break; }
-            i = i + 1;
-        }
-    }
-    return 0;
+    return sandhi_server_get_param(sandhi_server_get_path(buf, len), param_name);
 }
 
+# Body as a Str struct (data+len), or 0 if no body. Bounded by
+# Content-Length when the header is present (VULN-001 — never
+# trust raw recv'd bytes past the declared length).
 fn http_parse_body(buf, len) {
-    # Find header/body boundary: CRLFCRLF or LFLF
-    var hdr_end = 0;
-    var body_off = 0;
-    var i = 0;
-    while (i < len - 1) {
-        if (load8(buf + i) == 13) {
-            if (i + 3 < len) {
-                if (load8(buf + i + 1) == 10) {
-                    if (load8(buf + i + 2) == 13) {
-                        if (load8(buf + i + 3) == 10) {
-                            hdr_end = i;
-                            body_off = i + 4;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        if (load8(buf + i) == 10) {
-            if (load8(buf + i + 1) == 10) {
-                hdr_end = i;
-                body_off = i + 2;
-                break;
-            }
-        }
-        i = i + 1;
-    }
-    if (body_off == 0) { return 0; }
-    var avail = len - body_off;
+    var bo = sandhi_server_body_offset(buf, len);
+    if (bo < 0) { return 0; }
+    var avail = len - bo;
     if (avail <= 0) { return 0; }
-
-    # Use Content-Length to bound body size if present (VULN-001)
-    var cl = http_parse_content_length(buf, hdr_end);
-    if (cl >= 0) {
-        if (cl < avail) { avail = cl; }
-    }
-    return str_new(buf + body_off, avail);
+    var cl = sandhi_server_content_length(buf, len);
+    if (cl > 0 && cl < avail) { avail = cl; }
+    return str_new(buf + bo, avail);
 }
 
-fn http_crlf(sb) {
-    # Manually add CR LF (0x0D 0x0A) since \r not supported
-    var crlf[1];
-    store8(&crlf, 13);
-    store8(&crlf + 1, 10);
-    str_builder_add(sb, str_new(&crlf, 2));
+# Status-code → reason-phrase. Centralized so http_send_response
+# (sandhi-backed shim) can hand the right RFC 7231 phrase to
+# sandhi_server_send_response. Codes daimon emits today: 200, 201,
+# 204, 400, 404, 409, 413, 422, 429, 501.
+fn _http_reason(status) {
+    if (status == 200) { return "OK"; }
+    if (status == 201) { return "Created"; }
+    if (status == 204) { return "No Content"; }
+    if (status == 400) { return "Bad Request"; }
+    if (status == 404) { return "Not Found"; }
+    if (status == 409) { return "Conflict"; }
+    if (status == 413) { return "Payload Too Large"; }
+    if (status == 422) { return "Unprocessable Entity"; }
+    if (status == 429) { return "Too Many Requests"; }
+    if (status == 501) { return "Not Implemented"; }
+    return "Error";
 }
 
+# Sandhi-backed shim. Same signature as the pre-sandhi version so
+# every api_* call site stays unchanged. Always emits
+# Content-Type: application/json + Connection: close, matching
+# daimon original behaviour.
 fn http_send_response(fd, status, body_data, body_len) {
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "HTTP/1.1 ");
-    str_builder_add_int(sb, status);
-    if (status == 200) { str_builder_add_cstr(sb, " OK"); }
-    elif (status == 201) { str_builder_add_cstr(sb, " Created"); }
-    elif (status == 204) { str_builder_add_cstr(sb, " No Content"); }
-    elif (status == 400) { str_builder_add_cstr(sb, " Bad Request"); }
-    elif (status == 404) { str_builder_add_cstr(sb, " Not Found"); }
-    elif (status == 409) { str_builder_add_cstr(sb, " Conflict"); }
-    elif (status == 413) { str_builder_add_cstr(sb, " Payload Too Large"); }
-    elif (status == 422) { str_builder_add_cstr(sb, " Unprocessable Entity"); }
-    elif (status == 429) { str_builder_add_cstr(sb, " Too Many Requests"); }
-    elif (status == 501) { str_builder_add_cstr(sb, " Not Implemented"); }
-    else { str_builder_add_cstr(sb, " Error"); }
-    http_crlf(sb);
-    str_builder_add_cstr(sb, "Content-Type: application/json");
-    http_crlf(sb);
-    str_builder_add_cstr(sb, "Content-Length: ");
-    str_builder_add_int(sb, body_len);
-    http_crlf(sb);
-    str_builder_add_cstr(sb, "Connection: close");
-    http_crlf(sb);
-    http_crlf(sb);
-    var header = str_builder_build(sb);
-    sock_send(fd, str_data(header), str_len(header));
-    if (body_len > 0) {
-        sock_send(fd, body_data, body_len);
-    }
+    sandhi_server_send_response(fd, status, _http_reason(status),
+        "application/json", body_data, body_len, 0);
 }
 
 fn http_ok(fd, body) {
@@ -3698,44 +3575,6 @@ fn api_sched_stats(fd) {
     return 0;
 }
 
-# --- Path segment extractor (for /v1/edge/nodes/{id}) ---
-fn http_path_segment(path, n) {
-    var pi = 0;
-    var seg = 0;
-    var seg_start = 0;
-    while (load8(path + pi) != 0) {
-        if (load8(path + pi) == 47) {  # /
-            seg = seg + 1;
-            seg_start = pi + 1;
-        }
-        pi = pi + 1;
-    }
-    if (seg < n) { return 0; }
-    # Return pointer to the nth segment
-    var ci = 0;
-    var current_seg = 0;
-    while (load8(path + ci) != 0) {
-        if (load8(path + ci) == 47) {
-            current_seg = current_seg + 1;
-            if (current_seg == n) {
-                var start = ci + 1;
-                var end = start;
-                while (load8(path + end) != 0) {
-                    if (load8(path + end) == 47) { break; }
-                    end = end + 1;
-                }
-                var slen = end - start;
-                var sbuf = alloc(slen + 1);
-                memcpy(sbuf, path + start, slen);
-                store8(sbuf + slen, 0);
-                return sbuf;
-            }
-        }
-        ci = ci + 1;
-    }
-    return 0;
-}
-
 # --- Main HTTP router ---
 
 fn http_route(fd, method, path, buf, buf_len) {
@@ -3969,74 +3808,47 @@ fn rate_check(cfd) {
     return 1;
 }
 
-# --- Per-request handler (shared by sync + async modes) ---
-
-fn handle_request(cfd) {
-    # Rate limiting
+# --- Per-request handler (sandhi-shape: ctx, cfd, buf, blen) ---
+#
+# Sandhi gives us: a fully-recv'd request buffer, smuggling-validated
+# (Content-Length+Transfer-Encoding conflict, Host.Host / CL.CL /
+# TE.TE duplicates already 400'd before we get the call). We add:
+# (1) per-IP rate limiting (VULN-009 — daimon-specific, not in sandhi),
+# (2) MAX_REQUEST_SIZE oversized-request rejection (VULN-008),
+# (3) Transfer-Encoding rejection (daimon does not implement chunked
+# request decode; sandhi accepts it for legit servers, we reject).
+# Sandhi closes cfd after we return — do NOT sock_close here.
+fn handle_request(ctx, cfd, buf, blen) {
     if (rate_check(cfd) == 0) {
-        http_send_response(cfd, 429, "{\"error\":\"too many requests\"}", 28);
-        sock_close(cfd);
+        var rl_msg = "{\"error\":\"too many requests\"}";
+        http_send_response(cfd, 429, rl_msg, strlen(rl_msg));
         return 0;
     }
 
-    # Read headers
-    var req_buf = alloc(MAX_REQUEST_SIZE + 1);
-    var recv_result = sock_recv(cfd, req_buf, MAX_HEADER_SIZE);
-    if (is_err_result(recv_result) == 1) { sock_close(cfd); return 0; }
-    var req_len = payload(recv_result);
-    if (req_len <= 0) { sock_close(cfd); return 0; }
-    store8(req_buf + req_len, 0);
-
-    # Reject Transfer-Encoding
-    if (http_has_transfer_encoding(req_buf, req_len) == 1) {
-        http_send_response(cfd, 501, "{\"error\":\"chunked transfer not supported\"}", 42);
-        sock_close(cfd);
+    # VULN-008: sandhi caps recv at HSV_REQ_BUF_SIZE = 65536, so
+    # daimon's memory use is bounded regardless of declared
+    # Content-Length. The fast pre-recv 413 the old hand-rolled
+    # parser emitted on `cl > MAX_REQUEST_SIZE` is no longer
+    # reachable here — by the time we have `blen`, sandhi has
+    # already finished its recv loop (or hit the 30s SO_RCVTIMEO).
+    # See docs/audit/2026-04-27-sandhi-migration.md for the
+    # trade-off analysis. The blen guard stays as belt-and-braces
+    # against future buffer-size changes.
+    if (blen > MAX_REQUEST_SIZE) {
+        var pt_msg = "{\"error\":\"payload too large\"}";
+        http_send_response(cfd, 413, pt_msg, strlen(pt_msg));
         return 0;
     }
 
-    # Content-Length validation + body read
-    var cl = http_parse_content_length(req_buf, req_len);
-    if (cl > MAX_REQUEST_SIZE) {
-        http_send_response(cfd, 413, "{\"error\":\"payload too large\"}", 28);
-        sock_close(cfd);
+    if (http_has_transfer_encoding(buf, blen) == 1) {
+        var te_msg = "{\"error\":\"chunked transfer not supported\"}";
+        http_send_response(cfd, 501, te_msg, strlen(te_msg));
         return 0;
     }
 
-    if (cl > 0) {
-        var hdr_boundary = 0;
-        var hbi = 0;
-        while (hbi < req_len - 3) {
-            if (load8(req_buf + hbi) == 13) {
-                if (load8(req_buf + hbi + 1) == 10) {
-                    if (load8(req_buf + hbi + 2) == 13) {
-                        if (load8(req_buf + hbi + 3) == 10) {
-                            hdr_boundary = hbi + 4;
-                            break;
-                        }
-                    }
-                }
-            }
-            hbi = hbi + 1;
-        }
-        if (hdr_boundary > 0) {
-            var body_have = req_len - hdr_boundary;
-            var body_need = cl - body_have;
-            if (body_need > 0) {
-                if (hdr_boundary + cl <= MAX_REQUEST_SIZE) {
-                    var extra = sock_recv(cfd, req_buf + req_len, body_need);
-                    if (is_ok(extra) == 1) {
-                        req_len = req_len + payload(extra);
-                    }
-                }
-            }
-        }
-        store8(req_buf + req_len, 0);
-    }
-
-    var method = http_parse_method(req_buf, req_len);
-    var path = http_parse_path(req_buf, req_len);
-    http_route(cfd, method, path, req_buf, req_len);
-    sock_close(cfd);
+    var method = http_parse_method(buf, blen);
+    var path = http_parse_path(buf, blen);
+    http_route(cfd, method, path, buf, blen);
     return 0;
 }
 
@@ -4045,7 +3857,7 @@ fn handle_request(cfd) {
 fn server_bind(port) {
     var sfd_result = tcp_socket();
     if (is_err_result(sfd_result) == 1) {
-        sakshi_error("failed to create socket");
+        sakshi_error("failed to create socket", 23);
         return 0 - 1;
     }
     var sfd = payload(sfd_result);
@@ -4056,13 +3868,13 @@ fn server_bind(port) {
 
     var bind_result = sock_bind(sfd, INADDR_ANY(), port);
     if (is_err_result(bind_result) == 1) {
-        sakshi_error("failed to bind");
+        sakshi_error("failed to bind", 14);
         return 0 - 1;
     }
 
     var listen_result = sock_listen(sfd, 128);
     if (is_err_result(listen_result) == 1) {
-        sakshi_error("failed to listen");
+        sakshi_error("failed to listen", 16);
         return 0 - 1;
     }
 
@@ -4070,7 +3882,7 @@ fn server_bind(port) {
 }
 
 fn server_banner(port, mode) {
-    sakshi_info("daimon listening");
+    sakshi_info("daimon listening", 16);
     var sb = str_builder_new();
     str_builder_add_cstr(sb, "daimon v");
     var ver_buf = alloc(16);
@@ -4093,25 +3905,49 @@ fn server_banner(port, mode) {
 # --- Synchronous server ---
 
 fn serve(port) {
-    var sfd = server_bind(port);
-    if (sfd < 0) { return 1; }
     server_banner(port, "sync");
-
-    while (1 == 1) {
-        var client_result = sock_accept(sfd);
-        if (is_err_result(client_result) == 1) { continue; }
-        handle_request(payload(client_result));
-    }
-    return 0;
+    # sandhi_server_run owns bind/listen/accept/recv + smuggling rejection
+    # (CL+TE conflict, Host.Host / CL.CL / TE.TE duplicates per RFC 7230
+    # §3.3.2 + §3.3.3) before our handler runs. It closes cfd after the
+    # handler returns. Returns when the loop exits (today: never).
+    return sandhi_server_run(INADDR_ANY(), port, &handle_request, 0);
 }
 
 # --- Async server (epoll-based cooperative concurrency) ---
+#
+# Sandhi's server is sync-only ("single-threaded until 0.8.0" per
+# sandhi/http/server.cyr), so daimon owns the async accept loop and
+# uses sandhi only for per-request recv + smuggling rejection +
+# parse + send. Same handle_request runs under both modes.
 
-# Async handler wrapper — called by async_run for each spawned client
+# Per-handler buffer — async runs handlers cooperatively (no preemption),
+# but multiple in-flight requests may overlap in scheduling. Allocate
+# fresh per call so each handler has its own buffer (sandhi's
+# `_hsv_req_buf` global is fine for sync because sandhi_server_run is
+# single-flight, but unsafe for async if two handlers ever interleave
+# their recv loops).
 fn async_handle_client(cfd) {
-    # Wait for the client fd to be readable before processing
     async_await_readable(cfd);
-    handle_request(cfd);
+
+    var buf = alloc(MAX_REQUEST_SIZE + 1);
+    var n = sandhi_server_recv_request(cfd, buf, MAX_REQUEST_SIZE);
+    if (n <= 0) { sock_close(cfd); return 0; }
+
+    # Smuggling rejection — sandhi_server_run does this in its own loop
+    # via the same fns; we mirror it here for the async path.
+    if (sandhi_server_request_has_cl_te_conflict(buf, n) == 1) {
+        sandhi_server_send_status(cfd, 400, "Bad Request");
+        sock_close(cfd);
+        return 0;
+    }
+    if (sandhi_server_request_has_dup_smuggling_header(buf, n) == 1) {
+        sandhi_server_send_status(cfd, 400, "Bad Request");
+        sock_close(cfd);
+        return 0;
+    }
+
+    handle_request(0, cfd, buf, n);
+    sock_close(cfd);
     return 0;
 }
 
