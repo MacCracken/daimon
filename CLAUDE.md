@@ -8,7 +8,7 @@
 - **Language**: Cyrius (ported from 9,724 LOC Rust)
 - **Purpose**: AGNOS agent orchestrator — HTTP API, supervisor, IPC, scheduler, federation, edge fleet, memory, MCP dispatch (port 8090)
 - **License**: GPL-3.0-only
-- **Cyrius**: 4.2.0 (pinned in `.cyrius-toolchain`)
+- **Cyrius**: 5.7.12 (pinned in `cyrius.cyml`)
 - **Version**: CalVer (see VERSION file)
 - **Genesis repo**: [agnosticos](https://github.com/MacCracken/agnosticos)
 - **Philosophy**: [AGNOS Philosophy & Intention](https://github.com/MacCracken/agnosticos/blob/main/docs/philosophy.md)
@@ -19,20 +19,26 @@
 
 ## Cyrius Stdlib — Available Modules
 
-The following stdlib modules are available via `cyrius.toml` deps. **Async IS available.**
+The following stdlib modules are available via `cyrius.cyml` deps. **Async IS available.**
 
 | Module | Purpose |
 |--------|---------|
 | `async` | **Cooperative async runtime — epoll event loop, spawn, sleep, await_readable, timeout** |
 | `thread` | Clone-based threads, mutex, MPSC channels |
 | `net` | TCP sockets (connect, listen, accept, read, write) |
-| `http` | HTTP client/server helpers |
+| `http` | HTTP client helpers (server use deprecated — see `sandhi` below) |
+| `sandhi` | **Recommended for new HTTP server work** — replaces `lib/http.cyr` server. HTTP/1.1 + HTTP/2, SSE/streaming, JSON-RPC + MCP-over-HTTP (`sandhi_rpc_mcp_call`), service discovery, mTLS. Adopt incrementally. |
 | `json` | JSON parse/emit |
-| `hashmap` | Hash map with string keys |
+| `hashmap` | Hash map. `map_new()` = cstr keys; `map_new_str()` = `Str` struct keys; `map_u64_new()` = u64 inline keys (5.5.20). Pick at construction. |
 | `process` | Fork, exec, waitpid |
 | `fs` | File operations |
 | `chrono` | Timestamps |
-| `sakshi` | Structured logging/tracing |
+
+External (non-stdlib) deps used by daimon:
+
+| Dep | Purpose |
+|--------|--------|
+| `sakshi` (2.0.0) | Structured logging/tracing — git-pinned via `[deps.sakshi]` in `cyrius.cyml`; resolved into `lib/sakshi.cyr` as a symlink by `cyrius deps`. |
 
 **ADR-002 is invalid** — `lib/async.cyr` provides epoll-based cooperative async:
 ```cyrius
@@ -77,7 +83,7 @@ Every AGNOS agent, every consumer app, hoosh, agnoshi, aethersafha.
 9. Run benchmarks again — prove the wins
 10. If review heavy → return to step 5
 11. Documentation — update CHANGELOG, roadmap, docs, ADRs for design decisions, source citations for algorithms/formulas, update docs/sources.md, guides and examples for new API surface, verify recipe version in zugot
-12. Version check — VERSION, cyrius.toml, recipe (in zugot) all in sync
+12. Version check — VERSION, cyrius.cyml, recipe (in zugot) all in sync
 13. Return to step 1
 
 ### Task Sizing

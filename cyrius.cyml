@@ -1,0 +1,44 @@
+[package]
+name = "daimon"
+version = "${file:VERSION}"
+description = "daimon — AGNOS agent orchestrator"
+license = "GPL-3.0-only"
+repository = "https://github.com/MacCracken/daimon"
+language = "cyrius"
+cyrius = "5.7.12"
+
+[build]
+entry = "src/main.cyr"
+output = "build/daimon"
+
+[deps]
+stdlib = [
+    "string",
+    "fmt",
+    "alloc",
+    "vec",
+    "str",
+    "syscalls",
+    "io",
+    "fs",
+    "hashmap",
+    "tagged",
+    "json",
+    "net",
+    "http",
+    "args",
+    "chrono",
+    "fnptr",
+    "process",
+    "async",
+    "thread",
+    "callback",
+    "assert",
+    "bench",
+    "freelist",
+]
+
+[deps.sakshi]
+git = "https://github.com/MacCracken/sakshi.git"
+tag = "2.0.0"
+modules = ["dist/sakshi.cyr"]
