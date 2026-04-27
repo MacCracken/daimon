@@ -43,3 +43,11 @@ stdlib = [
 git = "https://github.com/MacCracken/sakshi.git"
 tag = "2.0.0"
 modules = ["dist/sakshi.cyr"]
+
+# Distribution manifest. Single binary today (`daimon`), with a best-effort
+# aarch64 cross-build; release.yml ships both when cc5_aarch64 is available
+# in the toolchain bundle. Kept declarative so future tooling
+# (`cyrius package`, ark) reads from one source instead of release.yml.
+[release]
+bins = ["daimon"]
+cross_bins = ["daimon-aarch64"]

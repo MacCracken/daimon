@@ -1072,7 +1072,8 @@ fn rag_config_default() {
     store64(rc + 8, 512);          # chunk_size
     store64(rc + 16, 64);          # overlap
     store64(rc + 24, f64_from(0)); # min_relevance (0.1 not easily representable, use 0)
-    store64(rc + 32, str_from("Use the following context to answer the question.\n\n---\n{context}\n---\n\nQuestion: {query}"));
+    var prompt_tmpl = "Use the following context to answer the question.\n\n---\n{context}\n---\n\nQuestion: {query}";
+    store64(rc + 32, str_from(prompt_tmpl));
     return rc;
 }
 
@@ -2820,7 +2821,10 @@ fn agent_ipc_accept_one(fd, ipc) {
     }
 
     # Parse big-endian u32
-    var msg_len = load8(&len_buf) * 16777216 + load8(&len_buf + 1) * 65536 + load8(&len_buf + 2) * 256 + load8(&len_buf + 3);
+    var msg_len = load8(&len_buf) * 16777216
+        + load8(&len_buf + 1) * 65536
+        + load8(&len_buf + 2) * 256
+        + load8(&len_buf + 3);
 
     if (msg_len > MAX_MESSAGE_SIZE) {
         # Send NACK
@@ -3390,7 +3394,9 @@ fn api_mcp_call(fd, body) {
     if (tool == 0) { http_bad_request(fd, str_from("tool not found")); return 0; }
     # No external forwarding in sync mode — return error
     var sb = str_builder_new();
-    str_builder_add_cstr(sb, "{\"content\":[{\"type\":\"text/plain\",\"text\":\"tool dispatch not available in sync mode\"}],\"isError\":true}");
+    str_builder_add_cstr(sb, "{\"content\":[{\"type\":\"text/plain\",\"text\":\"");
+    str_builder_add_cstr(sb, "tool dispatch not available in sync mode");
+    str_builder_add_cstr(sb, "\"}],\"isError\":true}");
     http_ok(fd, str_builder_build(sb));
     return 0;
 }
@@ -3915,8 +3921,15 @@ fn ip_to_cstr(ip) {
     var pi = 0;
     while (pi < 4) {
         var val = load64(&parts + pi * 8);
-        if (val >= 100) { store8(ib + off, 48 + val / 100); off = off + 1; val = val % 100; store8(ib + off, 48 + val / 10); off = off + 1; store8(ib + off, 48 + val % 10); off = off + 1; }
-        elif (val >= 10) { store8(ib + off, 48 + val / 10); off = off + 1; store8(ib + off, 48 + val % 10); off = off + 1; }
+        if (val >= 100) {
+            store8(ib + off, 48 + val / 100); off = off + 1; val = val % 100;
+            store8(ib + off, 48 + val / 10); off = off + 1;
+            store8(ib + off, 48 + val % 10); off = off + 1;
+        }
+        elif (val >= 10) {
+            store8(ib + off, 48 + val / 10); off = off + 1;
+            store8(ib + off, 48 + val % 10); off = off + 1;
+        }
         else { store8(ib + off, 48 + val); off = off + 1; }
         if (pi < 3) { store8(ib + off, 46); off = off + 1; }
         pi = pi + 1;
