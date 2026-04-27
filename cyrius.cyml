@@ -15,6 +15,7 @@ output = "build/daimon"
 stdlib = [
     "string",
     "fmt",
+    "math",
     "alloc",
     "vec",
     "str",

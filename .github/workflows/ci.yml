@@ -13,14 +13,14 @@ concurrency:
 
 jobs:
   build:
-    name: Build
+    name: Build & Test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Cyrius toolchain
         run: |
-          CYRIUS_VERSION="${CYRIUS_VERSION:-$(cat .cyrius-toolchain | tr -d '[:space:]')}"
+          CYRIUS_VERSION="${CYRIUS_VERSION:-$(grep -oP '(?<=^cyrius = ")[^"]+' cyrius.cyml)}"
           echo "Installing Cyrius $CYRIUS_VERSION"
           curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
@@ -35,19 +35,135 @@ jobs:
       - name: Resolve dependencies
         run: cyrius deps
 
-      - name: Build
+      - name: Verify dep hashes
+        # Skip on the first push that introduces a new dep before
+        # cyrius.lock is generated and committed. Once present, enforce.
+        run: |
+          if [ -f cyrius.lock ]; then
+            cyrius deps --verify
+          else
+            echo "::warning::cyrius.lock not committed — skipping hash verification"
+          fi
+
+      - name: Vet
+        run: cyrius vet src/main.cyr
+
+      - name: Lint (advisory)
+        # Advisory-only for v1.x. Tier-3 cleanup will eliminate the
+        # 6 standing warnings (4 long lines + 1 false-positive brace
+        # from JSON-in-string-literal); after that, flip this to fail
+        # on warnings the way agnostik/yukti CI does.
+        continue-on-error: true
+        run: |
+          for f in src/*.cyr tests/*.tcyr tests/*.bcyr fuzz/*.fcyr; do
+            [ -f "$f" ] || continue
+            cyrius lint "$f"
+          done
+
+      - name: Build (DCE)
         run: |
           mkdir -p build
-          cyrius build src/main.cyr build/daimon
+          CYRIUS_DCE=1 cyrius build src/main.cyr build/daimon
           echo "daimon: $(wc -c < build/daimon) bytes"
+
+      - name: Verify ELF
+        run: xxd -l 4 build/daimon | grep -q "7f45 4c46"
+
+      - name: Cross-build aarch64
+        # Best-effort: only when toolchain bundle includes cc5_aarch64.
+        run: |
+          if [ ! -x "$HOME/.cyrius/bin/cc5_aarch64" ]; then
+            echo "::warning::cc5_aarch64 not shipped with Cyrius $CYRIUS_VERSION — skipping"
+            exit 0
+          fi
+          CYRIUS_DCE=1 cyrius build --aarch64 src/main.cyr build/daimon-aarch64
+          file build/daimon-aarch64 | grep -q "aarch64" || {
+            echo "ERROR: daimon-aarch64 is not aarch64 ELF"; exit 1; }
+          echo "daimon-aarch64: $(wc -c < build/daimon-aarch64) bytes"
+
+      - name: Test
+        run: |
+          fail=0
+          for t in tests/*.tcyr; do
+            [ -f "$t" ] || continue
+            name=$(basename "$t" .tcyr)
+            echo "=== $name ==="
+            if ! cyrius test "$t"; then
+              echo "FAIL: $name"
+              fail=1
+            fi
+          done
+          [ $fail -eq 0 ] || { echo "test failures"; exit 1; }
+
+      - name: Bench
+        run: |
+          for b in tests/*.bcyr; do
+            [ -f "$b" ] || continue
+            cyrius bench "$b"
+          done
+
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan for dangerous patterns
+        # daimon is a process supervisor — fork/execve/clone are intentional
+        # (see src/main.cyr agent_spawn_with_limits). We scan for patterns
+        # daimon should NEVER exhibit: writes to system paths, unbounded
+        # stack buffers, unguarded shell-out via sys_system. Matches code
+        # lines only — comments (#) are skipped.
+        run: |
+          FAIL=0
+          scan() {
+            local label="$1"; shift
+            local pat="$1"; shift
+            local hits
+            hits=$(grep -rn "$pat" src/ 2>/dev/null | awk -F: '
+              { line=$3; for(i=4;i<=NF;i++) line=line":"$i;
+                sub(/^[[:space:]]+/,"",line);
+                if (substr(line,1,1) != "#") print $1":"$2":"line }')
+            if [ -n "$hits" ]; then
+              echo "FAIL: $label"
+              echo "$hits"
+              FAIL=1
+            fi
+          }
+          # Shell-out is forbidden (use sys_execve directly with arg arrays).
+          scan "sys_system"      '\bsys_system\s*\('
+          # Hardcoded system path writes — agent FS scope must stay sandboxed.
+          scan "writes to /etc"  '"/etc/'
+          scan "writes to /bin"  '"/bin/'
+          scan "writes to /sbin" '"/sbin/'
+          # Unbounded stack buffers (>= 64 KB) — force heap review.
+          awk -F: '
+            /var [A-Za-z_][A-Za-z0-9_]*\[[0-9]+\]/ {
+              match($0, /\[[0-9]+\]/); s=substr($0,RSTART+1,RLENGTH-2); n=s+0;
+              if (n >= 65536) print FILENAME":"NR": large stack buffer ("n" bytes): "$0
+            }' src/*.cyr | tee /tmp/bigbuf.txt
+          [ -s /tmp/bigbuf.txt ] && FAIL=1
+          echo "security scan complete (fail: $FAIL)"
+          exit $FAIL
 
   docs:
     name: Documentation
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Check required docs
+      - name: Check required files
         run: |
-          for doc in README.md CHANGELOG.md VERSION LICENSE cyrius.toml; do
-            test -f "$doc" && echo "OK: $doc" || { echo "MISSING: $doc"; exit 1; }
+          MISSING=0
+          for f in README.md CHANGELOG.md VERSION CONTRIBUTING.md SECURITY.md \
+                   CODE_OF_CONDUCT.md LICENSE CLAUDE.md cyrius.cyml cyrius.lock \
+                   docs/architecture/overview.md docs/development/roadmap.md; do
+            if [ -f "$f" ]; then echo "  OK: $f"
+            else echo "  MISSING: $f"; MISSING=1; fi
           done
+          exit $MISSING
+
+      - name: Verify version consistency
+        run: |
+          VERSION=$(cat VERSION | tr -d '[:space:]')
+          echo "VERSION file: $VERSION"
+          grep -q "$VERSION" CHANGELOG.md || { echo "FAIL: version not in CHANGELOG.md"; exit 1; }
+          echo "Version consistent (cyrius.cyml pulls VERSION via \${file:VERSION})"

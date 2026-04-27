@@ -6,14 +6,14 @@ to get involved.
 ## Getting Started
 
 1. Fork the repository and clone your fork
-2. Install [Cyrius](https://github.com/MacCracken/cyrius) 4.2.0+ (see `.cyrius-toolchain`)
+2. Install [Cyrius](https://github.com/MacCracken/cyrius) 5.7.12+ (see `cyrius.cyml` `[package].cyrius`)
 3. Run `cyrius check` to verify your environment
 
 ## Development Workflow
 
 ```bash
 cyrius deps                          # Resolve dependencies
-cyrius build                         # Build (reads cyrius.toml)
+cyrius build                         # Build (reads cyrius.cyml)
 cyrius check                         # Format + lint + test + build
 cyrius test tests/daimon.tcyr        # Run test suite
 cyrius bench tests/daimon.bcyr       # Run benchmarks
