@@ -143,17 +143,39 @@ jobs:
       - name: Verify ELF
         run: xxd -l 4 build/daimon | grep -q "7f45 4c46"
 
-      - name: Cross-build aarch64
-        # Best-effort: only when cc5_aarch64 is in the toolchain bundle.
+      - name: Cross-build aarch64 (best-effort)
+        # Best-effort: only when cc5_aarch64 is in the toolchain bundle,
+        # and tolerant of known upstream stdlib aarch64 gaps. Same posture
+        # as sakshi 2.2.2's aarch64 lane (upstream stdlib emits unresolved
+        # `vec_get` / `vec_len` refs there; we hit a different symbol).
+        #
+        # Known upstream-blocker symbols (downgrade to warning, exit 0):
+        #   - SYS_EPOLL_WAIT: lib/async.cyr line 117/145 calls it unconditionally,
+        #     but lib/syscalls_aarch64_linux.cyr only defines SYS_EPOLL_PWAIT
+        #     (aarch64 has no plain epoll_wait syscall). Tracked in
+        #     docs/development/issues/2026-05-10-cyrius-async-aarch64.md.
+        #
+        # Any other failure still fails the step — we want signal when a
+        # daimon-side regression breaks the cross-build, just not when
+        # upstream is the blocker.
         run: |
           if [ ! -x "$HOME/.cyrius/bin/cc5_aarch64" ]; then
             echo "::warning::cc5_aarch64 not shipped with Cyrius $CYRIUS_VERSION — skipping"
             exit 0
           fi
-          cyrius build --aarch64 src/main.cyr build/daimon-aarch64
-          file build/daimon-aarch64 | grep -q "aarch64" || {
-            echo "ERROR: daimon-aarch64 is not aarch64 ELF"; exit 1; }
-          echo "daimon-aarch64: $(wc -c < build/daimon-aarch64) bytes"
+          if cyrius build --aarch64 src/main.cyr build/daimon-aarch64 2>&1 | tee /tmp/aarch64.log; then
+            file build/daimon-aarch64 | grep -q "aarch64" || {
+              echo "ERROR: daimon-aarch64 is not aarch64 ELF"; exit 1; }
+            echo "daimon-aarch64: $(wc -c < build/daimon-aarch64) bytes"
+            exit 0
+          fi
+          # Build failed — check whether it's a known upstream stdlib gap.
+          if grep -qE "undefined variable 'SYS_EPOLL_WAIT'" /tmp/aarch64.log; then
+            echo "::warning::aarch64 cross-build blocked on upstream stdlib gap (SYS_EPOLL_WAIT not defined on aarch64 — see docs/development/issues/2026-05-10-cyrius-async-aarch64.md). Treated as non-fatal; x86_64 build remains authoritative."
+            exit 0
+          fi
+          echo "ERROR: aarch64 cross-build failed for a non-blocker reason"
+          exit 1
 
       - name: Test
         run: |

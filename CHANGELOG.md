@@ -30,7 +30,12 @@ CI and release workflows rewritten on the **libro / bote / agnosys 5.10.x shape*
 - **`cyrius fmt` re-enabled** — `diff -q <(cyrius fmt $f) $f` per file (5.9.x+ `--check` is a no-op). Covers src/ + tests/ + bench/ + fuzz/. Daimon is clean on first run; gate fires on drift.
 - **Lint flipped fail-on-warn** — `continue-on-error: true` removed. Daimon is clean under 5.10.34 (was 6 standing warnings on 5.7.12, all resolved upstream or by the cosmetic edits above).
 - **Docs job** — adds `docs/doc-health.md` to the required-files list.
-- **Release workflow** — mirrors agnosys release.yml: split into `ci` → `build` → `release` jobs; ships `daimon-<tag>-src.tar.gz` + `daimon-<tag>-x86_64-linux` + `daimon-<tag>-aarch64-linux` (when `cc5_aarch64` is present) + `cyrius.lock` + `SHA256SUMS`; pre-release detection on both `0.x` and `v0.x` tag styles.
+- **Release workflow** — mirrors agnosys release.yml: split into `ci` → `build` → `release` jobs; ships `daimon-<tag>-src.tar.gz` + `daimon-<tag>-x86_64-linux` + `daimon-<tag>-aarch64-linux` (when `cc5_aarch64` is present **and** the cross-build clears the upstream stdlib aarch64 gap — see Known issues below) + `cyrius.lock` + `SHA256SUMS`; pre-release detection on both `0.x` and `v0.x` tag styles.
+- **aarch64 cross-build is tolerant of upstream stdlib gaps** — known-blocker symbols (currently `SYS_EPOLL_WAIT`) downgrade to a `::warning::` and exit 0. Any other failure still fails the step. Same posture as sakshi 2.2.2's aarch64 lane. Tracked in `docs/development/issues/2026-05-10-cyrius-async-aarch64.md`.
+
+### Known issues
+
+- **aarch64 cross-build blocked on upstream stdlib gap.** `lib/async.cyr` references `SYS_EPOLL_WAIT` unconditionally, but `lib/syscalls_aarch64_linux.cyr` only defines `SYS_EPOLL_PWAIT` (aarch64 has no plain `epoll_wait` syscall). Reproduces on both cyrius 5.10.34 and 5.10.47. Daimon's source is portable — the gap is in the cyrius stdlib. CI / release downgrade this specific error to a warning so the x86_64 ship is unblocked; aarch64 binaries return automatically when upstream patches `lib/async.cyr` or adds an arch-dispatch shim. Full write-up + workaround mechanism in `docs/development/issues/2026-05-10-cyrius-async-aarch64.md`.
 
 ### Added
 

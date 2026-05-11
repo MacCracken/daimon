@@ -72,6 +72,12 @@ Daimon is the AGNOS agent orchestrator — every consumer (hoosh, agnoshi, aethe
 - `development/state.md` — agnosys convention for the live volatile state file (pin / build sizes / test count / consumer table / recent releases / slot ledger). Daimon's roadmap.md partially covers this; consider splitting in 1.2.x if scope grows.
 - `development/capability-map.md` — auto-generated per-module kernel-surface map. Daimon's surface is mostly userland (HTTP API + IPC over Unix sockets), so the security value is smaller than for agnosys; flag as nice-to-have, not P1.
 
+**Tier — Engineering issues (`docs/development/issues/`)**
+
+| File | Filed | Status | Notes |
+|---|---|---|---|
+| `2026-05-10-cyrius-async-aarch64.md` | 2026-05-10 | 🟢 Active / passive upstream | `SYS_EPOLL_WAIT` undefined on aarch64 (lib/async.cyr × lib/syscalls_aarch64_linux.cyr). Blocks `--aarch64` cross-build. CI tolerant via warn-on-detect; x86_64 unaffected. Close when upstream lands the arch-dispatch shim. |
+
 ---
 
 ## Tier 4 — ADRs (`docs/adr/`)

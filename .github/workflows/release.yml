@@ -95,13 +95,24 @@ jobs:
           echo "daimon: $(wc -c < build/daimon) bytes"
 
       - name: Cross-build aarch64 (best-effort)
+        # See ci.yml for the upstream-stdlib-gap rationale. Release ships
+        # the x86_64 binary regardless; aarch64 is bonus when the build
+        # is clean.
         run: |
-          if [ -x "$HOME/.cyrius/bin/cc5_aarch64" ]; then
-            cyrius build --aarch64 src/main.cyr build/daimon-aarch64
-            echo "daimon-aarch64: $(wc -c < build/daimon-aarch64) bytes"
-          else
+          if [ ! -x "$HOME/.cyrius/bin/cc5_aarch64" ]; then
             echo "::warning::cc5_aarch64 not in toolchain — aarch64 binary skipped"
+            exit 0
           fi
+          if cyrius build --aarch64 src/main.cyr build/daimon-aarch64 2>&1 | tee /tmp/aarch64.log; then
+            echo "daimon-aarch64: $(wc -c < build/daimon-aarch64) bytes"
+            exit 0
+          fi
+          if grep -qE "undefined variable 'SYS_EPOLL_WAIT'" /tmp/aarch64.log; then
+            echo "::warning::aarch64 cross-build blocked on upstream stdlib gap (SYS_EPOLL_WAIT not defined on aarch64). x86_64 release ships without the aarch64 binary this tag."
+            exit 0
+          fi
+          echo "ERROR: aarch64 cross-build failed for a non-blocker reason"
+          exit 1
 
       - name: Test
         run: |
