@@ -1099,8 +1099,11 @@ fn fed_vstore_merge_results(fvs, local_results, remote_batches, top_k) {
         var fvdr = vec_get(fv_all, fvdi);
         var fvdid = str_cstr(remote_result_id(fvdr));
         var fvde = map_get(fv_dedup, fvdid);
-        if (fvde == 0) { map_set(fv_dedup, fvdid, fvdr); }
-        else { if (f64_gt(remote_result_score(fvdr), remote_result_score(fvde)) == 1) { map_set(fv_dedup, fvdid, fvdr); } }
+        if (fvde == 0) {
+            map_set(fv_dedup, fvdid, fvdr);
+        } elif (f64_gt(remote_result_score(fvdr), remote_result_score(fvde)) == 1) {
+            map_set(fv_dedup, fvdid, fvdr);
+        }
         fvdi = fvdi + 1;
     }
     var fv_dk = map_keys(fv_dedup);
@@ -1759,7 +1762,8 @@ fn main() {
     test_group("rag_pipeline");
 
     var rpipe = rag_pipeline_new(rag_config_default());
-    var rids = rag_ingest_text(rpipe, str_from("Rust is a systems programming language focused on safety and performance"), str_from("test"));
+    var rdoc = str_from("Rust is a systems programming language focused on safety and performance");
+    var rids = rag_ingest_text(rpipe, rdoc, str_from("test"));
     assert(vec_len(rids) > 0, "ingested chunks");
 
     var rctx = rag_query_text(rpipe, str_from("rust safety"));
@@ -1818,7 +1822,8 @@ fn main() {
     var remote_batch = vec_new();
     var rbatch1 = vec_new();
     vec_push(rbatch1, remote_result_new(str_from("v3"), f64_from(85), str_from("doc3"), str_from("node-2")));
-    vec_push(rbatch1, remote_result_new(str_from("v1"), f64_from(80), str_from("doc1-dup"), str_from("node-2")));  # dup, lower score
+    # v1 dup at lower score (80 vs local's 90); merge should keep the local entry
+    vec_push(rbatch1, remote_result_new(str_from("v1"), f64_from(80), str_from("doc1-dup"), str_from("node-2")));
     vec_push(remote_batch, rbatch1);
 
     var merged = fed_vstore_merge_results(fvs, local_res, remote_batch, 3);

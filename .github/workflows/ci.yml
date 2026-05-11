@@ -11,6 +11,18 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # `cyrius deps` populates ./lib/ from the version-pinned snapshot,
+  # which then shadows the global ~/.cyrius/versions/<V>/lib/ snapshot
+  # on every subsequent `cyrius build` invocation. That's intentional
+  # (the cwd lib IS the version-pinned content cyrius deps just
+  # copied), but cyrius emits an informational note about it on every
+  # build. Silence it across all CI steps. Mirrors agnosys / bote /
+  # libro / majra CI post-5.10.x.
+  CYRIUS_NO_WARN_SHADOW_LIB: "1"
+  # Whole-program dead-code elimination — first-party convention.
+  CYRIUS_DCE: "1"
+
 jobs:
   build:
     name: Build & Test
@@ -19,25 +31,69 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Cyrius toolchain
+        # Versioned layout — cc5 5.10.9+ resolves arch-peer includes
+        # (syscalls_x86_64_linux.cyr etc.) under
+        # ~/.cyrius/versions/<V>/lib/. The 5.10.x release tarball
+        # ships bin/ + deps/ only — the lib/ stdlib snapshot is NOT
+        # in the tarball — so we also pull the GitHub source archive
+        # at the version tag and copy lib/ from there. Same installer
+        # body as agnosys / bote / libro / majra.
         run: |
-          CYRIUS_VERSION="${CYRIUS_VERSION:-$(grep -oP '(?<=^cyrius = ")[^"]+' cyrius.cyml)}"
+          CYRIUS_VERSION="${CYRIUS_VERSION:-$(grep -E '^cyrius[[:space:]]*=' cyrius.cyml | sed -E 's/^cyrius[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')}"
           echo "Installing Cyrius $CYRIUS_VERSION"
+
+          # Release tarball — binaries + first-party deps cache.
           curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           CYRIUS_DIR="cyrius-$CYRIUS_VERSION-x86_64-linux"
-          mkdir -p "$HOME/.cyrius/bin" "$HOME/.cyrius/lib"
-          cp "$CYRIUS_DIR/bin/"* "$HOME/.cyrius/bin/" 2>/dev/null || true
-          cp -r "$CYRIUS_DIR/lib/"* "$HOME/.cyrius/lib/" 2>/dev/null || true
-          chmod +x "$HOME/.cyrius/bin/"* 2>/dev/null || true
+
+          # Source archive — stdlib (lib/) snapshot at the version tag.
+          curl -sL "https://github.com/MacCracken/cyrius/archive/refs/tags/$CYRIUS_VERSION.tar.gz" -o cyrius-src.tar.gz
+          tar xzf cyrius-src.tar.gz
+          CYRIUS_SRC="cyrius-$CYRIUS_VERSION"
+
+          VERSIONED="$HOME/.cyrius/versions/$CYRIUS_VERSION"
+          mkdir -p "$VERSIONED/bin" "$VERSIONED/lib"
+          cp "$CYRIUS_DIR/bin/"* "$VERSIONED/bin/" 2>/dev/null || true
+          cp "$CYRIUS_DIR/scripts/cyrius" "$VERSIONED/bin/cyrius" 2>/dev/null || true
+          # cc5_aarch64 moved out of bin/ to the tarball top level at
+          # 5.7.48; pick it up explicitly so the cross-build step works.
+          if [ -f "$CYRIUS_DIR/cc5_aarch64" ]; then
+            cp "$CYRIUS_DIR/cc5_aarch64" "$VERSIONED/bin/cc5_aarch64"
+          fi
+          cp -r "$CYRIUS_SRC/lib/"* "$VERSIONED/lib/"
+          # Carry the prebuilt deps snapshot so `cyrius deps` doesn't
+          # have to git-clone the first-party tree on every CI run.
+          if [ -d "$CYRIUS_DIR/deps" ]; then
+            mkdir -p "$HOME/.cyrius/deps"
+            cp -r "$CYRIUS_DIR/deps/"* "$HOME/.cyrius/deps/"
+          fi
+          chmod +x "$VERSIONED/bin/"* 2>/dev/null || true
+          ln -sfn "$VERSIONED/bin" "$HOME/.cyrius/bin"
+          ln -sfn "$VERSIONED/lib" "$HOME/.cyrius/lib"
+          echo "$CYRIUS_VERSION" > "$HOME/.cyrius/current"
           echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
           echo "CYRIUS_HOME=$HOME/.cyrius" >> $GITHUB_ENV
 
+          # Sanity checks.
+          test -f "$VERSIONED/lib/syscalls_x86_64_linux.cyr" || { echo "FAIL: stdlib lib/syscalls_x86_64_linux.cyr missing — source archive extraction failed"; exit 1; }
+          test -x "$VERSIONED/bin/cc5" || { echo "FAIL: bin/cc5 missing — release tarball extraction failed"; exit 1; }
+          echo "OK: stdlib + binaries installed under $VERSIONED"
+
+      - name: Verify toolchain
+        run: cc5 --version
+
       - name: Resolve dependencies
+        # Populates ./lib/ from the version-pinned stdlib snapshot
+        # plus [deps.sakshi] dist bundle at its tagged version.
+        # ./lib/ is gitignored — first-party convention across
+        # agnosys / bote / libro / majra.
         run: cyrius deps
 
       - name: Verify dep hashes
         # Skip on the first push that introduces a new dep before
-        # cyrius.lock is generated and committed. Once present, enforce.
+        # cyrius.lock has been generated and committed. Once present,
+        # enforce.
         run: |
           if [ -f cyrius.lock ]; then
             cyrius deps --verify
@@ -48,35 +104,53 @@ jobs:
       - name: Vet
         run: cyrius vet src/main.cyr
 
-      - name: Lint (advisory)
-        # Advisory-only for v1.x. Tier-3 cleanup will eliminate the
-        # 6 standing warnings (4 long lines + 1 false-positive brace
-        # from JSON-in-string-literal); after that, flip this to fail
-        # on warnings the way agnostik/yukti CI does.
-        continue-on-error: true
+      - name: Format check
+        # `cyrius fmt --check` became a no-op in 5.9.x (emits nothing,
+        # exits 0 regardless of drift), so diff against the committed
+        # source is the actual gate. Covers src/ + tests/ + bench.
         run: |
+          fail=0
           for f in src/*.cyr tests/*.tcyr tests/*.bcyr fuzz/*.fcyr; do
             [ -f "$f" ] || continue
-            cyrius lint "$f"
+            if ! diff -q <(cyrius fmt "$f" 2>/dev/null) "$f" > /dev/null; then
+              echo "needs fmt: $f"
+              fail=1
+            fi
           done
+          [ $fail -eq 0 ] || { echo "fmt: drift detected"; exit 1; }
+
+      - name: Lint
+        # Fail-on-warn — daimon is clean under 5.10.34. Lint covers
+        # src/ + tests/ + bench/ + fuzz/.
+        run: |
+          fail=0
+          for f in src/*.cyr tests/*.tcyr tests/*.bcyr fuzz/*.fcyr; do
+            [ -f "$f" ] || continue
+            out=$(cyrius lint "$f" 2>&1)
+            echo "$out"
+            if echo "$out" | grep -qE '^\s*warn '; then
+              fail=1
+            fi
+          done
+          [ $fail -eq 0 ] || { echo "lint: warnings present"; exit 1; }
 
       - name: Build (DCE)
         run: |
           mkdir -p build
-          CYRIUS_DCE=1 cyrius build src/main.cyr build/daimon
+          cyrius build src/main.cyr build/daimon
           echo "daimon: $(wc -c < build/daimon) bytes"
 
       - name: Verify ELF
         run: xxd -l 4 build/daimon | grep -q "7f45 4c46"
 
       - name: Cross-build aarch64
-        # Best-effort: only when toolchain bundle includes cc5_aarch64.
+        # Best-effort: only when cc5_aarch64 is in the toolchain bundle.
         run: |
           if [ ! -x "$HOME/.cyrius/bin/cc5_aarch64" ]; then
             echo "::warning::cc5_aarch64 not shipped with Cyrius $CYRIUS_VERSION — skipping"
             exit 0
           fi
-          CYRIUS_DCE=1 cyrius build --aarch64 src/main.cyr build/daimon-aarch64
+          cyrius build --aarch64 src/main.cyr build/daimon-aarch64
           file build/daimon-aarch64 | grep -q "aarch64" || {
             echo "ERROR: daimon-aarch64 is not aarch64 ELF"; exit 1; }
           echo "daimon-aarch64: $(wc -c < build/daimon-aarch64) bytes"
@@ -155,7 +229,8 @@ jobs:
           MISSING=0
           for f in README.md CHANGELOG.md VERSION CONTRIBUTING.md SECURITY.md \
                    CODE_OF_CONDUCT.md LICENSE CLAUDE.md cyrius.cyml cyrius.lock \
-                   docs/architecture/overview.md docs/development/roadmap.md; do
+                   docs/architecture/overview.md docs/development/roadmap.md \
+                   docs/doc-health.md; do
             if [ -f "$f" ]; then echo "  OK: $f"
             else echo "  MISSING: $f"; MISSING=1; fi
           done
@@ -163,7 +238,10 @@ jobs:
 
       - name: Verify version consistency
         run: |
-          VERSION=$(cat VERSION | tr -d '[:space:]')
-          echo "VERSION file: $VERSION"
-          grep -q "$VERSION" CHANGELOG.md || { echo "FAIL: version not in CHANGELOG.md"; exit 1; }
-          echo "Version consistent (cyrius.cyml pulls VERSION via \${file:VERSION})"
+          FILE_VERSION=$(tr -d '[:space:]' < VERSION)
+          echo "VERSION file: $FILE_VERSION"
+          grep -q '^version = "\${file:VERSION}"' cyrius.cyml || {
+            echo "FAIL: cyrius.cyml version must be \${file:VERSION}"; exit 1; }
+          grep -q "\[$FILE_VERSION\]" CHANGELOG.md || {
+            echo "FAIL: version $FILE_VERSION not in CHANGELOG.md"; exit 1; }
+          echo "Version consistent: $FILE_VERSION (cyrius.cyml pulls from VERSION via \${file:VERSION})"

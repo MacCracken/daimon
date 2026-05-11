@@ -11,6 +11,13 @@ on:
 permissions:
   contents: write
 
+env:
+  # See ci.yml — `cyrius deps` shadows the version-pinned snapshot
+  # with cwd lib (identical content); silence the informational note.
+  CYRIUS_NO_WARN_SHADOW_LIB: "1"
+  # Whole-program dead-code elimination — smaller release binary.
+  CYRIUS_DCE: "1"
+
 jobs:
   ci:
     name: CI Gate
@@ -25,27 +32,50 @@ jobs:
 
       - name: Verify version
         run: |
-          FILE_VERSION=$(cat VERSION | tr -d '[:space:]')
+          FILE_VERSION=$(tr -d '[:space:]' < VERSION)
           TAG="${GITHUB_REF_NAME#v}"   # strip optional leading 'v' so v1.0.0 == 1.0.0
           echo "$TAG" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' || {
             echo "tag ($TAG) is not semver x.y.z"; exit 1; }
           [ "$FILE_VERSION" = "$TAG" ] || {
             echo "VERSION ($FILE_VERSION) != tag ($TAG)"; exit 1; }
+          grep -q '^version = "\${file:VERSION}"' cyrius.cyml || {
+            echo "cyrius.cyml version must be \${file:VERSION}"; exit 1; }
           echo "Version verified: $TAG (cyrius.cyml pulls from VERSION via \${file:VERSION})"
 
       - name: Install Cyrius toolchain
+        # Versioned layout — see ci.yml for rationale. 5.10.x release
+        # tarballs ship bin/ + deps/ only, so we also pull the source
+        # archive at the version tag to get lib/ (the stdlib snapshot).
         run: |
-          CYRIUS_VERSION="${CYRIUS_VERSION:-$(grep -oP '(?<=^cyrius = ")[^"]+' cyrius.cyml)}"
+          CYRIUS_VERSION="${CYRIUS_VERSION:-$(grep -E '^cyrius[[:space:]]*=' cyrius.cyml | sed -E 's/^cyrius[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')}"
           echo "Installing Cyrius $CYRIUS_VERSION"
           curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           CYRIUS_DIR="cyrius-$CYRIUS_VERSION-x86_64-linux"
-          mkdir -p "$HOME/.cyrius/bin" "$HOME/.cyrius/lib"
-          cp "$CYRIUS_DIR/bin/"* "$HOME/.cyrius/bin/" 2>/dev/null || true
-          cp -r "$CYRIUS_DIR/lib/"* "$HOME/.cyrius/lib/" 2>/dev/null || true
-          chmod +x "$HOME/.cyrius/bin/"* 2>/dev/null || true
+          curl -sL "https://github.com/MacCracken/cyrius/archive/refs/tags/$CYRIUS_VERSION.tar.gz" -o cyrius-src.tar.gz
+          tar xzf cyrius-src.tar.gz
+          CYRIUS_SRC="cyrius-$CYRIUS_VERSION"
+          VERSIONED="$HOME/.cyrius/versions/$CYRIUS_VERSION"
+          mkdir -p "$VERSIONED/bin" "$VERSIONED/lib"
+          cp "$CYRIUS_DIR/bin/"* "$VERSIONED/bin/" 2>/dev/null || true
+          cp "$CYRIUS_DIR/scripts/cyrius" "$VERSIONED/bin/cyrius" 2>/dev/null || true
+          if [ -f "$CYRIUS_DIR/cc5_aarch64" ]; then
+            cp "$CYRIUS_DIR/cc5_aarch64" "$VERSIONED/bin/cc5_aarch64"
+          fi
+          cp -r "$CYRIUS_SRC/lib/"* "$VERSIONED/lib/"
+          if [ -d "$CYRIUS_DIR/deps" ]; then
+            mkdir -p "$HOME/.cyrius/deps"
+            cp -r "$CYRIUS_DIR/deps/"* "$HOME/.cyrius/deps/"
+          fi
+          chmod +x "$VERSIONED/bin/"* 2>/dev/null || true
+          ln -sfn "$VERSIONED/bin" "$HOME/.cyrius/bin"
+          ln -sfn "$VERSIONED/lib" "$HOME/.cyrius/lib"
+          echo "$CYRIUS_VERSION" > "$HOME/.cyrius/current"
           echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
           echo "CYRIUS_HOME=$HOME/.cyrius" >> $GITHUB_ENV
+
+      - name: Verify toolchain
+        run: cc5 --version
 
       - name: Resolve deps
         run: cyrius deps
@@ -61,13 +91,13 @@ jobs:
       - name: Build (DCE)
         run: |
           mkdir -p build
-          CYRIUS_DCE=1 cyrius build src/main.cyr build/daimon
+          cyrius build src/main.cyr build/daimon
           echo "daimon: $(wc -c < build/daimon) bytes"
 
       - name: Cross-build aarch64 (best-effort)
         run: |
           if [ -x "$HOME/.cyrius/bin/cc5_aarch64" ]; then
-            CYRIUS_DCE=1 cyrius build --aarch64 src/main.cyr build/daimon-aarch64
+            cyrius build --aarch64 src/main.cyr build/daimon-aarch64
             echo "daimon-aarch64: $(wc -c < build/daimon-aarch64) bytes"
           else
             echo "::warning::cc5_aarch64 not in toolchain — aarch64 binary skipped"

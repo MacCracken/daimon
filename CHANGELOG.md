@@ -6,6 +6,49 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-05-10
+
+**Toolchain modernization + CI/release rewrite.** Bumps Cyrius 5.7.12 → 5.10.34 and sakshi 2.0.0 → 2.2.3, gitignores `/lib/`, and rebuilds CI/release on the libro/bote/agnosys 5.10.x shape. No public-API changes; same 24 endpoints, same wire shape. Internal tightening from 15 patch slots of Cyrius improvements between 5.7.12 and 5.10.34.
+
+### Changed
+
+- **Cyrius pin**: `5.7.12` → `5.10.34`. Covers 15 patch slots of upstream improvements (struct-by-value ABI completion, `lib/tls.cyr` early-data accessors, sandhi 1.3.3 fold-in, hashmap key-type variants, `cyrius distlib` profile bundles, `#derive(accessors)` + `#derive(Serialize)` on structs). Daimon's source compiles unchanged under the new pin — the 4 long-line lint warnings + 1 false-positive `unclosed braces` warning from 5.7.12 are all gone (no source change required).
+- **Sakshi pin**: `2.0.0` → `2.2.3`. Picks up arch-portable syscalls (x86_64 + aarch64 dispatched at compile time via `_SK_SYS_*`), `sakshi_clock_recalibrate()` for long-running processes, and the 5.8.65 stdlib fold-in patch. No daimon source change — the `msg_len`-required call surface from 2.0.0 is unchanged.
+- **`cyrius.cyml` stdlib deps**: added `tls`, `mmap`, `dynlib`, `fdlopen`. Required at compile time because sandhi 1.3.3's bundle unconditionally references `TLS_EARLY_DATA_ACCEPTED` for its TLS 1.3 0-RTT client-write path (`sandhi_rpc_*`). Daimon doesn't use sandhi's HTTP client today — server only — so the runtime cost is zero (DCE drops the unused paths); the deps just have to be on disk for the bundle to compile.
+- **`/lib/` is now gitignored**. Repopulated by `cyrius deps` from the version-pinned stdlib snapshot + the `[deps.sakshi]` git pin. Matches the libro / bote / agnosys / patra / yukti convention. Removes 35 vendored stdlib files from the repo (binary `git diff` size shrinks substantially).
+- **`src/main.cyr`** — formatter-applied: 9 continuation-line indentation fixes (4 → 8 spaces) on lines 1034-1038, 2825-2827, 3057. Cosmetic; no behavioural change. `cyrius fmt` is stable on 5.10.34 (the 5.7.12 truncation-at-line-4168 bug is fixed upstream).
+- **`tests/daimon.tcyr`** — 3 long-line lint warnings cleared: dedup `else` branch split into `elif`; rag-pipeline ingest string extracted to a local; merge dup-result comment moved above the `vec_push` instead of trailing it.
+
+### CI / Release
+
+CI and release workflows rewritten on the **libro / bote / agnosys 5.10.x shape**:
+
+- **Toolchain installer** — versioned layout (`~/.cyrius/versions/<V>/{bin,lib}/` + symlinks + `~/.cyrius/current`). Required by cc5 5.10.9+ which resolves arch-peer includes (`syscalls_x86_64_linux.cyr`, etc.) through this path. Pulls both the release tarball (binaries + first-party deps cache) **and** the GitHub source archive at the version tag (for the `lib/` stdlib snapshot — 5.10.x release tarballs ship `bin/` + `deps/` only).
+- **`cc5_aarch64` top-level pickup** — moved out of `bin/` to the tarball top level at Cyrius 5.7.48; explicit copy step picks it up so the aarch64 cross-build keeps working.
+- **Workflow env** — `CYRIUS_NO_WARN_SHADOW_LIB=1` silences the post-5.10.x `./lib/ shadows version-pinned ...` informational note across all steps; `CYRIUS_DCE=1` set at workflow level (was per-step).
+- **`cc5 --version` verify** — added between install and dep-resolve.
+- **`cyrius fmt` re-enabled** — `diff -q <(cyrius fmt $f) $f` per file (5.9.x+ `--check` is a no-op). Covers src/ + tests/ + bench/ + fuzz/. Daimon is clean on first run; gate fires on drift.
+- **Lint flipped fail-on-warn** — `continue-on-error: true` removed. Daimon is clean under 5.10.34 (was 6 standing warnings on 5.7.12, all resolved upstream or by the cosmetic edits above).
+- **Docs job** — adds `docs/doc-health.md` to the required-files list.
+- **Release workflow** — mirrors agnosys release.yml: split into `ci` → `build` → `release` jobs; ships `daimon-<tag>-src.tar.gz` + `daimon-<tag>-x86_64-linux` + `daimon-<tag>-aarch64-linux` (when `cc5_aarch64` is present) + `cyrius.lock` + `SHA256SUMS`; pre-release detection on both `0.x` and `v0.x` tag styles.
+
+### Added
+
+- **`docs/doc-health.md`** — living ledger of doc currency (fresh / stale / read-through / evergreen / archive / open-question buckets per tier). Pattern lifted from agnosys / cyrius. Refresh discipline documented at the foot.
+
+### Verified
+
+- `cyrius check --with-deps src/main.cyr`: ok (one expected `shadow lib/` note silenced by `CYRIUS_NO_WARN_SHADOW_LIB=1`).
+- `cyrius build src/main.cyr build/daimon` (DCE on): **622 KB** statically-linked ELF. Size delta vs 1.1.4 (452 KB) is the tls/mmap/dynlib/fdlopen modules dragged in by sandhi 1.3.3's unconditional 0-RTT constant refs — DCE drops most of the body, the headers + symbol tables account for the +170 KB.
+- `cyrius test tests/daimon.tcyr`: **200 / 200** assertions pass across 26 test groups. No test changes required for the toolchain bump.
+- `cyrius lint`: 0 warnings across `src/`, `tests/`, `bench/`. Was 6 warnings on 5.7.12.
+- `cyrius fmt`: stable across `src/`, `tests/`, `bench/` (`diff` returns no drift).
+
+### Roadmap
+
+- 1.1.5 sandhi follow-ups rescoped to 1.2.1 / 1.2.2 — see `docs/development/roadmap.md`.
+- "Future (v1.2.0+)" items (jnana / gRPC / WebSocket / distributed tracing / agent migration) renamed to "Future (v1.3.0+)".
+
 ## [1.1.4] - 2026-04-27
 
 ### Changed

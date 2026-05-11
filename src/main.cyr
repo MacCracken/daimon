@@ -1031,11 +1031,11 @@ fn vindex_search(vi, query, query_dim, top_k) {
         var pair = vec_get(scored, ri);
         var e = load64(pair + 8);
         var sr = search_result_new(
-            vec_entry_id(e),
-            vec_entry_content(e),
-            vec_entry_metadata(e),
-            load64(pair),
-            ri
+        vec_entry_id(e),
+        vec_entry_content(e),
+        vec_entry_metadata(e),
+        load64(pair),
+        ri
         );
         vec_push(results, sr);
         ri = ri + 1;
@@ -2822,9 +2822,9 @@ fn agent_ipc_accept_one(fd, ipc) {
 
     # Parse big-endian u32
     var msg_len = load8(&len_buf) * 16777216
-        + load8(&len_buf + 1) * 65536
-        + load8(&len_buf + 2) * 256
-        + load8(&len_buf + 3);
+    + load8(&len_buf + 1) * 65536
+    + load8(&len_buf + 2) * 256
+    + load8(&len_buf + 3);
 
     if (msg_len > MAX_MESSAGE_SIZE) {
         # Send NACK
@@ -3054,7 +3054,7 @@ fn _http_reason(status) {
 # daimon original behaviour.
 fn http_send_response(fd, status, body_data, body_len) {
     sandhi_server_send_response(fd, status, _http_reason(status),
-        "application/json", body_data, body_len, 0);
+    "application/json", body_data, body_len, 0);
 }
 
 fn http_ok(fd, body) {

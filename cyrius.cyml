@@ -5,7 +5,7 @@ description = "daimon — AGNOS agent orchestrator"
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/daimon"
 language = "cyrius"
-cyrius = "5.7.12"
+cyrius = "5.10.34"
 
 [build]
 entry = "src/main.cyr"
@@ -26,6 +26,10 @@ stdlib = [
     "tagged",
     "json",
     "net",
+    "mmap",
+    "dynlib",
+    "fdlopen",
+    "tls",
     "sandhi",
     "args",
     "chrono",
@@ -41,7 +45,7 @@ stdlib = [
 
 [deps.sakshi]
 git = "https://github.com/MacCracken/sakshi.git"
-tag = "2.0.0"
+tag = "2.2.3"
 modules = ["dist/sakshi.cyr"]
 
 # Distribution manifest. Single binary today (`daimon`), with a best-effort

@@ -1,4 +1,11 @@
 /build/
+
+# Vendored deps — repopulated by `cyrius deps` from the version-pinned
+# snapshot in cyrius.cyml [deps]. Keeping this out of the repo prevents
+# stale stubs from a prior cyrius version sitting in tree (matches
+# libro/bote/agnosys/patra convention).
+/lib/
+
 *.swp
 *.swo
 *~
