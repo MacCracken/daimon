@@ -32,11 +32,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - `cyrius test`: **213 / 213** assertions pass (no test additions — both wirings exercise sandhi/syscall paths that aren't reachable from unit tests; integration verification is via running the binary against curl with slow-sender simulation in 1.2.x doc cleanup).
 - `cyrius lint`: 0 warnings across src/ + tests/.
 - `cyrius fmt`: stable.
-- aarch64 cross-build: still blocked on the upstream `SYS_EPOLL_WAIT` gap (`docs/development/issues/2026-05-10-cyrius-async-aarch64.md`); CI warn-on-detect path triggers cleanly.
+- aarch64 cross-build: still blocked on the upstream `SYS_EPOLL_WAIT` gap (tracked upstream at [cyrius/docs/development/issues/2026-05-10-daimon-async-aarch64-sys-epoll-wait.md](https://github.com/MacCracken/cyrius/blob/main/docs/development/issues/2026-05-10-daimon-async-aarch64-sys-epoll-wait.md), severity **P2**); CI warn-on-detect path triggers cleanly.
 
 ### Known issues
 
-- **`serve_async` collapse into `sandhi_server_run_opts` — still deferred upstream.** Bundled sandhi 1.3.3 (at cyrius 5.10.34) accepts `sandhi_server_options_max_conns(opts, n)` but does not honor it — the accept loop in `sandhi_server_run_opts` remains single-flight regardless of the configured value. Full write-up + auto-resolve mechanism in `docs/development/issues/2026-05-10-sandhi-server-max-conns.md`. Re-checked at every cyrius pin bump; collapses to a small follow-up patch when upstream wires the enforcement (worker pool or epoll-cooperative).
+- **`serve_async` collapse into `sandhi_server_run_opts` — still deferred upstream.** Bundled sandhi 1.3.3 (at cyrius 5.10.34) accepts `sandhi_server_options_max_conns(opts, n)` but does not honor it — the accept loop in `sandhi_server_run_opts` remains single-flight regardless of the configured value. Full write-up + auto-resolve mechanism tracked upstream at [sandhi/docs/issues/2026-05-10-daimon-server-max-conns.md](https://github.com/MacCracken/sandhi/blob/main/docs/issues/2026-05-10-daimon-server-max-conns.md) (severity **Low**). Re-checked at every cyrius pin bump; collapses to a small follow-up patch when upstream wires the enforcement (worker pool or epoll-cooperative).
 
 ## [1.2.1] - 2026-05-10
 
@@ -109,11 +109,11 @@ CI and release workflows rewritten on the **libro / bote / agnosys 5.10.x shape*
 - **Lint flipped fail-on-warn** — `continue-on-error: true` removed. Daimon is clean under 5.10.34 (was 6 standing warnings on 5.7.12, all resolved upstream or by the cosmetic edits above).
 - **Docs job** — adds `docs/doc-health.md` to the required-files list.
 - **Release workflow** — mirrors agnosys release.yml: split into `ci` → `build` → `release` jobs; ships `daimon-<tag>-src.tar.gz` + `daimon-<tag>-x86_64-linux` + `daimon-<tag>-aarch64-linux` (when `cc5_aarch64` is present **and** the cross-build clears the upstream stdlib aarch64 gap — see Known issues below) + `cyrius.lock` + `SHA256SUMS`; pre-release detection on both `0.x` and `v0.x` tag styles.
-- **aarch64 cross-build is tolerant of upstream stdlib gaps** — known-blocker symbols (currently `SYS_EPOLL_WAIT`) downgrade to a `::warning::` and exit 0. Any other failure still fails the step. Same posture as sakshi 2.2.2's aarch64 lane. Tracked in `docs/development/issues/2026-05-10-cyrius-async-aarch64.md`.
+- **aarch64 cross-build is tolerant of upstream stdlib gaps** — known-blocker symbols (currently `SYS_EPOLL_WAIT`) downgrade to a `::warning::` and exit 0. Any other failure still fails the step. Same posture as sakshi 2.2.2's aarch64 lane. Tracked upstream at [cyrius/docs/development/issues/2026-05-10-daimon-async-aarch64-sys-epoll-wait.md](https://github.com/MacCracken/cyrius/blob/main/docs/development/issues/2026-05-10-daimon-async-aarch64-sys-epoll-wait.md) (severity **P2**).
 
 ### Known issues
 
-- **aarch64 cross-build blocked on upstream stdlib gap.** `lib/async.cyr` references `SYS_EPOLL_WAIT` unconditionally, but `lib/syscalls_aarch64_linux.cyr` only defines `SYS_EPOLL_PWAIT` (aarch64 has no plain `epoll_wait` syscall). Reproduces on both cyrius 5.10.34 and 5.10.47. Daimon's source is portable — the gap is in the cyrius stdlib. CI / release downgrade this specific error to a warning so the x86_64 ship is unblocked; aarch64 binaries return automatically when upstream patches `lib/async.cyr` or adds an arch-dispatch shim. Full write-up + workaround mechanism in `docs/development/issues/2026-05-10-cyrius-async-aarch64.md`.
+- **aarch64 cross-build blocked on upstream stdlib gap.** `lib/async.cyr` references `SYS_EPOLL_WAIT` unconditionally, but `lib/syscalls_aarch64_linux.cyr` only defines `SYS_EPOLL_PWAIT` (aarch64 has no plain `epoll_wait` syscall). Reproduces on both cyrius 5.10.34 and 5.10.47. Daimon's source is portable — the gap is in the cyrius stdlib. CI / release downgrade this specific error to a warning so the x86_64 ship is unblocked; aarch64 binaries return automatically when upstream patches `lib/async.cyr` or adds an arch-dispatch shim. Full write-up + workaround mechanism tracked upstream at [cyrius/docs/development/issues/2026-05-10-daimon-async-aarch64-sys-epoll-wait.md](https://github.com/MacCracken/cyrius/blob/main/docs/development/issues/2026-05-10-daimon-async-aarch64-sys-epoll-wait.md) (severity **P2**).
 
 ### Added
 

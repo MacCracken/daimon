@@ -41,9 +41,12 @@ Daimon is the AGNOS agent orchestrator — every consumer (hoosh, agnoshi, aethe
 
 **Doc work shipped in 1.2.2:**
 - ✅ `CHANGELOG.md` — 1.2.2 entry: sync `serve` threads sandhi opts with `idle_ms = 5000`; `serve_async` applies SO_RCVTIMEO per accepted cfd (closes VULN-async-slowloris); `serve_async` collapse stays deferred (max_conns upstream).
-- ✅ `docs/development/issues/2026-05-10-sandhi-server-max-conns.md` — new internal blocker doc for the deferred collapse.
 - ✅ `docs/development/roadmap.md` — idle_ms half marked shipped; collapse half kept open with upstream pointer.
 - ✅ `docs/doc-health.md` — last-refresh date rolled.
+
+**Post-1.2.2 housekeeping (2026-05-10):**
+- ✅ Daimon-side blocker trackers migrated upstream per the "blockers live where they're fixed" rule. Two files removed from `daimon/docs/development/issues/`; replaced with upstream pointers in roadmap + CHANGELOG (severity tagged in both).
+- ✅ Daimon roadmap current-arc items now carry explicit severity markers.
 
 **Stale set carried into 1.2.1+:** the README footprint block, CONTRIBUTING workflow steps + cyrius pin, architecture overview's deps list, BENCHMARKS numbers, quickstart install command. None block 1.2.0 ship — all are read-through refreshes, batched into a 1.2.1 doc cleanup pass per the working-loop convention.
 
@@ -83,12 +86,14 @@ Daimon is the AGNOS agent orchestrator — every consumer (hoosh, agnoshi, aethe
 - `development/state.md` — agnosys convention for the live volatile state file (pin / build sizes / test count / consumer table / recent releases / slot ledger). Daimon's roadmap.md partially covers this; consider splitting in 1.2.x if scope grows.
 - `development/capability-map.md` — auto-generated per-module kernel-surface map. Daimon's surface is mostly userland (HTTP API + IPC over Unix sockets), so the security value is smaller than for agnosys; flag as nice-to-have, not P1.
 
-**Tier — Engineering issues (`docs/development/issues/`)**
+**Tier — Engineering issues (upstream trackers)**
 
-| File | Filed | Status | Notes |
-|---|---|---|---|
-| `2026-05-10-cyrius-async-aarch64.md` | 2026-05-10 | 🟢 Active / passive upstream | `SYS_EPOLL_WAIT` undefined on aarch64 (lib/async.cyr × lib/syscalls_aarch64_linux.cyr). Blocks `--aarch64` cross-build. CI tolerant via warn-on-detect; x86_64 unaffected. Close when upstream lands the arch-dispatch shim. |
-| `2026-05-10-sandhi-server-max-conns.md` | 2026-05-10 | 🟢 Active / passive upstream | Sandhi 1.3.3's `sandhi_server_options_max_conns` is accepted-but-not-honored. Blocks `serve_async` collapse into `sandhi_server_run_opts`. No security impact (1.2.2 closed async slowloris independently). Close when upstream wires worker-pool or epoll-cooperative enforcement. |
+Daimon does not carry its own `docs/development/issues/` directory — blockers that need upstream fixes live in the upstream repo (cyrius / sandhi / sakshi / etc.) per the "blockers live where they're fixed" convention. Daimon's roadmap + CHANGELOG carry pointers + severity tags; the upstream tracker is the source of truth.
+
+| Tracker | Severity | Filed | Status | Notes |
+|---|---|---|---|---|
+| [cyrius § daimon-async-aarch64-sys-epoll-wait](https://github.com/MacCracken/cyrius/blob/main/docs/development/issues/2026-05-10-daimon-async-aarch64-sys-epoll-wait.md) | **P2** | 2026-05-10 | 🟢 Open upstream / daimon CI tolerant | `SYS_EPOLL_WAIT` undefined on aarch64 (lib/async.cyr × lib/syscalls_aarch64_linux.cyr). Blocks `--aarch64` cross-build. CI warn-on-detect; x86_64 unaffected. Close when upstream lands the arch-dispatch shim. Pinned in cyrius roadmap under `v5.10.x — Held`. |
+| [sandhi § daimon-server-max-conns](https://github.com/MacCracken/sandhi/blob/main/docs/issues/2026-05-10-daimon-server-max-conns.md) | **Low** | 2026-05-10 | 🟢 Open upstream / no daimon-side action | Sandhi 1.3.3's `sandhi_server_options_max_conns` accepted-but-not-honored. Blocks daimon's `serve_async` collapse into `sandhi_server_run_opts`. No security impact — 1.2.2 closed async slowloris independently via `set_recv_timeout_ms`. Close when upstream wires worker-pool or epoll-cooperative enforcement. Pinned in sandhi roadmap under `Post-arc — wait-for-trigger`. |
 
 ---
 

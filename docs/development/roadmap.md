@@ -1,5 +1,13 @@
 # Daimon Roadmap
 
+> **Severity legend** (applied to open items on the current work arc):
+> **P0** blocking — security / correctness regression, must-fix before next ship.
+> **P1** high — must-have for the current arc to close.
+> **P2** medium — should-have, schedule when capacity opens.
+> **P3** / **Low** — nice-to-have, no urgency; no consumer pressure today.
+>
+> Upstream-blocker items quote the upstream tracker's severity directly (cyrius / sandhi / sakshi each use their own P-scale; daimon copies the upstream rating). Completed items don't carry severity (the work is done).
+
 ## Completed (v0.7.0)
 
 - [x] Full Rust → Cyrius port (9,724 LOC → 4,141 LOC, 15 modules, 24 endpoints)
@@ -9,13 +17,13 @@
 
 ## Security Gates (trigger-based)
 
-- [ ] VULN-007: Bump allocator memory zeroing — **MUST fix before enabling any of**: multi-tenant hosting, kavach sandboxing, untrusted federation, external MCP callbacks (bote). Remediation: per-agent arena allocators with zero-on-reset.
+- [ ] **P0 (gated)** — **VULN-007: Bump allocator memory zeroing.** **MUST fix before enabling any of**: multi-tenant hosting, kavach sandboxing, untrusted federation, external MCP callbacks (bote). Remediation: per-agent arena allocators with zero-on-reset. Severity is **P0 when triggered**, dormant today because no consumer has flipped any of the gating conditions. Re-evaluate at every v1.x.0 cut.
 
 ## Blocked on Upstream Ports
 
-- [ ] Firewall MCP tools — [nein](https://github.com/MacCracken/nein) core port complete (v0.1.0, 13 modules); MCP tool wiring still pending nein's own `mcp` module which is blocked on bote
-- [ ] MCP tool hosting (bote re-exports) — blocked on [bote](https://github.com/MacCracken/bote) Cyrius port
-- [x] ~~MCP tool call forwarding — blocked on bote + HTTP client library~~ — HTTP-client side unblocked by sandhi (`sandhi_rpc_mcp_call` available since Cyrius 5.7.0). Wiring is now a daimon-side feature, see v1.1.5 below.
+- [ ] **Low** — Firewall MCP tools — [nein](https://github.com/MacCracken/nein) core port complete (v0.1.0, 13 modules); MCP tool wiring still pending nein's own `mcp` module which is blocked on bote. No active consumer demand; bumps to **P2** when a consumer asks for firewall control via daimon's MCP surface.
+- [ ] **P2** — MCP tool hosting (bote re-exports) — blocked on [bote](https://github.com/MacCracken/bote) Cyrius port. Bote is actively shipping (2.7.1 as of 2026-05-10); the re-exports become wirable as bote's libro_tools port lands. Tracked passively until bote signals the dispatch surface is stable.
+- [x] ~~MCP tool call forwarding — blocked on bote + HTTP client library~~ — HTTP-client side unblocked by sandhi (`sandhi_rpc_mcp_call` available since Cyrius 5.7.0). Wired daimon-side at 1.2.1.
 
 ## Completed (v1.1.0)
 
@@ -47,18 +55,28 @@
 ## Completed (v1.2.2)
 
 - [x] **Lower sandhi `idle_ms` below the 30s default** — `serve` (sync) now uses `sandhi_server_run_opts` with `idle_ms = SERVE_IDLE_MS = 5000`. `serve_async` (async) applies `SO_RCVTIMEO = SERVE_IDLE_MS` per accepted cfd via the new `set_recv_timeout_ms` helper — closes a pre-existing slowloris gap in async (no per-connection timeout since 1.1.0). Both paths now bound the slow-sender hold at ~5 s instead of sandhi's 30 s default.
-- [ ] **Collapse `serve_async` to `sandhi_server_run_opts`** — **still blocked upstream.** Bundled sandhi 1.3.3 still accepts-but-does-not-honor `sandhi_server_options_max_conns`. Tracked in `docs/development/issues/2026-05-10-sandhi-server-max-conns.md`; re-check at every cyrius pin bump.
+- [ ] **Collapse `serve_async` to `sandhi_server_run_opts`** — **still blocked upstream.** Bundled sandhi 1.3.3 still accepts-but-does-not-honor `sandhi_server_options_max_conns`. Tracked upstream at [sandhi/docs/issues/2026-05-10-daimon-server-max-conns.md](https://github.com/MacCracken/sandhi/blob/main/docs/issues/2026-05-10-daimon-server-max-conns.md) (severity **Low**); re-check at every cyrius pin bump.
 
-## v1.2.x — Doc cleanup (rolling)
+## v1.2.x — Current work arc
 
-- [ ] README footprint block (cyrius 5.10.34, sakshi 2.2.3, ~622 KB binary, stdlib dep list)
-- [ ] CONTRIBUTING workflow steps + cyrius pin + `cyrius deps` usage + lib/ gitignored note
-- [ ] architecture/overview.md stdlib deps + sandhi 1.3.3 notes
-- [ ] BENCHMARKS re-baseline under 5.10.34 (within-noise expected — no microbenchmark touches HTTP)
-- [ ] guides/quickstart.md cyrius install one-liner (versioned layout)
-- [ ] guides/api.md cyrius pin + example commands
+Open items on the current arc, severity-tagged. The arc closes when the P2s land + the P3s drain (no hard cap; per the working-loop convention, ship when ready).
+
+- [ ] **P2** — `guides/quickstart.md` refresh — install one-liner references the 5.7.12 / sakshi 2.0.0 era (versioned toolchain layout + `cyrius deps` workflow + `lib/` gitignored). Load-bearing for new-user onboarding; an incorrect install command actively breaks first-run.
+- [ ] **P2** — `docs/architecture/overview.md` refresh — stdlib deps list adds tls/mmap/dynlib/fdlopen (1.2.0 transitive add via sandhi 1.3.3); sandhi 1.3.3 notes; `lib/` gitignored. Reference doc consulted on every architectural decision; staleness propagates downstream.
+- [ ] **P3** — `README.md` footprint block — cyrius 5.10.34, sakshi 2.2.3, ~624 KB binary, refreshed dep list. Marketing-surface, not load-bearing for correctness.
+- [ ] **P3** — `CONTRIBUTING.md` workflow steps — cyrius pin, `cyrius deps` workflow, lib/ gitignored expectation, fmt-via-diff gate + lint-fail-on-warn posture. Onboarding refinement; not blocking.
+- [ ] **P3** — `BENCHMARKS.md` re-baseline under 5.10.34. Within-noise expected — no microbenchmark touches HTTP. Useful for the "prove the wins" discipline but no consumer pressure.
+- [ ] **P3** — `guides/api.md` cyrius pin + example commands refresh.
+- [ ] **Low (upstream)** — **Collapse `serve_async` to `sandhi_server_run_opts`** — bundled sandhi 1.3.3 still accepts-but-does-not-honor `sandhi_server_options_max_conns`. Tracked upstream at [sandhi/docs/issues/2026-05-10-daimon-server-max-conns.md](https://github.com/MacCracken/sandhi/blob/main/docs/issues/2026-05-10-daimon-server-max-conns.md). Re-check at every cyrius pin bump; small follow-up patch when upstream wires the enforcement.
+
+**Upstream-blocker items** (not in daimon's hands; tracked for visibility):
+
+- [ ] **P2 (upstream cyrius)** — aarch64 cross-build `SYS_EPOLL_WAIT` gap — `lib/async.cyr` references the constant unconditionally, but `lib/syscalls_aarch64_linux.cyr` doesn't define it (aarch64 has no plain `epoll_wait` syscall). Daimon CI tolerant via warn-on-detect; aarch64 binaries return automatically when upstream patches. Tracked at [cyrius/docs/development/issues/2026-05-10-daimon-async-aarch64-sys-epoll-wait.md](https://github.com/MacCracken/cyrius/blob/main/docs/development/issues/2026-05-10-daimon-async-aarch64-sys-epoll-wait.md) (pinned in cyrius roadmap under `v5.10.x — Held`).
 
 ## Future (v1.3.0+)
+
+Severity assigned at v1.3.0 cut once the next arc's shape is chosen. Today these are unsequenced — none are blocking the v1.2.x close.
+
 - [ ] jnana integration — grounded knowledge queries backed by verified AGNOS science data
 - [ ] gRPC transport option alongside HTTP
 - [ ] WebSocket streaming for real-time agent events
