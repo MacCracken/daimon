@@ -25,7 +25,7 @@ var TASK_SIZE = 32;
 var RT_SIZE = 32;
 
 # Create a new async runtime with epoll
-fn async_new() {
+fn async_new(): i64 {
     alloc_init();
     var rt = alloc(RT_SIZE);
     var epfd = syscall(SYS_EPOLL_CREATE1, 0);
@@ -37,7 +37,7 @@ fn async_new() {
 }
 
 # Spawn a task on the runtime. fp is a function pointer, arg is its argument.
-fn async_spawn(rt, fp, arg) {
+fn async_spawn(rt, fp, arg): i64 {
     var t = alloc(TASK_SIZE);
     store64(t, fp);
     store64(t + 8, arg);
@@ -51,7 +51,7 @@ fn async_spawn(rt, fp, arg) {
 
 # Run all spawned tasks to completion.
 # Tasks run cooperatively — each task runs to completion or yield.
-fn async_run(rt) {
+fn async_run(rt): i64 {
     var go = 1;
     while (go == 1) {
         var active = 0;
@@ -77,7 +77,7 @@ fn async_run(rt) {
 }
 
 # Timer: sleep for ms milliseconds using timerfd + epoll
-fn async_sleep_ms(ms) {
+fn async_sleep_ms(ms): i64 {
     var tfd = syscall(SYS_TIMERFD_CREATE, 1, 0);
     if (tfd < 0) { return 0 - 1; }
     # itimerspec: { interval_sec, interval_nsec, value_sec, value_nsec }
@@ -95,7 +95,7 @@ fn async_sleep_ms(ms) {
 }
 
 # Non-blocking read: set fd non-blocking, try read, restore
-fn async_read(fd, buf, len) {
+fn async_read(fd, buf, len): i64 {
     # Set O_NONBLOCK (0x800) via fcntl
     var flags = syscall(SYS_FCNTL, fd, 3, 0);
     syscall(SYS_FCNTL, fd, 4, flags | 2048);
@@ -106,7 +106,7 @@ fn async_read(fd, buf, len) {
 }
 
 # Wait for fd to be readable using epoll (blocks efficiently)
-fn async_await_readable(fd) {
+fn async_await_readable(fd): i64 {
     var epfd = syscall(SYS_EPOLL_CREATE1, 0);
     # epoll_event: { events: u32, data: u64 } = 12 bytes (padded to 16)
     var ev[16];
@@ -121,7 +121,7 @@ fn async_await_readable(fd) {
 
 # Run a function with a timeout (ms). Returns function result or -1 on timeout.
 # Uses fork: child runs fn, parent waits with timeout.
-fn async_timeout(fp, arg, ms) {
+fn async_timeout(fp, arg, ms): i64 {
     var pipefd[16];
     syscall(SYS_PIPE, &pipefd);
     var rfd = load32(&pipefd);

@@ -28,7 +28,7 @@ var THREAD_TLS_SIZE = 4096;
 var THREAD_SIZE = 24;
 
 # Allocate stack via mmap (returns base address or MAP_FAILED)
-fn mmap_stack(size) {
+fn mmap_stack(size): i64 {
     var prot = PROT_READ | PROT_WRITE;
     var flags = MAP_PRIVATE | MAP_ANONYMOUS;
     var r = syscall(SYS_MMAP, 0, size, prot, flags, 0 - 1, 0);
@@ -36,7 +36,7 @@ fn mmap_stack(size) {
 }
 
 # Free stack via munmap
-fn munmap_stack(addr, size) {
+fn munmap_stack(addr, size): i64 {
     return syscall(SYS_MUNMAP, addr, size);
 }
 
@@ -63,7 +63,7 @@ fn munmap_stack(addr, size) {
 # child_stack, which has [fp][arg] at the top from the parent's
 # pre-clone stores) and RAX (per-thread). Parent's post-syscall
 # store of `ret` lands in the parent's own frame (RBP valid).
-fn _thread_spawn(flags, child_stack, t, tls) {
+fn _thread_spawn(flags, child_stack, t, tls): i64 {
     var ret = 0;
     #ifdef CYRIUS_ARCH_X86
     asm {
@@ -147,7 +147,7 @@ fn _thread_spawn(flags, child_stack, t, tls) {
 # Create a new thread running fn(arg).
 # Returns pointer to thread struct, or 0 on failure.
 # The function pointer must be obtained via &fn_name.
-fn thread_create(fp, arg) {
+fn thread_create(fp, arg): i64 {
     alloc_init();
     var t = alloc(THREAD_SIZE);
     var ssize = THREAD_STACK_SIZE;
@@ -216,7 +216,7 @@ fn thread_create(fp, arg) {
 # fix exposed it as a permanent hang. Verified empirically:
 # FUTEX_WAIT (= 0) wakes correctly, FUTEX_WAIT|FUTEX_PRIVATE_FLAG
 # (= 128) hangs.
-fn thread_join(t) {
+fn thread_join(t): i64 {
     if (t == 0) { return 0 - 1; }
     # CLONE_CHILD_CLEARTID: kernel sets tid to 0 and does futex_wake on exit
     while (load64(t) != 0) {
@@ -233,7 +233,7 @@ fn thread_join(t) {
 }
 
 # Get current thread ID
-fn gettid() {
+fn gettid(): i64 {
     return syscall(SYS_GETTID);
 }
 
@@ -251,7 +251,7 @@ fn gettid() {
 var MUTEX_SIZE = 8;
 
 # Create a new mutex (unlocked)
-fn mutex_new() {
+fn mutex_new(): i64 {
     alloc_init();
     var m = alloc(MUTEX_SIZE);
     store64(m, 0);
@@ -259,7 +259,7 @@ fn mutex_new() {
 }
 
 # Lock mutex. Blocks via futex when contended.
-fn mutex_lock(m) {
+fn mutex_lock(m): i64 {
     while (atomic_cas(m, 0, 1) == 0) {
         # Someone else holds the lock. FUTEX_WAIT atomically
         # checks `*m == 1` against the kernel — if the holder
@@ -277,7 +277,7 @@ fn mutex_lock(m) {
 
 # Unlock mutex. Always wakes exactly one waiter (if any);
 # kernel no-ops the wake when the futex has no waiters.
-fn mutex_unlock(m) {
+fn mutex_unlock(m): i64 {
     # Release barrier: flush critical-section writes before the
     # lock-release store. Without this on aarch64, a holder's
     # writes inside the critical section can be reordered after
@@ -294,7 +294,7 @@ fn mutex_unlock(m) {
 var CHAN_SIZE = 56;
 
 # Create a channel with given capacity
-fn chan_new(cap) {
+fn chan_new(cap): i64 {
     alloc_init();
     var ch = alloc(CHAN_SIZE);
     var buf = alloc(cap * 8);
@@ -309,7 +309,7 @@ fn chan_new(cap) {
 }
 
 # Send a value to the channel. Blocks if full. Returns 0 on success, -1 if closed.
-fn chan_send(ch, val) {
+fn chan_send(ch, val): i64 {
     var mtx = load64(ch + 40);
     var go = 1;
     while (go == 1) {
@@ -337,7 +337,7 @@ fn chan_send(ch, val) {
 }
 
 # Receive a value from the channel. Blocks if empty. Returns value, or 0 if closed.
-fn chan_recv(ch) {
+fn chan_recv(ch): i64 {
     var mtx = load64(ch + 40);
     var go = 1;
     var result = 0;
@@ -365,7 +365,7 @@ fn chan_recv(ch) {
 }
 
 # Close the channel (no more sends, receivers get 0)
-fn chan_close(ch) {
+fn chan_close(ch): i64 {
     var mtx = load64(ch + 40);
     mutex_lock(mtx);
     store64(ch + 48, 1);
