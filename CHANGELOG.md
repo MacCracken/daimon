@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.2.3] - 2026-05-11
+
+**Cyrius toolchain pin bump.** Moves the language pin from 5.10.34 → 5.10.44 in `cyrius.cyml` (and the mirrored line in `CLAUDE.md`). No daimon source changes; bundled sandhi version unchanged.
+
+### Changed
+
+- **`cyrius.cyml`** — `cyrius = "5.10.44"` (was `"5.10.34"`).
+- **`CLAUDE.md`** — Project-identity line synced to `Cyrius: 5.10.44`.
+
 ## [1.2.2] - 2026-05-10
 
 **Slowloris bound, on both sync and async.** Lowers the per-connection idle timeout from sandhi's 30 000 ms default to **5 000 ms** on the sync path (via `sandhi_server_run_opts` + `sandhi_server_options_idle_ms`), and **closes a pre-existing async-path slowloris gap** by applying `SO_RCVTIMEO` to async-accepted cfds (async had no per-connection timeout since 1.1.0). Second of the two 1.1.5 sandhi follow-ups; the third (`serve_async` collapse into `sandhi_server_run_opts`) stays deferred — upstream sandhi's `max_conns` is still accepted-but-not-honored, see Known issues.
