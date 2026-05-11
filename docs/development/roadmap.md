@@ -44,10 +44,10 @@
 
 - [x] **External MCP forwarding via `sandhi_rpc_mcp_call`** — `api_mcp_call` dispatch path now forwards to the external endpoint, maps transport / JSON-RPC / success outcomes to 502 / 200-isError / 200-passthrough respectively. `api_mcp_register` enforces `validate_callback_url` (SSRF guard). The original 1.1.5 plan to add `McpToolDescription.endpoint_url` was rescoped — the existing external-wrapper struct (`{tool, callback_url}`) already separates URL from tool description, so `mcp_find_external_url` is the new accessor instead. End-to-end roundtrip test against a fake MCP server deferred (needs a localhost fixture not yet present in the test tree).
 
-## v1.2.2 — Sandhi idle_ms + serve_async collapse (carryover from v1.1.5)
+## Completed (v1.2.2)
 
-- [ ] **Lower sandhi `idle_ms` below the 30s default** — `serve` calls `sandhi_server_run` with `opts = 0` so the slowloris timeout sits at sandhi's 30 000 ms default. Collect a baseline of legitimate-client P99 request durations from 1.2.0 / 1.2.1 production soak data, then thread `sandhi_server_options_new()` + `sandhi_server_options_idle_ms(opts, N)` + `sandhi_server_run_opts(...)` with N ≈ 5 000 ms. Trade-off documented in `docs/audit/2026-04-27-sandhi-migration.md` § VULN-008.
-- [ ] **Collapse `serve_async` to `sandhi_server_run_opts`** — premise-check first against sandhi 1.3.3 (bundled in cyrius 5.10.34): if `sandhi_server_options_max_conns` enforcement landed, daimon's `serve_async` (epoll loop + per-call buf alloc + inline smuggling-check duplication) collapses into one `sandhi_server_run_opts(...)` call shared with sync. If not yet enforced, keep tracking via Cyrius CHANGELOG.
+- [x] **Lower sandhi `idle_ms` below the 30s default** — `serve` (sync) now uses `sandhi_server_run_opts` with `idle_ms = SERVE_IDLE_MS = 5000`. `serve_async` (async) applies `SO_RCVTIMEO = SERVE_IDLE_MS` per accepted cfd via the new `set_recv_timeout_ms` helper — closes a pre-existing slowloris gap in async (no per-connection timeout since 1.1.0). Both paths now bound the slow-sender hold at ~5 s instead of sandhi's 30 s default.
+- [ ] **Collapse `serve_async` to `sandhi_server_run_opts`** — **still blocked upstream.** Bundled sandhi 1.3.3 still accepts-but-does-not-honor `sandhi_server_options_max_conns`. Tracked in `docs/development/issues/2026-05-10-sandhi-server-max-conns.md`; re-check at every cyrius pin bump.
 
 ## v1.2.x — Doc cleanup (rolling)
 

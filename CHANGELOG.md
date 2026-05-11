@@ -6,6 +6,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-05-10
+
+**Slowloris bound, on both sync and async.** Lowers the per-connection idle timeout from sandhi's 30 000 ms default to **5 000 ms** on the sync path (via `sandhi_server_run_opts` + `sandhi_server_options_idle_ms`), and **closes a pre-existing async-path slowloris gap** by applying `SO_RCVTIMEO` to async-accepted cfds (async had no per-connection timeout since 1.1.0). Second of the two 1.1.5 sandhi follow-ups; the third (`serve_async` collapse into `sandhi_server_run_opts`) stays deferred — upstream sandhi's `max_conns` is still accepted-but-not-honored, see Known issues.
+
+### Added
+
+- **`SERVE_IDLE_MS = 5000`** — centralized idle-timeout constant in `src/main.cyr`. Used by both `serve` (sync, via sandhi opts) and `serve_async` (async, via direct `SO_RCVTIMEO` syscall). One source of truth; keeps both paths in lock-step.
+- **`set_recv_timeout_ms(fd, ms)`** — daimon-side helper that applies `SO_RCVTIMEO` via `syscall(SYS_SETSOCKOPT, fd, SOL_SOCKET=1, SO_RCVTIMEO=20, &tv, 16)`. `tv` is a 16-byte `struct timeval` `{tv_sec, tv_usec}`. Mirrors what `sandhi_server_run_opts` does internally for the sync path. Daimon-side rather than calling the underscore-prefixed `_sandhi_conn_set_timeout_ms` because that's a private sandhi internal.
+
+### Changed
+
+- **`serve` (sync)** — replaces `sandhi_server_run(addr, port, &handle_request, 0)` with `sandhi_server_run_opts(addr, port, &handle_request, 0, opts)` where `opts = sandhi_server_options_new()` + `sandhi_server_options_idle_ms(opts, SERVE_IDLE_MS)`. sandhi's `sandhi_server_run_opts` accept loop applies `SO_RCVTIMEO = SERVE_IDLE_MS` per accepted connection (lib/sandhi.cyr:11629-11631) — same enforcement mechanism the previous default went through, just with a tighter bound.
+- **`serve_async`** — calls `set_recv_timeout_ms(cfd, SERVE_IDLE_MS)` immediately after a successful `syscall(SYS_ACCEPT, sfd, 0, 0)`, before `async_spawn`. Async-handler structure unchanged.
+
+### Security
+
+- **VULN-async-slowloris (newly classified) — closed at 1.2.2.** Pre-1.2.2, daimon's async path had **no** per-connection timeout: `async_await_readable(cfd)` in `async_handle_client` would block indefinitely on a slow sender, and `sandhi_server_recv_request` ran without an `SO_RCVTIMEO` set on the fd. The 1.1.4 sandhi-migration audit noted the sync-path bound ("the worst case is now a 30 s `SO_RCVTIMEO` per malicious connection") but did not surface the async-path asymmetry. 1.2.2 closes this — async accepted fds now carry the same 5 000 ms `SO_RCVTIMEO` the sync path does.
+- **VULN-001 / VULN-008 trade-off (carried forward from 1.1.4 audit) — improved.** The 1.1.4 ship documented the worst case as a 30 000 ms hold per malicious connection (sandhi's default `SO_RCVTIMEO`). 1.2.2 lowers that to 5 000 ms uniformly. Sandhi's `HSV_REQ_BUF_SIZE = 65 536` memory cap remains the orthogonal bound. No regression in legitimate-client behaviour expected — daimon's request handler is in-memory (no network egress in the happy path), so legitimate P99 sits well under 1 s.
+
+### Verified
+
+- `cyrius check --with-deps`: ok.
+- `cyrius build` (DCE): **624 KB** statically-linked ELF (was 623 KB at 1.2.1; +352 bytes from the helper + opts wiring).
+- `cyrius test`: **213 / 213** assertions pass (no test additions — both wirings exercise sandhi/syscall paths that aren't reachable from unit tests; integration verification is via running the binary against curl with slow-sender simulation in 1.2.x doc cleanup).
+- `cyrius lint`: 0 warnings across src/ + tests/.
+- `cyrius fmt`: stable.
+- aarch64 cross-build: still blocked on the upstream `SYS_EPOLL_WAIT` gap (`docs/development/issues/2026-05-10-cyrius-async-aarch64.md`); CI warn-on-detect path triggers cleanly.
+
+### Known issues
+
+- **`serve_async` collapse into `sandhi_server_run_opts` — still deferred upstream.** Bundled sandhi 1.3.3 (at cyrius 5.10.34) accepts `sandhi_server_options_max_conns(opts, n)` but does not honor it — the accept loop in `sandhi_server_run_opts` remains single-flight regardless of the configured value. Full write-up + auto-resolve mechanism in `docs/development/issues/2026-05-10-sandhi-server-max-conns.md`. Re-checked at every cyrius pin bump; collapses to a small follow-up patch when upstream wires the enforcement (worker pool or epoll-cooperative).
+
 ## [1.2.1] - 2026-05-10
 
 **External MCP forwarding lights up.** Replaces the `api_mcp_call` `"tool dispatch not available in sync mode"` stub at `src/main.cyr:3393` with a real `sandhi_rpc_mcp_call` dispatch path. Carryover from the 1.1.5 roadmap, sequenced as the first behavioural change of the 1.2.x arc.

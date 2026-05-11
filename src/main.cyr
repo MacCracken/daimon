@@ -3972,13 +3972,38 @@ fn server_banner(port, mode) {
 
 # --- Synchronous server ---
 
+# Slowloris bound — per-connection SO_RCVTIMEO applied at accept time.
+# 5 000 ms covers normal P99 request durations (the request handler is
+# in-memory; no network egress in the happy path) while bounding a
+# malicious slow-sender to ~5 s of worker hold instead of sandhi's 30 s
+# default. Centralized so sync + async modes stay in lock-step.
+var SERVE_IDLE_MS = 5000;
+
+# Apply SO_RCVTIMEO to a connection fd. Mirrors the per-accept timeout
+# sandhi_server_run_opts applies on the sync path — closes the
+# pre-1.2.2 slowloris gap on async where async_await_readable would
+# block indefinitely on a slow sender. struct timeval is {tv_sec: i64,
+# tv_usec: i64} on Linux (16 bytes). Reused by serve_async.
+fn set_recv_timeout_ms(fd, ms) {
+    var tv = alloc(16);
+    var secs = ms / 1000;
+    var usec = (ms - secs * 1000) * 1000;
+    store64(tv, secs);
+    store64(tv + 8, usec);
+    # SOL_SOCKET = 1, SO_RCVTIMEO = 20.
+    return syscall(SYS_SETSOCKOPT, fd, 1, 20, tv, 16);
+}
+
 fn serve(port) {
     server_banner(port, "sync");
-    # sandhi_server_run owns bind/listen/accept/recv + smuggling rejection
-    # (CL+TE conflict, Host.Host / CL.CL / TE.TE duplicates per RFC 7230
-    # §3.3.2 + §3.3.3) before our handler runs. It closes cfd after the
-    # handler returns. Returns when the loop exits (today: never).
-    return sandhi_server_run(INADDR_ANY(), port, &handle_request, 0);
+    # sandhi_server_run_opts owns bind/listen/accept/recv + smuggling
+    # rejection (CL+TE conflict, Host.Host / CL.CL / TE.TE duplicates per
+    # RFC 7230 §3.3.2 + §3.3.3) before our handler runs, and applies
+    # SO_RCVTIMEO = SERVE_IDLE_MS per accepted connection. It closes cfd
+    # after the handler returns. Returns when the loop exits (today: never).
+    var opts = sandhi_server_options_new();
+    sandhi_server_options_idle_ms(opts, SERVE_IDLE_MS);
+    return sandhi_server_run_opts(INADDR_ANY(), port, &handle_request, 0, opts);
 }
 
 # --- Async server (epoll-based cooperative concurrency) ---
@@ -4047,6 +4072,10 @@ fn serve_async(port) {
             if (cfd < 0) {
                 accepting = 0;
             } else {
+                # Slowloris bound — parity with sync path which gets
+                # SO_RCVTIMEO from sandhi_server_run_opts. Pre-1.2.2
+                # async had no per-connection timeout.
+                set_recv_timeout_ms(cfd, SERVE_IDLE_MS);
                 async_spawn(rt, &async_handle_client, cfd);
                 batch_size = batch_size + 1;
             }

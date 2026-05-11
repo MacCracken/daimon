@@ -6,7 +6,7 @@ type: state
 
 # Documentation Health — daimon
 
-> **Last refresh**: 2026-05-10 (1.2.1 ship — external MCP forwarding via `sandhi_rpc_mcp_call`; initial 1.2.0 audit context preserved below).
+> **Last refresh**: 2026-05-10 (1.2.2 ship — sandhi idle_ms tuning + async slowloris close; 1.2.0/1.2.1 context preserved below).
 > **Refresh cadence**: when docs are touched, update the affected row. Full re-audit at each minor (1.2.x → 1.3.0) cut.
 > **Scope**: this repo only (`daimon`) — root-level files plus the entire `docs/` tree.
 
@@ -37,6 +37,12 @@ Daimon is the AGNOS agent orchestrator — every consumer (hoosh, agnoshi, aethe
 **Doc work shipped in 1.2.1:**
 - ✅ `CHANGELOG.md` — 1.2.1 entry for external MCP forwarding (sandhi_rpc_mcp_call dispatch, validate_callback_url enforced at register boundary, +13 test assertions, +1 360 bytes binary).
 - ✅ `docs/development/roadmap.md` — 1.2.1 marked complete; rescoping note on the original `McpToolDescription.endpoint_url` plan (rescoped to use the existing external-wrapper struct + `mcp_find_external_url` accessor).
+- ✅ `docs/doc-health.md` — last-refresh date rolled.
+
+**Doc work shipped in 1.2.2:**
+- ✅ `CHANGELOG.md` — 1.2.2 entry: sync `serve` threads sandhi opts with `idle_ms = 5000`; `serve_async` applies SO_RCVTIMEO per accepted cfd (closes VULN-async-slowloris); `serve_async` collapse stays deferred (max_conns upstream).
+- ✅ `docs/development/issues/2026-05-10-sandhi-server-max-conns.md` — new internal blocker doc for the deferred collapse.
+- ✅ `docs/development/roadmap.md` — idle_ms half marked shipped; collapse half kept open with upstream pointer.
 - ✅ `docs/doc-health.md` — last-refresh date rolled.
 
 **Stale set carried into 1.2.1+:** the README footprint block, CONTRIBUTING workflow steps + cyrius pin, architecture overview's deps list, BENCHMARKS numbers, quickstart install command. None block 1.2.0 ship — all are read-through refreshes, batched into a 1.2.1 doc cleanup pass per the working-loop convention.
@@ -82,6 +88,7 @@ Daimon is the AGNOS agent orchestrator — every consumer (hoosh, agnoshi, aethe
 | File | Filed | Status | Notes |
 |---|---|---|---|
 | `2026-05-10-cyrius-async-aarch64.md` | 2026-05-10 | 🟢 Active / passive upstream | `SYS_EPOLL_WAIT` undefined on aarch64 (lib/async.cyr × lib/syscalls_aarch64_linux.cyr). Blocks `--aarch64` cross-build. CI tolerant via warn-on-detect; x86_64 unaffected. Close when upstream lands the arch-dispatch shim. |
+| `2026-05-10-sandhi-server-max-conns.md` | 2026-05-10 | 🟢 Active / passive upstream | Sandhi 1.3.3's `sandhi_server_options_max_conns` is accepted-but-not-honored. Blocks `serve_async` collapse into `sandhi_server_run_opts`. No security impact (1.2.2 closed async slowloris independently). Close when upstream wires worker-pool or epoll-cooperative enforcement. |
 
 ---
 
