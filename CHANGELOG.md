@@ -6,6 +6,52 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-05-10
+
+**External MCP forwarding lights up.** Replaces the `api_mcp_call` `"tool dispatch not available in sync mode"` stub at `src/main.cyr:3393` with a real `sandhi_rpc_mcp_call` dispatch path. Carryover from the 1.1.5 roadmap, sequenced as the first behavioural change of the 1.2.x arc.
+
+### Added
+
+- **`mcp_find_external_url(reg, name_cstr)`** — sibling lookup to `mcp_find_tool`. Returns the callback URL registered for an external tool, or `0` for builtin / not-found. Lets the dispatch site decide builtin vs external routing without re-parsing the wrapper.
+- **HTTP 502 ("Bad Gateway")** added to `_http_reason` — emitted by `api_mcp_call` on upstream transport failure.
+
+### Changed
+
+- **`api_mcp_register`** — now requires a `callback_url` field and validates it via `validate_callback_url` (SSRF guard: http:// or https:// only). Missing/empty/non-http(s) URLs return 400 with a specific message. Pre-1.2.1 silently registered tools with empty URLs (which would then be impossible to dispatch); rejecting at the boundary surfaces the error at registration time.
+- **`api_mcp_call`** — full implementation, replaces the sync-mode stub:
+    - Tool not found → 400 (unchanged).
+    - Tool found but builtin (no callback URL) → **501 Not Implemented** with `"builtin tool dispatch not implemented"`. Distinct from "not found" — the route exists but daimon has no in-process dispatcher for builtin tools today.
+    - Tool found + external → forward to `sandhi_rpc_mcp_call(url, "tools/call", body)`. The inbound `/v1/mcp/call` body shape (`{name, arguments}`) is already the MCP `tools/call` params shape, so the body is passed through verbatim as JSON-RPC params. Sandhi wraps with `{"jsonrpc":"2.0","id":N,"method":"tools/call","params":…}`.
+    - Transport failure (connect / TLS / timeout / non-2xx HTTP) → **502 Bad Gateway** with the sandhi error message embedded as JSON-escaped `upstream`.
+    - JSON-RPC error envelope (`error.code != 0`) → **200 OK** with the MCP `{"content":[{"type":"text/plain","text":"…"}],"isError":true,"code":N}` shape, so MCP clients see a normal MCP error rather than a transport error.
+    - Success → **200 OK** with the upstream `result` value passed through. Empty result (neither error nor result envelope) returns `{"content":[],"isError":false}`.
+
+### Security
+
+- **VULN-mcp-register-url (new) — closed.** `api_mcp_register` previously accepted any string (or no string at all) as `callback_url`. With `sandhi_rpc_mcp_call` now wired, an attacker who could register a tool could have caused daimon to fetch arbitrary URL schemes (`file://`, `gopher://`, internal-network HTTP — classic SSRF surface). The `validate_callback_url` allow-list (http:// + https:// only) is now enforced at the boundary. The validator was always present in `src/main.cyr:1323`; 1.2.1 wires it in.
+- **No new HTTP attack surface from the dispatch path** — daimon never echoes the inbound body to the upstream; it parses the JSON for routing and hands the original cstr to sandhi as params, which sandhi wraps in a JSON-RPC envelope. JSON injection on the upstream side requires already-tampered tool registration, which now goes through the URL validator.
+
+### Tests
+
+- **+13 assertions** (200 → **213**). New coverage in `tests/daimon.tcyr` mcp_registry group:
+    - External tool registration + name lookup + URL roundtrip.
+    - `mcp_find_external_url` returns 0 for builtin and missing tools.
+    - `validate_callback_url` boundary cases: null, empty, `file://`, `ftp://`, `javascript:` rejected; `http://` + `https://` accepted.
+
+### Verified
+
+- `cyrius check --with-deps`: ok.
+- `cyrius build` (DCE): **623 KB** statically-linked ELF (1.2.0 was 622 KB; +1 360 bytes from the new dispatch path + 502 reason phrase).
+- `cyrius test`: **213 / 213** assertions pass.
+- `cyrius bench`: 16 microbenchmarks within noise of 1.2.0 (no benchmark touches the HTTP / MCP path).
+- `cyrius lint`: 0 warnings across src/ + tests/.
+- `cyrius fmt`: stable.
+
+### Deferred (still in v1.2.x)
+
+- **End-to-end roundtrip test** against a fake MCP server — requires a localhost listener fixture that's out of scope for tcyr unit tests. Will land alongside the v1.2.2 sandhi tuning work or as a v1.2.x rolling addition once the fixture pattern is settled.
+- **Builtin tool dispatcher** — `api_mcp_call` returns 501 for builtin tools today. No in-tree consumer registers builtins through the HTTP path; if one shows up, builtin dispatch lands as its own slot.
+
 ## [1.2.0] - 2026-05-10
 
 **Toolchain modernization + CI/release rewrite.** Bumps Cyrius 5.7.12 → 5.10.34 and sakshi 2.0.0 → 2.2.3, gitignores `/lib/`, and rebuilds CI/release on the libro/bote/agnosys 5.10.x shape. No public-API changes; same 24 endpoints, same wire shape. Internal tightening from 15 patch slots of Cyrius improvements between 5.7.12 and 5.10.34.

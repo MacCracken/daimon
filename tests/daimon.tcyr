@@ -412,6 +412,13 @@ fn mcp_register_builtin(reg, tool) {
     map_set(load64(reg), str_data(load64(tool)), tool);
 }
 
+fn mcp_register_external(reg, tool, callback_url) {
+    var ext = alloc(16);
+    store64(ext, tool);
+    store64(ext + 8, callback_url);
+    map_set(load64(reg + 8), str_data(load64(tool)), ext);
+}
+
 fn mcp_tool_count(reg) {
     return map_count(load64(reg)) + map_count(load64(reg + 8));
 }
@@ -424,8 +431,25 @@ fn mcp_find_tool(reg, name_cstr) {
     return 0;
 }
 
+fn mcp_find_external_url(reg, name_cstr) {
+    var ext = map_get(load64(reg + 8), name_cstr);
+    if (ext == 0) { return 0; }
+    return load64(ext + 8);
+}
+
 fn mcp_deregister(reg, name_cstr) {
     return map_delete(load64(reg + 8), name_cstr);
+}
+
+fn validate_callback_url(url) {
+    if (url == 0) { return Err(ERR_INVALID_PARAM); }
+    if (str_len(url) == 0) { return Err(ERR_INVALID_PARAM); }
+    if (str_starts_with(url, str_from("http://")) == 0) {
+        if (str_starts_with(url, str_from("https://")) == 0) {
+            return Err(ERR_INVALID_PARAM);
+        }
+    }
+    return Ok(0);
 }
 
 # --- edge fleet ---
@@ -1501,6 +1525,28 @@ fn main() {
     var t2 = mcp_tool_new(str_from("deploy"), str_from("deployer"), str_from("{}"));
     mcp_register_builtin(reg, t2);
     assert_eq(mcp_tool_count(reg), 2, "two tools");
+
+    # External (URL-backed) tool registration + URL lookup.
+    var ext_tool = mcp_tool_new(str_from("remote-scan"), str_from("remote scanner"), str_from("{}"));
+    mcp_register_external(reg, ext_tool, str_from("https://mcp.example.test/scan"));
+    assert_eq(mcp_tool_count(reg), 3, "external tool counts");
+    assert(mcp_find_tool(reg, "remote-scan") != 0, "external tool findable by name");
+    var ext_url = mcp_find_external_url(reg, "remote-scan");
+    assert(ext_url != 0, "external URL recovered");
+    assert(str_eq(ext_url, str_from("https://mcp.example.test/scan")) == 1, "external URL roundtrips");
+
+    # Builtin lookups return 0 for the external-URL accessor.
+    assert(mcp_find_external_url(reg, "scan") == 0, "builtin has no external URL");
+    assert(mcp_find_external_url(reg, "nonexistent") == 0, "missing has no external URL");
+
+    # validate_callback_url — boundary cases for the SSRF guard.
+    assert(is_err_result(validate_callback_url(0)) == 1, "null url rejected");
+    assert(is_err_result(validate_callback_url(str_from(""))) == 1, "empty url rejected");
+    assert(is_err_result(validate_callback_url(str_from("file:///etc/passwd"))) == 1, "file:// rejected");
+    assert(is_err_result(validate_callback_url(str_from("ftp://example.test/foo"))) == 1, "ftp:// rejected");
+    assert(is_err_result(validate_callback_url(str_from("javascript:alert(1)"))) == 1, "javascript: rejected");
+    assert(is_ok(validate_callback_url(str_from("http://example.test/mcp"))) == 1, "http:// accepted");
+    assert(is_ok(validate_callback_url(str_from("https://example.test/mcp"))) == 1, "https:// accepted");
 
     # =============================================================
     # edge fleet

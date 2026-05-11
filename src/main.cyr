@@ -1319,6 +1319,15 @@ fn mcp_find_tool(reg, name_cstr) {
     return 0;
 }
 
+# Look up the callback URL for an external tool. Returns 0 if the name
+# resolves to a builtin or isn't registered. Pairs with mcp_find_tool —
+# call both at the dispatch site to decide builtin vs external routing.
+fn mcp_find_external_url(reg, name_cstr) {
+    var ext = map_get(load64(reg + 8), name_cstr);
+    if (ext == 0) { return 0; }
+    return load64(ext + 8);
+}
+
 # Validate a callback URL (basic SSRF protection)
 fn validate_callback_url(url) {
     if (url == 0) { return Err(ERR_INVALID_PARAM); }
@@ -3045,6 +3054,7 @@ fn _http_reason(status) {
     if (status == 422) { return "Unprocessable Entity"; }
     if (status == 429) { return "Too Many Requests"; }
     if (status == 501) { return "Not Implemented"; }
+    if (status == 502) { return "Bad Gateway"; }
     return "Error";
 }
 
@@ -3247,7 +3257,13 @@ fn api_mcp_register(fd, body) {
     var desc = jget(pairs, "description");
     if (desc == 0) { desc = str_from(""); }
     var url = jget(pairs, "callback_url");
-    if (url == 0) { url = str_from(""); }
+    if (url == 0) { http_bad_request(fd, str_from("missing callback_url")); return 0; }
+    # Reject non-http(s) URLs at the boundary — SSRF guard + downstream
+    # contract (sandhi_rpc_mcp_call requires an http:// or https:// URL).
+    if (is_err_result(validate_callback_url(url)) == 1) {
+        http_bad_request(fd, str_from("invalid callback_url (must be http:// or https://)"));
+        return 0;
+    }
     var tool = mcp_tool_new(name, desc, str_from("{}"));
     mcp_register_external(_mcp_registry, tool, url);
     http_send_response(fd, 201, "{\"ok\":true}", 11);
@@ -3262,19 +3278,71 @@ fn api_mcp_deregister(fd, name_cstr) {
 }
 
 # POST /v1/mcp/call
+# Body: {"name": "<tool-name>", "arguments": {…}} — MCP `tools/call`
+# params shape. For external tools the body is forwarded verbatim as
+# the JSON-RPC params to the registered callback URL via
+# sandhi_rpc_mcp_call. Builtin tools have no dispatcher today and
+# return 501.
 fn api_mcp_call(fd, body) {
     if (body == 0) { http_bad_request(fd, str_from("missing body")); return 0; }
     var pairs = json_parse(body);
     var name = jget(pairs, "name");
     if (name == 0) { http_bad_request(fd, str_from("missing tool name")); return 0; }
-    var tool = mcp_find_tool(_mcp_registry, str_cstr(name));
+    var name_c = str_cstr(name);
+    var tool = mcp_find_tool(_mcp_registry, name_c);
     if (tool == 0) { http_bad_request(fd, str_from("tool not found")); return 0; }
-    # No external forwarding in sync mode — return error
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "{\"content\":[{\"type\":\"text/plain\",\"text\":\"");
-    str_builder_add_cstr(sb, "tool dispatch not available in sync mode");
-    str_builder_add_cstr(sb, "\"}],\"isError\":true}");
-    http_ok(fd, str_builder_build(sb));
+    var url = mcp_find_external_url(_mcp_registry, name_c);
+    if (url == 0) {
+        # Builtin tools: no in-process dispatcher today. Distinct from
+        # "tool not found" — 501 signals the route exists but isn't
+        # implemented for this tool kind.
+        var b = error_json(501, str_from("builtin tool dispatch not implemented"));
+        http_send_response(fd, 501, str_data(b), str_len(b));
+        return 0;
+    }
+    # Forward to the external MCP endpoint. The inbound body is already
+    # the MCP `tools/call` params shape ({name, arguments}) so we hand
+    # it through verbatim. sandhi_rpc_mcp_call wraps it as JSON-RPC 2.0
+    # {jsonrpc, id, method:"tools/call", params:<body>}.
+    var resp = sandhi_rpc_mcp_call(str_cstr(url), "tools/call", str_cstr(body));
+    if (sandhi_rpc_ok(resp) == 0) {
+        # Transport-level failure — connect / TLS / timeout / non-2xx.
+        # Map to 502 with the upstream error message.
+        var em = sandhi_rpc_err_message(resp);
+        var sbe = str_builder_new();
+        str_builder_add_cstr(sbe, "{\"error\":\"upstream MCP call failed\",\"code\":502,\"upstream\":\"");
+        if (em != 0) { str_builder_add(sbe, json_escape_str(str_from(em))); }
+        str_builder_add_cstr(sbe, "\"}");
+        var bbody = str_builder_build(sbe);
+        http_send_response(fd, 502, str_data(bbody), str_len(bbody));
+        return 0;
+    }
+    var ec = sandhi_rpc_mcp_error_code(resp);
+    if (ec != 0) {
+        # JSON-RPC error envelope — return the MCP isError shape with
+        # the upstream error message embedded.
+        var em2 = sandhi_rpc_mcp_error_message(resp);
+        var sbm = str_builder_new();
+        str_builder_add_cstr(sbm, "{\"content\":[{\"type\":\"text/plain\",\"text\":\"");
+        if (em2 != 0) {
+            str_builder_add(sbm, json_escape_str(str_from(em2)));
+        } else {
+            str_builder_add_cstr(sbm, "upstream MCP error");
+        }
+        str_builder_add_cstr(sbm, "\"}],\"isError\":true,\"code\":");
+        str_builder_add_int(sbm, ec);
+        str_builder_add_cstr(sbm, "}");
+        http_ok(fd, str_builder_build(sbm));
+        return 0;
+    }
+    # Success — pass the `result` value through as the response body.
+    var rr = sandhi_rpc_mcp_result_raw(resp);
+    if (rr == 0) {
+        # No result envelope and no error — treat as empty success.
+        http_ok(fd, str_from("{\"content\":[],\"isError\":false}"));
+        return 0;
+    }
+    http_send_response(fd, 200, rr, str_len(str_from(rr)));
     return 0;
 }
 

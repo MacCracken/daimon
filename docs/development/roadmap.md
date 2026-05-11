@@ -40,9 +40,9 @@
 - [x] `docs/doc-health.md` ledger added (agnosys / cyrius convention).
 - [x] Build clean at 622 KB DCE, 200/200 tests pass, 0 lint warnings.
 
-## v1.2.1 — External MCP forwarding (carryover from v1.1.5)
+## Completed (v1.2.1)
 
-- [ ] **External MCP forwarding via `sandhi_rpc_mcp_call`** — replace the `api_mcp_call` `"tool dispatch not available in sync mode"` stub at `src/main.cyr:3393`. Requires extending `McpToolDescription` with an `endpoint_url` field, updating `api_mcp_register` to capture and validate it (HTTP/HTTPS only — no `file://` etc.; reuse `validate_callback_url` semantics if applicable), and wiring `sandhi_rpc_mcp_call` in the dispatcher. Add a roundtrip test against a fake MCP server. The 1.2.0 toolchain bump pulled in `tls/mmap/dynlib/fdlopen` deps so sandhi's 0-RTT client path is already wired at compile time — DCE drops it today; 1.2.1 turns it on.
+- [x] **External MCP forwarding via `sandhi_rpc_mcp_call`** — `api_mcp_call` dispatch path now forwards to the external endpoint, maps transport / JSON-RPC / success outcomes to 502 / 200-isError / 200-passthrough respectively. `api_mcp_register` enforces `validate_callback_url` (SSRF guard). The original 1.1.5 plan to add `McpToolDescription.endpoint_url` was rescoped — the existing external-wrapper struct (`{tool, callback_url}`) already separates URL from tool description, so `mcp_find_external_url` is the new accessor instead. End-to-end roundtrip test against a fake MCP server deferred (needs a localhost fixture not yet present in the test tree).
 
 ## v1.2.2 — Sandhi idle_ms + serve_async collapse (carryover from v1.1.5)
 

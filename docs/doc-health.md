@@ -6,7 +6,7 @@ type: state
 
 # Documentation Health — daimon
 
-> **Last refresh**: 2026-05-10 (initial audit at 1.2.0 ship — paired with the cyrius 5.10.34 + sakshi 2.2.3 bump + CI/release modernization).
+> **Last refresh**: 2026-05-10 (1.2.1 ship — external MCP forwarding via `sandhi_rpc_mcp_call`; initial 1.2.0 audit context preserved below).
 > **Refresh cadence**: when docs are touched, update the affected row. Full re-audit at each minor (1.2.x → 1.3.0) cut.
 > **Scope**: this repo only (`daimon`) — root-level files plus the entire `docs/` tree.
 
@@ -33,6 +33,11 @@ Daimon is the AGNOS agent orchestrator — every consumer (hoosh, agnoshi, aethe
 - ✅ `CLAUDE.md` — cyrius pin reference refreshed 5.7.12 → 5.10.34; sakshi line refreshed 2.0.0 → 2.2.3; sandhi note remains "in use".
 - ✅ `docs/development/roadmap.md` — 1.1.5 items rescoped to 1.2.1 / 1.2.2; "Future (v1.2.0+)" renamed to "Future (v1.3.0+)".
 - ✅ `docs/doc-health.md` — this file (initial scaffold; agnosys convention).
+
+**Doc work shipped in 1.2.1:**
+- ✅ `CHANGELOG.md` — 1.2.1 entry for external MCP forwarding (sandhi_rpc_mcp_call dispatch, validate_callback_url enforced at register boundary, +13 test assertions, +1 360 bytes binary).
+- ✅ `docs/development/roadmap.md` — 1.2.1 marked complete; rescoping note on the original `McpToolDescription.endpoint_url` plan (rescoped to use the existing external-wrapper struct + `mcp_find_external_url` accessor).
+- ✅ `docs/doc-health.md` — last-refresh date rolled.
 
 **Stale set carried into 1.2.1+:** the README footprint block, CONTRIBUTING workflow steps + cyrius pin, architecture overview's deps list, BENCHMARKS numbers, quickstart install command. None block 1.2.0 ship — all are read-through refreshes, batched into a 1.2.1 doc cleanup pass per the working-loop convention.
 
