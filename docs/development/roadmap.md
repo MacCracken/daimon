@@ -22,7 +22,7 @@
 ## Blocked on Upstream Ports
 
 - [ ] **Low** — Firewall MCP tools — [nein](https://github.com/MacCracken/nein) core port complete (v0.1.0, 13 modules); MCP tool wiring still pending nein's own `mcp` module which is blocked on bote. No active consumer demand; bumps to **P2** when a consumer asks for firewall control via daimon's MCP surface.
-- [ ] **P2** — MCP tool hosting (bote re-exports) — blocked on [bote](https://github.com/MacCracken/bote) Cyrius port. Bote is actively shipping (2.7.1 as of 2026-05-10); the re-exports become wirable as bote's libro_tools port lands. Tracked passively until bote signals the dispatch surface is stable.
+- [ ] **P2** — MCP tool hosting (bote re-exports) — blocked on [bote](https://github.com/MacCracken/bote) Cyrius port. Bote is actively shipping (2.7.2 as of 2026-05-11; the `dist/bote-core.cyr` opt-in transport-free profile landed in 2.7.2 and t-ron 2.1.3 is the trigger consumer); the re-exports become wirable as bote's libro_tools port lands. Tracked passively until bote signals the dispatch surface is stable.
 - [x] ~~MCP tool call forwarding — blocked on bote + HTTP client library~~ — HTTP-client side unblocked by sandhi (`sandhi_rpc_mcp_call` available since Cyrius 5.7.0). Wired daimon-side at 1.2.1.
 
 ## Completed (v1.1.0)
@@ -57,17 +57,25 @@
 - [x] **Lower sandhi `idle_ms` below the 30s default** — `serve` (sync) now uses `sandhi_server_run_opts` with `idle_ms = SERVE_IDLE_MS = 5000`. `serve_async` (async) applies `SO_RCVTIMEO = SERVE_IDLE_MS` per accepted cfd via the new `set_recv_timeout_ms` helper — closes a pre-existing slowloris gap in async (no per-connection timeout since 1.1.0). Both paths now bound the slow-sender hold at ~5 s instead of sandhi's 30 s default.
 - [ ] **Collapse `serve_async` to `sandhi_server_run_opts`** — **still blocked upstream.** Bundled sandhi 1.3.3 still accepts-but-does-not-honor `sandhi_server_options_max_conns`. Tracked upstream at [sandhi/docs/issues/2026-05-10-daimon-server-max-conns.md](https://github.com/MacCracken/sandhi/blob/main/docs/issues/2026-05-10-daimon-server-max-conns.md) (severity **Low**); re-check at every cyrius pin bump.
 
+## Completed (v1.2.4)
+
+- [x] **Cyrius pin `5.10.44` → `6.1.24`** — first 6.x toolchain pin. Bundled sandhi rides up `1.3.3` → `1.4.10`; `cyrius.lock` re-resolved to 53 deps (was 37). No daimon source changes; 213/213 tests pass, 0 lint warnings.
+- [x] **Sakshi pin `2.2.3` → `2.2.10`** — patch refresh; `msg_len`-required call surface unchanged since 2.0.0.
+- [x] **`./lib/` snapshot refreshed** — stale 5.10.44 stdlib (sandhi 1.3.3) deleted; `cyrius deps` re-resolved against the 6.1.24 version-pinned snapshot.
+- [x] Verified sandhi 1.4.10 keeps daimon's API surface (`sandhi_server_run{,_opts}`, `sandhi_server_options_idle_ms`, `sandhi_server_recv_request`, `sandhi_rpc_mcp_call`) and the `TLS_EARLY_DATA_ACCEPTED` rationale for the transitive tls/mmap/dynlib/fdlopen deps.
+- [x] Build size noted: ~624 KB (1.2.2) → ~1.43 MB — 6.x DCE NOPs-but-keeps dead code vs. 5.x stripping it; toolchain effect, not a daimon regression.
+
 ## v1.2.x — Current work arc
 
 Open items on the current arc, severity-tagged. The arc closes when the P2s land + the P3s drain (no hard cap; per the working-loop convention, ship when ready).
 
 - [ ] **P2** — `guides/quickstart.md` refresh — install one-liner references the 5.7.12 / sakshi 2.0.0 era (versioned toolchain layout + `cyrius deps` workflow + `lib/` gitignored). Load-bearing for new-user onboarding; an incorrect install command actively breaks first-run.
 - [ ] **P2** — `docs/architecture/overview.md` refresh — stdlib deps list adds tls/mmap/dynlib/fdlopen (1.2.0 transitive add via sandhi 1.3.3); sandhi 1.3.3 notes; `lib/` gitignored. Reference doc consulted on every architectural decision; staleness propagates downstream.
-- [ ] **P3** — `README.md` footprint block — cyrius 5.10.34, sakshi 2.2.3, ~624 KB binary, refreshed dep list. Marketing-surface, not load-bearing for correctness.
+- [ ] **P3** — `README.md` footprint block — cyrius 6.1.24, sakshi 2.2.10, ~1.43 MB binary (6.x DCE keeps NOPed-but-unstripped dead code; see 1.2.4 CHANGELOG), refreshed dep list. Marketing-surface, not load-bearing for correctness.
 - [ ] **P3** — `CONTRIBUTING.md` workflow steps — cyrius pin, `cyrius deps` workflow, lib/ gitignored expectation, fmt-via-diff gate + lint-fail-on-warn posture. Onboarding refinement; not blocking.
 - [ ] **P3** — `BENCHMARKS.md` re-baseline under 5.10.34. Within-noise expected — no microbenchmark touches HTTP. Useful for the "prove the wins" discipline but no consumer pressure.
 - [ ] **P3** — `guides/api.md` cyrius pin + example commands refresh.
-- [ ] **Low (upstream)** — **Collapse `serve_async` to `sandhi_server_run_opts`** — bundled sandhi 1.3.3 still accepts-but-does-not-honor `sandhi_server_options_max_conns`. Tracked upstream at [sandhi/docs/issues/2026-05-10-daimon-server-max-conns.md](https://github.com/MacCracken/sandhi/blob/main/docs/issues/2026-05-10-daimon-server-max-conns.md). Re-check at every cyrius pin bump; small follow-up patch when upstream wires the enforcement.
+- [ ] **P2 (unblocked at 1.2.4)** — **Collapse `serve_async` onto sandhi's `sandhi_server_run_async`** — upstream resolved as of bundled sandhi **1.4.9** (rides in with cyrius 6.1.24): `sandhi_server_run_async` is an epoll-cooperative accept loop that **does honor `sandhi_server_options_max_conns`** (the sync `sandhi_server_run` / `sandhi_server_run_opts` remain single-flight by design). Daimon's `serve_async` currently hand-rolls its own epoll accept loop (`set_recv_timeout_ms` + `async_spawn` per cfd, since 1.1.0). The collapse is now actionable — it's a behavioural change, so it earns a dedicated work-loop cycle with tests + benchmarks (concurrency-under-load comparison vs. the hand-rolled loop). Bumped from **Low (upstream-blocked)** → **P2 (actionable)** at the 1.2.4 pin bump.
 
 **Upstream-blocker items** (not in daimon's hands; tracked for visibility):
 

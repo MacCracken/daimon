@@ -6,6 +6,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.2.4] - 2026-06-10
+
+**Major toolchain bump + dependency refresh.** Moves the language pin from cyrius **5.10.44 → 6.1.24** (first 6.x pin) in `cyrius.cyml`, bumps the `sakshi` git-pin **2.2.3 → 2.2.10**, and picks up the bundled **sandhi 1.3.3 → 1.4.10** that rides in with the 6.1.24 toolchain. No daimon source changes — the sandhi/sakshi call surfaces daimon uses are unchanged.
+
+### Changed
+
+- **`cyrius.cyml`** — `cyrius = "6.1.24"` (was `"5.10.44"`); `[deps.sakshi].tag = "2.2.10"` (was `"2.2.3"`).
+- **`cyrius.lock`** — re-resolved under 6.1.24; **53 deps locked** (was 37). The version-pinned stdlib snapshot grew (new modules: `bigint`, `ct`, `keccak`, `sigil`, `thread_local`, `tls_native`, `*_agnos`/`*_win` arch variants).
+- **`./lib/` snapshot refreshed** — the gitignored local snapshot carried stale 5.10.44 stdlib (sandhi 1.3.3) that shadowed the 6.1.24 version-pinned lib. Deleted and re-resolved via `cyrius deps` so the snapshot tracks the new toolchain (sandhi now 1.4.10).
+- **`CLAUDE.md`** — project-identity line `Cyrius: 6.1.24`; sandhi-stdlib table cell + transitive-deps row `sandhi 1.3.3 → 1.4.10` / `5.10.44 → 6.1.24`; sakshi row `(2.2.3) → (2.2.10)`.
+
+### Changed (docs, folded from Unreleased)
+
+- **`docs/development/roadmap.md`** — refreshed two stale upstream version references after the 2026-05-11 first-party-set bump: (1) "Blocked on Upstream Ports" line for MCP tool hosting bumped `2.7.1 (as of 2026-05-10)` → `2.7.2 (as of 2026-05-11)` and adds a note that the `dist/bote-core.cyr` opt-in transport-free profile landed in bote 2.7.2 (t-ron 2.1.3 is the trigger consumer); (2) `README.md` footprint refresh todo bumped `cyrius 5.10.34` → `cyrius 5.10.44`.
+
+### Verified
+
+- **`TLS_EARLY_DATA_ACCEPTED` rationale still holds** — sandhi 1.4.10's bundle still references it (3 sites), so the transitive `tls`/`mmap`/`dynlib`/`fdlopen` stdlib deps (present since 1.2.0 for compile-time symbol resolution) stay required.
+- **Daimon's sandhi API surface intact in 1.4.10** — `sandhi_server_run`, `sandhi_server_run_opts`, `sandhi_server_options_idle_ms`, `sandhi_server_recv_request`, `sandhi_rpc_mcp_call` all present.
+- `cyrius lint src/main.cyr`: 0 warnings. `cyrius test`: **213 / 213** assertions pass (no test additions — a toolchain/dep bump touches no daimon source).
+- `cyrius build` (DCE): **1,466,136 bytes** (~1.43 MB) statically-linked, stripped ELF. **Up from ~624 KB at 1.2.2** — this is a 6.x codegen change, not a daimon regression: 6.1.24's DCE NOPs the 1,797 unreachable fns (511,548 bytes) in place but keeps them in the section layout, where the 5.x toolchain stripped them. Binary boots clean: `daimon v1.2.4 listening on port 8090 (sync)`.
+
+### Known issues
+
+- **`serve_async` collapse — upstream resolution path now exists (1.4.9+), still a deferred follow-up.** Bundled sandhi 1.4.9 introduced `sandhi_server_run_async`, an epoll-cooperative accept loop that **does honor `sandhi_server_options_max_conns`** (the sync `sandhi_server_run` / `sandhi_server_run_opts` stay single-flight by design). This unblocks the long-deferred "collapse `serve_async` into a sandhi-driven accept loop" item — but the migration is a behavioural change (daimon's hand-rolled async epoll loop → `sandhi_server_run_async`) that earns its own work-loop cycle with tests + benchmarks, out of scope for this toolchain bump. Roadmapped.
+
 ## [1.2.3] - 2026-05-11
 
 **Cyrius toolchain pin bump.** Moves the language pin from 5.10.34 → 5.10.44 in `cyrius.cyml` (and the mirrored line in `CLAUDE.md`). No daimon source changes; bundled sandhi version unchanged.
