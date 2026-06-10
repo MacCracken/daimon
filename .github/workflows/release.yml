@@ -43,39 +43,21 @@ jobs:
           echo "Version verified: $TAG (cyrius.cyml pulls from VERSION via \${file:VERSION})"
 
       - name: Install Cyrius toolchain
-        # Versioned layout — see ci.yml for rationale. 5.10.x release
-        # tarballs ship bin/ + deps/ only, so we also pull the source
-        # archive at the version tag to get lib/ (the stdlib snapshot).
+        # Delegates to the upstream installer keyed on the cyrius.cyml
+        # pin — lays out $HOME/.cyrius/{bin,lib} (binaries + stdlib
+        # snapshot). See ci.yml for the rationale (replaces the pre-6.x
+        # hand-rolled two-tarball extraction that probed for `bin/cc5`,
+        # renamed cc5 → cycc on the 6.x toolchain).
         run: |
-          CYRIUS_VERSION="${CYRIUS_VERSION:-$(grep -E '^cyrius[[:space:]]*=' cyrius.cyml | sed -E 's/^cyrius[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')}"
+          set -e
+          CYRIUS_VERSION="$(grep '^cyrius = ' cyrius.cyml | head -1 | sed 's/cyrius = "\(.*\)"/\1/')"
           echo "Installing Cyrius $CYRIUS_VERSION"
-          curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
-          tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
-          CYRIUS_DIR="cyrius-$CYRIUS_VERSION-x86_64-linux"
-          curl -sL "https://github.com/MacCracken/cyrius/archive/refs/tags/$CYRIUS_VERSION.tar.gz" -o cyrius-src.tar.gz
-          tar xzf cyrius-src.tar.gz
-          CYRIUS_SRC="cyrius-$CYRIUS_VERSION"
-          VERSIONED="$HOME/.cyrius/versions/$CYRIUS_VERSION"
-          mkdir -p "$VERSIONED/bin" "$VERSIONED/lib"
-          cp "$CYRIUS_DIR/bin/"* "$VERSIONED/bin/" 2>/dev/null || true
-          cp "$CYRIUS_DIR/scripts/cyrius" "$VERSIONED/bin/cyrius" 2>/dev/null || true
-          if [ -f "$CYRIUS_DIR/cc5_aarch64" ]; then
-            cp "$CYRIUS_DIR/cc5_aarch64" "$VERSIONED/bin/cc5_aarch64"
-          fi
-          cp -r "$CYRIUS_SRC/lib/"* "$VERSIONED/lib/"
-          if [ -d "$CYRIUS_DIR/deps" ]; then
-            mkdir -p "$HOME/.cyrius/deps"
-            cp -r "$CYRIUS_DIR/deps/"* "$HOME/.cyrius/deps/"
-          fi
-          chmod +x "$VERSIONED/bin/"* 2>/dev/null || true
-          ln -sfn "$VERSIONED/bin" "$HOME/.cyrius/bin"
-          ln -sfn "$VERSIONED/lib" "$HOME/.cyrius/lib"
-          echo "$CYRIUS_VERSION" > "$HOME/.cyrius/current"
-          echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
-          echo "CYRIUS_HOME=$HOME/.cyrius" >> $GITHUB_ENV
+          curl -sSf https://raw.githubusercontent.com/MacCracken/cyrius/main/scripts/install.sh | \
+            CYRIUS_VERSION="$CYRIUS_VERSION" sh
+          echo "$HOME/.cyrius/bin" >> "$GITHUB_PATH"
 
       - name: Verify toolchain
-        run: cc5 --version
+        run: cyrius --version
 
       - name: Resolve deps
         run: cyrius deps
@@ -99,16 +81,16 @@ jobs:
         # the x86_64 binary regardless; aarch64 is bonus when the build
         # is clean.
         run: |
-          if [ ! -x "$HOME/.cyrius/bin/cc5_aarch64" ]; then
-            echo "::warning::cc5_aarch64 not in toolchain — aarch64 binary skipped"
+          if [ ! -x "$HOME/.cyrius/bin/cycc_aarch64" ]; then
+            echo "::warning::cycc_aarch64 not in toolchain — aarch64 binary skipped"
             exit 0
           fi
           if cyrius build --aarch64 src/main.cyr build/daimon-aarch64 2>&1 | tee /tmp/aarch64.log; then
             echo "daimon-aarch64: $(wc -c < build/daimon-aarch64) bytes"
             exit 0
           fi
-          if grep -qE "undefined variable 'SYS_EPOLL_WAIT'" /tmp/aarch64.log; then
-            echo "::warning::aarch64 cross-build blocked on upstream stdlib gap (SYS_EPOLL_WAIT not defined on aarch64). x86_64 release ships without the aarch64 binary this tag."
+          if grep -qE "undefined variable 'SYS_(FORK|EPOLL_WAIT)'" /tmp/aarch64.log; then
+            echo "::warning::aarch64 cross-build blocked on an upstream stdlib gap (a SYS_* syscall not defined on aarch64 Linux — e.g. SYS_FORK / SYS_EPOLL_WAIT). x86_64 release ships without the aarch64 binary this tag."
             exit 0
           fi
           echo "ERROR: aarch64 cross-build failed for a non-blocker reason"
@@ -120,9 +102,6 @@ jobs:
             [ -f "$t" ] || continue
             cyrius test "$t"
           done
-
-      - name: Clean toolchain artifacts
-        run: rm -f cyrius-*.tar.gz
 
       - name: Archive
         run: |

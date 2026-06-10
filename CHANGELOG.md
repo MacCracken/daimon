@@ -17,6 +17,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - **`./lib/` snapshot refreshed** — the gitignored local snapshot carried stale 5.10.44 stdlib (sandhi 1.3.3) that shadowed the 6.1.24 version-pinned lib. Deleted and re-resolved via `cyrius deps` so the snapshot tracks the new toolchain (sandhi now 1.4.10).
 - **`CLAUDE.md`** — project-identity line `Cyrius: 6.1.24`; sandhi-stdlib table cell + transitive-deps row `sandhi 1.3.3 → 1.4.10` / `5.10.44 → 6.1.24`; sakshi row `(2.2.3) → (2.2.10)`.
 
+### Fixed (CI/release)
+
+- **Toolchain install migrated to the upstream `install.sh`** (`.github/workflows/{ci,release}.yml`). The 6.x toolchain renamed the compiler binary `cc5` → `cycc`, so the pre-6.x hand-rolled two-tarball extraction (release tarball for `bin/`, source archive for `lib/`) failed its sanity gate with `FAIL: bin/cc5 missing — release tarball extraction failed`. Both workflows now pipe `https://raw.githubusercontent.com/MacCracken/cyrius/main/scripts/install.sh` with `CYRIUS_VERSION` read from the `cyrius.cyml` pin, matching bote / patra / agnosys on the 6.x toolchain. The redundant "Clean toolchain artifacts" release step (which `rm`'d the no-longer-downloaded `cyrius-*.tar.gz`) was dropped.
+- **`cc5 --version` verify → `cyrius --version`** in both workflows (the `cyrius` wrapper is the stable entrypoint across the rename).
+- **aarch64 cross-build lane updated for 6.x** — `cc5_aarch64` → `cycc_aarch64` (binary rename), and the known-upstream-blocker grep generalized from `SYS_EPOLL_WAIT` to `SYS_(FORK|EPOLL_WAIT)`. The async-epoll gap was fixed upstream by 6.1.24, so the next aarch64-absent syscall — `SYS_FORK` (aarch64 Linux is clone-only, no `fork(2)`) — is now the surfaced blocker. The lane stays best-effort warn-and-continue; the x86_64 build remains authoritative.
+
 ### Changed (docs, folded from Unreleased)
 
 - **`docs/development/roadmap.md`** — refreshed two stale upstream version references after the 2026-05-11 first-party-set bump: (1) "Blocked on Upstream Ports" line for MCP tool hosting bumped `2.7.1 (as of 2026-05-10)` → `2.7.2 (as of 2026-05-11)` and adds a note that the `dist/bote-core.cyr` opt-in transport-free profile landed in bote 2.7.2 (t-ron 2.1.3 is the trigger consumer); (2) `README.md` footprint refresh todo bumped `cyrius 5.10.34` → `cyrius 5.10.44`.

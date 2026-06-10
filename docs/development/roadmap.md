@@ -79,7 +79,7 @@ Open items on the current arc, severity-tagged. The arc closes when the P2s land
 
 **Upstream-blocker items** (not in daimon's hands; tracked for visibility):
 
-- [ ] **P2 (upstream cyrius)** — aarch64 cross-build `SYS_EPOLL_WAIT` gap — `lib/async.cyr` references the constant unconditionally, but `lib/syscalls_aarch64_linux.cyr` doesn't define it (aarch64 has no plain `epoll_wait` syscall). Daimon CI tolerant via warn-on-detect; aarch64 binaries return automatically when upstream patches. Tracked at [cyrius/docs/development/issues/2026-05-10-daimon-async-aarch64-sys-epoll-wait.md](https://github.com/MacCracken/cyrius/blob/main/docs/development/issues/2026-05-10-daimon-async-aarch64-sys-epoll-wait.md) (pinned in cyrius roadmap under `v5.10.x — Held`).
+- [ ] **P2 (upstream cyrius)** — aarch64 cross-build syscall-table gap. The original `SYS_EPOLL_WAIT` blocker (`lib/async.cyr`) was **fixed upstream by cyrius 6.1.24**; the next aarch64-absent syscall now surfaces: `SYS_FORK` (referenced from `src/main.cyr`'s supervisor path, but undefined in `lib/syscalls_aarch64_linux.cyr` — aarch64 Linux is clone-only, no `fork(2)`). Daimon CI/release stay tolerant via warn-on-detect (the known-blocker grep covers `SYS_(FORK|EPOLL_WAIT)`); aarch64 binaries return automatically when upstream defines a clone-backed `SYS_FORK` shim or daimon's supervisor switches to `clone`. Original epoll gap tracked at [cyrius/docs/development/issues/2026-05-10-daimon-async-aarch64-sys-epoll-wait.md](https://github.com/MacCracken/cyrius/blob/main/docs/development/issues/2026-05-10-daimon-async-aarch64-sys-epoll-wait.md).
 
 ## Future (v1.3.0+)
 

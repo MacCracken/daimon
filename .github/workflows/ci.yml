@@ -31,57 +31,25 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Cyrius toolchain
-        # Versioned layout — cc5 5.10.9+ resolves arch-peer includes
-        # (syscalls_x86_64_linux.cyr etc.) under
-        # ~/.cyrius/versions/<V>/lib/. The 5.10.x release tarball
-        # ships bin/ + deps/ only — the lib/ stdlib snapshot is NOT
-        # in the tarball — so we also pull the GitHub source archive
-        # at the version tag and copy lib/ from there. Same installer
-        # body as agnosys / bote / libro / majra.
+        # The cyrius.cyml `[package].cyrius` pin is the single source of
+        # truth for the toolchain version — nothing is hardcoded in this
+        # YAML. Hand the pin to the upstream installer, which fetches +
+        # lays out $HOME/.cyrius/{bin,lib}: binaries (cycc / cyrius /
+        # cyrfmt / cyrlint ...) plus the stdlib snapshot, walking nested
+        # lib/ subdirs. Replaces the pre-6.x hand-rolled two-tarball
+        # extraction that probed for `bin/cc5` — the 6.x toolchain
+        # renamed cc5 → cycc, so that gate failed on every 6.x install.
+        # Same installer body as bote / patra / agnosys on 6.x.
         run: |
-          CYRIUS_VERSION="${CYRIUS_VERSION:-$(grep -E '^cyrius[[:space:]]*=' cyrius.cyml | sed -E 's/^cyrius[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')}"
+          set -e
+          CYRIUS_VERSION="$(grep '^cyrius = ' cyrius.cyml | head -1 | sed 's/cyrius = "\(.*\)"/\1/')"
           echo "Installing Cyrius $CYRIUS_VERSION"
-
-          # Release tarball — binaries + first-party deps cache.
-          curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
-          tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
-          CYRIUS_DIR="cyrius-$CYRIUS_VERSION-x86_64-linux"
-
-          # Source archive — stdlib (lib/) snapshot at the version tag.
-          curl -sL "https://github.com/MacCracken/cyrius/archive/refs/tags/$CYRIUS_VERSION.tar.gz" -o cyrius-src.tar.gz
-          tar xzf cyrius-src.tar.gz
-          CYRIUS_SRC="cyrius-$CYRIUS_VERSION"
-
-          VERSIONED="$HOME/.cyrius/versions/$CYRIUS_VERSION"
-          mkdir -p "$VERSIONED/bin" "$VERSIONED/lib"
-          cp "$CYRIUS_DIR/bin/"* "$VERSIONED/bin/" 2>/dev/null || true
-          cp "$CYRIUS_DIR/scripts/cyrius" "$VERSIONED/bin/cyrius" 2>/dev/null || true
-          # cc5_aarch64 moved out of bin/ to the tarball top level at
-          # 5.7.48; pick it up explicitly so the cross-build step works.
-          if [ -f "$CYRIUS_DIR/cc5_aarch64" ]; then
-            cp "$CYRIUS_DIR/cc5_aarch64" "$VERSIONED/bin/cc5_aarch64"
-          fi
-          cp -r "$CYRIUS_SRC/lib/"* "$VERSIONED/lib/"
-          # Carry the prebuilt deps snapshot so `cyrius deps` doesn't
-          # have to git-clone the first-party tree on every CI run.
-          if [ -d "$CYRIUS_DIR/deps" ]; then
-            mkdir -p "$HOME/.cyrius/deps"
-            cp -r "$CYRIUS_DIR/deps/"* "$HOME/.cyrius/deps/"
-          fi
-          chmod +x "$VERSIONED/bin/"* 2>/dev/null || true
-          ln -sfn "$VERSIONED/bin" "$HOME/.cyrius/bin"
-          ln -sfn "$VERSIONED/lib" "$HOME/.cyrius/lib"
-          echo "$CYRIUS_VERSION" > "$HOME/.cyrius/current"
-          echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
-          echo "CYRIUS_HOME=$HOME/.cyrius" >> $GITHUB_ENV
-
-          # Sanity checks.
-          test -f "$VERSIONED/lib/syscalls_x86_64_linux.cyr" || { echo "FAIL: stdlib lib/syscalls_x86_64_linux.cyr missing — source archive extraction failed"; exit 1; }
-          test -x "$VERSIONED/bin/cc5" || { echo "FAIL: bin/cc5 missing — release tarball extraction failed"; exit 1; }
-          echo "OK: stdlib + binaries installed under $VERSIONED"
+          curl -sSf https://raw.githubusercontent.com/MacCracken/cyrius/main/scripts/install.sh | \
+            CYRIUS_VERSION="$CYRIUS_VERSION" sh
+          echo "$HOME/.cyrius/bin" >> "$GITHUB_PATH"
 
       - name: Verify toolchain
-        run: cc5 --version
+        run: cyrius --version
 
       - name: Resolve dependencies
         # Populates ./lib/ from the version-pinned stdlib snapshot
@@ -120,7 +88,7 @@ jobs:
           [ $fail -eq 0 ] || { echo "fmt: drift detected"; exit 1; }
 
       - name: Lint
-        # Fail-on-warn — daimon is clean under 5.10.34. Lint covers
+        # Fail-on-warn — daimon is clean under 6.1.24. Lint covers
         # src/ + tests/ + bench/ + fuzz/.
         run: |
           fail=0
@@ -144,23 +112,29 @@ jobs:
         run: xxd -l 4 build/daimon | grep -q "7f45 4c46"
 
       - name: Cross-build aarch64 (best-effort)
-        # Best-effort: only when cc5_aarch64 is in the toolchain bundle,
+        # Best-effort: only when cycc_aarch64 is in the toolchain bundle,
         # and tolerant of known upstream stdlib aarch64 gaps. Same posture
         # as sakshi 2.2.2's aarch64 lane (upstream stdlib emits unresolved
         # `vec_get` / `vec_len` refs there; we hit a different symbol).
         #
-        # Known upstream-blocker symbols (downgrade to warning, exit 0):
-        #   - SYS_EPOLL_WAIT: lib/async.cyr line 117/145 calls it unconditionally,
-        #     but lib/syscalls_aarch64_linux.cyr only defines SYS_EPOLL_PWAIT
-        #     (aarch64 has no plain epoll_wait syscall). Tracked upstream at
+        # Known upstream-blocker symbols (downgrade to warning, exit 0) —
+        # syscalls the aarch64 stdlib table doesn't define because the
+        # syscall doesn't exist on aarch64 Linux:
+        #   - SYS_FORK: aarch64 has no fork(2) syscall (clone-only). Surfaced
+        #     at the cyrius 6.1.24 pin once the SYS_EPOLL_WAIT gap below was
+        #     fixed upstream — it's the next undefined symbol in line.
+        #   - SYS_EPOLL_WAIT: lib/async.cyr called it unconditionally while
+        #     lib/syscalls_aarch64_linux.cyr only defined SYS_EPOLL_PWAIT
+        #     (aarch64 has no plain epoll_wait). Kept here for older pins;
+        #     tracked upstream at
         #     cyrius/docs/development/issues/2026-05-10-daimon-async-aarch64-sys-epoll-wait.md.
         #
         # Any other failure still fails the step — we want signal when a
         # daimon-side regression breaks the cross-build, just not when
         # upstream is the blocker.
         run: |
-          if [ ! -x "$HOME/.cyrius/bin/cc5_aarch64" ]; then
-            echo "::warning::cc5_aarch64 not shipped with Cyrius $CYRIUS_VERSION — skipping"
+          if [ ! -x "$HOME/.cyrius/bin/cycc_aarch64" ]; then
+            echo "::warning::cycc_aarch64 not shipped with this Cyrius toolchain — skipping"
             exit 0
           fi
           if cyrius build --aarch64 src/main.cyr build/daimon-aarch64 2>&1 | tee /tmp/aarch64.log; then
@@ -170,8 +144,8 @@ jobs:
             exit 0
           fi
           # Build failed — check whether it's a known upstream stdlib gap.
-          if grep -qE "undefined variable 'SYS_EPOLL_WAIT'" /tmp/aarch64.log; then
-            echo "::warning::aarch64 cross-build blocked on upstream stdlib gap (SYS_EPOLL_WAIT not defined on aarch64 — tracked at cyrius/docs/development/issues/2026-05-10-daimon-async-aarch64-sys-epoll-wait.md). Treated as non-fatal; x86_64 build remains authoritative."
+          if grep -qE "undefined variable 'SYS_(FORK|EPOLL_WAIT)'" /tmp/aarch64.log; then
+            echo "::warning::aarch64 cross-build blocked on an upstream stdlib gap (a SYS_* syscall not defined on aarch64 Linux — e.g. SYS_FORK / SYS_EPOLL_WAIT). Treated as non-fatal; x86_64 build remains authoritative."
             exit 0
           fi
           echo "ERROR: aarch64 cross-build failed for a non-blocker reason"
