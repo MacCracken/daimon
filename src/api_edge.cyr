@@ -1,0 +1,129 @@
+# =========================================================================
+# api_edge — edge fleet endpoints
+# =========================================================================
+
+fn api_edge_stats(fd) {
+    var st = edge_fleet_stats(_edge_fleet);
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"total\":");
+    str_builder_add_int(sb, load64(st));
+    str_builder_add_cstr(sb, ",\"online\":");
+    str_builder_add_int(sb, load64(st + 8));
+    str_builder_add_cstr(sb, ",\"suspect\":");
+    str_builder_add_int(sb, load64(st + 16));
+    str_builder_add_cstr(sb, ",\"offline\":");
+    str_builder_add_int(sb, load64(st + 24));
+    str_builder_add_cstr(sb, ",\"active_tasks\":");
+    str_builder_add_int(sb, load64(st + 48));
+    str_builder_add_cstr(sb, ",\"tasks_completed\":");
+    str_builder_add_int(sb, load64(st + 56));
+    str_builder_add_cstr(sb, "}");
+    http_ok(fd, str_builder_build(sb));
+}
+
+# POST /v1/edge/nodes — register edge node
+fn api_edge_register(fd, body) {
+    if (body == 0) { http_bad_request(fd, str_from("missing body")); return 0; }
+    var pairs = json_parse(body);
+    var name = jget(pairs, "name");
+    if (name == 0) { http_error(fd, 422, str_from("name required")); return 0; }
+    if (str_len(name) == 0) { http_error(fd, 422, str_from("name cannot be empty")); return 0; }
+    var node = edge_node_new(name, str_from("x86_64"), 4, 4096);
+    var result = edge_fleet_register(_edge_fleet, node);
+    if (is_err_result(result) == 1) {
+        http_bad_request(fd, str_from("registration failed (duplicate or full)"));
+        return 0;
+    }
+    var id = payload(result);
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"id\":\"");
+    str_builder_add(sb, id);
+    str_builder_add_cstr(sb, "\"}");
+    http_send_response(fd, 201, str_data(str_builder_build(sb)), str_len(str_builder_build(sb)));
+    return 0;
+}
+
+# GET /v1/edge/nodes — list nodes
+fn api_edge_list(fd, buf, buf_len) {
+    var status_filter = 0 - 1;  # -1 = all
+    var qp = http_parse_query_param(buf, buf_len, "status");
+    if (qp != 0) {
+        if (streq(qp, "online") == 1) { status_filter = EDGE_ONLINE; }
+        elif (streq(qp, "suspect") == 1) { status_filter = EDGE_SUSPECT; }
+        elif (streq(qp, "offline") == 1) { status_filter = EDGE_OFFLINE; }
+        elif (streq(qp, "updating") == 1) { status_filter = EDGE_UPDATING; }
+        elif (streq(qp, "decommissioned") == 1) { status_filter = EDGE_DECOMMISSIONED; }
+    }
+    var nodes = edge_fleet_list(_edge_fleet, status_filter);
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"nodes\":[");
+    var ni = 0;
+    while (ni < vec_len(nodes)) {
+        if (ni > 0) { str_builder_add_cstr(sb, ","); }
+        var n = vec_get(nodes, ni);
+        str_builder_add_cstr(sb, "{\"id\":\"");
+        str_builder_add(sb, edge_node_id(n));
+        str_builder_add_cstr(sb, "\",\"name\":\"");
+        str_builder_add(sb, json_escape_str(load64(n + 8)));
+        str_builder_add_cstr(sb, "\",\"status\":");
+        str_builder_add_int(sb, edge_node_status(n));
+        str_builder_add_cstr(sb, "}");
+        ni = ni + 1;
+    }
+    str_builder_add_cstr(sb, "]}");
+    http_ok(fd, str_builder_build(sb));
+    return 0;
+}
+
+# GET /v1/edge/nodes/{id}
+fn api_edge_get(fd, id_cstr) {
+    var n = edge_fleet_get(_edge_fleet, id_cstr);
+    if (n == 0) { http_error(fd, 404, str_from("edge node not found")); return 0; }
+    var status_names: i64[5];
+    store64(&status_names, "Online");
+    store64(&status_names + 8, "Suspect");
+    store64(&status_names + 16, "Offline");
+    store64(&status_names + 24, "Updating");
+    store64(&status_names + 32, "Decommissioned");
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"id\":\"");
+    str_builder_add(sb, edge_node_id(n));
+    str_builder_add_cstr(sb, "\",\"name\":\"");
+    str_builder_add(sb, json_escape_str(load64(n + 8)));
+    str_builder_add_cstr(sb, "\",\"status\":\"");
+    str_builder_add_cstr(sb, load64(&status_names + edge_node_status(n) * 8));
+    str_builder_add_cstr(sb, "\",\"active_tasks\":");
+    str_builder_add_int(sb, edge_node_active_tasks(n));
+    str_builder_add_cstr(sb, "}");
+    http_ok(fd, str_builder_build(sb));
+    return 0;
+}
+
+# POST /v1/edge/nodes/{id}/heartbeat
+fn api_edge_heartbeat(fd, id_cstr, body) {
+    var active = 0;
+    var completed = 0;
+    if (body != 0) {
+        var pairs = json_parse(body);
+        active = jget_int(pairs, "active_tasks");
+        completed = jget_int(pairs, "tasks_completed");
+    }
+    var result = edge_fleet_heartbeat(_edge_fleet, id_cstr, active, completed);
+    if (is_err_result(result) == 1) {
+        http_error(fd, 404, str_from("node not found"));
+        return 0;
+    }
+    http_ok(fd, str_from("{\"ok\":true}"));
+    return 0;
+}
+
+# POST /v1/edge/nodes/{id}/decommission
+fn api_edge_decommission(fd, id_cstr) {
+    var result = edge_fleet_decommission(_edge_fleet, id_cstr);
+    if (is_err_result(result) == 1) {
+        http_error(fd, 404, str_from("node not found"));
+        return 0;
+    }
+    http_ok(fd, str_from("{\"ok\":true}"));
+    return 0;
+}

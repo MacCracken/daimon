@@ -1,0 +1,79 @@
+# =========================================================================
+# cron — interval-based recurring task triggers (CronScheduler)
+# =========================================================================
+
+# CronEntry: {name: Str, interval_secs, specific_hour, specific_minute,
+#              task_name: Str, task_agent_id: Str, task_priority,
+#              enabled, last_fired}
+# 9 fields x 8 = 72 bytes
+
+fn cron_entry_new(name, interval_secs, task_name, task_agent_id, task_priority) {
+    var ce = alloc(72);
+    store64(ce, name);
+    store64(ce + 8, interval_secs);
+    store64(ce + 16, 0 - 1);          # specific_hour (-1 = any)
+    store64(ce + 24, 0 - 1);          # specific_minute (-1 = any)
+    store64(ce + 32, task_name);
+    store64(ce + 40, task_agent_id);
+    store64(ce + 48, task_priority);
+    store64(ce + 56, 1);              # enabled
+    store64(ce + 64, 0);              # last_fired
+    return ce;
+}
+
+fn cron_entry_name(ce) { return load64(ce); }
+fn cron_entry_enabled(ce) { return load64(ce + 56); }
+fn cron_entry_set_enabled(ce, e) { store64(ce + 56, e); }
+
+# CronScheduler: {entries: map<name_cstr, CronEntry>}
+fn cron_scheduler_new() {
+    var cs = alloc(8);
+    store64(cs, map_new());
+    return cs;
+}
+
+fn cron_add_entry(cs, entry) {
+    var name = cron_entry_name(entry);
+    if (str_len(name) == 0) { return Err(ERR_SCHEDULER); }
+    # Validate hour/minute if specified
+    var hour = load64(entry + 16);
+    if (hour >= 0) {
+        if (hour > 23) { return Err(ERR_SCHEDULER); }
+    }
+    var minute = load64(entry + 24);
+    if (minute >= 0) {
+        if (minute > 59) { return Err(ERR_SCHEDULER); }
+    }
+    map_set(load64(cs), str_data(name), entry);
+    return Ok(0);
+}
+
+fn cron_remove_entry(cs, name_cstr) {
+    return map_delete(load64(cs), name_cstr);
+}
+
+# Check which entries should fire now, return vec of task templates
+fn cron_check_fires(cs) {
+    var entries = load64(cs);
+    var keys = map_keys(entries);
+    var now = clock_epoch_secs();
+    var fired = vec_new();
+    var i = 0;
+    while (i < vec_len(keys)) {
+        var entry = map_get(entries, vec_get(keys, i));
+        if (load64(entry + 56) == 0) { i = i + 1; continue; }  # disabled
+        var last = load64(entry + 64);
+        var interval = load64(entry + 8);
+        if (interval > 0) {
+            if (now - last >= interval) {
+                store64(entry + 64, now);  # update last_fired
+                vec_push(fired, entry);
+            }
+        }
+        i = i + 1;
+    }
+    return fired;
+}
+
+fn cron_entry_count(cs) { return map_count(load64(cs)); }
+

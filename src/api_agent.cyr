@@ -1,0 +1,79 @@
+# =========================================================================
+# api_agent — agent lifecycle endpoints
+# =========================================================================
+
+fn api_list_agents(fd) {
+    var keys = map_keys(_agents);
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"agents\":[");
+    var i = 0;
+    while (i < vec_len(keys)) {
+        if (i > 0) { str_builder_add_cstr(sb, ","); }
+        var h = map_get(_agents, vec_get(keys, i));
+        str_builder_add_cstr(sb, "{\"id\":");
+        str_builder_add_int(sb, agent_id(h));
+        str_builder_add_cstr(sb, ",\"name\":\"");
+        str_builder_add(sb, json_escape_str(agent_name(h)));
+        str_builder_add_cstr(sb, "\",\"status\":");
+        str_builder_add_int(sb, agent_status(h));
+        str_builder_add_cstr(sb, ",\"pid\":");
+        str_builder_add_int(sb, agent_pid(h));
+        str_builder_add_cstr(sb, "}");
+        i = i + 1;
+    }
+    str_builder_add_cstr(sb, "],\"count\":");
+    str_builder_add_int(sb, vec_len(keys));
+    str_builder_add_cstr(sb, "}");
+    http_ok(fd, str_builder_build(sb));
+}
+
+fn api_register_agent(fd, body) {
+    if (body == 0) {
+        http_bad_request(fd, str_from("missing body"));
+        return 0;
+    }
+    # Parse name from JSON body
+    var pairs = json_parse(body);
+    var name = jget(pairs, "name");
+    if (name == 0) { name = str_from("unnamed"); }
+
+    var id = agent_next_id();
+    var h = agent_handle_new(id, name);
+    var id_str = str_from_int(id);
+    map_set(_agents, str_data(id_str), h);
+
+    supervisor_register(_supervisor, id_str);
+
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"id\":");
+    str_builder_add_int(sb, id);
+    str_builder_add_cstr(sb, ",\"name\":\"");
+    str_builder_add(sb, json_escape_str(name));
+    str_builder_add_cstr(sb, "\",\"status\":");
+    str_builder_add_int(sb, AGENT_PENDING);
+    str_builder_add_cstr(sb, "}");
+    var resp = str_builder_build(sb);
+    http_send_response(fd, 201, str_data(resp), str_len(resp));
+}
+
+# --- Main HTTP router ---
+
+# --- Additional API handlers ---
+
+# GET /v1/agents/{id}
+fn api_get_agent(fd, id_cstr) {
+    var h = map_get(_agents, id_cstr);
+    if (h == 0) { http_error(fd, 404, str_from("agent not found")); return 0; }
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"id\":");
+    str_builder_add_int(sb, agent_id(h));
+    str_builder_add_cstr(sb, ",\"name\":\"");
+    str_builder_add(sb, json_escape_str(agent_name(h)));
+    str_builder_add_cstr(sb, "\",\"status\":");
+    str_builder_add_int(sb, agent_status(h));
+    str_builder_add_cstr(sb, ",\"pid\":");
+    str_builder_add_int(sb, agent_pid(h));
+    str_builder_add_cstr(sb, "}");
+    http_ok(fd, str_builder_build(sb));
+    return 0;
+}

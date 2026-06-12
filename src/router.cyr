@@ -1,0 +1,144 @@
+# =========================================================================
+# router — HTTP method/path dispatch (http_route)
+# =========================================================================
+
+# --- Main HTTP router ---
+
+fn http_route(fd, method, path, buf, buf_len) {
+    # GET /v1/health
+    if (streq(path, "/v1/health") == 1) { api_health(fd); return 0; }
+
+    # /v1/agents
+    if (streq(path, "/v1/agents") == 1) {
+        if (method == 0) { api_list_agents(fd); return 0; }
+        if (method == 1) {
+            api_register_agent(fd, http_parse_body(buf, buf_len));
+            return 0;
+        }
+    }
+
+    # /v1/agents/{id}
+    if (memeq(path, "/v1/agents/", 11) == 1) {
+        if (strlen(path + 11) > 0) {
+            api_get_agent(fd, path + 11);
+            return 0;
+        }
+    }
+
+    # /v1/mcp/tools
+    if (streq(path, "/v1/mcp/tools") == 1) {
+        if (method == 0) { api_mcp_manifest(fd); return 0; }
+        if (method == 1) { api_mcp_register(fd, http_parse_body(buf, buf_len)); return 0; }
+    }
+    if (streq(path, "/v1/mcp/manifest") == 1) { api_mcp_manifest(fd); return 0; }
+
+    # DELETE /v1/mcp/tools/{name}
+    if (memeq(path, "/v1/mcp/tools/", 14) == 1) {
+        if (method == 3) { api_mcp_deregister(fd, path + 14); return 0; }
+    }
+
+    # POST /v1/mcp/call
+    if (streq(path, "/v1/mcp/call") == 1) {
+        api_mcp_call(fd, http_parse_body(buf, buf_len));
+        return 0;
+    }
+
+    # POST /v1/rag/ingest
+    if (streq(path, "/v1/rag/ingest") == 1) {
+        api_rag_ingest(fd, http_parse_body(buf, buf_len));
+        return 0;
+    }
+
+    # POST /v1/rag/query
+    if (streq(path, "/v1/rag/query") == 1) {
+        api_rag_query(fd, http_parse_body(buf, buf_len));
+        return 0;
+    }
+
+    # /v1/edge/nodes
+    if (streq(path, "/v1/edge/nodes") == 1) {
+        if (method == 0) { api_edge_list(fd, buf, buf_len); return 0; }
+        if (method == 1) { api_edge_register(fd, http_parse_body(buf, buf_len)); return 0; }
+    }
+
+    # GET /v1/edge/stats
+    if (streq(path, "/v1/edge/stats") == 1) { api_edge_stats(fd); return 0; }
+
+    # /v1/edge/nodes/{id}/heartbeat
+    if (memeq(path, "/v1/edge/nodes/", 15) == 1) {
+        var sub = path + 15;
+        # Check for /heartbeat suffix
+        var sublen = strlen(sub);
+        if (sublen > 10) {
+            if (memeq(sub + sublen - 10, "/heartbeat", 10) == 1) {
+                var id_len = sublen - 10;
+                var id_buf = alloc(id_len + 1);
+                memcpy(id_buf, sub, id_len);
+                store8(id_buf + id_len, 0);
+                api_edge_heartbeat(fd, id_buf, http_parse_body(buf, buf_len));
+                return 0;
+            }
+        }
+        # Check for /decommission suffix (13 chars)
+        if (sublen > 13) {
+            if (memeq(sub + sublen - 13, "/decommission", 13) == 1) {
+                var dc_len = sublen - 13;
+                var dc_buf = alloc(dc_len + 1);
+                memcpy(dc_buf, sub, dc_len);
+                store8(dc_buf + dc_len, 0);
+                api_edge_decommission(fd, dc_buf);
+                return 0;
+            }
+        }
+        # Plain /v1/edge/nodes/{id}
+        api_edge_get(fd, sub);
+        return 0;
+    }
+
+    # /v1/scheduler/tasks
+    if (streq(path, "/v1/scheduler/tasks") == 1) {
+        if (method == 0) { api_sched_list(fd); return 0; }
+        if (method == 1) { api_sched_submit(fd, http_parse_body(buf, buf_len)); return 0; }
+    }
+
+    # POST /v1/scheduler/nodes
+    if (streq(path, "/v1/scheduler/nodes") == 1) {
+        api_sched_register_node(fd, http_parse_body(buf, buf_len));
+        return 0;
+    }
+
+    # POST /v1/scheduler/schedule
+    if (streq(path, "/v1/scheduler/schedule") == 1) {
+        api_sched_schedule(fd);
+        return 0;
+    }
+
+    # GET /v1/scheduler/stats
+    if (streq(path, "/v1/scheduler/stats") == 1) {
+        api_sched_stats(fd);
+        return 0;
+    }
+
+    # /v1/scheduler/tasks/{id} or /v1/scheduler/tasks/{id}/cancel
+    if (memeq(path, "/v1/scheduler/tasks/", 20) == 1) {
+        var sub = path + 20;
+        var sublen = strlen(sub);
+        if (sublen > 7) {
+            if (memeq(sub + sublen - 7, "/cancel", 7) == 1) {
+                var cn_len = sublen - 7;
+                var cn_buf = alloc(cn_len + 1);
+                memcpy(cn_buf, sub, cn_len);
+                store8(cn_buf + cn_len, 0);
+                api_sched_cancel(fd, cn_buf);
+                return 0;
+            }
+        }
+        api_sched_get_task(fd, sub);
+        return 0;
+    }
+
+    # GET /v1/metrics
+    if (streq(path, "/v1/metrics") == 1) { api_metrics(fd); return 0; }
+
+    http_not_found(fd);
+}

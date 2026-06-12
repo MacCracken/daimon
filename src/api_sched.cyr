@@ -1,0 +1,138 @@
+# =========================================================================
+# api_sched — scheduler endpoints
+# =========================================================================
+
+# POST /v1/scheduler/tasks — submit task
+fn api_sched_submit(fd, body) {
+    if (body == 0) { http_bad_request(fd, str_from("missing body")); return 0; }
+    var pairs = json_parse(body);
+    var name = jget(pairs, "name");
+    if (name == 0) { http_bad_request(fd, str_from("task name required")); return 0; }
+    if (str_len(name) == 0) { http_bad_request(fd, str_from("task name cannot be empty")); return 0; }
+    var agent_id = jget(pairs, "agent_id");
+    if (agent_id == 0) { agent_id = str_from("unknown"); }
+    var desc = jget(pairs, "description");
+    if (desc == 0) { desc = str_from(""); }
+    var priority = jget_int(pairs, "priority");
+    if (priority == 0) { priority = 5; }
+    var task = sched_task_new(name, desc, agent_id, priority);
+    var result = scheduler_submit(_scheduler, task);
+    var tid = payload(result);
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"task_id\":\"");
+    str_builder_add(sb, tid);
+    str_builder_add_cstr(sb, "\"}");
+    http_send_response(fd, 201, str_data(str_builder_build(sb)), str_len(str_builder_build(sb)));
+    return 0;
+}
+
+# GET /v1/scheduler/tasks
+fn api_sched_list(fd) {
+    var st = scheduler_stats(_scheduler);
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"stats\":{\"total_tasks\":");
+    str_builder_add_int(sb, load64(st));
+    str_builder_add_cstr(sb, ",\"queued\":");
+    str_builder_add_int(sb, load64(st + 8));
+    str_builder_add_cstr(sb, ",\"running\":");
+    str_builder_add_int(sb, load64(st + 16));
+    str_builder_add_cstr(sb, ",\"completed\":");
+    str_builder_add_int(sb, load64(st + 24));
+    str_builder_add_cstr(sb, ",\"failed\":");
+    str_builder_add_int(sb, load64(st + 32));
+    str_builder_add_cstr(sb, "}}");
+    http_ok(fd, str_builder_build(sb));
+    return 0;
+}
+
+# GET /v1/scheduler/tasks/{id}
+fn api_sched_get_task(fd, id_cstr) {
+    var task = scheduler_get(_scheduler, id_cstr);
+    if (task == 0) { http_error(fd, 404, str_from("task not found")); return 0; }
+    var status_names: i64[7];
+    store64(&status_names, "Queued");
+    store64(&status_names + 8, "Scheduled");
+    store64(&status_names + 16, "Running");
+    store64(&status_names + 24, "Completed");
+    store64(&status_names + 32, "Failed");
+    store64(&status_names + 40, "Cancelled");
+    store64(&status_names + 48, "Preempted");
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"task_id\":\"");
+    str_builder_add(sb, sched_task_id(task));
+    str_builder_add_cstr(sb, "\",\"name\":\"");
+    str_builder_add(sb, json_escape_str(sched_task_name(task)));
+    str_builder_add_cstr(sb, "\",\"priority\":");
+    str_builder_add_int(sb, sched_task_priority(task));
+    str_builder_add_cstr(sb, ",\"status\":\"");
+    str_builder_add_cstr(sb, load64(&status_names + sched_task_status(task) * 8));
+    str_builder_add_cstr(sb, "\"}");
+    http_ok(fd, str_builder_build(sb));
+    return 0;
+}
+
+# POST /v1/scheduler/tasks/{id}/cancel
+fn api_sched_cancel(fd, id_cstr) {
+    var result = scheduler_cancel(_scheduler, id_cstr);
+    if (is_err_result(result) == 1) {
+        http_error(fd, 404, str_from("task not found or invalid state"));
+        return 0;
+    }
+    http_ok(fd, str_from("{\"ok\":true}"));
+    return 0;
+}
+
+# POST /v1/scheduler/nodes — register scheduler node
+fn api_sched_register_node(fd, body) {
+    if (body == 0) { http_bad_request(fd, str_from("missing body")); return 0; }
+    var pairs = json_parse(body);
+    var node_id = jget(pairs, "node_id");
+    if (node_id == 0) { http_bad_request(fd, str_from("node_id required")); return 0; }
+    if (str_len(node_id) == 0) { http_bad_request(fd, str_from("node_id cannot be empty")); return 0; }
+    var total_cpu = jget_int(pairs, "total_cpu");
+    if (total_cpu <= 0) { http_bad_request(fd, str_from("total_cpu must be positive")); return 0; }
+    var total_mem = jget_int(pairs, "total_memory_mb");
+    if (total_mem <= 0) { http_bad_request(fd, str_from("total_memory_mb must be positive")); return 0; }
+    var total_disk = jget_int(pairs, "total_disk_mb");
+    if (total_disk == 0) { total_disk = 102400; }
+    var gpu = jget_int(pairs, "gpu_available");
+    var nc = node_cap_new(node_id, total_cpu, total_mem, total_disk, gpu);
+    scheduler_register_node(_scheduler, nc);
+    http_send_response(fd, 201, "{\"ok\":true}", 11);
+    return 0;
+}
+
+# POST /v1/scheduler/schedule — trigger scheduling
+fn api_sched_schedule(fd) {
+    var decisions = scheduler_schedule_pending(_scheduler);
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"decisions\":[");
+    var di = 0;
+    while (di < vec_len(decisions)) {
+        if (di > 0) { str_builder_add_cstr(sb, ","); }
+        str_builder_add(sb, vec_get(decisions, di));
+        di = di + 1;
+    }
+    str_builder_add_cstr(sb, "]}");
+    http_ok(fd, str_builder_build(sb));
+    return 0;
+}
+
+# GET /v1/scheduler/stats
+fn api_sched_stats(fd) {
+    var st = scheduler_stats(_scheduler);
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"total_tasks\":");
+    str_builder_add_int(sb, load64(st));
+    str_builder_add_cstr(sb, ",\"queued\":");
+    str_builder_add_int(sb, load64(st + 8));
+    str_builder_add_cstr(sb, ",\"running\":");
+    str_builder_add_int(sb, load64(st + 16));
+    str_builder_add_cstr(sb, ",\"completed\":");
+    str_builder_add_int(sb, load64(st + 24));
+    str_builder_add_cstr(sb, ",\"failed\":");
+    str_builder_add_int(sb, load64(st + 32));
+    str_builder_add_cstr(sb, "}");
+    http_ok(fd, str_builder_build(sb));
+    return 0;
+}

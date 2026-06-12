@@ -8,26 +8,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [1.2.8] - 2026-06-12
 
-**Codebase refactor — the 4.1k-line `src/main.cyr` monolith split into 17
+**Codebase refactor — the 4.1k-line `src/main.cyr` monolith split into 25
 per-domain modules.** Pure structural change: behavior-preserving, no API / wire
 / runtime change.
 
 ### Changed
 
-- **`src/main.cyr` (4,132 LOC) → 18 files.** `main.cyr` is now a 116-line
-  composition entry point (syscall-constant preamble + module `include`s +
-  the `main` serve loop). Each former section banner is its own `src/*.cyr`:
-  `error`, `config`, `agent`, `supervisor`, `memory`, `vector_store`, `rag`,
-  `mcp`, `screen`, `scheduler`, `federation`, `edge`, `ipc`, plus the HTTP layer
-  split four ways — `app` (global state + `app_init` composition root), `http`
-  (constants, JSON escaping, request/response helpers), `api` (route handlers +
-  router), `server` (rate limiting, per-request dispatch, sync/async serve).
-  Largest file is now `api.cyr` at 713 LOC (was a 1,102-LOC sub-section).
+- **`src/main.cyr` (4,132 LOC) → 26 files**, none over ~350 LOC. `main.cyr` is now
+  a 132-line composition entry point (syscall-constant preamble + module
+  `include`s + the `main` serve loop). The domain modules: `error`, `config`,
+  `agent`, `supervisor`, `memory`, `vector_store`, `rag`, `mcp`, `screen`,
+  `scheduler` + `cron` (interval triggers split out), `federation` +
+  `fed_vector_store` (replica merge/dedup split out), `edge`, `ipc`, and the HTTP
+  layer broken into `app` (global state + `app_init` composition root), `http`
+  (constants, JSON escaping, request/response helpers), the route handlers grouped
+  by domain (`api` = health/metrics, `api_agent`, `api_mcp`, `api_rag`,
+  `api_edge`, `api_sched`), `router` (`http_route` dispatch), and `server` (rate
+  limiting, per-request dispatch, sync/async serve). Largest file is now
+  `scheduler.cyr` / `agent.cyr` / `ipc.cyr` at ~345 LOC (were 421 / 345 / 341).
 - **Behavior-preserving by construction.** cyrius flattens `include`s into one
-  global scope; modules are sliced at the existing section banners in the
-  original source order, so the preprocessed token stream is **byte-identical**
-  to the former single file (verified: `md5sum` of the reassembled slices equals
-  the original `main.cyr`). No logic moved or rewritten.
+  global scope. Contiguous splits (most modules, the federation and cron splits)
+  are sliced at existing section banners in original source order → the
+  preprocessed token stream is **byte-identical** (verified by `md5sum` /
+  `diff`). The HTTP route handlers were regrouped by domain (pure functions, no
+  top-level state — verified `grep`), so order changed but the **sorted set of
+  code lines is identical** to the original `api.cyr` (verified by `diff`), and
+  every endpoint was exercised live.
 - CI needs no change — its fmt/lint/security steps already glob `src/*.cyr`, and
   the build entry (`src/main.cyr`) pulls in every module. `docs/architecture/
   overview.md` module map updated to the multi-file layout.
@@ -35,8 +41,9 @@ per-domain modules.** Pure structural change: behavior-preserving, no API / wire
 ### Verified
 
 - `cyrius build`: OK. `cyrius test`: **225 / 225** pass. `cyrius fmt --check` +
-  `cyrius lint`: clean across all 18 `src/*.cyr`. Benchmarks unchanged (byte-
-  identical binary behavior).
+  `cyrius lint`: clean across all 26 `src/*.cyr`. Live smoke across every endpoint
+  domain (health, metrics, mcp, edge, scheduler, rag) after the handler regroup.
+  Benchmarks unchanged (byte-identical binary behavior).
 
 ## [1.2.7] - 2026-06-12
 

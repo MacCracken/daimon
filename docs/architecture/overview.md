@@ -60,15 +60,15 @@ main.cyr   Preamble (syscall constants) + module includes + the `main` serve loo
 │   ├── ScheduledTask      State machine (Queued→Scheduled→Running→Completed/Failed/Cancelled/Preempted)
 │   ├── NodeCapacity       Resource fitting, reserve/release
 │   ├── TaskScheduler      Best-fit bin-packing, schedule_pending
-│   ├── CronScheduler      Interval-based recurring triggers
 │   └── scheduler_preempt_check   Priority preemption analysis
+├── cron.cyr           CronScheduler — interval-based recurring triggers
 │
 ├── federation.cyr     Multi-node clustering
 │   ├── FederationNode     Node with Raft role + capabilities
 │   ├── FederationManager  Heartbeat health, election, step-down
 │   ├── fed_score_node     4-factor weighted placement (resource/locality/load/affinity)
-│   ├── fed_place_agent    Best-node selection
-│   └── FederatedVectorStore   Collection replicas, cross-node merge + dedup
+│   └── fed_place_agent    Best-node selection
+├── fed_vector_store.cyr   FederatedVectorStore — collection replicas, cross-node merge + dedup
 │
 ├── edge.cyr           Edge fleet management
 │   ├── EdgeNode           Status, capabilities, GPU inventory
@@ -87,8 +87,13 @@ main.cyr   Preamble (syscall constants) + module includes + the `main` serve loo
 ├── http.cyr         HTTP plumbing
 │   ├── http_parse_*       Method, path, query params, body, Content-Length
 │   └── json_escape_str    Output encoding (VULN-002)
-├── api.cyr          HTTP REST API route handlers + router (port 8090)
-│   └── 24 endpoints       health, agents, mcp, rag, edge, scheduler, metrics
+├── api.cyr          Service-level endpoints (health, metrics)
+├── api_agent.cyr    Agent lifecycle endpoints
+├── api_mcp.cyr      MCP tool registry + dispatch endpoints
+├── api_rag.cyr      RAG ingest/query endpoints
+├── api_edge.cyr     Edge fleet endpoints
+├── api_sched.cyr    Scheduler endpoints  (24 endpoints total across api_*)
+├── router.cyr       http_route — HTTP method/path dispatch
 ├── server.cyr       Server lifecycle
 │   ├── rate_check         Per-IP 120 req/min sliding window
 │   └── serve / serve_async   sync + async (sandhi epoll) accept loops
@@ -137,7 +142,7 @@ Every AGNOS agent, hoosh, agnoshi, aethersafha, and any consumer app that talks 
 
 ## Key Design Decisions
 
-1. **Single compilation unit, multi-file source** — `src/main.cyr` `include`s 17 per-domain `src/*.cyr` modules (split from the former 4.1k-line monolith in 1.2.8). Cyrius flattens the includes into one global scope and compiles in one pass; no separate library crate. Include order matches the original source order, so the split is behavior-preserving.
+1. **Single compilation unit, multi-file source** — `src/main.cyr` `include`s 25 per-domain `src/*.cyr` modules (split from the former 4.1k-line monolith in 1.2.8; none over ~350 LOC). Cyrius flattens the includes into one global scope and compiles in one pass; no separate library crate. Contiguous module splits preserve original source order (byte-identical); the HTTP route handlers were regrouped by domain (pure functions, so order-independent), keeping behavior identical.
 2. **Synchronous HTTP** — single-threaded TCP accept loop. No async runtime. Sufficient for orchestrator workloads; async deferred to future Cyrius stdlib maturity.
 3. **Bump allocator** — fast allocation, no individual free. Single trust domain (see VULN-007 security gate for multi-tenant).
 4. **Everything is i64** — Cyrius type system. Structs are manually laid out with `alloc()` + `store64()`/`load64()` at fixed offsets.

@@ -1,0 +1,58 @@
+# =========================================================================
+# api_rag — RAG ingest/query endpoints
+# =========================================================================
+
+# POST /v1/rag/ingest
+fn api_rag_ingest(fd, body) {
+    if (body == 0) { http_bad_request(fd, str_from("missing body")); return 0; }
+    var pairs = json_parse(body);
+    var text = jget(pairs, "text");
+    if (text == 0) { http_bad_request(fd, str_from("text cannot be empty")); return 0; }
+    if (str_len(text) == 0) { http_bad_request(fd, str_from("text cannot be empty")); return 0; }
+    var metadata = jget(pairs, "metadata");
+    if (metadata == 0) { metadata = str_from("null"); }
+    var ids = rag_ingest_text(_rag_pipeline, text, metadata);
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"chunk_ids\":[");
+    var ri = 0;
+    while (ri < vec_len(ids)) {
+        if (ri > 0) { str_builder_add_cstr(sb, ","); }
+        str_builder_add_int(sb, vec_get(ids, ri));
+        ri = ri + 1;
+    }
+    str_builder_add_cstr(sb, "]}");
+    http_send_response(fd, 201, str_data(str_builder_build(sb)), str_len(str_builder_build(sb)));
+    return 0;
+}
+
+# POST /v1/rag/query
+fn api_rag_query(fd, body) {
+    if (body == 0) { http_bad_request(fd, str_from("missing body")); return 0; }
+    var pairs = json_parse(body);
+    var query = jget(pairs, "query");
+    if (query == 0) { http_bad_request(fd, str_from("query cannot be empty")); return 0; }
+    if (str_len(query) == 0) { http_bad_request(fd, str_from("query cannot be empty")); return 0; }
+    var ctx = rag_query_text(_rag_pipeline, query);
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"formatted_context\":\"");
+    # Escape the context for JSON
+    var cd = str_data(ctx);
+    var cl = str_len(ctx);
+    var ci = 0;
+    while (ci < cl) {
+        var c = load8(cd + ci);
+        if (c == 34) { str_builder_add_cstr(sb, "\\\""); }
+        elif (c == 10) { str_builder_add_cstr(sb, "\\n"); }
+        elif (c == 13) { str_builder_add_cstr(sb, "\\r"); }
+        elif (c == 92) { str_builder_add_cstr(sb, "\\\\"); }
+        else {
+            var cbuf[1];
+            store8(&cbuf, c);
+            str_builder_add(sb, str_new(&cbuf, 1));
+        }
+        ci = ci + 1;
+    }
+    str_builder_add_cstr(sb, "\"}");
+    http_ok(fd, str_builder_build(sb));
+    return 0;
+}
