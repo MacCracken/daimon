@@ -6,6 +6,57 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.2.6] - 2026-06-11
+
+**Async server collapse + aarch64 unblock + a HIGH-severity compiler-bug
+workaround uncovered along the way.** Toolchain pin moves **6.1.39 → 6.1.40**.
+
+### Fixed
+
+- **HIGH — every HTTP route silently 404'd in certain build layouts (static
+  memory corruption).** Root cause is a **cyrius compiler bug**: an address-taken
+  fixed local array `var a[N]` is placed in static storage but under-reserved by
+  one slot (`(N-1)*8` bytes), so a write to its last element corrupts the
+  adjacent static object. daimon's `ip_to_cstr` wrote `store64(&parts + 24, octet)`
+  on `var parts[4]`; for a `127.0.0.1` peer the `.1` octet landed on sandhi's
+  single-space `" "` string literal. `sandhi_server_get_path` then searched the
+  request line for byte `1` instead of `0x20`, found no space, returned an empty
+  path → **all `/v1/*` routes 404'd, sync and async**. Latent and layout-sensitive
+  — it surfaced only because the serve_async refactor below shifted static layout
+  so `parts` landed 24 bytes before that literal.
+  - **Workaround (this release):** `ip_to_cstr` now computes each octet inline
+    (`(ip >> (pi*8)) & 255`) instead of staging through an address-taken
+    `var parts[4]` — no `&`-of-local-array, no static placement, bug avoided.
+  - **Root fix is upstream (cyrius).** Reported with a ~20-line standalone
+    reproducer in `docs/development/issues/2026-06-11-cyrius-addr-taken-local-array-static-overlap.md`.
+
+### Changed
+
+- **Collapsed `serve_async` onto `sandhi_server_run_async`.** The hand-rolled
+  epoll accept loop (1.1.0–1.2.5) is replaced by sandhi's epoll-cooperative loop,
+  unblocked upstream by sandhi 1.4.9's `max_conns` enforcement. Wins over the old
+  loop: a **bounded, reused per-batch arena** for recv buffers (the old path
+  alloc'd 64 KiB/connection from the never-freeing global bump — leaked every
+  batch) and an **enforced concurrency cap** (`SERVE_MAX_CONNS = 128`, was an
+  implicit `max_batch = 64`). Per-connection `SO_RCVTIMEO` and CL/TE +
+  duplicate-header smuggling rejection now come from sandhi on both paths; the
+  shared `handle_request(ctx, cfd, buf, len)` contract is unchanged. Removed the
+  now-dead `server_bind` / `set_recv_timeout_ms` / `async_handle_client` helpers
+  and the `SYS_SETSOCKOPT` constant. Verified: sync + async both serve correctly;
+  100 concurrent async requests all return 200.
+- **aarch64 cross-build unblocked** — `agent_spawn_with_limits` now calls
+  `sys_fork()` instead of raw `syscall(SYS_FORK)`. x86_64 wraps `SYS_FORK`;
+  aarch64 (no `fork(2)`) wraps `clone(SIGCHLD)` via `SYS_CLONE`, the shim cyrius
+  6.1.x ships. This was the last aarch64-absent syscall after the epoll gap was
+  fixed upstream at 6.1.24.
+- **`cyrius.cyml`** — `cyrius = "6.1.40"` (was `"6.1.39"`).
+
+### Verified
+
+- `cyrius lint`: 0 warnings. `cyrius fmt --check`: clean. `cyrius test`:
+  **217 / 217** pass. `cyrius build`: OK; sync + async routing verified live
+  (`/v1/health`, `/v1/metrics`, `POST /v1/mcp/tools`), 100/100 concurrent async.
+
 ## [1.2.5] - 2026-06-11
 
 **Security fix + toolchain bump.** Closes a HIGH-severity registry-aliasing bug

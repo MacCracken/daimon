@@ -23,7 +23,6 @@ include "lib/process.cyr"
 
 # Syscall numbers not in stdlib
 var SYS_RENAME = 82;
-var SYS_SETSOCKOPT = 54;
 var SYS_SOCKET = 41;
 var SYS_CONNECT = 42;
 var SYS_ACCEPT = 43;
@@ -352,7 +351,11 @@ var RLIMIT_AS = 9;    # Address space
 var RLIMIT_CPU = 0;   # CPU time in seconds
 
 fn agent_spawn_with_limits(cmd, arg1, arg2, mem_limit, cpu_limit) {
-    var pid = syscall(SYS_FORK);
+    # sys_fork() (not raw syscall(SYS_FORK)) for arch portability: x86_64
+    # wraps SYS_FORK, aarch64 — which has no fork(2) — wraps clone(SIGCHLD)
+    # via SYS_CLONE. Both return child-pid-in-parent / 0-in-child / -1-on-error.
+    # Unblocks the aarch64 cross-build (cyrius 6.1.39 ships the aarch64 shim).
+    var pid = sys_fork();
     if (pid < 0) { return Err(ERR_SUPERVISOR); }
     if (pid == 0) {
         # Child: apply rlimits before exec
@@ -3836,20 +3839,13 @@ fn get_peer_ip(cfd) {
 # Format IPv4 integer as "a.b.c.d" cstr for map key
 fn ip_to_cstr(ip) {
     var ib = alloc(20);
-    var a = ip & 255;
-    var b = (ip >> 8) & 255;
-    var c = (ip >> 16) & 255;
-    var d = (ip >> 24) & 255;
     var off = 0;
-    # Write a.b.c.d manually
-    var parts[4];
-    store64(&parts, a);
-    store64(&parts + 8, b);
-    store64(&parts + 16, c);
-    store64(&parts + 24, d);
+    # Format a.b.c.d. Compute each octet inline (no address-taken local
+    # array — `&parts` here triggered a compiler bug that placed the
+    # array in static storage overlapping an adjacent string literal).
     var pi = 0;
     while (pi < 4) {
-        var val = load64(&parts + pi * 8);
+        var val = (ip >> (pi * 8)) & 255;
         if (val >= 100) {
             store8(ib + off, 48 + val / 100); off = off + 1; val = val % 100;
             store8(ib + off, 48 + val / 10); off = off + 1;
@@ -3942,34 +3938,10 @@ fn handle_request(ctx, cfd, buf, blen) {
     return 0;
 }
 
-# --- Server setup (shared by sync + async) ---
-
-fn server_bind(port) {
-    var sfd_result = tcp_socket();
-    if (is_err_result(sfd_result) == 1) {
-        sakshi_error("failed to create socket", 23);
-        return 0 - 1;
-    }
-    var sfd = payload(sfd_result);
-
-    var optval[1];
-    store32(&optval, 1);
-    syscall(SYS_SETSOCKOPT, sfd, 1, 2, &optval, 4);
-
-    var bind_result = sock_bind(sfd, INADDR_ANY(), port);
-    if (is_err_result(bind_result) == 1) {
-        sakshi_error("failed to bind", 14);
-        return 0 - 1;
-    }
-
-    var listen_result = sock_listen(sfd, 128);
-    if (is_err_result(listen_result) == 1) {
-        sakshi_error("failed to listen", 16);
-        return 0 - 1;
-    }
-
-    return sfd;
-}
+# --- Server banner ---
+# Both serve modes delegate bind/listen/accept to sandhi
+# (sandhi_server_run_opts sync, sandhi_server_run_async async), so daimon
+# no longer hand-rolls a socket setup helper.
 
 fn server_banner(port, mode) {
     sakshi_info("daimon listening", 16);
@@ -3994,27 +3966,14 @@ fn server_banner(port, mode) {
 
 # --- Synchronous server ---
 
-# Slowloris bound — per-connection SO_RCVTIMEO applied at accept time.
+# Slowloris bound — per-connection SO_RCVTIMEO applied at accept time by
+# sandhi (sandhi_server_options_idle_ms → SO_RCVTIMEO on both the sync
+# sandhi_server_run_opts and async sandhi_server_run_async paths).
 # 5 000 ms covers normal P99 request durations (the request handler is
 # in-memory; no network egress in the happy path) while bounding a
 # malicious slow-sender to ~5 s of worker hold instead of sandhi's 30 s
 # default. Centralized so sync + async modes stay in lock-step.
 var SERVE_IDLE_MS = 5000;
-
-# Apply SO_RCVTIMEO to a connection fd. Mirrors the per-accept timeout
-# sandhi_server_run_opts applies on the sync path — closes the
-# pre-1.2.2 slowloris gap on async where async_await_readable would
-# block indefinitely on a slow sender. struct timeval is {tv_sec: i64,
-# tv_usec: i64} on Linux (16 bytes). Reused by serve_async.
-fn set_recv_timeout_ms(fd, ms) {
-    var tv = alloc(16);
-    var secs = ms / 1000;
-    var usec = (ms - secs * 1000) * 1000;
-    store64(tv, secs);
-    store64(tv + 8, usec);
-    # SOL_SOCKET = 1, SO_RCVTIMEO = 20.
-    return syscall(SYS_SETSOCKOPT, fd, 1, 20, tv, 16);
-}
 
 fn serve(port) {
     server_banner(port, "sync");
@@ -4028,96 +3987,43 @@ fn serve(port) {
     return sandhi_server_run_opts(INADDR_ANY(), port, &handle_request, 0, opts);
 }
 
-# --- Async server (epoll-based cooperative concurrency) ---
+# --- Async server (sandhi epoll-cooperative accept loop) ---
 #
-# Sandhi's server is sync-only as of sandhi 1.0.0 (folded into
-# Cyrius 5.7.0 stdlib, sandhi repo in maintenance mode). The
-# `sandhi_server_options_max_conns(opts, n)` field exists but is
-# unenforced — "reserved for a future concurrent" model per
-# sandhi/docs/guides/server.md, no version target. The bundled
-# `lib/sandhi.cyr` carries a stale "single-threaded until 0.8.0"
-# comment that predates the 0.8.0 scope shift (which actually
-# shipped HTTP/2 + client connection pool, not server multi-conn).
-# Daimon owns the async accept loop and uses sandhi only for
-# per-request recv + smuggling rejection + parse + send. Same
-# handle_request runs under both modes.
+# Collapsed onto sandhi_server_run_async at 1.2.6 (was a hand-rolled epoll
+# accept loop, 1.1.0–1.2.5). Upstream sandhi 1.4.9 made
+# sandhi_server_run_async honor sandhi_server_options_max_conns: an
+# epoll-cooperative loop that drains the non-blocking accept queue up to
+# max_conns, spawns a handler task per connection from a SINGLE reused
+# per-batch arena, runs the batch via async_run, resets the arena, and
+# blocks on the listen fd when the queue is empty. It applies
+# SO_RCVTIMEO = idle_ms per accepted connection (slowloris bound) and runs
+# the same CL/TE + duplicate-header smuggling rejection before our handler.
+#
+# This subsumes the entire hand-rolled loop, plus two wins it lacked:
+#   1. Bounded recv buffers — the old async_handle_client alloc'd
+#      MAX_REQUEST_SIZE (64 KiB) per connection from the never-freeing
+#      global bump, so every batch leaked. sandhi's per-batch arena is
+#      sized once and reset each drain.
+#   2. Enforced concurrency cap via max_conns (the old loop had an
+#      implicit max_batch = 64).
+# handle_request keeps the shared (ctx, cfd, buf, len) handler contract
+# used by the sync path, so one handler serves both modes.
 
-# Per-handler buffer — async runs handlers cooperatively (no preemption),
-# but multiple in-flight requests may overlap in scheduling. Allocate
-# fresh per call so each handler has its own buffer (sandhi's
-# `_hsv_req_buf` global is fine for sync because sandhi_server_run is
-# single-flight, but unsafe for async if two handlers ever interleave
-# their recv loops).
-fn async_handle_client(cfd) {
-    async_await_readable(cfd);
-
-    var buf = alloc(MAX_REQUEST_SIZE + 1);
-    var n = sandhi_server_recv_request(cfd, buf, MAX_REQUEST_SIZE);
-    if (n <= 0) { sock_close(cfd); return 0; }
-
-    # Smuggling rejection — sandhi_server_run does this in its own loop
-    # via the same fns; we mirror it here for the async path.
-    if (sandhi_server_request_has_cl_te_conflict(buf, n) == 1) {
-        sandhi_server_send_status(cfd, 400, "Bad Request");
-        sock_close(cfd);
-        return 0;
-    }
-    if (sandhi_server_request_has_dup_smuggling_header(buf, n) == 1) {
-        sandhi_server_send_status(cfd, 400, "Bad Request");
-        sock_close(cfd);
-        return 0;
-    }
-
-    handle_request(0, cfd, buf, n);
-    sock_close(cfd);
-    return 0;
-}
+# Per-drain concurrency cap. 128 matches sandhi's documented default (was
+# an implicit max_batch = 64 in the hand-rolled loop). sandhi sizes its
+# reused per-batch arena at max_conns × (HSV_REQ_BUF_SIZE + slack), so this
+# is the steady-state recv-buffer working set (~8.4 MiB), allocated once.
+var SERVE_MAX_CONNS = 128;
 
 fn serve_async(port) {
-    var sfd = server_bind(port);
-    if (sfd < 0) { return 1; }
     server_banner(port, "async");
-
-    # Set server socket non-blocking for cooperative accept
-    var flags = syscall(72, sfd, 3, 0);  # F_GETFL
-    syscall(72, sfd, 4, flags | 2048);   # F_SETFL O_NONBLOCK
-
-    var rt = async_new();
-    var batch_size = 0;
-    var max_batch = 64;
-
-    while (1 == 1) {
-        # Accept as many pending connections as available (non-blocking)
-        var accepting = 1;
-        while (accepting == 1) {
-            var cfd = syscall(SYS_ACCEPT, sfd, 0, 0);
-            if (cfd < 0) {
-                accepting = 0;
-            } else {
-                # Slowloris bound — parity with sync path which gets
-                # SO_RCVTIMEO from sandhi_server_run_opts. Pre-1.2.2
-                # async had no per-connection timeout.
-                set_recv_timeout_ms(cfd, SERVE_IDLE_MS);
-                async_spawn(rt, &async_handle_client, cfd);
-                batch_size = batch_size + 1;
-            }
-            if (batch_size >= max_batch) { accepting = 0; }
-        }
-
-        # Run all spawned handlers to completion
-        if (batch_size > 0) {
-            async_run(rt);
-            batch_size = 0;
-            # Reset runtime for next batch
-            rt = async_new();
-        }
-
-        # If no connections were pending, wait for the server socket to be readable
-        if (batch_size == 0) {
-            async_await_readable(sfd);
-        }
-    }
-    return 0;
+    var opts = sandhi_server_options_new();
+    sandhi_server_options_idle_ms(opts, SERVE_IDLE_MS);
+    sandhi_server_options_max_conns(opts, SERVE_MAX_CONNS);
+    # sandhi owns bind/listen/accept/recv + smuggling rejection + per-conn
+    # SO_RCVTIMEO; closes each cfd after handle_request returns. Returns 1
+    # on bind/listen/arena failure; otherwise loops forever.
+    return sandhi_server_run_async(INADDR_ANY(), port, &handle_request, 0, opts);
 }
 
 # =========================================================================
