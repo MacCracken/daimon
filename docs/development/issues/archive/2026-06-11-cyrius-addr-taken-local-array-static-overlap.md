@@ -1,6 +1,6 @@
 # cyrius 6.1.40 — address-taken fixed local array under-reserves static backing, corrupts adjacent literal
 
-**Status:** RESOLVED upstream in **cyrius 6.2.1**; adopted daimon-side in 1.2.8
+**Status:** RESOLVED upstream in **cyrius 6.2.1**; adopted daimon-side in 1.2.7
 (pin → 6.2.2). The fix was a **language change, not a silent codegen patch** —
 see the cyrius 6.2.1 CHANGELOG ("element-typed arrays `var a: T[N]` + daimon-class
 slot-array sweep"). Bare `var a[N]` now has explicit per-scope semantics (N
@@ -9,7 +9,7 @@ slot-array sweep"). Bare `var a[N]` now has explicit per-scope semantics (N
 daimon converted every address-taken slot/multi-byte local array to a sized
 element-typed array (`argv_buf: i64[4]`, two `status_names: i64[N]`, plus
 `status_buf: i32[1]` / `cred_len: u32[1]` / `len_buf` + `hdr: u8[4]`); see
-CHANGELOG [1.2.8]. The `ip_to_cstr` inline workaround is retained (allocates no
+CHANGELOG [1.2.7]. The `ip_to_cstr` inline workaround is retained (allocates no
 array; clearest for that hot path).
 
 > **Note (2026-06-12):** an interim re-test claimed this "still reproduces under

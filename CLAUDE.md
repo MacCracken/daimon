@@ -109,11 +109,17 @@ Every AGNOS agent, every consumer app, hoosh, agnoshi, aethersafha.
 - Use `Result`/`Option` tagged unions for error handling
 - Zero-crash in library code — no unguarded aborts
 - Use accessor functions for struct fields
-- **Fixed local arrays: use element-typed `var a: i64[N]` for slot arrays** (and `u8[N]` / `i32[N]` / `u32[N]` for sized byte/scalar buffers). Since cyrius 6.2.1, bare `var a[N]` is **N bytes in a function** (N i64 slots only at top level) — an address-taken `var a[N]` written via `store64(&a + i*8)` under-reserves and silently corrupts adjacent memory. This caused the 1.2.6 routing-404 bug; swept in 1.2.8. Before re-testing any "fixed" compiler footgun, **read the cyrius language CHANGELOG** — fixes there are often language changes, not silent codegen patches.
+- **Fixed local arrays: use element-typed `var a: i64[N]` for slot arrays** (and `u8[N]` / `i32[N]` / `u32[N]` for sized byte/scalar buffers). Since cyrius 6.2.1, bare `var a[N]` is **N bytes in a function** (N i64 slots only at top level) — an address-taken `var a[N]` written via `store64(&a + i*8)` under-reserves and silently corrupts adjacent memory. This caused the 1.2.6 routing-404 bug; swept in 1.2.7. Before re-testing any "fixed" compiler footgun, **read the cyrius language CHANGELOG** — fixes there are often language changes, not silent codegen patches.
 - Original Rust implementations available in git history (pre-v0.7.0 tags)
 
 ## DO NOT
 
+- **NEVER bump VERSION without the user's express permission.** Not as part of a
+  feature, a fix, a lint repair, a doc update, or "the work loop" — never on your
+  own initiative. The user owns versioning and release scheduling. If a change
+  seems to warrant a version bump, *ask first*. (Work-loop step 12 below means
+  keep VERSION/cyrius.cyml/recipe *consistent with each other*, NOT "bump VERSION
+  yourself.")
 - **Do not commit or push** — the user handles all git operations
 - **NEVER use `gh` CLI** — use `curl` to GitHub API only
 - Do not add unnecessary dependencies
