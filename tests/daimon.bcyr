@@ -288,7 +288,10 @@ fn bench_mcp_find_tool() {
 # Schema extraction on registration (typed parse + compact re-emit). Mirrors
 # api_mcp_register's mcp_extract_input_schema on a representative MCP body.
 fn bench_mcp_extract_schema() {
-    var body = str_from("{\"name\":\"echo\",\"description\":\"echo back\",\"callback_url\":\"http://127.0.0.1:9000\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}},\"required\":[\"text\"]}}");
+    var head = str_from("{\"name\":\"echo\",\"callback_url\":\"http://127.0.0.1:9000\",\"inputSchema\":");
+    var sj_a = str_from("{\"type\":\"object\",\"properties\":{\"text\":");
+    var sj_b = str_from("{\"type\":\"string\"}},\"required\":[\"text\"]}}");
+    var body = str_cat(head, str_cat(sj_a, sj_b));
     var root = bayan_json_v_parse(body);
     if (root == 0) { return 0; }
     var sv = bayan_json_v_obj_get(root, "inputSchema");
