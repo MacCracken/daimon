@@ -1,0 +1,163 @@
+# =========================================================================
+# vector_store — in-memory cosine-similarity search
+# =========================================================================
+
+# Cosine similarity between two f64 arrays of equal length
+fn cosine_similarity(a, b, dim) {
+    if (dim == 0) { return 0; }
+    var dot = f64_from(0);
+    var norm_a = f64_from(0);
+    var norm_b = f64_from(0);
+    var i = 0;
+    while (i < dim) {
+        var x = load64(a + i * 8);
+        var y = load64(b + i * 8);
+        dot = f64_add(dot, f64_mul(x, y));
+        norm_a = f64_add(norm_a, f64_mul(x, x));
+        norm_b = f64_add(norm_b, f64_mul(y, y));
+        i = i + 1;
+    }
+    var denom = f64_mul(f64_sqrt(norm_a), f64_sqrt(norm_b));
+    if (f64_eq(denom, f64_from(0)) == 1) { return f64_from(0); }
+    return f64_div(dot, denom);
+}
+
+# VectorEntry: {id, embedding_ptr, embedding_dim, content: Str, metadata: Str, created_at}
+# 6 fields x 8 = 48 bytes
+
+fn vec_entry_new(id, embedding, dim, content, metadata) {
+    var ve = alloc(48);
+    store64(ve, id);
+    store64(ve + 8, embedding);
+    store64(ve + 16, dim);
+    store64(ve + 24, content);
+    store64(ve + 32, metadata);
+    store64(ve + 40, clock_epoch_secs());
+    return ve;
+}
+
+fn vec_entry_id(ve) { return load64(ve); }
+fn vec_entry_embedding(ve) { return load64(ve + 8); }
+fn vec_entry_dim(ve) { return load64(ve + 16); }
+fn vec_entry_content(ve) { return load64(ve + 24); }
+fn vec_entry_metadata(ve) { return load64(ve + 32); }
+
+# SearchResult: {id, content: Str, metadata: Str, score (f64), rank}
+# 5 fields x 8 = 40 bytes
+
+fn search_result_new(id, content, metadata, score, rank) {
+    var sr = alloc(40);
+    store64(sr, id);
+    store64(sr + 8, content);
+    store64(sr + 16, metadata);
+    store64(sr + 24, score);
+    store64(sr + 32, rank);
+    return sr;
+}
+
+fn search_result_content(sr) { return load64(sr + 8); }
+fn search_result_score(sr) { return load64(sr + 24); }
+fn search_result_rank(sr) { return load64(sr + 32); }
+
+# VectorIndex: {entries: vec of VectorEntry, dimension: i64}
+# 2 fields x 8 = 16 bytes
+
+fn vindex_new() {
+    var vi = alloc(16);
+    store64(vi, vec_new());
+    store64(vi + 8, 0);  # dimension (0 = not set)
+    return vi;
+}
+
+fn vindex_len(vi) { return vec_len(load64(vi)); }
+fn vindex_dimension(vi) { return load64(vi + 8); }
+
+fn vindex_insert(vi, entry) {
+    var dim = vec_entry_dim(entry);
+    if (dim == 0) { return Err(ERR_INVALID_PARAM); }
+
+    var idx_dim = load64(vi + 8);
+    if (idx_dim == 0) {
+        store64(vi + 8, dim);
+    }
+    elif (idx_dim != dim) {
+        return Err(ERR_INVALID_PARAM);
+    }
+
+    vec_push(load64(vi), entry);
+    return Ok(vec_entry_id(entry));
+}
+
+fn vindex_search(vi, query, query_dim, top_k) {
+    var entries = load64(vi);
+    var n = vec_len(entries);
+    if (n == 0) { return vec_new(); }
+    if (top_k == 0) { return vec_new(); }
+    if (query_dim == 0) { return vec_new(); }
+
+    # Score all entries
+    var scored = vec_new();
+    var i = 0;
+    while (i < n) {
+        var e = vec_get(entries, i);
+        var score = cosine_similarity(query, vec_entry_embedding(e), query_dim);
+        # Store (score, entry) pair — pack into a 16-byte struct
+        var pair = alloc(16);
+        store64(pair, score);
+        store64(pair + 8, e);
+        vec_push(scored, pair);
+        i = i + 1;
+    }
+
+    # Sort by score descending (simple insertion sort for moderate sizes)
+    var sn = vec_len(scored);
+    var si = 1;
+    while (si < sn) {
+        var key = vec_get(scored, si);
+        var key_score = load64(key);
+        var sj = si - 1;
+        while (sj >= 0) {
+            var cmp_score = load64(vec_get(scored, sj));
+            if (f64_gt(cmp_score, key_score) == 1) { break; }
+            vec_set(scored, sj + 1, vec_get(scored, sj));
+            sj = sj - 1;
+        }
+        vec_set(scored, sj + 1, key);
+        si = si + 1;
+    }
+
+    # Take top_k
+    var results = vec_new();
+    var ri = 0;
+    while (ri < top_k) {
+        if (ri >= sn) { break; }
+        var pair = vec_get(scored, ri);
+        var e = load64(pair + 8);
+        var sr = search_result_new(
+        vec_entry_id(e),
+        vec_entry_content(e),
+        vec_entry_metadata(e),
+        load64(pair),
+        ri
+        );
+        vec_push(results, sr);
+        ri = ri + 1;
+    }
+    return results;
+}
+
+fn vindex_remove(vi, target_id) {
+    var entries = load64(vi);
+    var n = vec_len(entries);
+    var i = 0;
+    while (i < n) {
+        var e = vec_get(entries, i);
+        if (vec_entry_id(e) == target_id) {
+            vec_remove(entries, i);
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+

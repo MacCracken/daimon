@@ -1,0 +1,235 @@
+# =========================================================================
+# supervisor — circuit breaker, output capture, health, quotas
+# =========================================================================
+
+enum CircuitState {
+    CB_CLOSED = 0;
+    CB_OPEN = 1;
+    CB_HALF_OPEN = 2;
+}
+
+# CircuitBreaker: {state, failure_count, success_count,
+#                  failure_threshold, recovery_timeout_ms, half_open_max,
+#                  last_failure_time}
+# 7 fields x 8 = 56 bytes
+
+fn cb_new(threshold, timeout_ms, half_open_max) {
+    var cb = alloc(56);
+    store64(cb, CB_CLOSED);
+    store64(cb + 8, 0);               # failure_count
+    store64(cb + 16, 0);              # success_count
+    store64(cb + 24, threshold);
+    store64(cb + 32, timeout_ms);
+    store64(cb + 40, half_open_max);
+    store64(cb + 48, 0);              # last_failure_time
+    return cb;
+}
+
+fn cb_default() { return cb_new(5, 30000, 3); }
+
+fn cb_state(cb) { return load64(cb); }
+fn cb_failure_count(cb) { return load64(cb + 8); }
+
+fn cb_record_success(cb) {
+    var state = load64(cb);
+    if (state == CB_HALF_OPEN) {
+        var sc = load64(cb + 16) + 1;
+        store64(cb + 16, sc);
+        if (sc >= load64(cb + 40)) {
+            store64(cb, CB_CLOSED);
+            store64(cb + 8, 0);
+            store64(cb + 16, 0);
+        }
+    }
+    elif (state == CB_CLOSED) {
+        store64(cb + 8, 0);
+    }
+}
+
+fn cb_record_failure(cb) {
+    var fc = load64(cb + 8) + 1;
+    store64(cb + 8, fc);
+    store64(cb + 48, clock_epoch_secs());
+    var state = load64(cb);
+    if (state == CB_CLOSED) {
+        if (fc >= load64(cb + 24)) {
+            store64(cb, CB_OPEN);
+            sakshi_warn("circuit breaker opened", 22);
+        }
+    }
+    elif (state == CB_HALF_OPEN) {
+        store64(cb, CB_OPEN);
+        store64(cb + 16, 0);
+    }
+}
+
+fn cb_can_execute(cb) {
+    var state = load64(cb);
+    if (state == CB_CLOSED) { return 1; }
+    if (state == CB_HALF_OPEN) { return 1; }
+    # CB_OPEN — check recovery timeout
+    var last = load64(cb + 48);
+    if (last > 0) {
+        var elapsed_ms = (clock_epoch_secs() - last) * 1000;
+        if (elapsed_ms >= load64(cb + 32)) {
+            store64(cb, CB_HALF_OPEN);
+            store64(cb + 16, 0);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+fn cb_reset(cb) {
+    store64(cb, CB_CLOSED);
+    store64(cb + 8, 0);
+    store64(cb + 16, 0);
+    store64(cb + 48, 0);
+}
+
+# OutputCapture — ring buffer for stdout/stderr lines
+# OutputLine: {timestamp: Str, stream: i64 (0=stdout, 1=stderr), content: Str}
+# 3 fields x 8 = 24 bytes
+
+enum OutputStream {
+    OUT_STDOUT = 0;
+    OUT_STDERR = 1;
+}
+
+fn output_line_new(stream, content) {
+    var ol = alloc(24);
+    store64(ol, str_from_int(clock_epoch_secs()));
+    store64(ol + 8, stream);
+    store64(ol + 16, content);
+    return ol;
+}
+
+# OutputCapture: {lines: vec, max_lines: i64}
+# 2 fields x 8 = 16 bytes
+
+fn output_capture_new(max_lines) {
+    var oc = alloc(16);
+    store64(oc, vec_new());
+    store64(oc + 8, max_lines);
+    return oc;
+}
+
+fn output_capture_push(oc, stream, content) {
+    var lines = load64(oc);
+    var max = load64(oc + 8);
+    if (vec_len(lines) >= max) {
+        vec_remove(lines, 0);
+    }
+    vec_push(lines, output_line_new(stream, content));
+}
+
+fn output_capture_len(oc) { return vec_len(load64(oc)); }
+
+fn output_capture_tail(oc, n) {
+    var lines = load64(oc);
+    var total = vec_len(lines);
+    var result = vec_new();
+    var start = total - n;
+    if (start < 0) { start = 0; }
+    var i = start;
+    while (i < total) {
+        vec_push(result, vec_get(lines, i));
+        i = i + 1;
+    }
+    return result;
+}
+
+fn output_capture_clear(oc) {
+    store64(oc, vec_new());
+}
+
+# ResourceQuota: {mem_warn_pct, mem_kill_pct, cpu_throttle_pct,
+#                  mem_limit, cpu_time_limit}
+# Pct values stored as integer basis points (8000 = 80.00%)
+# 5 fields x 8 = 40 bytes
+
+fn quota_new(mem_limit, cpu_time_limit) {
+    var q = alloc(40);
+    store64(q, 8000);              # mem_warn_pct (80%)
+    store64(q + 8, 9500);          # mem_kill_pct (95%)
+    store64(q + 16, 9000);         # cpu_throttle_pct (90%)
+    store64(q + 24, mem_limit);
+    store64(q + 32, cpu_time_limit);
+    return q;
+}
+
+fn quota_default() {
+    return quota_new(1073741824, 3600000);  # 1 GiB, 1 hour ms
+}
+
+fn quota_mem_limit(q) { return load64(q + 24); }
+fn quota_cpu_time_limit(q) { return load64(q + 32); }
+
+# AgentHealth: {agent_id, is_healthy, consecutive_failures,
+#               consecutive_successes, last_check_time, last_response_ms,
+#               mem_used, cpu_time, fds, threads}
+# 10 fields x 8 = 80 bytes
+
+fn agent_health_new(aid) {
+    var ah = alloc(80);
+    store64(ah, aid);
+    store64(ah + 8, 1);       # is_healthy
+    store64(ah + 16, 0);      # consecutive_failures
+    store64(ah + 24, 0);      # consecutive_successes
+    store64(ah + 32, clock_epoch_secs());
+    store64(ah + 40, 0);      # last_response_ms
+    store64(ah + 48, 0);      # mem_used
+    store64(ah + 56, 0);      # cpu_time
+    store64(ah + 64, 0);      # fds
+    store64(ah + 72, 0);      # threads
+    return ah;
+}
+
+fn health_agent_id(ah) { return load64(ah); }
+fn health_is_healthy(ah) { return load64(ah + 8); }
+fn health_failures(ah) { return load64(ah + 16); }
+fn health_successes(ah) { return load64(ah + 24); }
+
+# HealthCheckConfig: {interval_secs, timeout_secs, unhealthy_threshold,
+#                      healthy_threshold}
+# 4 fields x 8 = 32 bytes
+
+fn hc_config_default() {
+    var hc = alloc(32);
+    store64(hc, 30);    # interval_secs
+    store64(hc + 8, 5);  # timeout_secs
+    store64(hc + 16, 3); # unhealthy_threshold
+    store64(hc + 24, 2); # healthy_threshold
+    return hc;
+}
+
+# Supervisor: {health_map, quota_map, breaker_map, hc_config}
+# 4 fields x 8 = 32 bytes
+
+fn supervisor_new() {
+    var sup = alloc(32);
+    store64(sup, map_new());      # health_map: agent_id_str -> AgentHealth
+    store64(sup + 8, map_new());  # quota_map: agent_id_str -> ResourceQuota
+    store64(sup + 16, map_new()); # breaker_map: agent_id_str -> CircuitBreaker
+    store64(sup + 24, hc_config_default());
+    return sup;
+}
+
+fn supervisor_register(sup, agent_id_str) {
+    var hmap = load64(sup);
+    var qmap = load64(sup + 8);
+    var bmap = load64(sup + 16);
+
+    var id_cstr = str_data(agent_id_str);
+    map_set(hmap, id_cstr, agent_health_new(0));
+    map_set(qmap, id_cstr, quota_default());
+    map_set(bmap, id_cstr, cb_default());
+}
+
+fn supervisor_unregister(sup, agent_id_str) {
+    var id_cstr = str_data(agent_id_str);
+    map_delete(load64(sup), id_cstr);
+    map_delete(load64(sup + 8), id_cstr);
+    map_delete(load64(sup + 16), id_cstr);
+}
+

@@ -1,0 +1,345 @@
+# =========================================================================
+# agent — agent lifecycle, process spawning, /proc helpers
+# =========================================================================
+
+enum AgentStatus {
+    AGENT_PENDING = 0;
+    AGENT_STARTING = 1;
+    AGENT_RUNNING = 2;
+    AGENT_PAUSED = 3;
+    AGENT_STOPPING = 4;
+    AGENT_STOPPED = 5;
+    AGENT_FAILED = 6;
+}
+
+enum StopReason {
+    STOP_USER = 0;
+    STOP_ERROR = 1;
+    STOP_RESOURCE = 2;
+    STOP_TIMEOUT = 3;
+    STOP_PREEMPTED = 4;
+}
+
+# AgentHandle: {id, name, status, created_at, started_at, pid,
+#               mem_used, cpu_time, fds_used, threads_used}
+# 10 fields x 8 bytes = 80 bytes
+
+fn agent_handle_new(id, name) {
+    var h = alloc(80);
+    store64(h, id);                # id (integer counter)
+    store64(h + 8, name);          # name: Str
+    store64(h + 16, AGENT_PENDING); # status
+    store64(h + 24, clock_epoch_secs());   # created_at (epoch secs)
+    store64(h + 32, 0);            # started_at
+    store64(h + 40, 0);            # pid
+    store64(h + 48, 0);            # mem_used
+    store64(h + 56, 0);            # cpu_time
+    store64(h + 64, 0);            # fds_used
+    store64(h + 72, 0);            # threads_used
+    return h;
+}
+
+fn agent_id(h) { return load64(h); }
+fn agent_name(h) { return load64(h + 8); }
+fn agent_status(h) { return load64(h + 16); }
+fn agent_created_at(h) { return load64(h + 24); }
+fn agent_started_at(h) { return load64(h + 32); }
+fn agent_pid(h) { return load64(h + 40); }
+fn agent_mem_used(h) { return load64(h + 48); }
+fn agent_cpu_time(h) { return load64(h + 56); }
+fn agent_fds_used(h) { return load64(h + 64); }
+fn agent_threads(h) { return load64(h + 72); }
+
+fn agent_set_status(h, s) { store64(h + 16, s); }
+fn agent_set_pid(h, pid) { store64(h + 40, pid); }
+fn agent_set_started_at(h, t) { store64(h + 32, t); }
+
+# Global agent ID counter
+var _next_agent_id = 1;
+
+fn agent_next_id() {
+    var id = _next_agent_id;
+    _next_agent_id = _next_agent_id + 1;
+    return id;
+}
+
+# /proc helpers — read resource usage for a PID
+
+fn read_vm_rss(pid) {
+    if (pid == 0) { return 0; }
+    var path_sb = str_builder_new();
+    str_builder_add_cstr(path_sb, "/proc/");
+    str_builder_add_int(path_sb, pid);
+    str_builder_add_cstr(path_sb, "/status");
+    var path = str_builder_build(path_sb);
+
+    var buf = alloc(8192);
+    var n = file_read_all(str_data(path), buf, 8191);
+    if (n <= 0) { return 0; }
+    store8(buf + n, 0);
+
+    # Search for "VmRSS:" line
+    var i = 0;
+    while (i < n) {
+        if (memeq(buf + i, "VmRSS:", 6) == 1) {
+            var j = i + 6;
+            # Skip whitespace
+            while (j < n) {
+                if (load8(buf + j) != 32) { break; }
+                if (load8(buf + j) != 9) { break; }
+                j = j + 1;
+            }
+            # Parse number (in kB)
+            var kb = 0;
+            while (j < n) {
+                var c = load8(buf + j);
+                if (c < 48) { break; }
+                if (c > 57) { break; }
+                kb = kb * 10 + c - 48;
+                j = j + 1;
+            }
+            return kb * 1024;
+        }
+        # Advance to next line
+        while (i < n) {
+            if (load8(buf + i) == 10) { i = i + 1; break; }
+            i = i + 1;
+        }
+    }
+    return 0;
+}
+
+# Read CPU time (utime+stime) from /proc/{pid}/stat in milliseconds
+fn read_cpu_time_ms(pid) {
+    if (pid == 0) { return 0; }
+    var path_sb = str_builder_new();
+    str_builder_add_cstr(path_sb, "/proc/");
+    str_builder_add_int(path_sb, pid);
+    str_builder_add_cstr(path_sb, "/stat");
+    var path = str_builder_build(path_sb);
+    var buf = alloc(4096);
+    var n = file_read_all(str_data(path), buf, 4095);
+    if (n <= 0) { return 0; }
+    store8(buf + n, 0);
+    # Find ')' — fields are after the comm field
+    var ci = 0;
+    while (ci < n) {
+        if (load8(buf + ci) == 41) { break; }  # ')'
+        ci = ci + 1;
+    }
+    ci = ci + 2;  # skip ') '
+    # utime is field 14 (0-indexed from start, 11th after comm)
+    # stime is field 15 (12th after comm)
+    var field = 0;
+    var utime = 0;
+    var stime = 0;
+    while (ci < n) {
+        # Skip whitespace
+        while (ci < n) {
+            if (load8(buf + ci) != 32) { break; }
+            ci = ci + 1;
+        }
+        # Parse number
+        var val = 0;
+        while (ci < n) {
+            var c = load8(buf + ci);
+            if (c < 48) { break; }
+            if (c > 57) { break; }
+            val = val * 10 + c - 48;
+            ci = ci + 1;
+        }
+        if (field == 11) { utime = val; }
+        if (field == 12) { stime = val; }
+        if (field > 12) { break; }
+        field = field + 1;
+    }
+    # Convert ticks to ms (assume 100 Hz = 10ms per tick)
+    return (utime + stime) * 10;
+}
+
+# Normalize a vector to unit length
+fn normalize_vec(v, dim) {
+    var mag_sq = f64_from(0);
+    var ni = 0;
+    while (ni < dim) {
+        var x = load64(v + ni * 8);
+        mag_sq = f64_add(mag_sq, f64_mul(x, x));
+        ni = ni + 1;
+    }
+    var mag = f64_sqrt(mag_sq);
+    var result = alloc(dim * 8);
+    if (f64_eq(mag, f64_from(0)) == 1) {
+        ni = 0;
+        while (ni < dim) { store64(result + ni * 8, f64_from(0)); ni = ni + 1; }
+    } else {
+        ni = 0;
+        while (ni < dim) {
+            store64(result + ni * 8, f64_div(load64(v + ni * 8), mag));
+            ni = ni + 1;
+        }
+    }
+    return result;
+}
+
+fn count_fds(pid) {
+    if (pid == 0) { return 0; }
+    var path_sb = str_builder_new();
+    str_builder_add_cstr(path_sb, "/proc/");
+    str_builder_add_int(path_sb, pid);
+    str_builder_add_cstr(path_sb, "/fd");
+    var path = str_builder_build(path_sb);
+    var entries = dir_list(str_data(path));
+    if (entries == 0) { return 0; }
+    return vec_len(entries);
+}
+
+fn count_threads(pid) {
+    if (pid == 0) { return 1; }
+    var path_sb = str_builder_new();
+    str_builder_add_cstr(path_sb, "/proc/");
+    str_builder_add_int(path_sb, pid);
+    str_builder_add_cstr(path_sb, "/task");
+    var path = str_builder_build(path_sb);
+    var entries = dir_list(str_data(path));
+    if (entries == 0) { return 1; }
+    var n = vec_len(entries);
+    if (n == 0) { return 1; }
+    return n;
+}
+
+# Update resource usage for an agent from /proc
+fn agent_update_resources(h) {
+    var pid = agent_pid(h);
+    if (pid == 0) { return 0; }
+    store64(h + 48, read_vm_rss(pid));
+    store64(h + 64, count_fds(pid));
+    store64(h + 72, count_threads(pid));
+}
+
+# Check if agent process is alive (kill -0)
+fn agent_is_alive(h) {
+    var pid = agent_pid(h);
+    if (pid == 0) { return 0; }
+    var r = syscall(SYS_KILL, pid, 0);
+    if (r == 0) { return 1; }
+    return 0;
+}
+
+# Start an agent process
+# VULN-010: Spawn with resource limits
+# setrlimit(resource, &rlimit{cur, max}) — syscall 160
+var SYS_SETRLIMIT = 160;
+var RLIMIT_AS = 9;    # Address space
+var RLIMIT_CPU = 0;   # CPU time in seconds
+
+fn agent_spawn_with_limits(cmd, arg1, arg2, mem_limit, cpu_limit) {
+    # sys_fork() (not raw syscall(SYS_FORK)) for arch portability: x86_64
+    # wraps SYS_FORK, aarch64 — which has no fork(2) — wraps clone(SIGCHLD)
+    # via SYS_CLONE. Both return child-pid-in-parent / 0-in-child / -1-on-error.
+    # Unblocks the aarch64 cross-build (cyrius 6.1.39 ships the aarch64 shim).
+    var pid = sys_fork();
+    if (pid < 0) { return Err(ERR_SUPERVISOR); }
+    if (pid == 0) {
+        # Child: apply rlimits before exec
+        if (mem_limit > 0) {
+            var rlim = alloc(16);
+            store64(rlim, mem_limit);
+            store64(rlim + 8, mem_limit);
+            syscall(SYS_SETRLIMIT, RLIMIT_AS, rlim);
+        }
+        if (cpu_limit > 0) {
+            var rlim_cpu = alloc(16);
+            store64(rlim_cpu, cpu_limit);
+            store64(rlim_cpu + 8, cpu_limit);
+            syscall(SYS_SETRLIMIT, RLIMIT_CPU, rlim_cpu);
+        }
+        # exec
+        var argv_buf: i64[4];
+        store64(&argv_buf, cmd);
+        store64(&argv_buf + 8, arg1);
+        store64(&argv_buf + 16, arg2);
+        store64(&argv_buf + 24, 0);
+        syscall(SYS_EXECVE, cmd, &argv_buf, 0);
+        syscall(SYS_EXIT, 127);
+    }
+    return Ok(pid);
+}
+
+fn agent_start(h, executable) {
+    var status = agent_status(h);
+    if (status != AGENT_PENDING) {
+        if (status != AGENT_STOPPED) {
+            return Err(ERR_SUPERVISOR);
+        }
+    }
+    agent_set_status(h, AGENT_STARTING);
+
+    var name = agent_name(h);
+    var id = agent_id(h);
+
+    var id_str_sb = str_builder_new();
+    str_builder_add_int(id_str_sb, id);
+    var id_str = str_builder_build(id_str_sb);
+
+    sakshi_info("starting agent", 14);
+
+    var pid_result = spawn(str_data(executable), str_data(id_str), str_data(name));
+    if (is_err_result(pid_result) == 1) {
+        agent_set_status(h, AGENT_FAILED);
+        return Err(ERR_SUPERVISOR);
+    }
+    var pid = payload(pid_result);
+    agent_set_pid(h, pid);
+    agent_set_started_at(h, clock_epoch_secs());
+    agent_set_status(h, AGENT_RUNNING);
+    return Ok(pid);
+}
+
+# VULN-004: Race-free signal delivery via pidfd (Linux 5.3+), fallback to kill()
+fn agent_send_signal(pid, sig) {
+    if (pid <= 0) { return 0; }
+    # Try pidfd_open + pidfd_send_signal for race-free delivery
+    var pidfd = syscall(SYS_PIDFD_OPEN, pid, 0);
+    if (pidfd >= 0) {
+        syscall(SYS_PIDFD_SEND_SIGNAL, pidfd, sig, 0, 0);
+        syscall(SYS_CLOSE, pidfd);
+        return 1;
+    }
+    # Fallback: plain kill (susceptible to PID reuse race)
+    syscall(SYS_KILL, pid, sig);
+    return 1;
+}
+
+# Stop an agent (SIGTERM then SIGKILL)
+fn agent_stop(h, reason) {
+    agent_set_status(h, AGENT_STOPPING);
+    var pid = agent_pid(h);
+    if (pid > 0) {
+        agent_send_signal(pid, 15);  # SIGTERM
+        var status_buf: i32[1];  # wait4 writes a 4-byte int status
+        var wr = syscall(SYS_WAIT4, pid, &status_buf, 1, 0);  # WNOHANG
+        if (wr == 0) {
+            agent_send_signal(pid, 9);  # SIGKILL
+            syscall(SYS_WAIT4, pid, &status_buf, 0, 0);
+        }
+    }
+    agent_set_status(h, AGENT_STOPPED);
+    return Ok(0);
+}
+
+# Pause (SIGSTOP)
+fn agent_pause(h) {
+    if (agent_status(h) != AGENT_RUNNING) { return Err(ERR_SUPERVISOR); }
+    agent_send_signal(agent_pid(h), 19);  # SIGSTOP
+    agent_set_status(h, AGENT_PAUSED);
+    return Ok(0);
+}
+
+# Resume (SIGCONT)
+fn agent_resume(h) {
+    if (agent_status(h) != AGENT_PAUSED) { return Err(ERR_SUPERVISOR); }
+    agent_send_signal(agent_pid(h), 18);  # SIGCONT
+    agent_set_status(h, AGENT_RUNNING);
+    return Ok(0);
+}
+

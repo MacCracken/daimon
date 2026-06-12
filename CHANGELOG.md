@@ -6,6 +6,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.2.8] - 2026-06-12
+
+**Codebase refactor — the 4.1k-line `src/main.cyr` monolith split into 17
+per-domain modules.** Pure structural change: behavior-preserving, no API / wire
+/ runtime change.
+
+### Changed
+
+- **`src/main.cyr` (4,132 LOC) → 18 files.** `main.cyr` is now a 116-line
+  composition entry point (syscall-constant preamble + module `include`s +
+  the `main` serve loop). Each former section banner is its own `src/*.cyr`:
+  `error`, `config`, `agent`, `supervisor`, `memory`, `vector_store`, `rag`,
+  `mcp`, `screen`, `scheduler`, `federation`, `edge`, `ipc`, plus the HTTP layer
+  split four ways — `app` (global state + `app_init` composition root), `http`
+  (constants, JSON escaping, request/response helpers), `api` (route handlers +
+  router), `server` (rate limiting, per-request dispatch, sync/async serve).
+  Largest file is now `api.cyr` at 713 LOC (was a 1,102-LOC sub-section).
+- **Behavior-preserving by construction.** cyrius flattens `include`s into one
+  global scope; modules are sliced at the existing section banners in the
+  original source order, so the preprocessed token stream is **byte-identical**
+  to the former single file (verified: `md5sum` of the reassembled slices equals
+  the original `main.cyr`). No logic moved or rewritten.
+- CI needs no change — its fmt/lint/security steps already glob `src/*.cyr`, and
+  the build entry (`src/main.cyr`) pulls in every module. `docs/architecture/
+  overview.md` module map updated to the multi-file layout.
+
+### Verified
+
+- `cyrius build`: OK. `cyrius test`: **225 / 225** pass. `cyrius fmt --check` +
+  `cyrius lint`: clean across all 18 `src/*.cyr`. Benchmarks unchanged (byte-
+  identical binary behavior).
+
 ## [1.2.7] - 2026-06-12
 
 **MCP per-tool input schemas + cyrius 6.2.2 toolchain / element-typed-array

@@ -1,0 +1,38 @@
+# =========================================================================
+# app — global service state + composition root (app_init)
+# =========================================================================
+
+# Global application state
+var _config = 0;
+var _agents = 0;        # map<id_str_cstr, AgentHandle>
+var _supervisor = 0;
+var _mem_store = 0;
+var _vindex = 0;
+var _mcp_registry = 0;
+var _scheduler = 0;
+var _fed_mgr = 0;
+var _edge_fleet = 0;
+var _msg_bus = 0;
+var _rec_mgr = 0;
+var _cap_mgr = 0;
+var _rag_pipeline = 0;
+var _rpc_registry = 0;
+
+fn app_init() {
+    _config = config_new();
+    _agents = map_new();
+    _supervisor = supervisor_new();
+    _mem_store = memory_store_new(str_from("/var/lib/agnos/agent-memory"));
+    _vindex = vindex_new();
+    _mcp_registry = mcp_registry_new();
+    _scheduler = task_scheduler_new();
+    _fed_mgr = fed_mgr_new(SCHED_BALANCED);
+    _edge_fleet = edge_fleet_new(edge_fleet_config_default());
+    _msg_bus = msg_bus_new();
+    _rec_mgr = rec_mgr_new();
+    _cap_mgr = cap_mgr_new();
+    _rag_pipeline = rag_pipeline_new(rag_config_default());
+    _rpc_registry = rpc_registry_new();
+    rate_limiter_init();
+}
+

@@ -1,0 +1,25 @@
+# =========================================================================
+# config — service configuration
+# =========================================================================
+
+# Config: {listen_addr: Str, port: i64, data_dir: Str, max_agents: i64}
+# Layout: 4 fields x 8 bytes = 32 bytes
+
+fn config_new() {
+    var c = alloc(32);
+    store64(c, str_from("127.0.0.1"));     # listen_addr
+    store64(c + 8, 8090);                   # port
+    store64(c + 16, str_from("/var/lib/agnos")); # data_dir
+    store64(c + 24, 1000);                  # max_agents
+    return c;
+}
+
+fn config_listen_addr(c) { return load64(c); }
+fn config_port(c) { return load64(c + 8); }
+fn config_data_dir(c) { return load64(c + 16); }
+fn config_max_agents(c) { return load64(c + 24); }
+
+fn config_set_port(c, port) { store64(c + 8, port); }
+fn config_set_data_dir(c, dir) { store64(c + 16, dir); }
+fn config_set_max_agents(c, n) { store64(c + 24, n); }
+

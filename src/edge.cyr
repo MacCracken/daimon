@@ -1,0 +1,193 @@
+# =========================================================================
+# edge — edge fleet management
+# =========================================================================
+
+enum EdgeStatus {
+    EDGE_ONLINE = 0;
+    EDGE_SUSPECT = 1;
+    EDGE_OFFLINE = 2;
+    EDGE_UPDATING = 3;
+    EDGE_DECOMMISSIONED = 4;
+}
+
+# EdgeNode: {id: Str, name: Str, status, arch: Str, cpu_cores,
+#             memory_mb, disk_mb, has_gpu, last_heartbeat,
+#             active_tasks, tasks_completed, agent_version: Str}
+# 12 fields x 8 = 96 bytes
+
+fn edge_node_new(name, arch, cpu_cores, memory_mb) {
+    var n = alloc(96);
+    var nid = str_from_int(_next_agent_id);
+    _next_agent_id = _next_agent_id + 1;
+    store64(n, nid);
+    store64(n + 8, name);
+    store64(n + 16, EDGE_ONLINE);
+    store64(n + 24, arch);
+    store64(n + 32, cpu_cores);
+    store64(n + 40, memory_mb);
+    store64(n + 48, 32768);       # disk_mb default
+    store64(n + 56, 0);           # has_gpu
+    store64(n + 64, clock_epoch_secs());  # last_heartbeat
+    store64(n + 72, 0);           # active_tasks
+    store64(n + 80, 0);           # tasks_completed
+    store64(n + 88, str_from("0.0.0"));  # agent_version
+    return n;
+}
+
+fn edge_node_id(n) { return load64(n); }
+fn edge_node_name(n) { return load64(n + 8); }
+fn edge_node_status(n) { return load64(n + 16); }
+fn edge_node_set_status(n, s) { store64(n + 16, s); }
+fn edge_node_active_tasks(n) { return load64(n + 72); }
+fn edge_node_tasks_completed(n) { return load64(n + 80); }
+
+fn edge_node_heartbeat(n, active, completed) {
+    store64(n + 64, clock_epoch_secs());
+    store64(n + 72, active);
+    store64(n + 80, completed);
+}
+
+# EdgeFleetConfig: {suspect_secs, offline_secs, max_nodes, require_tpm}
+fn edge_fleet_config_default() {
+    var c = alloc(32);
+    store64(c, 30);     # suspect_threshold_secs
+    store64(c + 8, 90); # offline_threshold_secs
+    store64(c + 16, 1000);
+    store64(c + 24, 0);  # require_tpm = false
+    return c;
+}
+
+# EdgeFleetManager: {config, nodes: map<id_cstr, EdgeNode>}
+fn edge_fleet_new(config) {
+    var ef = alloc(16);
+    store64(ef, config);
+    store64(ef + 8, map_new());
+    return ef;
+}
+
+fn edge_fleet_register(ef, node) {
+    var nodes = load64(ef + 8);
+    var config = load64(ef);
+    var max_nodes = load64(config + 16);
+    if (map_count(nodes) >= max_nodes) { return Err(ERR_INVALID_PARAM); }
+
+    # Check for empty name
+    var name = load64(node + 8);
+    if (str_len(name) == 0) { return Err(ERR_INVALID_PARAM); }
+
+    # Check for duplicate name
+    var keys = map_keys(nodes);
+    var di = 0;
+    while (di < vec_len(keys)) {
+        var existing = map_get(nodes, vec_get(keys, di));
+        if (str_eq(load64(existing + 8), name) == 1) { return Err(ERR_INVALID_PARAM); }
+        di = di + 1;
+    }
+
+    map_set(nodes, str_cstr(edge_node_id(node)), node);
+    return Ok(edge_node_id(node));
+}
+
+fn edge_fleet_get(ef, id_cstr) {
+    return map_get(load64(ef + 8), id_cstr);
+}
+
+fn edge_fleet_node_count(ef) { return map_count(load64(ef + 8)); }
+
+fn edge_fleet_heartbeat(ef, id_cstr, active_tasks, tasks_completed) {
+    var node = map_get(load64(ef + 8), id_cstr);
+    if (node == 0) { return Err(ERR_AGENT_NOT_FOUND); }
+    if (edge_node_status(node) == EDGE_DECOMMISSIONED) { return Err(ERR_INVALID_PARAM); }
+    store64(node + 64, clock_epoch_secs());
+    edge_node_set_status(node, EDGE_ONLINE);
+    store64(node + 72, active_tasks);
+    store64(node + 80, tasks_completed);
+    return Ok(0);
+}
+
+fn edge_fleet_check_health(ef) {
+    var nodes = load64(ef + 8);
+    var config = load64(ef);
+    var suspect_secs = load64(config);
+    var offline_secs = load64(config + 8);
+    var now = clock_epoch_secs();
+    var keys = map_keys(nodes);
+    var i = 0;
+    while (i < vec_len(keys)) {
+        var node = map_get(nodes, vec_get(keys, i));
+        var s = edge_node_status(node);
+        if (s == EDGE_DECOMMISSIONED) { i = i + 1; continue; }
+        if (s == EDGE_UPDATING) { i = i + 1; continue; }
+        var age = now - load64(node + 64);
+        if (age > offline_secs) {
+            if (s != EDGE_OFFLINE) { edge_node_set_status(node, EDGE_OFFLINE); }
+        }
+        elif (age > suspect_secs) {
+            if (s == EDGE_ONLINE) { edge_node_set_status(node, EDGE_SUSPECT); }
+        }
+        i = i + 1;
+    }
+}
+
+fn edge_fleet_decommission(ef, id_cstr) {
+    var node = map_get(load64(ef + 8), id_cstr);
+    if (node == 0) { return Err(ERR_AGENT_NOT_FOUND); }
+    edge_node_set_status(node, EDGE_DECOMMISSIONED);
+    return Ok(0);
+}
+
+fn edge_fleet_list(ef, status_filter) {
+    var nodes = load64(ef + 8);
+    var keys = map_keys(nodes);
+    var result = vec_new();
+    var i = 0;
+    while (i < vec_len(keys)) {
+        var node = map_get(nodes, vec_get(keys, i));
+        if (status_filter < 0) {
+            vec_push(result, node);
+        }
+        elif (edge_node_status(node) == status_filter) {
+            vec_push(result, node);
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+fn edge_fleet_stats(ef) {
+    var nodes = load64(ef + 8);
+    var keys = map_keys(nodes);
+    var total = vec_len(keys);
+    var online = 0;
+    var suspect = 0;
+    var offline = 0;
+    var updating = 0;
+    var decomm = 0;
+    var active = 0;
+    var completed = 0;
+    var i = 0;
+    while (i < total) {
+        var n = map_get(nodes, vec_get(keys, i));
+        var s = edge_node_status(n);
+        if (s == EDGE_ONLINE) { online = online + 1; }
+        elif (s == EDGE_SUSPECT) { suspect = suspect + 1; }
+        elif (s == EDGE_OFFLINE) { offline = offline + 1; }
+        elif (s == EDGE_UPDATING) { updating = updating + 1; }
+        elif (s == EDGE_DECOMMISSIONED) { decomm = decomm + 1; }
+        active = active + edge_node_active_tasks(n);
+        completed = completed + edge_node_tasks_completed(n);
+        i = i + 1;
+    }
+    # Return stats as 8 packed fields
+    var st = alloc(64);
+    store64(st, total);
+    store64(st + 8, online);
+    store64(st + 16, suspect);
+    store64(st + 24, offline);
+    store64(st + 32, updating);
+    store64(st + 40, decomm);
+    store64(st + 48, active);
+    store64(st + 56, completed);
+    return st;
+}
+

@@ -1,0 +1,135 @@
+# =========================================================================
+# screen — capture permissions, rate limiting, recording sessions
+# =========================================================================
+
+enum CaptureTarget {
+    CAP_FULLSCREEN = 0;
+    CAP_WINDOW = 1;
+    CAP_REGION = 2;
+}
+
+enum RecordingStatus {
+    REC_ACTIVE = 0;
+    REC_PAUSED = 1;
+    REC_STOPPED = 2;
+}
+
+# RecordingSession: {id: Str, status, frame_count, started_at, agent_id: Str}
+# 5 fields x 8 = 40 bytes
+
+fn recording_session_new(agent_id) {
+    var s = alloc(40);
+    store64(s, str_from_int(_next_agent_id)); # reuse counter for unique IDs
+    _next_agent_id = _next_agent_id + 1;
+    store64(s + 8, REC_ACTIVE);
+    store64(s + 16, 0);            # frame_count
+    store64(s + 24, clock_epoch_secs());
+    store64(s + 32, agent_id);
+    return s;
+}
+
+fn recording_id(s) { return load64(s); }
+fn recording_status(s) { return load64(s + 8); }
+fn recording_frame_count(s) { return load64(s + 16); }
+
+fn recording_add_frame(s) {
+    if (load64(s + 8) != REC_ACTIVE) { return Err(ERR_INVALID_PARAM); }
+    var fc = load64(s + 16) + 1;
+    store64(s + 16, fc);
+    return Ok(fc);
+}
+
+fn recording_pause(s) {
+    if (load64(s + 8) != REC_ACTIVE) { return Err(ERR_INVALID_PARAM); }
+    store64(s + 8, REC_PAUSED);
+    return Ok(0);
+}
+
+fn recording_resume(s) {
+    if (load64(s + 8) != REC_PAUSED) { return Err(ERR_INVALID_PARAM); }
+    store64(s + 8, REC_ACTIVE);
+    return Ok(0);
+}
+
+fn recording_stop(s) {
+    store64(s + 8, REC_STOPPED);
+    return Ok(0);
+}
+
+# RecordingManager: {sessions: map<id_cstr, RecordingSession>}
+fn rec_mgr_new() {
+    var rm = alloc(8);
+    store64(rm, map_new());
+    return rm;
+}
+
+fn rec_mgr_start(rm, agent_id) {
+    var s = recording_session_new(agent_id);
+    var id = recording_id(s);
+    map_set(load64(rm), str_data(id), s);
+    return id;
+}
+
+fn rec_mgr_get(rm, id_cstr) {
+    return map_get(load64(rm), id_cstr);
+}
+
+# CapturePermission: {agent_id: Str, max_per_minute, expires_at,
+#                      rate_timestamps: vec}
+# 4 fields x 8 = 32 bytes
+
+fn cap_perm_new(agent_id, max_per_minute) {
+    var cp = alloc(32);
+    store64(cp, agent_id);
+    store64(cp + 8, max_per_minute);
+    store64(cp + 16, 0);           # expires_at (0 = never)
+    store64(cp + 24, vec_new());   # rate_timestamps
+    return cp;
+}
+
+# CapturePermissionManager: {permissions: map<agent_id_cstr, CapturePermission>}
+fn cap_mgr_new() {
+    var cm = alloc(8);
+    store64(cm, map_new());
+    return cm;
+}
+
+fn cap_mgr_grant(cm, perm) {
+    var aid = load64(perm);
+    map_set(load64(cm), str_data(aid), perm);
+}
+
+fn cap_mgr_revoke(cm, agent_id_cstr) {
+    map_delete(load64(cm), agent_id_cstr);
+}
+
+fn cap_mgr_check(cm, agent_id_cstr) {
+    var perm = map_get(load64(cm), agent_id_cstr);
+    if (perm == 0) { return Err(ERR_INVALID_PARAM); }
+
+    # Check expiry
+    var expires = load64(perm + 16);
+    if (expires > 0) {
+        if (clock_epoch_secs() > expires) { return Err(ERR_INVALID_PARAM); }
+    }
+
+    # Check rate limit
+    var timestamps = load64(perm + 24);
+    var now = clock_epoch_secs();
+    # Remove entries older than 60 seconds
+    var new_ts = vec_new();
+    var i = 0;
+    while (i < vec_len(timestamps)) {
+        var t = vec_get(timestamps, i);
+        if (now - t < 60) { vec_push(new_ts, t); }
+        i = i + 1;
+    }
+    store64(perm + 24, new_ts);
+
+    var max = load64(perm + 8);
+    if (vec_len(new_ts) >= max) { return Err(ERR_INVALID_PARAM); }
+
+    vec_push(new_ts, now);
+    return Ok(0);
+}
+

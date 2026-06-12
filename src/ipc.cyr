@@ -1,0 +1,341 @@
+# =========================================================================
+# ipc — message types (sync version, no async runtime)
+# =========================================================================
+
+# IpcMessage: {id: Str, source: Str, target: Str, msg_type, payload: Str,
+#               timestamp}
+# 6 fields x 8 = 48 bytes
+
+enum MessageType {
+    MSG_REQUEST = 0;
+    MSG_RESPONSE = 1;
+    MSG_EVENT = 2;
+    MSG_HEARTBEAT = 3;
+    MSG_COMMAND = 4;
+}
+
+var MAX_MESSAGE_SIZE = 65536;
+
+fn ipc_msg_new(source, target, msg_type, payload) {
+    var m = alloc(48);
+    store64(m, str_from_int(_next_agent_id));
+    _next_agent_id = _next_agent_id + 1;
+    store64(m + 8, source);
+    store64(m + 16, target);
+    store64(m + 24, msg_type);
+    store64(m + 32, payload);
+    store64(m + 40, clock_epoch_secs());
+    return m;
+}
+
+fn ipc_msg_source(m) { return load64(m + 8); }
+fn ipc_msg_target(m) { return load64(m + 16); }
+fn ipc_msg_type(m) { return load64(m + 24); }
+fn ipc_msg_payload(m) { return load64(m + 32); }
+
+# MessageBus: {subscribers: map<agent_id_cstr, queue_vec>,
+#               agent_names: map<name_cstr, agent_id_cstr>}
+fn msg_bus_new() {
+    var mb = alloc(16);
+    store64(mb, map_new());      # subscribers
+    store64(mb + 8, map_new());  # agent_names
+    return mb;
+}
+
+fn msg_bus_subscribe(mb, agent_id_cstr) {
+    map_set(load64(mb), agent_id_cstr, vec_new());
+}
+
+fn msg_bus_unsubscribe(mb, agent_id_cstr) {
+    map_delete(load64(mb), agent_id_cstr);
+}
+
+fn msg_bus_register_name(mb, name_cstr, agent_id_cstr) {
+    map_set(load64(mb + 8), name_cstr, agent_id_cstr);
+}
+
+fn msg_bus_publish(mb, msg) {
+    var target = ipc_msg_target(msg);
+    var target_cstr = str_data(target);
+    var subs = load64(mb);
+
+    # Check if broadcast
+    if (streq(target_cstr, "*") == 1) {
+        var keys = map_keys(subs);
+        var i = 0;
+        while (i < vec_len(keys)) {
+            var queue = map_get(subs, vec_get(keys, i));
+            if (queue != 0) { vec_push(queue, msg); }
+            i = i + 1;
+        }
+        return Ok(0);
+    }
+
+    # Named routing
+    var names = load64(mb + 8);
+    var resolved = map_get(names, target_cstr);
+    if (resolved != 0) {
+        var queue = map_get(subs, resolved);
+        if (queue != 0) { vec_push(queue, msg); }
+        return Ok(0);
+    }
+
+    # Direct ID routing
+    var queue = map_get(subs, target_cstr);
+    if (queue != 0) { vec_push(queue, msg); }
+    return Ok(0);
+}
+
+fn msg_bus_send_to(mb, agent_id_cstr, msg) {
+    var queue = map_get(load64(mb), agent_id_cstr);
+    if (queue == 0) { return Err(ERR_AGENT_NOT_FOUND); }
+    vec_push(queue, msg);
+    return Ok(0);
+}
+
+fn msg_bus_send_to_name(mb, name_cstr, msg) {
+    var id = map_get(load64(mb + 8), name_cstr);
+    if (id == 0) { return Err(ERR_AGENT_NOT_FOUND); }
+    return msg_bus_send_to(mb, id, msg);
+}
+
+fn msg_bus_get_agent_id(mb, name_cstr) {
+    return map_get(load64(mb + 8), name_cstr);
+}
+
+# RpcRegistry: {methods: map<method_name_cstr, agent_id_cstr>}
+fn rpc_registry_new() {
+    var rr = alloc(8);
+    store64(rr, map_new());
+    return rr;
+}
+
+fn rpc_register_method(rr, method_cstr, agent_id_cstr) {
+    map_set(load64(rr), method_cstr, agent_id_cstr);
+}
+
+fn rpc_find_handler(rr, method_cstr) {
+    return map_get(load64(rr), method_cstr);
+}
+
+fn rpc_unregister_agent(rr, agent_id_cstr) {
+    var methods = load64(rr);
+    var keys = map_keys(methods);
+    var i = 0;
+    while (i < vec_len(keys)) {
+        var handler = map_get(methods, vec_get(keys, i));
+        if (handler == agent_id_cstr) { map_delete(methods, vec_get(keys, i)); }
+        i = i + 1;
+    }
+}
+
+fn rpc_list_methods(rr) {
+    return map_keys(load64(rr));
+}
+
+# --- AgentIpc — per-agent Unix domain socket endpoint ---
+
+var MAX_CONCURRENT_CONNECTIONS = 64;
+var MAX_GLOBAL_FD_LIMIT = 1024;
+var _global_active_connections = 0;
+
+# Wire protocol response codes
+var ACK = 1;
+var NACK_QUEUE_FULL = 2;
+var NACK_INVALID = 3;
+
+fn active_connection_count() { return _global_active_connections; }
+
+# AgentIpc: {agent_id: Str, socket_path: Str, queue: vec<IpcMessage>}
+# 3 fields x 8 = 24 bytes
+
+fn agent_ipc_new(agent_id_str, socket_dir) {
+    var ipc = alloc(24);
+    store64(ipc, agent_id_str);
+    var sock_name = str_cat(agent_id_str, str_from(".sock"));
+    var spath = path_join(str_data(socket_dir), str_data(sock_name));
+    store64(ipc + 8, spath);
+    store64(ipc + 16, vec_new());    # message queue
+    return ipc;
+}
+
+fn agent_ipc_id(ipc) { return load64(ipc); }
+fn agent_ipc_socket_path(ipc) { return load64(ipc + 8); }
+fn agent_ipc_queue(ipc) { return load64(ipc + 16); }
+
+# Bind a Unix domain socket at the agent's path
+fn agent_ipc_bind(ipc) {
+    var spath = load64(ipc + 8);
+    var path_cstr = str_data(spath);
+
+    # Ensure parent directory exists
+    var dir = path_dirname(spath);
+    syscall(SYS_MKDIR, str_data(dir), 493);  # 0755
+
+    # Remove stale socket if it exists
+    syscall(SYS_UNLINK, path_cstr);
+
+    # Create Unix domain socket (AF_UNIX=1, SOCK_STREAM=1)
+    var fd = syscall(SYS_SOCKET, 1, 1, 0);
+    if (fd < 0) { return Err(ERR_IPC); }
+
+    # Build sockaddr_un: {sa_family=1, sun_path=...}
+    var addr_buf = alloc(112);  # sizeof(sockaddr_un) = 110
+    store16(addr_buf, 1);        # AF_UNIX
+    var plen = str_len(spath);
+    if (plen > 107) { plen = 107; }
+    memcpy(addr_buf + 2, path_cstr, plen);
+    store8(addr_buf + 2 + plen, 0);
+
+    var br = syscall(SYS_BIND, fd, addr_buf, 2 + plen + 1);
+    if (br < 0) {
+        syscall(SYS_CLOSE, fd);
+        return Err(ERR_IPC);
+    }
+
+    # Set socket permissions (owner only: 0700)
+    syscall(SYS_CHMOD, path_cstr, 448);  # 0700
+
+    # Listen
+    var lr = syscall(SYS_LISTEN, fd, MAX_CONCURRENT_CONNECTIONS);
+    if (lr < 0) {
+        syscall(SYS_CLOSE, fd);
+        return Err(ERR_IPC);
+    }
+
+    return Ok(fd);
+}
+
+# Accept a connection and read one length-prefixed message
+# VULN-006: Get peer UID via SO_PEERCRED (returns UID or -1)
+fn ipc_get_peer_uid(cfd) {
+    # struct ucred { pid_t pid; uid_t uid; gid_t gid; } = 12 bytes
+    var cred_buf = alloc(16);
+    var cred_len: u32[1];  # socklen_t in/out (4 bytes)
+    store32(&cred_len, 12);
+    # getsockopt(fd, SOL_SOCKET=1, SO_PEERCRED=17, buf, &len)
+    var r = syscall(SYS_GETSOCKOPT, cfd, 1, 17, cred_buf, &cred_len);
+    if (r < 0) { return 0 - 1; }
+    # uid is at offset 4 (after pid)
+    return load32(cred_buf + 4);
+}
+
+fn agent_ipc_accept_one(fd, ipc) {
+    var cfd = syscall(SYS_ACCEPT, fd, 0, 0);
+    if (cfd < 0) { return Err(ERR_IPC); }
+
+    # VULN-006: Verify peer credentials
+    var peer_uid = ipc_get_peer_uid(cfd);
+    var my_uid = syscall(SYS_GETUID);
+    if (peer_uid >= 0) {
+        if (peer_uid != my_uid) {
+            if (peer_uid != 0) {  # Allow root
+                syscall(SYS_CLOSE, cfd);
+                return Err(ERR_IPC);
+            }
+        }
+    }
+
+    if (_global_active_connections >= MAX_GLOBAL_FD_LIMIT) {
+        syscall(SYS_CLOSE, cfd);
+        return Err(ERR_IPC);
+    }
+    _global_active_connections = _global_active_connections + 1;
+
+    # Read 4-byte big-endian length prefix
+    var len_buf: u8[4];  # 4-byte big-endian length prefix
+    var nr = syscall(SYS_READ, cfd, &len_buf, 4);
+    if (nr != 4) {
+        syscall(SYS_CLOSE, cfd);
+        _global_active_connections = _global_active_connections - 1;
+        return Err(ERR_IPC);
+    }
+
+    # Parse big-endian u32
+    var msg_len = load8(&len_buf) * 16777216
+    + load8(&len_buf + 1) * 65536
+    + load8(&len_buf + 2) * 256
+    + load8(&len_buf + 3);
+
+    if (msg_len > MAX_MESSAGE_SIZE) {
+        # Send NACK
+        store8(&len_buf, NACK_INVALID);
+        syscall(SYS_WRITE, cfd, &len_buf, 1);
+        syscall(SYS_CLOSE, cfd);
+        _global_active_connections = _global_active_connections - 1;
+        return Err(ERR_IPC);
+    }
+
+    # Read message body
+    var msg_buf = alloc(msg_len + 1);
+    var total_read = 0;
+    while (total_read < msg_len) {
+        var chunk = syscall(SYS_READ, cfd, msg_buf + total_read, msg_len - total_read);
+        if (chunk <= 0) { break; }
+        total_read = total_read + chunk;
+    }
+    store8(msg_buf + total_read, 0);
+
+    # Parse JSON message and enqueue
+    var msg_str = str_new(msg_buf, total_read);
+    var queue = load64(ipc + 16);
+    vec_push(queue, msg_str);
+
+    # Send ACK
+    store8(&len_buf, ACK);
+    syscall(SYS_WRITE, cfd, &len_buf, 1);
+
+    syscall(SYS_CLOSE, cfd);
+    _global_active_connections = _global_active_connections - 1;
+    return Ok(total_read);
+}
+
+# Send a message to another agent's socket
+fn agent_ipc_send(target_socket_path, message_str) {
+    var path_cstr = str_data(target_socket_path);
+
+    # Connect to Unix socket
+    var fd = syscall(SYS_SOCKET, 1, 1, 0);
+    if (fd < 0) { return Err(ERR_IPC); }
+
+    var addr_buf = alloc(112);
+    store16(addr_buf, 1);  # AF_UNIX
+    var plen = str_len(target_socket_path);
+    if (plen > 107) { plen = 107; }
+    memcpy(addr_buf + 2, path_cstr, plen);
+    store8(addr_buf + 2 + plen, 0);
+
+    var cr = syscall(SYS_CONNECT, fd, addr_buf, 2 + plen + 1);
+    if (cr < 0) {
+        syscall(SYS_CLOSE, fd);
+        return Err(ERR_IPC);
+    }
+
+    # Write length prefix (big-endian u32) + message
+    var msg_len = str_len(message_str);
+    var hdr: u8[4];  # 4-byte big-endian length prefix
+    store8(&hdr, (msg_len >> 24) & 255);
+    store8(&hdr + 1, (msg_len >> 16) & 255);
+    store8(&hdr + 2, (msg_len >> 8) & 255);
+    store8(&hdr + 3, msg_len & 255);
+    syscall(SYS_WRITE, fd, &hdr, 4);
+    syscall(SYS_WRITE, fd, str_data(message_str), msg_len);
+
+    # Read ACK
+    var ack_buf[1];
+    syscall(SYS_READ, fd, &ack_buf, 1);
+    var ack = load8(&ack_buf);
+
+    syscall(SYS_CLOSE, fd);
+
+    if (ack == ACK) { return Ok(0); }
+    if (ack == NACK_QUEUE_FULL) { return Err(ERR_IPC); }
+    return Err(ERR_IPC);
+}
+
+# Cleanup: remove socket file
+fn agent_ipc_cleanup(ipc) {
+    var spath = load64(ipc + 8);
+    syscall(SYS_UNLINK, str_data(spath));
+}
+

@@ -1,0 +1,202 @@
+# =========================================================================
+# memory — per-agent key-value store
+# =========================================================================
+
+var MAX_KEY_LENGTH = 256;
+var MAX_VALUE_SIZE = 1048576;
+
+# Validate a memory key
+fn validate_key(key) {
+    var klen = str_len(key);
+    if (klen == 0) { return Err(ERR_INVALID_PARAM); }
+    if (klen > MAX_KEY_LENGTH) { return Err(ERR_INVALID_PARAM); }
+
+    # Check for path traversal
+    if (str_contains(key, str_from("..")) == 1) { return Err(ERR_INVALID_PARAM); }
+    if (str_contains(key, str_from("/")) == 1) { return Err(ERR_INVALID_PARAM); }
+    if (str_contains(key, str_from("\\")) == 1) { return Err(ERR_INVALID_PARAM); }
+    return Ok(0);
+}
+
+# Sanitize a key for use as filename — replace non-alnum with underscore
+fn sanitize_key(key) {
+    var data = str_data(key);
+    var klen = str_len(key);
+    var buf = alloc(klen + 1);
+    var i = 0;
+    while (i < klen) {
+        var c = load8(data + i);
+        # Allow a-z, A-Z, 0-9, - _ .
+        if (c >= 97) {
+            if (c <= 122) { store8(buf + i, c); i = i + 1; continue; }
+        }
+        if (c >= 65) {
+            if (c <= 90) { store8(buf + i, c); i = i + 1; continue; }
+        }
+        if (c >= 48) {
+            if (c <= 57) { store8(buf + i, c); i = i + 1; continue; }
+        }
+        if (c == 45) { store8(buf + i, c); i = i + 1; continue; }  # -
+        if (c == 95) { store8(buf + i, c); i = i + 1; continue; }  # _
+        if (c == 46) { store8(buf + i, c); i = i + 1; continue; }  # .
+        store8(buf + i, 95);  # Replace with _
+        i = i + 1;
+    }
+    store8(buf + klen, 0);
+    return str_new(buf, klen);
+}
+
+# MemoryStore: {base_dir: Str}
+fn memory_store_new(base_dir) {
+    var ms = alloc(8);
+    store64(ms, base_dir);
+    return ms;
+}
+
+fn memory_store_agent_dir(ms, agent_id_str) {
+    return path_join(str_data(load64(ms)), str_data(agent_id_str));
+}
+
+fn memory_store_set(ms, agent_id_str, key, value_json) {
+    var vr = validate_key(key);
+    if (is_err_result(vr) == 1) { return vr; }
+
+    var dir = memory_store_agent_dir(ms, agent_id_str);
+    # Ensure directory exists (VULN-005: 0700 not 0755)
+    syscall(SYS_MKDIR, str_data(dir), 448);  # 0700
+
+    var safe_key = sanitize_key(key);
+    var fname = str_cat(safe_key, str_from(".json"));
+    var fpath = path_join(str_data(dir), str_data(fname));
+
+    # Build JSON entry
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"key\":\"");
+    str_builder_add(sb, key);
+    str_builder_add_cstr(sb, "\",\"value\":");
+    str_builder_add(sb, value_json);
+    str_builder_add_cstr(sb, ",\"updated_at\":");
+    str_builder_add_int(sb, clock_epoch_secs());
+    str_builder_add_cstr(sb, "}");
+    var content = str_builder_build(sb);
+
+    # Atomic write: tmp then rename
+    var tmp_path = str_cat(fpath, str_from(".tmp"));
+    file_write_all(str_data(tmp_path), str_data(content), str_len(content));
+    syscall(SYS_RENAME, str_data(tmp_path), str_data(fpath));
+
+    return Ok(0);
+}
+
+fn memory_store_get(ms, agent_id_str, key) {
+    var dir = memory_store_agent_dir(ms, agent_id_str);
+    var safe_key = sanitize_key(key);
+    var fname = str_cat(safe_key, str_from(".json"));
+    var fpath = path_join(str_data(dir), str_data(fname));
+
+    var buf = alloc(MAX_VALUE_SIZE);
+    var n = file_read_all(str_data(fpath), buf, MAX_VALUE_SIZE - 1);
+    if (n <= 0) { return None(); }
+    store8(buf + n, 0);
+    return Some(str_new(buf, n));
+}
+
+fn memory_store_delete(ms, agent_id_str, key) {
+    var dir = memory_store_agent_dir(ms, agent_id_str);
+    var safe_key = sanitize_key(key);
+    var fname = str_cat(safe_key, str_from(".json"));
+    var fpath = path_join(str_data(dir), str_data(fname));
+
+    var r = syscall(SYS_UNLINK, str_data(fpath));
+    if (r == 0) { return Ok(1); }
+    return Ok(0);
+}
+
+fn memory_store_list_keys(ms, agent_id_str) {
+    var dir = memory_store_agent_dir(ms, agent_id_str);
+    var entries = dir_list(str_data(dir));
+    if (entries == 0) { return vec_new(); }
+    var keys = vec_new();
+    var i = 0;
+    while (i < vec_len(entries)) {
+        var name = vec_get(entries, i);
+        # Check .json extension
+        var name_s = str_from(name);
+        if (str_ends_with(name_s, str_from(".json")) == 1) {
+            # Strip .json suffix (5 chars)
+            var stem = str_sub(name_s, 0, str_len(name_s) - 5);
+            vec_push(keys, stem);
+        }
+        i = i + 1;
+    }
+    return keys;
+}
+
+fn memory_store_clear(ms, agent_id_str) {
+    var dir = memory_store_agent_dir(ms, agent_id_str);
+    var entries = dir_list(str_data(dir));
+    if (entries == 0) { return 0; }
+    var count = 0;
+    var i = 0;
+    while (i < vec_len(entries)) {
+        var name = vec_get(entries, i);
+        var name_s = str_from(name);
+        if (str_ends_with(name_s, str_from(".json")) == 1) {
+            var fpath = path_join(str_data(dir), name);
+            syscall(SYS_UNLINK, str_data(fpath));
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    return count;
+}
+
+fn memory_store_list_by_tag(ms, agent_id_str, tag) {
+    var dir = memory_store_agent_dir(ms, agent_id_str);
+    var entries = dir_list(str_data(dir));
+    if (entries == 0) { return vec_new(); }
+    var matching = vec_new();
+    var mi = 0;
+    while (mi < vec_len(entries)) {
+        var name = vec_get(entries, mi);
+        var name_s = str_from(name);
+        if (str_ends_with(name_s, str_from(".json")) == 1) {
+            var fpath = path_join(str_data(dir), name);
+            var fbuf = alloc(MAX_VALUE_SIZE);
+            var frd = file_read_all(str_data(fpath), fbuf, MAX_VALUE_SIZE - 1);
+            if (frd > 0) {
+                store8(fbuf + frd, 0);
+                var content = str_new(fbuf, frd);
+                # Check if content contains the tag string
+                if (str_contains(content, tag) == 1) {
+                    var stem = str_sub(name_s, 0, str_len(name_s) - 5);
+                    vec_push(matching, stem);
+                }
+            }
+        }
+        mi = mi + 1;
+    }
+    return matching;
+}
+
+fn memory_store_usage_bytes(ms, agent_id_str) {
+    var dir = memory_store_agent_dir(ms, agent_id_str);
+    var entries = dir_list(str_data(dir));
+    if (entries == 0) { return 0; }
+    var total = 0;
+    var ui = 0;
+    while (ui < vec_len(entries)) {
+        var name = vec_get(entries, ui);
+        var fpath = path_join(str_data(dir), name);
+        # stat the file to get size — use read length as proxy
+        var buf = alloc(1);
+        var sz = file_read_all(str_data(fpath), buf, 0);
+        # Since we can't easily stat(), count actual file content
+        var rbuf = alloc(65536);
+        var rn = file_read_all(str_data(fpath), rbuf, 65535);
+        if (rn > 0) { total = total + rn; }
+        ui = ui + 1;
+    }
+    return total;
+}
+

@@ -1,0 +1,224 @@
+# =========================================================================
+# server — rate limiting, per-request dispatch, sync + async serve loops
+# =========================================================================
+
+# --- HTTP server ---
+
+# --- VULN-009: Per-IP rate limiting ---
+
+var RATE_LIMIT_WINDOW = 60;     # seconds
+var RATE_LIMIT_MAX = 120;       # max requests per window per IP
+var SYS_GETPEERNAME = 52;
+
+# Rate limiter: {buckets: map<ip_cstr, {count, window_start}>}
+var _rate_limiter = 0;
+
+fn rate_limiter_init() {
+    _rate_limiter = map_new();
+}
+
+# Get peer IPv4 address as integer from a connected socket fd
+fn get_peer_ip(cfd) {
+    var addr_buf = alloc(32);   # sockaddr_in = 16 bytes, pad
+    var addr_len = alloc(8);
+    store32(addr_len, 16);
+    var r = syscall(SYS_GETPEERNAME, cfd, addr_buf, addr_len);
+    if (r < 0) { return 0; }
+    # sockaddr_in: family(2) + port(2) + addr(4)
+    # IP address is at offset 4, 4 bytes
+    return load32(addr_buf + 4);
+}
+
+# Format IPv4 integer as "a.b.c.d" cstr for map key
+fn ip_to_cstr(ip) {
+    var ib = alloc(20);
+    var off = 0;
+    # Format a.b.c.d. Compute each octet inline (no fixed local array).
+    # Originally a workaround for a 6.1.x compiler bug where an address-taken
+    # `var parts[4]` under-reserved its static backing; cyrius 6.2.1 fixed the
+    # footgun by introducing element-typed arrays (`var a: i64[N]`, used
+    # elsewhere in this file for slot arrays). The inline form is retained here
+    # — it allocates no array and is the clearest spelling for this hot path.
+    var pi = 0;
+    while (pi < 4) {
+        var val = (ip >> (pi * 8)) & 255;
+        if (val >= 100) {
+            store8(ib + off, 48 + val / 100); off = off + 1; val = val % 100;
+            store8(ib + off, 48 + val / 10); off = off + 1;
+            store8(ib + off, 48 + val % 10); off = off + 1;
+        }
+        elif (val >= 10) {
+            store8(ib + off, 48 + val / 10); off = off + 1;
+            store8(ib + off, 48 + val % 10); off = off + 1;
+        }
+        else { store8(ib + off, 48 + val); off = off + 1; }
+        if (pi < 3) { store8(ib + off, 46); off = off + 1; }
+        pi = pi + 1;
+    }
+    store8(ib + off, 0);
+    return ib;
+}
+
+# Check rate limit for an IP. Returns 1 if allowed, 0 if rate-limited.
+fn rate_check(cfd) {
+    var ip = get_peer_ip(cfd);
+    if (ip == 0) { return 1; }  # Can't determine IP, allow
+    var ip_key = ip_to_cstr(ip);
+    var now = clock_epoch_secs();
+
+    var bucket = map_get(_rate_limiter, ip_key);
+    if (bucket == 0) {
+        # New bucket: {count, window_start}
+        bucket = alloc(16);
+        store64(bucket, 1);
+        store64(bucket + 8, now);
+        map_set(_rate_limiter, ip_key, bucket);
+        return 1;
+    }
+
+    var window_start = load64(bucket + 8);
+    if (now - window_start >= RATE_LIMIT_WINDOW) {
+        # Window expired, reset
+        store64(bucket, 1);
+        store64(bucket + 8, now);
+        return 1;
+    }
+
+    var count = load64(bucket) + 1;
+    store64(bucket, count);
+    if (count > RATE_LIMIT_MAX) { return 0; }
+    return 1;
+}
+
+# --- Per-request handler (sandhi-shape: ctx, cfd, buf, blen) ---
+#
+# Sandhi gives us: a fully-recv'd request buffer, smuggling-validated
+# (Content-Length+Transfer-Encoding conflict, Host.Host / CL.CL /
+# TE.TE duplicates already 400'd before we get the call). We add:
+# (1) per-IP rate limiting (VULN-009 — daimon-specific, not in sandhi),
+# (2) MAX_REQUEST_SIZE oversized-request rejection (VULN-008),
+# (3) Transfer-Encoding rejection (daimon does not implement chunked
+# request decode; sandhi accepts it for legit servers, we reject).
+# Sandhi closes cfd after we return — do NOT sock_close here.
+fn handle_request(ctx, cfd, buf, blen) {
+    if (rate_check(cfd) == 0) {
+        var rl_msg = "{\"error\":\"too many requests\"}";
+        http_send_response(cfd, 429, rl_msg, strlen(rl_msg));
+        return 0;
+    }
+
+    # VULN-008: sandhi caps recv at HSV_REQ_BUF_SIZE = 65536, so
+    # daimon's memory use is bounded regardless of declared
+    # Content-Length. The fast pre-recv 413 the old hand-rolled
+    # parser emitted on `cl > MAX_REQUEST_SIZE` is no longer
+    # reachable here — by the time we have `blen`, sandhi has
+    # already finished its recv loop (or hit the 30s SO_RCVTIMEO).
+    # See docs/audit/2026-04-27-sandhi-migration.md for the
+    # trade-off analysis. The blen guard stays as belt-and-braces
+    # against future buffer-size changes.
+    if (blen > MAX_REQUEST_SIZE) {
+        var pt_msg = "{\"error\":\"payload too large\"}";
+        http_send_response(cfd, 413, pt_msg, strlen(pt_msg));
+        return 0;
+    }
+
+    if (http_has_transfer_encoding(buf, blen) == 1) {
+        var te_msg = "{\"error\":\"chunked transfer not supported\"}";
+        http_send_response(cfd, 501, te_msg, strlen(te_msg));
+        return 0;
+    }
+
+    var method = http_parse_method(buf, blen);
+    var path = http_parse_path(buf, blen);
+    http_route(cfd, method, path, buf, blen);
+    return 0;
+}
+
+# --- Server banner ---
+# Both serve modes delegate bind/listen/accept to sandhi
+# (sandhi_server_run_opts sync, sandhi_server_run_async async), so daimon
+# no longer hand-rolls a socket setup helper.
+
+fn server_banner(port, mode) {
+    sakshi_info("daimon listening", 16);
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "daimon v");
+    var ver_buf = alloc(16);
+    var ver_n = file_read_all("VERSION", ver_buf, 15);
+    if (ver_n > 0) {
+        if (load8(ver_buf + ver_n - 1) == 10) { ver_n = ver_n - 1; }
+        store8(ver_buf + ver_n, 0);
+        str_builder_add_cstr(sb, ver_buf);
+    }
+    else { str_builder_add_cstr(sb, "1.1.0"); }
+    str_builder_add_cstr(sb, " listening on port ");
+    str_builder_add_int(sb, port);
+    str_builder_add_cstr(sb, " (");
+    str_builder_add_cstr(sb, mode);
+    str_builder_add_cstr(sb, ")\n");
+    var banner = str_builder_build(sb);
+    print(str_data(banner), str_len(banner));
+}
+
+# --- Synchronous server ---
+
+# Slowloris bound — per-connection SO_RCVTIMEO applied at accept time by
+# sandhi (sandhi_server_options_idle_ms → SO_RCVTIMEO on both the sync
+# sandhi_server_run_opts and async sandhi_server_run_async paths).
+# 5 000 ms covers normal P99 request durations (the request handler is
+# in-memory; no network egress in the happy path) while bounding a
+# malicious slow-sender to ~5 s of worker hold instead of sandhi's 30 s
+# default. Centralized so sync + async modes stay in lock-step.
+var SERVE_IDLE_MS = 5000;
+
+fn serve(port) {
+    server_banner(port, "sync");
+    # sandhi_server_run_opts owns bind/listen/accept/recv + smuggling
+    # rejection (CL+TE conflict, Host.Host / CL.CL / TE.TE duplicates per
+    # RFC 7230 §3.3.2 + §3.3.3) before our handler runs, and applies
+    # SO_RCVTIMEO = SERVE_IDLE_MS per accepted connection. It closes cfd
+    # after the handler returns. Returns when the loop exits (today: never).
+    var opts = sandhi_server_options_new();
+    sandhi_server_options_idle_ms(opts, SERVE_IDLE_MS);
+    return sandhi_server_run_opts(INADDR_ANY(), port, &handle_request, 0, opts);
+}
+
+# --- Async server (sandhi epoll-cooperative accept loop) ---
+#
+# Collapsed onto sandhi_server_run_async at 1.2.6 (was a hand-rolled epoll
+# accept loop, 1.1.0–1.2.5). Upstream sandhi 1.4.9 made
+# sandhi_server_run_async honor sandhi_server_options_max_conns: an
+# epoll-cooperative loop that drains the non-blocking accept queue up to
+# max_conns, spawns a handler task per connection from a SINGLE reused
+# per-batch arena, runs the batch via async_run, resets the arena, and
+# blocks on the listen fd when the queue is empty. It applies
+# SO_RCVTIMEO = idle_ms per accepted connection (slowloris bound) and runs
+# the same CL/TE + duplicate-header smuggling rejection before our handler.
+#
+# This subsumes the entire hand-rolled loop, plus two wins it lacked:
+#   1. Bounded recv buffers — the old async_handle_client alloc'd
+#      MAX_REQUEST_SIZE (64 KiB) per connection from the never-freeing
+#      global bump, so every batch leaked. sandhi's per-batch arena is
+#      sized once and reset each drain.
+#   2. Enforced concurrency cap via max_conns (the old loop had an
+#      implicit max_batch = 64).
+# handle_request keeps the shared (ctx, cfd, buf, len) handler contract
+# used by the sync path, so one handler serves both modes.
+
+# Per-drain concurrency cap. 128 matches sandhi's documented default (was
+# an implicit max_batch = 64 in the hand-rolled loop). sandhi sizes its
+# reused per-batch arena at max_conns × (HSV_REQ_BUF_SIZE + slack), so this
+# is the steady-state recv-buffer working set (~8.4 MiB), allocated once.
+var SERVE_MAX_CONNS = 128;
+
+fn serve_async(port) {
+    server_banner(port, "async");
+    var opts = sandhi_server_options_new();
+    sandhi_server_options_idle_ms(opts, SERVE_IDLE_MS);
+    sandhi_server_options_max_conns(opts, SERVE_MAX_CONNS);
+    # sandhi owns bind/listen/accept/recv + smuggling rejection + per-conn
+    # SO_RCVTIMEO; closes each cfd after handle_request returns. Returns 1
+    # on bind/listen/arena failure; otherwise loops forever.
+    return sandhi_server_run_async(INADDR_ANY(), port, &handle_request, 0, opts);
+}
+

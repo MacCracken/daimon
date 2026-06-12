@@ -1,0 +1,482 @@
+# =========================================================================
+# federation — multi-node clustering (types + placement scoring)
+# =========================================================================
+
+enum NodeRole {
+    ROLE_COORDINATOR = 0;
+    ROLE_FOLLOWER = 1;
+    ROLE_CANDIDATE = 2;
+}
+
+enum FedNodeStatus {
+    FED_ONLINE = 0;
+    FED_SUSPECT = 1;
+    FED_DEAD = 2;
+}
+
+enum SchedulingStrategy {
+    SCHED_BALANCED = 0;
+    SCHED_PACKED = 1;
+    SCHED_SPREAD = 2;
+}
+
+# FederationNode: {node_id: Str, name: Str, role, status,
+#                   last_heartbeat, current_term, voted_for: Str,
+#                   cpu_cores, memory_mb, gpu_count}
+# 10 fields x 8 = 80 bytes
+
+fn fed_node_new(name, cpu_cores, memory_mb, gpu_count) {
+    var n = alloc(80);
+    var nid = str_from_int(_next_agent_id);
+    _next_agent_id = _next_agent_id + 1;
+    store64(n, nid);
+    store64(n + 8, name);
+    store64(n + 16, ROLE_FOLLOWER);
+    store64(n + 24, FED_ONLINE);
+    store64(n + 32, clock_epoch_secs());
+    store64(n + 40, 0);           # current_term
+    store64(n + 48, 0);           # voted_for
+    store64(n + 56, cpu_cores);
+    store64(n + 64, memory_mb);
+    store64(n + 72, gpu_count);
+    return n;
+}
+
+fn fed_node_id(n) { return load64(n); }
+fn fed_node_name(n) { return load64(n + 8); }
+fn fed_node_role(n) { return load64(n + 16); }
+fn fed_node_status(n) { return load64(n + 24); }
+fn fed_node_set_role(n, r) { store64(n + 16, r); }
+fn fed_node_set_status(n, s) { store64(n + 24, s); }
+fn fed_node_update_heartbeat(n) { store64(n + 32, clock_epoch_secs()); }
+
+# FederationManager: {nodes: map<id_cstr, FederationNode>, strategy}
+fn fed_mgr_new(strategy) {
+    var fm = alloc(16);
+    store64(fm, map_new());
+    store64(fm + 8, strategy);
+    return fm;
+}
+
+fn fed_mgr_add_node(fm, node) {
+    map_set(load64(fm), str_data(fed_node_id(node)), node);
+}
+
+fn fed_mgr_remove_node(fm, id_cstr) {
+    return map_delete(load64(fm), id_cstr);
+}
+
+fn fed_mgr_get_node(fm, id_cstr) {
+    return map_get(load64(fm), id_cstr);
+}
+
+fn fed_mgr_node_count(fm) { return map_count(load64(fm)); }
+
+fn fed_mgr_record_heartbeat(fm, id_cstr) {
+    var node = map_get(load64(fm), id_cstr);
+    if (node == 0) { return Err(ERR_FEDERATION); }
+    store64(node + 32, clock_epoch_secs());
+    store64(node + 24, FED_ONLINE);
+    return Ok(0);
+}
+
+# Check health of all nodes based on heartbeat age
+fn fed_mgr_check_health(fm, suspect_secs, dead_secs) {
+    var nodes = load64(fm);
+    var keys = map_keys(nodes);
+    var now = clock_epoch_secs();
+    var i = 0;
+    while (i < vec_len(keys)) {
+        var node = map_get(nodes, vec_get(keys, i));
+        var age = now - load64(node + 32);
+        if (age > dead_secs) {
+            if (load64(node + 24) != FED_DEAD) { store64(node + 24, FED_DEAD); }
+        }
+        elif (age > suspect_secs) {
+            if (load64(node + 24) == FED_ONLINE) { store64(node + 24, FED_SUSPECT); }
+        }
+        i = i + 1;
+    }
+}
+
+# Get nodes with ONLINE status
+fn fed_mgr_live_nodes(fm) {
+    var nodes = load64(fm);
+    var keys = map_keys(nodes);
+    var live = vec_new();
+    var i = 0;
+    while (i < vec_len(keys)) {
+        var node = map_get(nodes, vec_get(keys, i));
+        if (load64(node + 24) == FED_ONLINE) { vec_push(live, node); }
+        i = i + 1;
+    }
+    return live;
+}
+
+# Start election — local node becomes candidate, increments term
+fn fed_mgr_start_election(fm, local_id_cstr) {
+    var node = map_get(load64(fm), local_id_cstr);
+    if (node == 0) { return Err(ERR_FEDERATION); }
+    store64(node + 16, ROLE_CANDIDATE);
+    var term = load64(node + 40) + 1;
+    store64(node + 40, term);
+    store64(node + 48, fed_node_id(node));  # voted_for = self
+    return Ok(term);
+}
+
+# Process a vote request from a candidate
+# Returns: 0 = denied, 1 = granted
+fn fed_mgr_receive_vote_request(fm, local_id_cstr, candidate_id_cstr, candidate_term) {
+    var local = map_get(load64(fm), local_id_cstr);
+    if (local == 0) { return 0; }
+    var local_term = load64(local + 40);
+    if (candidate_term <= local_term) { return 0; }
+    # Higher term — step down and grant vote
+    store64(local + 40, candidate_term);
+    store64(local + 16, ROLE_FOLLOWER);
+    return 1;
+}
+
+# Process a received vote, returns 1 if majority reached
+fn fed_mgr_receive_vote(fm, vote_granted, total_nodes, votes_so_far) {
+    if (vote_granted == 0) { return 0; }
+    var new_votes = votes_so_far + 1;
+    var majority = total_nodes / 2 + 1;
+    if (new_votes >= majority) { return 1; }
+    return 0;
+}
+
+# Step a node down to follower
+fn fed_mgr_step_down(fm, id_cstr, new_term) {
+    var node = map_get(load64(fm), id_cstr);
+    if (node == 0) { return Err(ERR_FEDERATION); }
+    store64(node + 16, ROLE_FOLLOWER);
+    store64(node + 40, new_term);
+    store64(node + 48, 0);  # voted_for = none
+    return Ok(0);
+}
+
+# Become coordinator
+fn fed_mgr_become_coordinator(fm, id_cstr) {
+    var node = map_get(load64(fm), id_cstr);
+    if (node == 0) { return Err(ERR_FEDERATION); }
+    store64(node + 16, ROLE_COORDINATOR);
+    return Ok(0);
+}
+
+# Node scorer — weighted 4-factor placement scoring
+# Score = 0.4*resource_headroom + 0.3*locality + 0.2*load_balance + 0.1*affinity
+fn fed_score_node(node, req_cpu, req_mem, preferred_id, max_load, node_load) {
+    var cpu_cores = load64(node + 56);
+    var memory_mb = load64(node + 64);
+
+    # Resource headroom (40%)
+    var cpu_head = 100;
+    if (req_cpu > 0) {
+        if (cpu_cores > 0) {
+            cpu_head = (cpu_cores - req_cpu) * 100 / cpu_cores;
+            if (cpu_head < 0) { cpu_head = 0; }
+        }
+        else { cpu_head = 0; }
+    }
+    var mem_head = 100;
+    if (req_mem > 0) {
+        if (memory_mb > 0) {
+            mem_head = (memory_mb - req_mem) * 100 / memory_mb;
+            if (mem_head < 0) { mem_head = 0; }
+        }
+        else { mem_head = 0; }
+    }
+    var resource = (cpu_head + mem_head) / 2;
+
+    # Locality (30%)
+    var locality = 0;
+    if (preferred_id != 0) {
+        if (str_eq(fed_node_id(node), preferred_id) == 1) { locality = 100; }
+    }
+
+    # Load balance (20%)
+    var load_bal = 100;
+    if (max_load > 0) {
+        load_bal = 100 - (node_load * 100 / max_load);
+    }
+
+    # Total: weighted sum (integer, 0-100 scale)
+    return resource * 40 / 100 + locality * 30 / 100 + load_bal * 20 / 100;
+}
+
+# Place an agent on the best eligible node
+fn fed_place_agent(fm, req_cpu, req_mem, gpu_required, preferred_id) {
+    var nodes = load64(fm);
+    var keys = map_keys(nodes);
+    var best_node = 0;
+    var best_score = 0 - 1;
+    var pi = 0;
+    while (pi < vec_len(keys)) {
+        var node = map_get(nodes, vec_get(keys, pi));
+        if (load64(node + 24) != FED_ONLINE) { pi = pi + 1; continue; }
+        # Check GPU requirement
+        if (gpu_required == 1) {
+            if (load64(node + 72) == 0) { pi = pi + 1; continue; }
+        }
+        var score = fed_score_node(node, req_cpu, req_mem, preferred_id, 1, 0);
+        if (score > best_score) {
+            best_score = score;
+            best_node = node;
+        }
+        pi = pi + 1;
+    }
+    if (best_node == 0) { return Err(ERR_FEDERATION); }
+    return Ok(best_node);
+}
+
+fn fed_mgr_stats(fm) {
+    var nodes = load64(fm);
+    var keys = map_keys(nodes);
+    var total = vec_len(keys);
+    var live = 0;
+    var suspect = 0;
+    var dead = 0;
+    var i = 0;
+    while (i < total) {
+        var n = map_get(nodes, vec_get(keys, i));
+        var s = load64(n + 24);
+        if (s == FED_ONLINE) { live = live + 1; }
+        elif (s == FED_SUSPECT) { suspect = suspect + 1; }
+        elif (s == FED_DEAD) { dead = dead + 1; }
+        i = i + 1;
+    }
+    var st = alloc(32);
+    store64(st, total);
+    store64(st + 8, live);
+    store64(st + 16, suspect);
+    store64(st + 24, dead);
+    return st;
+}
+
+# --- Federated vector store ---
+
+enum VectorReplication {
+    REPL_FULL = 0;
+    REPL_PARTIAL = 1;
+    REPL_SHARDED = 2;
+}
+
+# CollectionReplica: {node_id: Str, address: Str, vector_count, last_synced}
+# 4 fields x 8 = 32 bytes
+
+fn collection_replica_new(node_id, address, vector_count) {
+    var cr = alloc(32);
+    store64(cr, node_id);
+    store64(cr + 8, address);
+    store64(cr + 16, vector_count);
+    store64(cr + 24, clock_epoch_secs());
+    return cr;
+}
+
+fn replica_node_id(cr) { return load64(cr); }
+fn replica_vector_count(cr) { return load64(cr + 16); }
+
+# FederatedVectorStore: {local_node_id: Str, collections: map<name_cstr, vec<Replica>>,
+#                         strategy, max_remote_results}
+# 4 fields x 8 = 32 bytes
+
+fn fed_vstore_new(local_node_id, strategy) {
+    var fvs = alloc(32);
+    store64(fvs, local_node_id);
+    store64(fvs + 8, map_new());     # collections map
+    store64(fvs + 16, strategy);
+    store64(fvs + 24, 100);           # max_remote_results
+    return fvs;
+}
+
+fn fed_vstore_local_id(fvs) { return load64(fvs); }
+fn fed_vstore_strategy(fvs) { return load64(fvs + 16); }
+
+fn fed_vstore_register_replica(fvs, collection_cstr, node_id, address, vector_count) {
+    var colls = load64(fvs + 8);
+    var replicas = map_get(colls, collection_cstr);
+    if (replicas == 0) {
+        replicas = vec_new();
+        map_set(colls, collection_cstr, replicas);
+    }
+    vec_push(replicas, collection_replica_new(node_id, address, vector_count));
+}
+
+fn fed_vstore_remove_node(fvs, node_id) {
+    var colls = load64(fvs + 8);
+    var keys = map_keys(colls);
+    var ki = 0;
+    while (ki < vec_len(keys)) {
+        var replicas = map_get(colls, vec_get(keys, ki));
+        if (replicas != 0) {
+            # Filter out replicas from this node
+            var kept = vec_new();
+            var ri = 0;
+            while (ri < vec_len(replicas)) {
+                var r = vec_get(replicas, ri);
+                if (str_eq(replica_node_id(r), node_id) == 0) {
+                    vec_push(kept, r);
+                }
+                ri = ri + 1;
+            }
+            map_set(colls, vec_get(keys, ki), kept);
+        }
+        ki = ki + 1;
+    }
+}
+
+fn fed_vstore_remote_replicas(fvs, collection_cstr) {
+    var colls = load64(fvs + 8);
+    var replicas = map_get(colls, collection_cstr);
+    if (replicas == 0) { return vec_new(); }
+    var local_id = load64(fvs);
+    var remote = vec_new();
+    var ri = 0;
+    while (ri < vec_len(replicas)) {
+        var r = vec_get(replicas, ri);
+        if (str_eq(replica_node_id(r), local_id) == 0) {
+            vec_push(remote, r);
+        }
+        ri = ri + 1;
+    }
+    return remote;
+}
+
+fn fed_vstore_all_replicas(fvs, collection_cstr) {
+    var colls = load64(fvs + 8);
+    var replicas = map_get(colls, collection_cstr);
+    if (replicas == 0) { return vec_new(); }
+    return replicas;
+}
+
+fn fed_vstore_collections(fvs) {
+    return map_keys(load64(fvs + 8));
+}
+
+fn fed_vstore_collection_count(fvs) {
+    return map_count(load64(fvs + 8));
+}
+
+# Merge local + remote search results, dedup by ID (keep highest score), re-rank
+# Results are packed as: {id: Str, score (f64), content: Str, source_node: Str}
+# 4 fields x 8 = 32 bytes
+
+fn remote_result_new(id, score, content, source_node) {
+    var rr = alloc(32);
+    store64(rr, id);
+    store64(rr + 8, score);
+    store64(rr + 16, content);
+    store64(rr + 24, source_node);
+    return rr;
+}
+
+fn remote_result_id(rr) { return load64(rr); }
+fn remote_result_score(rr) { return load64(rr + 8); }
+fn remote_result_content(rr) { return load64(rr + 16); }
+
+fn fed_vstore_merge_results(fvs, local_results, remote_batches, top_k) {
+    var max_remote = load64(fvs + 24);
+    # Collect all results
+    var all = vec_new();
+    var li = 0;
+    while (li < vec_len(local_results)) {
+        vec_push(all, vec_get(local_results, li));
+        li = li + 1;
+    }
+    var bi = 0;
+    while (bi < vec_len(remote_batches)) {
+        var batch = vec_get(remote_batches, bi);
+        var ri = 0;
+        while (ri < vec_len(batch)) {
+            if (ri >= max_remote) { break; }
+            vec_push(all, vec_get(batch, ri));
+            ri = ri + 1;
+        }
+        bi = bi + 1;
+    }
+
+    # Dedup by id (keep highest score) using a map
+    var dedup = map_new();
+    var di = 0;
+    while (di < vec_len(all)) {
+        var r = vec_get(all, di);
+        var id_cstr = str_cstr(remote_result_id(r));
+        var existing = map_get(dedup, id_cstr);
+        if (existing == 0) {
+            map_set(dedup, id_cstr, r);
+        } else {
+            if (f64_gt(remote_result_score(r), remote_result_score(existing)) == 1) {
+                map_set(dedup, id_cstr, r);
+            }
+        }
+        di = di + 1;
+    }
+
+    # Collect deduped results
+    var dedup_keys = map_keys(dedup);
+    var results = vec_new();
+    var dk = 0;
+    while (dk < vec_len(dedup_keys)) {
+        vec_push(results, map_get(dedup, vec_get(dedup_keys, dk)));
+        dk = dk + 1;
+    }
+
+    # Sort by score descending (insertion sort)
+    var rn = vec_len(results);
+    var si = 1;
+    while (si < rn) {
+        var key = vec_get(results, si);
+        var ks = remote_result_score(key);
+        var sj = si - 1;
+        while (sj >= 0) {
+            if (f64_gt(remote_result_score(vec_get(results, sj)), ks) == 1) { break; }
+            vec_set(results, sj + 1, vec_get(results, sj));
+            sj = sj - 1;
+        }
+        vec_set(results, sj + 1, key);
+        si = si + 1;
+    }
+
+    # Truncate to top_k
+    var final_results = vec_new();
+    var fi = 0;
+    while (fi < top_k) {
+        if (fi >= vec_len(results)) { break; }
+        vec_push(final_results, vec_get(results, fi));
+        fi = fi + 1;
+    }
+    return final_results;
+}
+
+fn fed_vstore_stats(fvs) {
+    var colls = load64(fvs + 8);
+    var keys = map_keys(colls);
+    var total_replicas = 0;
+    var total_vectors = 0;
+    var node_set = map_new();
+    var ki = 0;
+    while (ki < vec_len(keys)) {
+        var replicas = map_get(colls, vec_get(keys, ki));
+        if (replicas != 0) {
+            var ri = 0;
+            while (ri < vec_len(replicas)) {
+                var r = vec_get(replicas, ri);
+                total_replicas = total_replicas + 1;
+                total_vectors = total_vectors + replica_vector_count(r);
+                map_set(node_set, str_cstr(replica_node_id(r)), 1);
+                ri = ri + 1;
+            }
+        }
+        ki = ki + 1;
+    }
+    # Return: {collection_count, total_replicas, total_vectors, nodes_with_vectors, strategy}
+    var st = alloc(40);
+    store64(st, vec_len(keys));
+    store64(st + 8, total_replicas);
+    store64(st + 16, total_vectors);
+    store64(st + 24, map_count(node_set));
+    store64(st + 32, load64(fvs + 16));
+    return st;
+}
+

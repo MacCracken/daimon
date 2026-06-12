@@ -1,0 +1,421 @@
+# =========================================================================
+# scheduler — priority-aware task scheduling
+# =========================================================================
+
+enum TaskStatus {
+    TASK_QUEUED = 0;
+    TASK_SCHEDULED = 1;
+    TASK_RUNNING = 2;
+    TASK_COMPLETED = 3;
+    TASK_FAILED = 4;
+    TASK_CANCELLED = 5;
+    TASK_PREEMPTED = 6;
+}
+
+enum TaskPriority {
+    PRIO_NORMAL = 0;
+    PRIO_HIGH = 1;
+    PRIO_CRITICAL = 2;
+    PRIO_EMERGENCY = 3;
+}
+
+fn priority_from_numeric(p) {
+    if (p <= 3) { return PRIO_NORMAL; }
+    if (p <= 6) { return PRIO_HIGH; }
+    if (p <= 9) { return PRIO_CRITICAL; }
+    return PRIO_EMERGENCY;
+}
+
+# ScheduledTask: {task_id: Str, name: Str, description: Str, agent_id: Str,
+#                  priority, status, created_at, cpu_cores, memory_mb}
+# 9 fields x 8 = 72 bytes
+
+fn sched_task_new(name, desc, agent_id, priority) {
+    var t = alloc(72);
+    var tid = str_from_int(_next_agent_id);
+    _next_agent_id = _next_agent_id + 1;
+    store64(t, tid);
+    store64(t + 8, name);
+    store64(t + 16, desc);
+    store64(t + 24, agent_id);
+    # Clamp priority 1-10
+    if (priority < 1) { priority = 1; }
+    if (priority > 10) { priority = 10; }
+    store64(t + 32, priority);
+    store64(t + 40, TASK_QUEUED);
+    store64(t + 48, clock_epoch_secs());
+    store64(t + 56, 1);    # cpu_cores (integer)
+    store64(t + 64, 256);  # memory_mb
+    return t;
+}
+
+fn sched_task_id(t) { return load64(t); }
+fn sched_task_name(t) { return load64(t + 8); }
+fn sched_task_priority(t) { return load64(t + 32); }
+fn sched_task_status(t) { return load64(t + 40); }
+fn sched_task_set_status(t, s) { store64(t + 40, s); }
+
+fn sched_task_transition(t, new_status) {
+    var from = load64(t + 40);
+    # Validate transition
+    var valid = 0;
+    if (from == TASK_QUEUED) {
+        if (new_status == TASK_SCHEDULED) { valid = 1; }
+        if (new_status == TASK_CANCELLED) { valid = 1; }
+    }
+    if (from == TASK_SCHEDULED) {
+        if (new_status == TASK_RUNNING) { valid = 1; }
+        if (new_status == TASK_CANCELLED) { valid = 1; }
+        if (new_status == TASK_QUEUED) { valid = 1; }
+    }
+    if (from == TASK_RUNNING) {
+        if (new_status == TASK_COMPLETED) { valid = 1; }
+        if (new_status == TASK_FAILED) { valid = 1; }
+        if (new_status == TASK_CANCELLED) { valid = 1; }
+        if (new_status == TASK_PREEMPTED) { valid = 1; }
+    }
+    if (from == TASK_PREEMPTED) {
+        if (new_status == TASK_QUEUED) { valid = 1; }
+    }
+    if (valid == 0) { return Err(ERR_SCHEDULER); }
+    store64(t + 40, new_status);
+    return Ok(0);
+}
+
+# NodeCapacity: {node_id: Str, total_cpu, avail_cpu, total_mem, avail_mem,
+#                 total_disk, avail_disk, gpu_available, tpu_available,
+#                 tpu_chips, running_tasks}
+# 11 fields x 8 = 88 bytes
+
+fn node_cap_new(node_id, total_cpu, total_mem, total_disk, gpu) {
+    var nc = alloc(88);
+    store64(nc, node_id);
+    store64(nc + 8, total_cpu);
+    store64(nc + 16, total_cpu);      # avail_cpu = total initially
+    store64(nc + 24, total_mem);
+    store64(nc + 32, total_mem);      # avail_mem = total
+    store64(nc + 40, total_disk);
+    store64(nc + 48, total_disk);     # avail_disk = total
+    store64(nc + 56, gpu);
+    store64(nc + 64, 0);              # tpu_available
+    store64(nc + 72, 0);              # tpu_chips
+    store64(nc + 80, 0);              # running_tasks
+    return nc;
+}
+
+fn node_cap_id(nc) { return load64(nc); }
+fn node_cap_avail_cpu(nc) { return load64(nc + 16); }
+fn node_cap_avail_mem(nc) { return load64(nc + 32); }
+
+fn node_cap_can_fit(nc, cpu, mem, disk) {
+    if (load64(nc + 16) < cpu) { return 0; }
+    if (load64(nc + 32) < mem) { return 0; }
+    if (load64(nc + 48) < disk) { return 0; }
+    return 1;
+}
+
+fn node_cap_utilization(nc) {
+    var total_cpu = load64(nc + 8);
+    var total_mem = load64(nc + 24);
+    if (total_cpu == 0) {
+        if (total_mem == 0) { return 0; }
+    }
+    var cpu_util = 0;
+    if (total_cpu > 0) {
+        cpu_util = 100 - (load64(nc + 16) * 100 / total_cpu);
+    }
+    var mem_util = 0;
+    if (total_mem > 0) {
+        mem_util = 100 - (load64(nc + 32) * 100 / total_mem);
+    }
+    return (cpu_util + mem_util) / 2;
+}
+
+fn node_cap_reserve(nc, cpu, mem, disk) {
+    var ac = load64(nc + 16) - cpu;
+    if (ac < 0) { ac = 0; }
+    store64(nc + 16, ac);
+    var am = load64(nc + 32) - mem;
+    if (am < 0) { am = 0; }
+    store64(nc + 32, am);
+    var ad = load64(nc + 48) - disk;
+    if (ad < 0) { ad = 0; }
+    store64(nc + 48, ad);
+    store64(nc + 80, load64(nc + 80) + 1);
+}
+
+fn node_cap_release(nc, cpu, mem, disk) {
+    var ac = load64(nc + 16) + cpu;
+    if (ac > load64(nc + 8)) { ac = load64(nc + 8); }
+    store64(nc + 16, ac);
+    var am = load64(nc + 32) + mem;
+    if (am > load64(nc + 24)) { am = load64(nc + 24); }
+    store64(nc + 32, am);
+    var ad = load64(nc + 48) + disk;
+    if (ad > load64(nc + 40)) { ad = load64(nc + 40); }
+    store64(nc + 48, ad);
+    var rt = load64(nc + 80) - 1;
+    if (rt < 0) { rt = 0; }
+    store64(nc + 80, rt);
+}
+
+# TaskScheduler: {tasks: map, nodes: map}
+# 2 fields x 8 = 16 bytes
+fn task_scheduler_new() {
+    var ts = alloc(16);
+    store64(ts, map_new());       # tasks: id_cstr -> ScheduledTask
+    store64(ts + 8, map_new());   # nodes: id_cstr -> NodeCapacity
+    return ts;
+}
+
+fn scheduler_register_node(ts, nc) {
+    map_set(load64(ts + 8), str_data(node_cap_id(nc)), nc);
+}
+
+fn scheduler_submit(ts, task) {
+    var id = sched_task_id(task);
+    map_set(load64(ts), str_data(id), task);
+    return Ok(id);
+}
+
+fn scheduler_get(ts, id_cstr) {
+    return map_get(load64(ts), id_cstr);
+}
+
+fn scheduler_cancel(ts, id_cstr) {
+    var task = map_get(load64(ts), id_cstr);
+    if (task == 0) { return Err(ERR_SCHEDULER); }
+    return sched_task_transition(task, TASK_CANCELLED);
+}
+
+# Get pending tasks sorted by priority desc, created_at asc
+fn scheduler_pending_tasks(ts) {
+    var tasks = load64(ts);
+    var keys = map_keys(tasks);
+    var pending = vec_new();
+    var i = 0;
+    while (i < vec_len(keys)) {
+        var t = map_get(tasks, vec_get(keys, i));
+        if (sched_task_status(t) == TASK_QUEUED) { vec_push(pending, t); }
+        i = i + 1;
+    }
+    # Sort by priority desc (insertion sort)
+    var n = vec_len(pending);
+    i = 1;
+    while (i < n) {
+        var key = vec_get(pending, i);
+        var kp = sched_task_priority(key);
+        var j = i - 1;
+        while (j >= 0) {
+            var jp = sched_task_priority(vec_get(pending, j));
+            if (jp >= kp) { break; }
+            vec_set(pending, j + 1, vec_get(pending, j));
+            j = j - 1;
+        }
+        vec_set(pending, j + 1, key);
+        i = i + 1;
+    }
+    return pending;
+}
+
+# Find the best-fit node (lowest utilization that can fit the resource req)
+fn scheduler_best_fit(ts, cpu, mem, disk) {
+    var nodes = load64(ts + 8);
+    var keys = map_keys(nodes);
+    var best_id = 0;
+    var best_util = 101;  # Higher than max (100)
+    var i = 0;
+    while (i < vec_len(keys)) {
+        var nc = map_get(nodes, vec_get(keys, i));
+        if (node_cap_can_fit(nc, cpu, mem, disk) == 1) {
+            var util = node_cap_utilization(nc);
+            if (util < best_util) {
+                best_util = util;
+                best_id = node_cap_id(nc);
+            }
+        }
+        i = i + 1;
+    }
+    return best_id;
+}
+
+# Schedule all pending tasks — returns vec of decisions (as JSON strings)
+fn scheduler_schedule_pending(ts) {
+    var pending = scheduler_pending_tasks(ts);
+    var decisions = vec_new();
+    var nodes = load64(ts + 8);
+    var tasks = load64(ts);
+    var i = 0;
+    while (i < vec_len(pending)) {
+        var task = vec_get(pending, i);
+        var cpu = load64(task + 56);
+        var mem = load64(task + 64);
+        var node_id = scheduler_best_fit(ts, cpu, mem, 0);
+        if (node_id != 0) {
+            var nc = map_get(nodes, str_data(node_id));
+            if (nc != 0) { node_cap_reserve(nc, cpu, mem, 0); }
+            sched_task_transition(task, TASK_SCHEDULED);
+            # Build decision JSON
+            var sb = str_builder_new();
+            str_builder_add_cstr(sb, "{\"task_id\":\"");
+            str_builder_add(sb, sched_task_id(task));
+            str_builder_add_cstr(sb, "\",\"assigned_node\":\"");
+            str_builder_add(sb, node_id);
+            str_builder_add_cstr(sb, "\",\"reason\":\"best-fit\"}");
+            vec_push(decisions, str_builder_build(sb));
+        }
+        i = i + 1;
+    }
+    return decisions;
+}
+
+# Compute scheduler statistics
+fn scheduler_stats(ts) {
+    var tasks = load64(ts);
+    var keys = map_keys(tasks);
+    var total = vec_len(keys);
+    var queued = 0;
+    var running = 0;
+    var completed = 0;
+    var failed = 0;
+    var i = 0;
+    while (i < total) {
+        var t = map_get(tasks, vec_get(keys, i));
+        var s = sched_task_status(t);
+        if (s == TASK_QUEUED) { queued = queued + 1; }
+        elif (s == TASK_SCHEDULED) { queued = queued + 1; }
+        elif (s == TASK_PREEMPTED) { queued = queued + 1; }
+        elif (s == TASK_RUNNING) { running = running + 1; }
+        elif (s == TASK_COMPLETED) { completed = completed + 1; }
+        elif (s == TASK_CANCELLED) { completed = completed + 1; }
+        elif (s == TASK_FAILED) { failed = failed + 1; }
+        i = i + 1;
+    }
+    # Return packed stats: {total, queued, running, completed, failed}
+    var st = alloc(40);
+    store64(st, total);
+    store64(st + 8, queued);
+    store64(st + 16, running);
+    store64(st + 24, completed);
+    store64(st + 32, failed);
+    return st;
+}
+
+# Check if a high-priority task should preempt an existing running task
+fn scheduler_preempt_check(ts, new_task) {
+    var tasks = load64(ts);
+    var keys = map_keys(tasks);
+    var new_prio = sched_task_priority(new_task);
+    var new_class = priority_from_numeric(new_prio);
+    var candidate = 0;
+    var candidate_prio = 11;  # higher than max
+    var pi = 0;
+    while (pi < vec_len(keys)) {
+        var t = map_get(tasks, vec_get(keys, pi));
+        if (sched_task_status(t) == TASK_RUNNING) {
+            var tp = sched_task_priority(t);
+            var tc = priority_from_numeric(tp);
+            # new_class > tc means new task has higher priority
+            if (new_class > tc) {
+                if (tp < candidate_prio) {
+                    candidate = t;
+                    candidate_prio = tp;
+                }
+            }
+        }
+        pi = pi + 1;
+    }
+    return candidate;  # 0 if no preemption needed
+}
+
+# Tasks assigned to a specific node
+fn scheduler_tasks_for_node(ts, node_id_cstr) {
+    var tasks = load64(ts);
+    var keys = map_keys(tasks);
+    var result = vec_new();
+    var ti = 0;
+    while (ti < vec_len(keys)) {
+        var t = map_get(tasks, vec_get(keys, ti));
+        var status = sched_task_status(t);
+        if (status == TASK_SCHEDULED) { vec_push(result, t); }
+        elif (status == TASK_RUNNING) { vec_push(result, t); }
+        ti = ti + 1;
+    }
+    return result;
+}
+
+# CronEntry: {name: Str, interval_secs, specific_hour, specific_minute,
+#              task_name: Str, task_agent_id: Str, task_priority,
+#              enabled, last_fired}
+# 9 fields x 8 = 72 bytes
+
+fn cron_entry_new(name, interval_secs, task_name, task_agent_id, task_priority) {
+    var ce = alloc(72);
+    store64(ce, name);
+    store64(ce + 8, interval_secs);
+    store64(ce + 16, 0 - 1);          # specific_hour (-1 = any)
+    store64(ce + 24, 0 - 1);          # specific_minute (-1 = any)
+    store64(ce + 32, task_name);
+    store64(ce + 40, task_agent_id);
+    store64(ce + 48, task_priority);
+    store64(ce + 56, 1);              # enabled
+    store64(ce + 64, 0);              # last_fired
+    return ce;
+}
+
+fn cron_entry_name(ce) { return load64(ce); }
+fn cron_entry_enabled(ce) { return load64(ce + 56); }
+fn cron_entry_set_enabled(ce, e) { store64(ce + 56, e); }
+
+# CronScheduler: {entries: map<name_cstr, CronEntry>}
+fn cron_scheduler_new() {
+    var cs = alloc(8);
+    store64(cs, map_new());
+    return cs;
+}
+
+fn cron_add_entry(cs, entry) {
+    var name = cron_entry_name(entry);
+    if (str_len(name) == 0) { return Err(ERR_SCHEDULER); }
+    # Validate hour/minute if specified
+    var hour = load64(entry + 16);
+    if (hour >= 0) {
+        if (hour > 23) { return Err(ERR_SCHEDULER); }
+    }
+    var minute = load64(entry + 24);
+    if (minute >= 0) {
+        if (minute > 59) { return Err(ERR_SCHEDULER); }
+    }
+    map_set(load64(cs), str_data(name), entry);
+    return Ok(0);
+}
+
+fn cron_remove_entry(cs, name_cstr) {
+    return map_delete(load64(cs), name_cstr);
+}
+
+# Check which entries should fire now, return vec of task templates
+fn cron_check_fires(cs) {
+    var entries = load64(cs);
+    var keys = map_keys(entries);
+    var now = clock_epoch_secs();
+    var fired = vec_new();
+    var i = 0;
+    while (i < vec_len(keys)) {
+        var entry = map_get(entries, vec_get(keys, i));
+        if (load64(entry + 56) == 0) { i = i + 1; continue; }  # disabled
+        var last = load64(entry + 64);
+        var interval = load64(entry + 8);
+        if (interval > 0) {
+            if (now - last >= interval) {
+                store64(entry + 64, now);  # update last_fired
+                vec_push(fired, entry);
+            }
+        }
+        i = i + 1;
+    }
+    return fired;
+}
+
+fn cron_entry_count(cs) { return map_count(load64(cs)); }
+

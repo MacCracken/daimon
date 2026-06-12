@@ -1,0 +1,195 @@
+# =========================================================================
+# rag — text chunking, bag-of-words embedding, retrieval pipeline
+# =========================================================================
+
+# RagConfig: {top_k, chunk_size, overlap, min_relevance_score (f64),
+#              context_template: Str}
+# 5 fields x 8 = 40 bytes
+
+fn rag_config_default() {
+    var rc = alloc(40);
+    store64(rc, 5);                # top_k
+    store64(rc + 8, 512);          # chunk_size
+    store64(rc + 16, 64);          # overlap
+    store64(rc + 24, f64_from(0)); # min_relevance (0.1 not easily representable, use 0)
+    var prompt_tmpl = "Use the following context to answer the question.\n\n---\n{context}\n---\n\nQuestion: {query}";
+    store64(rc + 32, str_from(prompt_tmpl));
+    return rc;
+}
+
+fn rag_top_k(rc) { return load64(rc); }
+fn rag_chunk_size(rc) { return load64(rc + 8); }
+
+# Chunk text into pieces of at most chunk_size chars with overlap
+fn chunk_text(text, chunk_size, overlap) {
+    var chunks = vec_new();
+    var tlen = str_len(text);
+    if (tlen == 0) { return chunks; }
+    if (chunk_size == 0) { return chunks; }
+
+    if (overlap >= chunk_size) { overlap = chunk_size - 1; }
+    var step = chunk_size - overlap;
+    if (step == 0) { step = 1; }
+
+    var pos = 0;
+    while (pos < tlen) {
+        var end = pos + chunk_size;
+        if (end > tlen) { end = tlen; }
+        var chunk = str_sub(text, pos, end - pos);
+        vec_push(chunks, chunk);
+        pos = pos + step;
+    }
+    return chunks;
+}
+
+# Simple tokenize: split on non-alnum, lowercase
+fn tokenize(text) {
+    var tokens = vec_new();
+    var data = str_data(text);
+    var tlen = str_len(text);
+    var start = 0;
+    var i = 0;
+    while (i <= tlen) {
+        var c = 0;
+        if (i < tlen) { c = load8(data + i); }
+        var is_alnum = 0;
+        if (c >= 97) { if (c <= 122) { is_alnum = 1; } }
+        if (c >= 65) { if (c <= 90) { is_alnum = 1; } }
+        if (c >= 48) { if (c <= 57) { is_alnum = 1; } }
+
+        if (is_alnum == 0) {
+            if (i > start) {
+                # Extract token and lowercase it
+                var tok_len = i - start;
+                var tok_buf = alloc(tok_len + 1);
+                var j = 0;
+                while (j < tok_len) {
+                    var tc = load8(data + start + j);
+                    # Lowercase A-Z
+                    if (tc >= 65) { if (tc <= 90) { tc = tc + 32; } }
+                    store8(tok_buf + j, tc);
+                    j = j + 1;
+                }
+                store8(tok_buf + tok_len, 0);
+                vec_push(tokens, str_new(tok_buf, tok_len));
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return tokens;
+}
+
+# RagPipeline: {index: VectorIndex, config: RagConfig, next_id}
+# 3 fields x 8 = 24 bytes
+
+fn rag_pipeline_new(config) {
+    var rp = alloc(24);
+    store64(rp, vindex_new());
+    store64(rp + 8, config);
+    store64(rp + 16, 1);  # next_id counter
+    return rp;
+}
+
+fn rag_pipeline_index(rp) { return load64(rp); }
+fn rag_pipeline_config(rp) { return load64(rp + 8); }
+
+# Ingest text: chunk, create simple embeddings, insert into index
+fn rag_ingest_text(rp, text, metadata) {
+    var config = load64(rp + 8);
+    var cs = load64(config + 8);   # chunk_size
+    var ov = load64(config + 16);  # overlap
+    var chunks = chunk_text(text, cs, ov);
+    if (vec_len(chunks) == 0) { return vec_new(); }
+
+    var ids = vec_new();
+    var ci = 0;
+    while (ci < vec_len(chunks)) {
+        var chunk = vec_get(chunks, ci);
+        # Simple bag-of-words embedding: tokenize + count
+        var toks = tokenize(chunk);
+        var ntoks = vec_len(toks);
+        if (ntoks == 0) { ci = ci + 1; continue; }
+
+        # Create a simple embedding based on token hashes
+        var dim = 32;
+        var emb = alloc(dim * 8);
+        var ei = 0;
+        while (ei < dim) { store64(emb + ei * 8, f64_from(0)); ei = ei + 1; }
+
+        var ti = 0;
+        while (ti < ntoks) {
+            var tok = vec_get(toks, ti);
+            # Simple hash: sum of char values mod dim
+            var hash = 0;
+            var td = str_data(tok);
+            var tl = str_len(tok);
+            var hi = 0;
+            while (hi < tl) {
+                hash = hash + load8(td + hi);
+                hi = hi + 1;
+            }
+            var slot = hash % dim;
+            var cur = load64(emb + slot * 8);
+            store64(emb + slot * 8, f64_add(cur, f64_from(1)));
+            ti = ti + 1;
+        }
+
+        var id = load64(rp + 16);
+        store64(rp + 16, id + 1);
+        var entry = vec_entry_new(id, emb, dim, chunk, metadata);
+        vindex_insert(load64(rp), entry);
+        vec_push(ids, id);
+        ci = ci + 1;
+    }
+    return ids;
+}
+
+# Query the pipeline: embed query, search, format context
+fn rag_query_text(rp, query) {
+    var config = load64(rp + 8);
+    var top_k = load64(config);
+    var idx = load64(rp);
+
+    # Embed query same way as ingest
+    var toks = tokenize(query);
+    var ntoks = vec_len(toks);
+    var dim = 32;
+    var qemb = alloc(dim * 8);
+    var ei = 0;
+    while (ei < dim) { store64(qemb + ei * 8, f64_from(0)); ei = ei + 1; }
+
+    var ti = 0;
+    while (ti < ntoks) {
+        var tok = vec_get(toks, ti);
+        var hash = 0;
+        var td = str_data(tok);
+        var tl = str_len(tok);
+        var hi = 0;
+        while (hi < tl) { hash = hash + load8(td + hi); hi = hi + 1; }
+        var slot = hash % dim;
+        var cur = load64(qemb + slot * 8);
+        store64(qemb + slot * 8, f64_add(cur, f64_from(1)));
+        ti = ti + 1;
+    }
+
+    var results = vindex_search(idx, qemb, dim, top_k);
+
+    # Format context
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "Use the following context to answer the question.\n\n---\n");
+    var ri = 0;
+    while (ri < vec_len(results)) {
+        var sr = vec_get(results, ri);
+        str_builder_add_cstr(sb, "[");
+        str_builder_add_int(sb, ri + 1);
+        str_builder_add_cstr(sb, "] ");
+        str_builder_add(sb, search_result_content(sr));
+        str_builder_add_cstr(sb, "\n\n");
+        ri = ri + 1;
+    }
+    str_builder_add_cstr(sb, "---\n\nQuestion: ");
+    str_builder_add(sb, query);
+    return str_builder_build(sb);
+}
+

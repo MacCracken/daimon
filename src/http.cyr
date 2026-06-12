@@ -1,0 +1,135 @@
+# =========================================================================
+# http — HTTP constants, JSON escaping (VULN-002), request/response helpers
+# =========================================================================
+
+# --- HTTP constants ---
+
+var MAX_REQUEST_SIZE = 65536;
+var MAX_HEADER_SIZE = 8192;
+
+# --- JSON escaping (VULN-002) ---
+
+fn json_escape_str(s) {
+    var data = str_data(s);
+    var slen = str_len(s);
+    var sb = str_builder_new();
+    var ei = 0;
+    while (ei < slen) {
+        var c = load8(data + ei);
+        if (c == 34) { str_builder_add_cstr(sb, "\\\""); }
+        elif (c == 92) { str_builder_add_cstr(sb, "\\\\"); }
+        elif (c == 10) { str_builder_add_cstr(sb, "\\n"); }
+        elif (c == 13) { str_builder_add_cstr(sb, "\\r"); }
+        elif (c == 9) { str_builder_add_cstr(sb, "\\t"); }
+        elif (c < 32) {
+            # Control character — skip
+        }
+        else {
+            var cbuf[1];
+            store8(&cbuf, c);
+            str_builder_add(sb, str_new(&cbuf, 1));
+        }
+        ei = ei + 1;
+    }
+    return str_builder_build(sb);
+}
+
+# --- HTTP helpers ---
+
+# Sandhi-backed shims. Same signatures as the pre-1.1.4 hand-rolled
+# parsers so api_* / http_route call sites stay unchanged. Sandhi
+# brings hardening for free: case-insensitive header lookup, strict
+# RFC 7230 §3.3.2 Content-Length parsing (rejects "10, 20" CL.CL
+# smuggling vector that the old loose parser accepted), and tolerant
+# Transfer-Encoding token scan.
+
+fn http_parse_method(buf, len) {
+    var m = sandhi_server_get_method(buf, len);
+    if (streq(m, "GET") == 1) { return 0; }
+    if (streq(m, "POST") == 1) { return 1; }
+    if (streq(m, "PUT") == 1) { return 2; }
+    if (streq(m, "DELETE") == 1) { return 3; }
+    return 0;
+}
+
+# Returns path WITHOUT query string. sandhi_server_get_path returns
+# the full request-line path-and-query ("/foo?bar=baz");
+# sandhi_server_path_only strips at the first '?'.
+fn http_parse_path(buf, len) {
+    return sandhi_server_path_only(sandhi_server_get_path(buf, len));
+}
+
+# VULN-001: 1 if the request carries a Transfer-Encoding header at all
+# (daimon does not implement chunked decode and rejects with 501).
+# Sandhi additionally rejects CL+TE conflict in its accept-loop with
+# 400 before the handler runs (sandhi_server_request_has_cl_te_conflict).
+fn http_has_transfer_encoding(buf, len) {
+    if (sandhi_server_find_header(buf, len, "Transfer-Encoding") == 0) { return 0; }
+    return 1;
+}
+
+# Query param value, or 0 if absent. URL-decoded by sandhi.
+fn http_parse_query_param(buf, len, param_name) {
+    return sandhi_server_get_param(sandhi_server_get_path(buf, len), param_name);
+}
+
+# Body as a Str struct (data+len), or 0 if no body. Bounded by
+# Content-Length when the header is present (VULN-001 — never
+# trust raw recv'd bytes past the declared length).
+fn http_parse_body(buf, len) {
+    var bo = sandhi_server_body_offset(buf, len);
+    if (bo < 0) { return 0; }
+    var avail = len - bo;
+    if (avail <= 0) { return 0; }
+    var cl = sandhi_server_content_length(buf, len);
+    if (cl > 0 && cl < avail) { avail = cl; }
+    return str_new(buf + bo, avail);
+}
+
+# Status-code → reason-phrase. Centralized so http_send_response
+# (sandhi-backed shim) can hand the right RFC 7231 phrase to
+# sandhi_server_send_response. Codes daimon emits today: 200, 201,
+# 204, 400, 404, 409, 413, 422, 429, 501.
+fn _http_reason(status) {
+    if (status == 200) { return "OK"; }
+    if (status == 201) { return "Created"; }
+    if (status == 204) { return "No Content"; }
+    if (status == 400) { return "Bad Request"; }
+    if (status == 404) { return "Not Found"; }
+    if (status == 409) { return "Conflict"; }
+    if (status == 413) { return "Payload Too Large"; }
+    if (status == 422) { return "Unprocessable Entity"; }
+    if (status == 429) { return "Too Many Requests"; }
+    if (status == 501) { return "Not Implemented"; }
+    if (status == 502) { return "Bad Gateway"; }
+    return "Error";
+}
+
+# Sandhi-backed shim. Same signature as the pre-sandhi version so
+# every api_* call site stays unchanged. Always emits
+# Content-Type: application/json + Connection: close, matching
+# daimon original behaviour.
+fn http_send_response(fd, status, body_data, body_len) {
+    sandhi_server_send_response(fd, status, _http_reason(status),
+    "application/json", body_data, body_len, 0);
+}
+
+fn http_ok(fd, body) {
+    http_send_response(fd, 200, str_data(body), str_len(body));
+}
+
+fn http_not_found(fd) {
+    var body = str_from("{\"error\":\"not found\"}");
+    http_send_response(fd, 404, str_data(body), str_len(body));
+}
+
+fn http_bad_request(fd, msg) {
+    var body = error_json(400, msg);
+    http_send_response(fd, 400, str_data(body), str_len(body));
+}
+
+fn http_error(fd, code, msg) {
+    var body = error_json(code, msg);
+    http_send_response(fd, code, str_data(body), str_len(body));
+}
+

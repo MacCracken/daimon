@@ -1,0 +1,137 @@
+# =========================================================================
+# mcp — MCP tool registry (standalone types, no bote dependency)
+# =========================================================================
+
+# McpToolDescription: {name: Str, description: Str, input_schema: Str}
+# 3 fields x 8 = 24 bytes
+
+fn mcp_tool_new(name, desc, schema) {
+    var t = alloc(24);
+    store64(t, name);
+    store64(t + 8, desc);
+    store64(t + 16, schema);
+    return t;
+}
+
+fn mcp_tool_name(t) { return load64(t); }
+fn mcp_tool_desc(t) { return load64(t + 8); }
+fn mcp_tool_schema(t) { return load64(t + 16); }
+
+# Extract the MCP `inputSchema` from a registration body as compact JSON text.
+# inputSchema is a nested JSON object (e.g. {"type":"object","properties":{…}})
+# — the flat jget/json_parse path mangles nested values (it scans to the first
+# `,`/`}`), so we use bayan's typed engine: parse the body, look up the schema
+# (accepting the snake_case `input_schema` alias too), require a JSON object, and
+# re-emit it compactly. The returned Str is fresh str_builder heap, not aliased
+# to the request buffer. Returns str_from("{}") when the field is absent or is
+# not a JSON object — back-compatible with registrants that send no schema.
+# See docs/development/issues/2026-06-11-mcp-manifest-omits-tool-input-schema.md.
+fn mcp_extract_input_schema(body) {
+    if (body == 0) { return str_from("{}"); }
+    var root = bayan_json_v_parse(body);
+    if (root == 0) { return str_from("{}"); }
+    if (bayan_json_v_is_obj(root) == 0) { return str_from("{}"); }
+    var sv = bayan_json_v_obj_get(root, "inputSchema");
+    if (sv == 0) { sv = bayan_json_v_obj_get(root, "input_schema"); }
+    if (sv == 0) { return str_from("{}"); }
+    if (bayan_json_v_is_obj(sv) == 0) { return str_from("{}"); }
+    return bayan_json_v_build(sv);
+}
+
+# Schema text to emit for a tool in the MCP manifest. The stored schema is JSON
+# object text ({} or a real schema). Fall back to a permissive {"type":"object"}
+# when a tool has no schema (0 / empty) so the emitted `inputSchema` is always
+# valid JSON — builtins register with no schema today.
+fn mcp_manifest_schema(t) {
+    var s = mcp_tool_schema(t);
+    if (s == 0) { return str_from("{\"type\":\"object\"}"); }
+    if (str_len(s) == 0) { return str_from("{\"type\":\"object\"}"); }
+    return s;
+}
+
+# McpToolResult: {content: Str, is_error: i64}
+fn mcp_result_text(text) {
+    var r = alloc(16);
+    store64(r, text);
+    store64(r + 8, 0);
+    return r;
+}
+
+fn mcp_result_error(msg) {
+    var r = alloc(16);
+    store64(r, msg);
+    store64(r + 8, 1);
+    return r;
+}
+
+# McpHostRegistry: {builtin: map, external: map}
+fn mcp_registry_new() {
+    var reg = alloc(16);
+    store64(reg, map_new());     # builtin: name_cstr -> McpToolDescription
+    store64(reg + 8, map_new()); # external: name_cstr -> McpToolDescription
+    return reg;
+}
+
+fn mcp_register_builtin(reg, tool) {
+    var name = mcp_tool_name(tool);
+    map_set(load64(reg), str_cstr(name), tool);
+}
+
+# Deep-copy the tool's Strs and callback_url into registry-owned storage
+# before storing. The Strs handed in by api_mcp_register point into the
+# transient per-connection request buffer, which sync mode reuses for later
+# requests — storing them raw lets subsequent requests overwrite the registry
+# (names/descriptions/URLs render as fragments of later request bytes; a
+# clobbered URL sidesteps the registration-time SSRF guard). The bump
+# allocator never frees, so a plain str_clone is stable for the process
+# lifetime. See docs/development/issues/2026-06-11-mcp-registry-aliases-
+# request-buffer.md.
+fn mcp_register_external(reg, tool, callback_url) {
+    var name = str_clone(mcp_tool_name(tool));
+    var desc = str_clone(mcp_tool_desc(tool));
+    var schema = str_clone(mcp_tool_schema(tool));
+    var owned = mcp_tool_new(name, desc, schema);
+    var ext = alloc(16);
+    store64(ext, owned);
+    store64(ext + 8, str_clone(callback_url));
+    map_set(load64(reg + 8), str_cstr(name), ext);
+}
+
+fn mcp_tool_count(reg) {
+    return map_count(load64(reg)) + map_count(load64(reg + 8));
+}
+
+fn mcp_find_tool(reg, name_cstr) {
+    var t = map_get(load64(reg), name_cstr);
+    if (t != 0) { return t; }
+    var ext = map_get(load64(reg + 8), name_cstr);
+    if (ext != 0) { return load64(ext); }
+    return 0;
+}
+
+# Look up the callback URL for an external tool. Returns 0 if the name
+# resolves to a builtin or isn't registered. Pairs with mcp_find_tool —
+# call both at the dispatch site to decide builtin vs external routing.
+fn mcp_find_external_url(reg, name_cstr) {
+    var ext = map_get(load64(reg + 8), name_cstr);
+    if (ext == 0) { return 0; }
+    return load64(ext + 8);
+}
+
+# Validate a callback URL (basic SSRF protection)
+fn validate_callback_url(url) {
+    if (url == 0) { return Err(ERR_INVALID_PARAM); }
+    if (str_len(url) == 0) { return Err(ERR_INVALID_PARAM); }
+    # Must start with http:// or https://
+    if (str_starts_with(url, str_from("http://")) == 0) {
+        if (str_starts_with(url, str_from("https://")) == 0) {
+            return Err(ERR_INVALID_PARAM);
+        }
+    }
+    return Ok(0);
+}
+
+fn mcp_deregister(reg, name_cstr) {
+    return map_delete(load64(reg + 8), name_cstr);
+}
+
