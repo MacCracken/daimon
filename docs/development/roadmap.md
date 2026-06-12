@@ -78,6 +78,11 @@
 - [x] **Cyrius pin `6.1.39` → `6.1.40`** — `cyrius.lock` re-resolved (52 deps). Compiler-bug above reproduces under both pins (not a 6.1.40 regression).
 - [x] **Upstream-port status checked.** nein's Cyrius port still has **no `mcp.cyr`** (only `firewall`/`mesh`/`nat`/… ported; the Rust `mcp.rs` is unported) — firewall-MCP item stays blocked. bote **has landed `src/libro_tools.cyr` + `src/dispatch.cyr`** (tags through 2.7.3) — the MCP-hosting re-export dependency is now available; wiring it is its own future item.
 
+## Completed (v1.2.7)
+
+- [x] **MCP `inputSchema` on registration + manifest** (the MEDIUM consumer gap, filed by thoth — `docs/development/issues/2026-06-11-mcp-manifest-omits-tool-input-schema.md`). `api_mcp_register` reads an optional `inputSchema` (alias `input_schema`) and stores it verbatim; `api_mcp_manifest` emits it as raw JSON per tool (permissive `{"type":"object"}` fallback when unset). Nested-object value extracted via bayan's typed engine (`bayan_json_v_parse`→`obj_get`→`build`) since the flat `jget` path mangles nested values; ~1 µs/registration. Backward-compatible (absent → `{}`). 225/225 tests (+8), live round-trip verified.
+- [x] **Toolchain bump deferred — compiler bug not yet fixed.** Confirmed the upstream address-taken-local-array under-reservation (`2026-06-11-cyrius-addr-taken-local-array-static-overlap.md`) **still reproduces under cycc 6.2.0** (4-slot `var parts[4]` write corrupts the adjacent literal; 3-slot control clean). Pin stays at **6.1.40**, `ip_to_cstr` workaround stays. Re-check on the upstream fix (tracked for 6.2.1).
+
 ## v1.2.x — Current work arc
 
 Open items on the current arc, severity-tagged. The arc closes when the P2s land + the P3s drain (no hard cap; per the working-loop convention, ship when ready).

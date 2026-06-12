@@ -6,6 +6,49 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.2.7] - 2026-06-12
+
+**MCP tools now advertise per-tool input schemas** — closes the last gap blocking
+high-fidelity model-driven tool calling (filed by thoth,
+`docs/development/issues/2026-06-11-mcp-manifest-omits-tool-input-schema.md`).
+
+### Added
+
+- **`inputSchema` on MCP tool registration + manifest.** `POST /v1/mcp/tools`
+  now reads an optional `inputSchema` (accepting the `input_schema` snake_case
+  alias) — a nested JSON Schema object — and stores it verbatim on the tool;
+  `GET /v1/mcp/tools` emits it as raw JSON per tool. The `McpToolDescription`
+  struct already carried the slot (`input_schema`, accessor `mcp_tool_schema`);
+  it was write-once-empty (`mcp_tool_new(name, desc, str_from("{}"))`) and never
+  exported. Consumers (thoth → hoosh) can now pass real `function.parameters`
+  schemas to the model instead of a permissive `{"type":"object"}` guess.
+  - **Nested-object extraction.** The flat `json_parse`/`jget` path scans a value
+    to the first `,`/`}` and so mangles nested objects; `mcp_extract_input_schema`
+    instead uses bayan's typed engine (`bayan_json_v_parse` →
+    `bayan_json_v_obj_get` → `bayan_json_v_build`), requiring a JSON object and
+    re-emitting it compactly into fresh heap (not aliased to the request buffer —
+    consistent with the 1.2.5 deep-copy fix). ~1 µs per registration body
+    (`mcp_extract_input_schema` bench).
+  - **Manifest fallback.** `mcp_manifest_schema` emits the stored schema verbatim,
+    falling back to a permissive `{"type":"object"}` for any tool with no schema
+    (builtins register none today) so the emitted `inputSchema` is always valid
+    JSON.
+  - **Backward-compatible.** Absent `inputSchema` still defaults to `{}`; the
+    change is an additive response field + a new optional request field. No
+    route/contract change.
+
+### Verified
+
+- `cyrius lint`: 0 warnings. `cyrius fmt --check`: clean. `cyrius test`:
+  **225 / 225** pass (+8). Live end-to-end: register with a nested `inputSchema`
+  → manifest round-trips it as raw JSON; register without → `"inputSchema":{}`.
+- `cyrius.cyml` pin unchanged at **6.1.40**. Verified the upstream
+  address-taken-local-array compiler bug
+  (`2026-06-11-cyrius-addr-taken-local-array-static-overlap.md`) **still
+  reproduces under cycc 6.2.0** (minimal repro: 4-slot write to `var parts[4]`
+  corrupts the adjacent literal; 3-slot control clean) — the `ip_to_cstr`
+  workaround stays. Toolchain bump deferred pending the upstream fix.
+
 ## [1.2.6] - 2026-06-11
 
 **Async server collapse + aarch64 unblock + a HIGH-severity compiler-bug

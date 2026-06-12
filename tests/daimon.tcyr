@@ -430,6 +430,28 @@ fn mcp_tool_count(reg) {
     return map_count(load64(reg)) + map_count(load64(reg + 8));
 }
 
+# Mirrors src/main.cyr — extract the MCP inputSchema (or input_schema alias)
+# from a registration body as compact object text; "{}" when absent / non-object.
+fn mcp_extract_input_schema(body) {
+    if (body == 0) { return str_from("{}"); }
+    var root = bayan_json_v_parse(body);
+    if (root == 0) { return str_from("{}"); }
+    if (bayan_json_v_is_obj(root) == 0) { return str_from("{}"); }
+    var sv = bayan_json_v_obj_get(root, "inputSchema");
+    if (sv == 0) { sv = bayan_json_v_obj_get(root, "input_schema"); }
+    if (sv == 0) { return str_from("{}"); }
+    if (bayan_json_v_is_obj(sv) == 0) { return str_from("{}"); }
+    return bayan_json_v_build(sv);
+}
+
+# Mirrors src/main.cyr — manifest schema text with a permissive fallback.
+fn mcp_manifest_schema(t) {
+    var s = load64(t + 16);
+    if (s == 0) { return str_from("{\"type\":\"object\"}"); }
+    if (str_len(s) == 0) { return str_from("{\"type\":\"object\"}"); }
+    return s;
+}
+
 fn mcp_find_tool(reg, name_cstr) {
     var t = map_get(load64(reg), name_cstr);
     if (t != 0) { return t; }
@@ -1579,6 +1601,46 @@ fn main() {
     assert(is_err_result(validate_callback_url(str_from("javascript:alert(1)"))) == 1, "javascript: rejected");
     assert(is_ok(validate_callback_url(str_from("http://example.test/mcp"))) == 1, "http:// accepted");
     assert(is_ok(validate_callback_url(str_from("https://example.test/mcp"))) == 1, "https:// accepted");
+
+    # inputSchema extraction (issue 2026-06-11-mcp-manifest-omits-tool-input-schema).
+    # A nested object value must round-trip verbatim — the flat parser can't do
+    # this, so mcp_extract_input_schema uses bayan's typed engine. The compact
+    # re-emit is canonical, so equality against schema_json is exact.
+    var sj_a = str_from("{\"type\":\"object\",\"properties\":{\"text\":");
+    var sj_b = str_from("{\"type\":\"string\"}},\"required\":[\"text\"]}");
+    var schema_json = str_cat(sj_a, sj_b);
+    var sch_prefix = str_from("{\"name\":\"echo\",\"callback_url\":\"http://127.0.0.1:9000\",\"inputSchema\":");
+    var body_sch = str_cat(sch_prefix, str_cat(schema_json, str_from("}")));
+    var got_sch = mcp_extract_input_schema(body_sch);
+    assert(str_eq(got_sch, schema_json) == 1, "nested inputSchema extracted verbatim (compact)");
+
+    # snake_case alias accepted.
+    var body_alias = str_from("{\"name\":\"a\",\"input_schema\":{\"type\":\"object\"}}");
+    assert(str_eq(mcp_extract_input_schema(body_alias), str_from("{\"type\":\"object\"}")) == 1,
+    "input_schema alias accepted");
+
+    # Absent schema → {} (back-compatible default).
+    var body_none = str_from("{\"name\":\"a\",\"description\":\"d\"}");
+    assert(str_eq(mcp_extract_input_schema(body_none), str_from("{}")) == 1,
+    "absent inputSchema defaults to {}");
+
+    # Non-object schema (e.g. a string) rejected → {}.
+    var body_bad = str_from("{\"name\":\"a\",\"inputSchema\":\"not-an-object\"}");
+    assert(str_eq(mcp_extract_input_schema(body_bad), str_from("{}")) == 1,
+    "non-object inputSchema rejected → {}");
+
+    # End-to-end: register with a schema, recover it from the stored tool.
+    var sch_tool = mcp_tool_new(str_from("schematool"), str_from("d"), got_sch);
+    mcp_register_external(reg, sch_tool, str_from("http://127.0.0.1:9000"));
+    var stored = mcp_find_tool(reg, "schematool");
+    assert(stored != 0, "schema tool registered");
+    assert(str_eq(load64(stored + 16), schema_json) == 1, "stored schema deep-copied + recoverable");
+
+    # mcp_manifest_schema fallback: no schema → permissive {"type":"object"}.
+    var no_sch_tool = mcp_tool_new(str_from("b"), str_from("d"), str_from(""));
+    assert(str_eq(mcp_manifest_schema(no_sch_tool), str_from("{\"type\":\"object\"}")) == 1,
+    "empty schema falls back to permissive object");
+    assert(str_eq(mcp_manifest_schema(stored), schema_json) == 1, "manifest emits stored schema verbatim");
 
     # =============================================================
     # edge fleet

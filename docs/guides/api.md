@@ -33,13 +33,15 @@ Agent status values: 0=Pending, 1=Starting, 2=Running, 3=Paused, 4=Stopping, 5=S
 ## MCP Tools
 
 ```
-# List tools
+# List tools (inputSchema is raw JSON Schema; {} / {"type":"object"} when unset)
 GET /v1/mcp/tools
-→ {"tools":[{"name":"scan","description":"port scanner"}],"count":1}
+→ {"tools":[{"name":"scan","description":"port scanner","inputSchema":{"type":"object","properties":{"target":{"type":"string"}},"required":["target"]}}],"count":1}
 
-# Register external tool
+# Register external tool — inputSchema is optional (alias: input_schema),
+# stored verbatim, defaults to {} when omitted (back-compatible).
 POST /v1/mcp/tools
-{"name":"scan","description":"port scanner","callback_url":"http://localhost:9000"}
+{"name":"scan","description":"port scanner","callback_url":"http://localhost:9000",
+ "inputSchema":{"type":"object","properties":{"target":{"type":"string"}},"required":["target"]}}
 → 201 {"ok":true}
 
 # Call tool

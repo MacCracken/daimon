@@ -1275,6 +1275,38 @@ fn mcp_tool_name(t) { return load64(t); }
 fn mcp_tool_desc(t) { return load64(t + 8); }
 fn mcp_tool_schema(t) { return load64(t + 16); }
 
+# Extract the MCP `inputSchema` from a registration body as compact JSON text.
+# inputSchema is a nested JSON object (e.g. {"type":"object","properties":{…}})
+# — the flat jget/json_parse path mangles nested values (it scans to the first
+# `,`/`}`), so we use bayan's typed engine: parse the body, look up the schema
+# (accepting the snake_case `input_schema` alias too), require a JSON object, and
+# re-emit it compactly. The returned Str is fresh str_builder heap, not aliased
+# to the request buffer. Returns str_from("{}") when the field is absent or is
+# not a JSON object — back-compatible with registrants that send no schema.
+# See docs/development/issues/2026-06-11-mcp-manifest-omits-tool-input-schema.md.
+fn mcp_extract_input_schema(body) {
+    if (body == 0) { return str_from("{}"); }
+    var root = bayan_json_v_parse(body);
+    if (root == 0) { return str_from("{}"); }
+    if (bayan_json_v_is_obj(root) == 0) { return str_from("{}"); }
+    var sv = bayan_json_v_obj_get(root, "inputSchema");
+    if (sv == 0) { sv = bayan_json_v_obj_get(root, "input_schema"); }
+    if (sv == 0) { return str_from("{}"); }
+    if (bayan_json_v_is_obj(sv) == 0) { return str_from("{}"); }
+    return bayan_json_v_build(sv);
+}
+
+# Schema text to emit for a tool in the MCP manifest. The stored schema is JSON
+# object text ({} or a real schema). Fall back to a permissive {"type":"object"}
+# when a tool has no schema (0 / empty) so the emitted `inputSchema` is always
+# valid JSON — builtins register with no schema today.
+fn mcp_manifest_schema(t) {
+    var s = mcp_tool_schema(t);
+    if (s == 0) { return str_from("{\"type\":\"object\"}"); }
+    if (str_len(s) == 0) { return str_from("{\"type\":\"object\"}"); }
+    return s;
+}
+
 # McpToolResult: {content: Str, is_error: i64}
 fn mcp_result_text(text) {
     var r = alloc(16);
@@ -3184,7 +3216,9 @@ fn api_mcp_manifest(fd) {
         str_builder_add(sb, json_escape_str(mcp_tool_name(t)));
         str_builder_add_cstr(sb, "\",\"description\":\"");
         str_builder_add(sb, json_escape_str(mcp_tool_desc(t)));
-        str_builder_add_cstr(sb, "\"}");
+        str_builder_add_cstr(sb, "\",\"inputSchema\":");
+        str_builder_add(sb, mcp_manifest_schema(t));
+        str_builder_add_cstr(sb, "}");
         i = i + 1;
     }
     # Also add external tools
@@ -3198,7 +3232,9 @@ fn api_mcp_manifest(fd) {
         str_builder_add(sb, json_escape_str(mcp_tool_name(t)));
         str_builder_add_cstr(sb, "\",\"description\":\"");
         str_builder_add(sb, json_escape_str(mcp_tool_desc(t)));
-        str_builder_add_cstr(sb, "\"}");
+        str_builder_add_cstr(sb, "\",\"inputSchema\":");
+        str_builder_add(sb, mcp_manifest_schema(t));
+        str_builder_add_cstr(sb, "}");
         j = j + 1;
     }
     str_builder_add_cstr(sb, "],\"count\":");
@@ -3280,7 +3316,9 @@ fn api_mcp_register(fd, body) {
         http_bad_request(fd, str_from("invalid callback_url (must be http:// or https://)"));
         return 0;
     }
-    var tool = mcp_tool_new(name, desc, str_from("{}"));
+    # Read the optional MCP inputSchema (verbatim object text, {} if absent).
+    var schema = mcp_extract_input_schema(body);
+    var tool = mcp_tool_new(name, desc, schema);
     mcp_register_external(_mcp_registry, tool, url);
     http_send_response(fd, 201, "{\"ok\":true}", 11);
     return 0;
