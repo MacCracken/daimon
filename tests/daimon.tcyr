@@ -1565,11 +1565,11 @@ fn main() {
     var rb_url = mcp_find_external_url(reg, "buftool");
     assert(rb_url != 0, "buffer-backed tool survives source clobber (lookup)");
     assert(str_eq(rb_url, str_from("http://up.test/x")) == 1,
-        "callback_url deep-copied, not aliased to request buffer");
+    "callback_url deep-copied, not aliased to request buffer");
     var rb_tool = mcp_find_tool(reg, "buftool");
     assert(rb_tool != 0, "buffer-backed tool findable after clobber");
     assert(str_eq(load64(rb_tool), str_from("buftool")) == 1,
-        "tool name deep-copied, not aliased to request buffer");
+    "tool name deep-copied, not aliased to request buffer");
 
     # validate_callback_url — boundary cases for the SSRF guard.
     assert(is_err_result(validate_callback_url(0)) == 1, "null url rejected");
