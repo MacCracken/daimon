@@ -6,6 +6,49 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.2.5] - 2026-06-11
+
+**Security fix + toolchain bump.** Closes a HIGH-severity registry-aliasing bug
+reported by thoth (consumer), and moves the language pin **6.1.24 → 6.1.39**.
+
+### Fixed
+
+- **MCP host registry aliased the transient request buffer (HIGH).** `mcp_register_external`
+  stored the `name` / `description` / `callback_url` `Str`s produced by `json_parse(body)`
+  directly into the registry. Those `Str`s point into the per-connection request buffer,
+  which sync mode reuses for later requests — so every subsequent request overwrote the
+  bytes the registry pointed at. Symptoms: `GET /v1/mcp/tools` rendered tool names/descriptions
+  as fragments of *later* requests' bytes, and `POST /v1/mcp/call` returned `502 {"upstream":""}`
+  because the stored `callback_url` was clobbered. Worse than availability: a clobbered URL is
+  *whatever bytes a later request left at that offset*, which could steer an external tool call
+  to an attacker-influenced URL **after** registration, sidestepping the `validate_callback_url`
+  SSRF guard that runs only at registration time.
+  - **Fix:** `mcp_register_external` now deep-copies (`str_clone`) the tool's `name` /
+    `description` / `schema` and the `callback_url` into registry-owned (bump-allocated,
+    process-lifetime-stable) storage before storing. `api_mcp_call` re-validates the stored
+    URL with `validate_callback_url` at dispatch time (defense-in-depth; returns `502` if a
+    stored URL is ever non-http(s)).
+  - **Verified:** new `mcp_registry` regression test registers an external tool from a mutable
+    buffer, overwrites every source byte (as a later request would), and asserts the registry
+    still resolves the original name + URL. Live repro from the issue now passes — a tool
+    registered with a 1-byte description survives arbitrary intervening requests.
+  - Reported in `docs/development/issues/2026-06-11-mcp-registry-aliases-request-buffer.md`
+    (thoth 0.3.0, M4). Consumer-side padding workaround is no longer needed.
+
+### Changed
+
+- **`cyrius.cyml`** — `cyrius = "6.1.39"` (was `"6.1.24"`). The `json` stdlib module was folded
+  into the **`bayan`** distribution bundle in the 6.1.x line (`json_parse` / `json_get` /
+  `json_get_int` ship as compat shims from `bayan.cyr`); `[deps].stdlib` swaps `"json"` → `"bayan"`,
+  and the two test files' `include "lib/json.cyr"` become `include "lib/bayan.cyr"`. Daimon's own
+  `json_escape_str` (src/main.cyr) is unaffected. `cyrius.lock` re-resolved: **52 deps locked**.
+
+### Verified
+
+- `cyrius lint src/main.cyr`: 0 warnings. `cyrius fmt --check`: clean. `cyrius test`:
+  **217 / 217** assertions pass (was 213 — +4 from the registry regression test).
+- `cyrius build src/main.cyr`: OK. Binary boots clean: `daimon v1.2.5 listening on port 8090 (sync)`.
+
 ## [1.2.4] - 2026-06-10
 
 **Major toolchain bump + dependency refresh.** Moves the language pin from cyrius **5.10.44 → 6.1.24** (first 6.x pin) in `cyrius.cyml`, bumps the `sakshi` git-pin **2.2.3 → 2.2.10**, and picks up the bundled **sandhi 1.3.3 → 1.4.10** that rides in with the 6.1.24 toolchain. No daimon source changes — the sandhi/sakshi call surfaces daimon uses are unchanged.

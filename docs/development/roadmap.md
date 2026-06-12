@@ -65,6 +65,11 @@
 - [x] Verified sandhi 1.4.10 keeps daimon's API surface (`sandhi_server_run{,_opts}`, `sandhi_server_options_idle_ms`, `sandhi_server_recv_request`, `sandhi_rpc_mcp_call`) and the `TLS_EARLY_DATA_ACCEPTED` rationale for the transitive tls/mmap/dynlib/fdlopen deps.
 - [x] Build size noted: ~624 KB (1.2.2) → ~1.43 MB — 6.x DCE NOPs-but-keeps dead code vs. 5.x stripping it; toolchain effect, not a daimon regression.
 
+## Completed (v1.2.5)
+
+- [x] **HIGH security fix — MCP host registry aliased the transient request buffer.** `mcp_register_external` stored the `name`/`description`/`callback_url` `Str`s straight from `json_parse(body)` (which point into the per-connection request buffer, reused for later requests), so subsequent requests silently overwrote the registry — corrupting `/v1/mcp/tools` output and clobbering stored callback URLs (an SSRF-guard bypass at call time). Fix deep-copies (`str_clone`) all four fields into registry-owned bump storage and re-validates the URL in `api_mcp_call`. New `mcp_registry` regression test (source-buffer-clobber). Reported by thoth 0.3.0 (M4) — `docs/development/issues/2026-06-11-mcp-registry-aliases-request-buffer.md`. **217/217 tests pass** (+4), 0 lint warnings.
+- [x] **Cyrius pin `6.1.24` → `6.1.39`** — the `json` stdlib module folded into the `bayan` distribution bundle (`json_parse`/`json_get`/`json_get_int` ship as compat shims from `bayan.cyr`); `[deps].stdlib` swaps `"json"` → `"bayan"` and the two test files' `include "lib/json.cyr"` → `include "lib/bayan.cyr"`. Daimon's own `json_escape_str` unaffected. `cyrius.lock` re-resolved to 52 deps.
+
 ## v1.2.x — Current work arc
 
 Open items on the current arc, severity-tagged. The arc closes when the P2s land + the P3s drain (no hard cap; per the working-loop convention, ship when ready).

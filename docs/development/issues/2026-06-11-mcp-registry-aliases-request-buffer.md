@@ -1,8 +1,22 @@
 # MCP host registry aliases the transient request buffer — entries corrupt as later requests arrive
 
-**Status:** open — filed 2026-06-11 by thoth (consumer), daimon 1.2.4
+**Status:** RESOLVED in daimon 1.2.5 — filed 2026-06-11 by thoth (consumer),
+daimon 1.2.4
 **Severity:** HIGH — external MCP tool calls fail or fire at attacker-influenced
 URLs depending on byte offsets of *subsequent unrelated requests*
+
+## Resolution (1.2.5)
+
+`mcp_register_external` (src/main.cyr) now deep-copies (`str_clone`) the tool's
+`name` / `description` / `schema` and the `callback_url` into registry-owned
+bump-allocated storage before storing — the bump allocator never frees, so the
+copies are stable for the process lifetime. `api_mcp_call` additionally
+re-validates the stored URL with `validate_callback_url` at dispatch time
+(defense-in-depth against a stored URL ever holding a non-http(s) value). A new
+`mcp_registry` regression test registers a tool from a mutable buffer, overwrites
+every source byte as a later request would, and asserts the registry still
+resolves the original name + URL. The 1-byte-description repro below now succeeds.
+The operator-side padding workaround is no longer needed.
 
 ## Symptom
 

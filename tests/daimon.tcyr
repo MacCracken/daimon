@@ -13,7 +13,7 @@ include "lib/io.cyr"
 include "lib/fs.cyr"
 include "lib/hashmap.cyr"
 include "lib/tagged.cyr"
-include "lib/json.cyr"
+include "lib/bayan.cyr"
 include "lib/chrono.cyr"
 include "lib/syscalls.cyr"
 include "lib/assert.cyr"
@@ -412,11 +412,18 @@ fn mcp_register_builtin(reg, tool) {
     map_set(load64(reg), str_data(load64(tool)), tool);
 }
 
+# Mirrors src/main.cyr — deep-copies the tool Strs and callback_url into
+# registry-owned storage so transient request-buffer reuse can't corrupt the
+# registry (issue 2026-06-11-mcp-registry-aliases-request-buffer).
 fn mcp_register_external(reg, tool, callback_url) {
+    var name = str_clone(load64(tool));
+    var desc = str_clone(load64(tool + 8));
+    var schema = str_clone(load64(tool + 16));
+    var owned = mcp_tool_new(name, desc, schema);
     var ext = alloc(16);
-    store64(ext, tool);
-    store64(ext + 8, callback_url);
-    map_set(load64(reg + 8), str_data(load64(tool)), ext);
+    store64(ext, owned);
+    store64(ext + 8, str_clone(callback_url));
+    map_set(load64(reg + 8), str_data(name), ext);
 }
 
 fn mcp_tool_count(reg) {
@@ -1538,6 +1545,31 @@ fn main() {
     # Builtin lookups return 0 for the external-URL accessor.
     assert(mcp_find_external_url(reg, "scan") == 0, "builtin has no external URL");
     assert(mcp_find_external_url(reg, "nonexistent") == 0, "missing has no external URL");
+
+    # Regression (issue 2026-06-11): registration must deep-copy the tool
+    # Strs and callback_url. Simulate the transient per-connection request
+    # buffer by registering from a mutable buffer, then overwriting every
+    # byte of it with later-request garbage. The registry must still resolve
+    # the original name/URL — not fragments of the clobbering bytes.
+    var rbuf = alloc(64);
+    memcpy(rbuf, str_data(str_from("buftool")), 7);
+    var buf_name = str_new(rbuf, 7);
+    var ubuf = alloc(64);
+    memcpy(ubuf, str_data(str_from("http://up.test/x")), 16);
+    var buf_url = str_new(ubuf, 16);
+    var buf_tool = mcp_tool_new(buf_name, str_from("d"), str_from("{}"));
+    mcp_register_external(reg, buf_tool, buf_url);
+    # Clobber both source buffers — as a subsequent request would.
+    memset(rbuf, 88, 64); # 'X'
+    memset(ubuf, 88, 64);
+    var rb_url = mcp_find_external_url(reg, "buftool");
+    assert(rb_url != 0, "buffer-backed tool survives source clobber (lookup)");
+    assert(str_eq(rb_url, str_from("http://up.test/x")) == 1,
+        "callback_url deep-copied, not aliased to request buffer");
+    var rb_tool = mcp_find_tool(reg, "buftool");
+    assert(rb_tool != 0, "buffer-backed tool findable after clobber");
+    assert(str_eq(load64(rb_tool), str_from("buftool")) == 1,
+        "tool name deep-copied, not aliased to request buffer");
 
     # validate_callback_url — boundary cases for the SSRF guard.
     assert(is_err_result(validate_callback_url(0)) == 1, "null url rejected");

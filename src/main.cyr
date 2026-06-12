@@ -1270,6 +1270,7 @@ fn mcp_tool_new(name, desc, schema) {
 
 fn mcp_tool_name(t) { return load64(t); }
 fn mcp_tool_desc(t) { return load64(t + 8); }
+fn mcp_tool_schema(t) { return load64(t + 16); }
 
 # McpToolResult: {content: Str, is_error: i64}
 fn mcp_result_text(text) {
@@ -1299,11 +1300,23 @@ fn mcp_register_builtin(reg, tool) {
     map_set(load64(reg), str_cstr(name), tool);
 }
 
+# Deep-copy the tool's Strs and callback_url into registry-owned storage
+# before storing. The Strs handed in by api_mcp_register point into the
+# transient per-connection request buffer, which sync mode reuses for later
+# requests — storing them raw lets subsequent requests overwrite the registry
+# (names/descriptions/URLs render as fragments of later request bytes; a
+# clobbered URL sidesteps the registration-time SSRF guard). The bump
+# allocator never frees, so a plain str_clone is stable for the process
+# lifetime. See docs/development/issues/2026-06-11-mcp-registry-aliases-
+# request-buffer.md.
 fn mcp_register_external(reg, tool, callback_url) {
-    var name = mcp_tool_name(tool);
+    var name = str_clone(mcp_tool_name(tool));
+    var desc = str_clone(mcp_tool_desc(tool));
+    var schema = str_clone(mcp_tool_schema(tool));
+    var owned = mcp_tool_new(name, desc, schema);
     var ext = alloc(16);
-    store64(ext, tool);
-    store64(ext + 8, callback_url);
+    store64(ext, owned);
+    store64(ext + 8, str_clone(callback_url));
     map_set(load64(reg + 8), str_cstr(name), ext);
 }
 
@@ -3298,6 +3311,15 @@ fn api_mcp_call(fd, body) {
         # implemented for this tool kind.
         var b = error_json(501, str_from("builtin tool dispatch not implemented"));
         http_send_response(fd, 501, str_data(b), str_len(b));
+        return 0;
+    }
+    # Re-validate the stored URL at dispatch time. Registration already runs
+    # validate_callback_url, but re-checking here is cheap defense-in-depth
+    # against a registry-owned URL ever holding a non-http(s) value before we
+    # hand it to sandhi_rpc_mcp_call.
+    if (is_err_result(validate_callback_url(url)) == 1) {
+        var bu = error_json(502, str_from("registered callback_url is not http(s)"));
+        http_send_response(fd, 502, str_data(bu), str_len(bu));
         return 0;
     }
     # Forward to the external MCP endpoint. The inbound body is already
