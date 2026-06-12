@@ -372,7 +372,7 @@ fn agent_spawn_with_limits(cmd, arg1, arg2, mem_limit, cpu_limit) {
             syscall(SYS_SETRLIMIT, RLIMIT_CPU, rlim_cpu);
         }
         # exec
-        var argv_buf[4];
+        var argv_buf: i64[4];
         store64(&argv_buf, cmd);
         store64(&argv_buf + 8, arg1);
         store64(&argv_buf + 16, arg2);
@@ -434,7 +434,7 @@ fn agent_stop(h, reason) {
     var pid = agent_pid(h);
     if (pid > 0) {
         agent_send_signal(pid, 15);  # SIGTERM
-        var status_buf[1];
+        var status_buf: i32[1];  # wait4 writes a 4-byte int status
         var wr = syscall(SYS_WAIT4, pid, &status_buf, 1, 0);  # WNOHANG
         if (wr == 0) {
             agent_send_signal(pid, 9);  # SIGKILL
@@ -2837,7 +2837,7 @@ fn agent_ipc_bind(ipc) {
 fn ipc_get_peer_uid(cfd) {
     # struct ucred { pid_t pid; uid_t uid; gid_t gid; } = 12 bytes
     var cred_buf = alloc(16);
-    var cred_len[1];
+    var cred_len: u32[1];  # socklen_t in/out (4 bytes)
     store32(&cred_len, 12);
     # getsockopt(fd, SOL_SOCKET=1, SO_PEERCRED=17, buf, &len)
     var r = syscall(SYS_GETSOCKOPT, cfd, 1, 17, cred_buf, &cred_len);
@@ -2869,7 +2869,7 @@ fn agent_ipc_accept_one(fd, ipc) {
     _global_active_connections = _global_active_connections + 1;
 
     # Read 4-byte big-endian length prefix
-    var len_buf[1];
+    var len_buf: u8[4];  # 4-byte big-endian length prefix
     var nr = syscall(SYS_READ, cfd, &len_buf, 4);
     if (nr != 4) {
         syscall(SYS_CLOSE, cfd);
@@ -2939,7 +2939,7 @@ fn agent_ipc_send(target_socket_path, message_str) {
 
     # Write length prefix (big-endian u32) + message
     var msg_len = str_len(message_str);
-    var hdr[1];
+    var hdr: u8[4];  # 4-byte big-endian length prefix
     store8(&hdr, (msg_len >> 24) & 255);
     store8(&hdr + 1, (msg_len >> 16) & 255);
     store8(&hdr + 2, (msg_len >> 8) & 255);
@@ -3522,7 +3522,7 @@ fn api_edge_list(fd, buf, buf_len) {
 fn api_edge_get(fd, id_cstr) {
     var n = edge_fleet_get(_edge_fleet, id_cstr);
     if (n == 0) { http_error(fd, 404, str_from("edge node not found")); return 0; }
-    var status_names[5];
+    var status_names: i64[5];
     store64(&status_names, "Online");
     store64(&status_names + 8, "Suspect");
     store64(&status_names + 16, "Offline");
@@ -3618,7 +3618,7 @@ fn api_sched_list(fd) {
 fn api_sched_get_task(fd, id_cstr) {
     var task = scheduler_get(_scheduler, id_cstr);
     if (task == 0) { http_error(fd, 404, str_from("task not found")); return 0; }
-    var status_names[7];
+    var status_names: i64[7];
     store64(&status_names, "Queued");
     store64(&status_names + 8, "Scheduled");
     store64(&status_names + 16, "Running");
@@ -3878,9 +3878,12 @@ fn get_peer_ip(cfd) {
 fn ip_to_cstr(ip) {
     var ib = alloc(20);
     var off = 0;
-    # Format a.b.c.d. Compute each octet inline (no address-taken local
-    # array — `&parts` here triggered a compiler bug that placed the
-    # array in static storage overlapping an adjacent string literal).
+    # Format a.b.c.d. Compute each octet inline (no fixed local array).
+    # Originally a workaround for a 6.1.x compiler bug where an address-taken
+    # `var parts[4]` under-reserved its static backing; cyrius 6.2.1 fixed the
+    # footgun by introducing element-typed arrays (`var a: i64[N]`, used
+    # elsewhere in this file for slot arrays). The inline form is retained here
+    # — it allocates no array and is the clearest spelling for this hot path.
     var pi = 0;
     while (pi < 4) {
         var val = (ip >> (pi * 8)) & 255;

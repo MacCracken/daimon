@@ -6,11 +6,59 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.2.8] - 2026-06-12
+
+**Toolchain pin `6.1.40` → `6.2.2` + adoption of cyrius 6.2.1's element-typed
+arrays.** This retires the 1.2.6 compiler-bug workaround era: the upstream fix
+was a **language change**, not a silent codegen patch.
+
+### Breaking (internal ABI of fixed local arrays — no API/wire change)
+
+- **cyrius 6.2.1 redefined bare `var a[N]`.** It now has explicit per-scope
+  semantics — **N bytes inside a function**, N i64 slots at top level — and adds
+  element-typed arrays `var a: T[N]` (reserves `N * sizeof(T)` bytes identically
+  in any scope). Under the new rule, daimon's address-taken fixed local arrays
+  that stored i64 slots / multi-byte syscall buffers were **under-reserved** (a
+  function-local `var a[4]` is 4 bytes, not 32) — latent, layout-sensitive
+  corruption on the exec / IPC / edge-status paths. See the cyrius 6.2.1
+  CHANGELOG ("element-typed arrays + daimon-class slot-array sweep"); daimon was
+  the motivating consumer (the 1.2.6 `parts[4]` 404 bug).
+
+### Fixed
+
+- **Daimon-class slot-array sweep — every address-taken fixed local array sized
+  to its real footprint** (`src/main.cyr`):
+  - `argv_buf: i64[4]` (execve argv — 4 pointer slots), and the two edge/scheduler
+    `status_names: i64[5]` / `i64[7]` status tables (store64 string slots).
+  - Syscall scratch buffers to exact widths: `status_buf: i32[1]` (wait4 status
+    int), `cred_len: u32[1]` (SO_PEERCRED socklen_t), `len_buf: u8[4]` +
+    `hdr: u8[4]` (4-byte big-endian IPC length prefixes). The genuine 1-byte
+    buffers (`ack_buf`, two `cbuf`) stay bare `[1]` — now idiomatically 1 byte.
+  - `ip_to_cstr` keeps its inline-octet form (allocates no array; clearest for
+    the rate-limiter hot path); stale "compiler-bug workaround" comment updated.
+
+### Changed
+
+- **`cyrius.cyml` pin `6.1.40` → `6.2.2`** (frontend annotation-token fix for
+  aarch64/macOS + ecosystem stdlib fold-in; `cyrius.lock` 52 deps).
+- **Sakshi pin `2.2.10` → `2.3.0`** — the re-folded release carrying sakshi's own
+  daimon-class fix (`ts[2]` timespec hot path); requires pin ≥ 6.2.1.
+
+### Verified
+
+- `cyrius lint`: 0 warnings. `cyrius fmt --check`: clean. `cyrius test`:
+  **225 / 225** pass. Build clean (pin matches cycc 6.2.2; drift warning gone).
+  Live: edge-node GET renders `"status":"Online"` (exercises `status_names:
+  i64[5]`); element-typed `var parts: i64[4]` reproducer returns exit 32 (no
+  corruption) under 6.2.2, confirming the upstream fix.
+- Resolved compiler-bug issue archived
+  (`docs/development/issues/archive/2026-06-11-cyrius-addr-taken-local-array-static-overlap.md`).
+
 ## [1.2.7] - 2026-06-12
 
 **MCP tools now advertise per-tool input schemas** — closes the last gap blocking
 high-fidelity model-driven tool calling (filed by thoth,
-`docs/development/issues/2026-06-11-mcp-manifest-omits-tool-input-schema.md`).
+`docs/development/issues/archive/2026-06-11-mcp-manifest-omits-tool-input-schema.md`).
 
 ### Added
 
@@ -45,9 +93,10 @@ high-fidelity model-driven tool calling (filed by thoth,
 - `cyrius.cyml` pin unchanged at **6.1.40**. Verified the upstream
   address-taken-local-array compiler bug
   (`2026-06-11-cyrius-addr-taken-local-array-static-overlap.md`) **still
-  reproduces under cycc 6.2.0** (minimal repro: 4-slot write to `var parts[4]`
-  corrupts the adjacent literal; 3-slot control clean) — the `ip_to_cstr`
-  workaround stays. Toolchain bump deferred pending the upstream fix.
+  reproduces under cycc 6.2.0 *and* 6.2.1** (minimal repro: 4-slot write to
+  `var parts[4]` corrupts the adjacent literal → exit 99; 3-slot control clean
+  → exit 32) — the `ip_to_cstr` workaround stays. Toolchain bump deferred
+  pending the upstream fix.
 
 ## [1.2.6] - 2026-06-11
 

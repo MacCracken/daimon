@@ -80,8 +80,12 @@
 
 ## Completed (v1.2.7)
 
-- [x] **MCP `inputSchema` on registration + manifest** (the MEDIUM consumer gap, filed by thoth — `docs/development/issues/2026-06-11-mcp-manifest-omits-tool-input-schema.md`). `api_mcp_register` reads an optional `inputSchema` (alias `input_schema`) and stores it verbatim; `api_mcp_manifest` emits it as raw JSON per tool (permissive `{"type":"object"}` fallback when unset). Nested-object value extracted via bayan's typed engine (`bayan_json_v_parse`→`obj_get`→`build`) since the flat `jget` path mangles nested values; ~1 µs/registration. Backward-compatible (absent → `{}`). 225/225 tests (+8), live round-trip verified.
-- [x] **Toolchain bump deferred — compiler bug not yet fixed.** Confirmed the upstream address-taken-local-array under-reservation (`2026-06-11-cyrius-addr-taken-local-array-static-overlap.md`) **still reproduces under cycc 6.2.0** (4-slot `var parts[4]` write corrupts the adjacent literal; 3-slot control clean). Pin stays at **6.1.40**, `ip_to_cstr` workaround stays. Re-check on the upstream fix (tracked for 6.2.1).
+- [x] **MCP `inputSchema` on registration + manifest** (the MEDIUM consumer gap, filed by thoth — `docs/development/issues/archive/2026-06-11-mcp-manifest-omits-tool-input-schema.md`). `api_mcp_register` reads an optional `inputSchema` (alias `input_schema`) and stores it verbatim; `api_mcp_manifest` emits it as raw JSON per tool (permissive `{"type":"object"}` fallback when unset). Nested-object value extracted via bayan's typed engine (`bayan_json_v_parse`→`obj_get`→`build`) since the flat `jget` path mangles nested values; ~1 µs/registration. Backward-compatible (absent → `{}`). 225/225 tests (+8), live round-trip verified.
+- [x] **Toolchain bump deferred — compiler bug not yet fixed (superseded by v1.2.8).** An interim note here claimed the address-taken-local-array bug "still reproduces under 6.2.0/6.2.1" — that was a **test error** (the reproducer used bare `var parts[4]`, which 6.2.1 *correctly* makes a 4-byte buffer). The bug was in fact **fixed in cyrius 6.2.1** via element-typed arrays; adopted in v1.2.8 below.
+
+## Completed (v1.2.8)
+
+- [x] **Toolchain pin `6.1.40` → `6.2.2` + adopted cyrius 6.2.1 element-typed arrays.** The compiler bug (`docs/development/issues/archive/2026-06-11-cyrius-addr-taken-local-array-static-overlap.md`) was fixed upstream as a **language change**: bare `var a[N]` is now N **bytes** in a fn, and the slot form is `var a: i64[N]` (full `N*8` bytes). Swept every daimon-class site in `src/main.cyr` — `argv_buf: i64[4]`, two `status_names: i64[N]`, plus sized syscall buffers (`status_buf: i32[1]`, `cred_len: u32[1]`, `len_buf`/`hdr: u8[4]`). `ip_to_cstr` keeps its inline form. Sakshi pin `2.2.10` → `2.3.0` (re-folded daimon-class fix). **Lesson: read the upstream language CHANGELOG before re-testing a "fixed" footgun.** 225/225 tests, 0 lint, live edge-status render verified.
 
 ## v1.2.x — Current work arc
 

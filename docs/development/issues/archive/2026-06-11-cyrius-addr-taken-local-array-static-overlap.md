@@ -1,10 +1,28 @@
 # cyrius 6.1.40 — address-taken fixed local array under-reserves static backing, corrupts adjacent literal
 
-**Status:** open — filed 2026-06-11, daimon 1.2.6
+**Status:** RESOLVED upstream in **cyrius 6.2.1**; adopted daimon-side in 1.2.8
+(pin → 6.2.2). The fix was a **language change, not a silent codegen patch** —
+see the cyrius 6.2.1 CHANGELOG ("element-typed arrays `var a: T[N]` + daimon-class
+slot-array sweep"). Bare `var a[N]` now has explicit per-scope semantics (N
+**bytes** in a fn, N i64 slots at top level); the unambiguous slot form is
+`var a: i64[N]`, which reserves the full `N*8` bytes identically in any scope.
+daimon converted every address-taken slot/multi-byte local array to a sized
+element-typed array (`argv_buf: i64[4]`, two `status_names: i64[N]`, plus
+`status_buf: i32[1]` / `cred_len: u32[1]` / `len_buf` + `hdr: u8[4]`); see
+CHANGELOG [1.2.8]. The `ip_to_cstr` inline workaround is retained (allocates no
+array; clearest for that hot path).
+
+> **Note (2026-06-12):** an interim re-test claimed this "still reproduces under
+> 6.2.0/6.2.1" — that was a **test error**: the reproducer used bare `var parts[4]`,
+> which under the 6.2.1 language is *correctly* a 4-byte buffer, so a 32-byte slot
+> write overruns *by design*. Re-tested with `var parts: i64[4]` → exit 32 (clean)
+> under 6.2.2. Read the upstream CHANGELOG before re-testing a "fixed" footgun.
+
 **Severity:** HIGH (upstream cyrius) — silent static-memory corruption; in daimon
 it manifested as *every* HTTP route returning 404
-**Component:** cyrius compiler (`cycc` 6.1.40, also reproduced under the 6.1.39
-pin) — codegen / storage allocation for address-taken fixed-size local arrays
+**Component:** cyrius compiler (`cycc` 6.1.40, also reproduced under 6.1.39) —
+storage allocation for address-taken fixed-size local arrays. Fixed in 6.2.1 by
+the element-typed-array language feature.
 **Filed by:** daimon (consumer)
 
 ## Summary

@@ -8,7 +8,7 @@
 - **Language**: Cyrius (ported from 9,724 LOC Rust)
 - **Purpose**: AGNOS agent orchestrator — HTTP API, supervisor, IPC, scheduler, federation, edge fleet, memory, MCP dispatch (port 8090)
 - **License**: GPL-3.0-only
-- **Cyrius**: 6.1.40 (pinned in `cyrius.cyml`)
+- **Cyrius**: 6.2.2 (pinned in `cyrius.cyml`)
 - **Version**: CalVer (see VERSION file)
 - **Genesis repo**: [agnosticos](https://github.com/MacCracken/agnosticos)
 - **Philosophy**: [AGNOS Philosophy & Intention](https://github.com/MacCracken/agnosticos/blob/main/docs/philosophy.md)
@@ -38,7 +38,7 @@ External (non-stdlib) deps used by daimon:
 
 | Dep | Purpose |
 |--------|--------|
-| `sakshi` (2.2.10) | Structured logging/tracing — git-pinned via `[deps.sakshi]` in `cyrius.cyml`; resolved into `lib/sakshi.cyr` (gitignored) by `cyrius deps`. 2.2.x adds arch-portable syscalls (x86_64 + aarch64) and opt-in `sakshi_clock_recalibrate()`. The `msg_len`-required call surface is unchanged since 2.0.0. |
+| `sakshi` (2.3.0) | Structured logging/tracing — git-pinned via `[deps.sakshi]` in `cyrius.cyml`; resolved into `lib/sakshi.cyr` (gitignored) by `cyrius deps`. 2.3.0 is the re-folded release carrying sakshi's own daimon-class slot-array fix (`ts[2]` timespec → `i64[N]`; requires pin ≥ 6.2.1). 2.2.x added arch-portable syscalls (x86_64 + aarch64) and opt-in `sakshi_clock_recalibrate()`. The `msg_len`-required call surface is unchanged since 2.0.0. |
 
 **ADR-002 is invalid** — `lib/async.cyr` provides epoll-based cooperative async:
 ```cyrius
@@ -109,6 +109,7 @@ Every AGNOS agent, every consumer app, hoosh, agnoshi, aethersafha.
 - Use `Result`/`Option` tagged unions for error handling
 - Zero-crash in library code — no unguarded aborts
 - Use accessor functions for struct fields
+- **Fixed local arrays: use element-typed `var a: i64[N]` for slot arrays** (and `u8[N]` / `i32[N]` / `u32[N]` for sized byte/scalar buffers). Since cyrius 6.2.1, bare `var a[N]` is **N bytes in a function** (N i64 slots only at top level) — an address-taken `var a[N]` written via `store64(&a + i*8)` under-reserves and silently corrupts adjacent memory. This caused the 1.2.6 routing-404 bug; swept in 1.2.8. Before re-testing any "fixed" compiler footgun, **read the cyrius language CHANGELOG** — fixes there are often language changes, not silent codegen patches.
 - Original Rust implementations available in git history (pre-v0.7.0 tags)
 
 ## DO NOT
