@@ -6,6 +6,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.2.9] - 2026-06-15
+
+**Toolchain + stdlib refresh: cyrius `6.2.2` → `6.2.11`, vendored sandhi
+`1.4.10` → `1.6.2`.** Routine dependency bump that also clears a latent
+cross-module constant collision newly surfaced by 6.2.11's guardrail.
+
+### Changed
+
+- **cyrius pin `6.2.2` → `6.2.11`** (`cyrius.cyml`). Picks up the
+  constant-collision guardrail (warns on data symbols redefined with a
+  conflicting compile-time value), the aarch64-Linux INET/`poll`→`ppoll`
+  syscall fix, and the Darwin IPv6 socket surface.
+- **Vendored stdlib resynced to the 6.2.11 snapshot** — `lib/sandhi.cyr`
+  `1.4.10` → `1.6.2` (composes the new `net` IPv6 + non-blocking surface,
+  drops its hand-rolled Darwin socket shims) and the `tls_native` module
+  split into per-concern peers (`tls_native_conn/ctx/hs12/hs13/keysched/
+  lowlevel`). `cyrius.lock`'s reachable closure grew 52 → 60 entries
+  accordingly (gitignored `lib/` repopulated by `cyrius deps`). `sakshi`
+  stays at `2.3.0` (already latest).
+
+### Fixed
+
+- **`DaimonError.ERR_IO` removed — name-collided with sigil's
+  `SigilError.ERR_IO`.** sigil (pulled in transitively via `tls`) defines
+  `ERR_IO = 6` and returns it from four internal I/O-failure paths; daimon's
+  enum defined `ERR_IO = 10`. Under cyrius's flatten-to-one-scope model this
+  is a "last definition wins" collision (newly flagged by the 6.2.11
+  guardrail) that could silently corrupt sigil's error code. daimon never
+  referenced `ERR_IO`, so the slot was dropped; reintroduce only under a
+  non-colliding name (e.g. `ERR_IO_FAULT`).
+
 ## [1.2.8] - 2026-06-12
 
 **Codebase refactor — the 4.1k-line `src/main.cyr` monolith split into 25

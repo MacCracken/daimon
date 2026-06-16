@@ -13,7 +13,12 @@ enum DaimonError {
     ERR_FEDERATION = 7;
     ERR_API = 8;
     ERR_STORAGE = 9;
-    ERR_IO = 10;
+    # NB: no ERR_IO here — the name collides with sigil's SigilError.ERR_IO
+    # (=6, used internally by lib/sigil.cyr), which is pulled in transitively
+    # via tls. cyrius 6.2.11's constant-collision guardrail flags it
+    # ("last definition wins"), and a stray daimon def would silently
+    # corrupt sigil's I/O error code. daimon never used ERR_IO; reintroduce
+    # only under a non-colliding name (e.g. ERR_IO_FAULT).
 }
 
 # Map error code to HTTP status code

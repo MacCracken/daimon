@@ -5,7 +5,7 @@ description = "daimon — AGNOS agent orchestrator"
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/daimon"
 language = "cyrius"
-cyrius = "6.2.2"
+cyrius = "6.2.11"
 
 [build]
 entry = "src/main.cyr"

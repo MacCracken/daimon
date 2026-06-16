@@ -8,7 +8,7 @@
 - **Language**: Cyrius (ported from 9,724 LOC Rust)
 - **Purpose**: AGNOS agent orchestrator — HTTP API, supervisor, IPC, scheduler, federation, edge fleet, memory, MCP dispatch (port 8090)
 - **License**: GPL-3.0-only
-- **Cyrius**: 6.2.2 (pinned in `cyrius.cyml`)
+- **Cyrius**: 6.2.11 (pinned in `cyrius.cyml`)
 - **Version**: CalVer (see VERSION file)
 - **Genesis repo**: [agnosticos](https://github.com/MacCracken/agnosticos)
 - **Philosophy**: [AGNOS Philosophy & Intention](https://github.com/MacCracken/agnosticos/blob/main/docs/philosophy.md)
@@ -26,8 +26,8 @@ The following stdlib modules are available via `cyrius.cyml` deps. **Async IS av
 | `async` | **Cooperative async runtime — epoll event loop, spawn, sleep, await_readable, timeout** |
 | `thread` | Clone-based threads, mutex, MPSC channels |
 | `net` | TCP sockets (connect, listen, accept, read, write) |
-| `sandhi` | **In use as of 1.1.4** (bundled `sandhi 1.4.10` as of cyrius 6.1.24) — drives both sync (`sandhi_server_run`) and async (`sandhi_server_recv_request` + smuggling checks inline) HTTP paths. `http_*` shims in `src/main.cyr` are sandhi-backed. Daimon does NOT use sandhi's HTTP/2 / SSE / RPC modules at runtime — but their compile-time deps (`tls`, `mmap`, `dynlib`, `fdlopen`) ARE in `[deps].stdlib` since 1.2.0 because sandhi 1.4.10's bundle unconditionally references `TLS_EARLY_DATA_ACCEPTED` for its 0-RTT client-write path. DCE drops the unused runtime; `sandhi_rpc_mcp_call` is the 1.2.1 hook for unstubbing external MCP forwarding (see `api_mcp_call`). |
-| `tls`, `mmap`, `dynlib`, `fdlopen` | Pulled in transitively by sandhi 1.4.10's bundle. Daimon does not call any of these directly today — present for compile-time symbol resolution only. |
+| `sandhi` | **In use as of 1.1.4** (bundled `sandhi 1.6.2` as of cyrius 6.2.11) — drives both sync (`sandhi_server_run`) and async (`sandhi_server_recv_request` + smuggling checks inline) HTTP paths. `http_*` shims in `src/main.cyr` are sandhi-backed. Daimon does NOT use sandhi's HTTP/2 / SSE / RPC modules at runtime — but their compile-time deps (`tls`, `mmap`, `dynlib`, `fdlopen`) ARE in `[deps].stdlib` since 1.2.0 because sandhi's bundle unconditionally references `TLS_EARLY_DATA_ACCEPTED` for its 0-RTT client-write path. DCE drops the unused runtime; `sandhi_rpc_mcp_call` is the 1.2.1 hook for unstubbing external MCP forwarding (see `api_mcp_call`). |
+| `tls`, `mmap`, `dynlib`, `fdlopen` | Pulled in transitively by sandhi 1.6.2's bundle. Daimon does not call any of these directly today — present for compile-time symbol resolution only. (As of cyrius 6.2.11 `tls_native` is split into per-concern peers — `tls_native_conn/ctx/hs12/hs13/keysched/lowlevel` — all resolved transitively; no daimon-side change.) |
 | `bayan` | JSON parse/emit (+ base64, csv, u128). The `json` stdlib module folded into the `bayan` distribution bundle in the 6.1.x line as of the 6.1.39 pin; `json_parse` / `json_get` / `json_get_int` ship as compat shims from `bayan.cyr`. Daimon's own `json_escape_str` lives in `src/main.cyr`. |
 | `hashmap` | Hash map. `map_new()` = cstr keys; `map_new_str()` = `Str` struct keys; `map_u64_new()` = u64 inline keys (5.5.20). Pick at construction. |
 | `process` | Fork, exec, waitpid |
