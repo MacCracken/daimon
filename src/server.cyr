@@ -103,6 +103,7 @@ fn rate_check(cfd) {
 fn handle_request(ctx, cfd, buf, blen) {
     if (rate_check(cfd) == 0) {
         var rl_msg = "{\"error\":\"too many requests\"}";
+        daimon_audit(SEV_WARNING, "http", "http.ratelimit", "per-ip rate limit exceeded");
         http_send_response(cfd, 429, rl_msg, strlen(rl_msg));
         return 0;
     }

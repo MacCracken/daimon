@@ -25,7 +25,8 @@ fn app_init() {
     _mem_store = memory_store_new(str_from("/var/lib/agnos/agent-memory"));
     _vindex = vindex_new();
     _mcp_registry = mcp_registry_new();
-    mcp_libro_init(_mcp_registry);  # register bote libro audit tools as builtins
+    daimon_audit_init();            # create the libro audit chain + genesis entry
+    mcp_libro_init(_mcp_registry);  # register bote libro audit tools as builtins (over that chain)
     _scheduler = task_scheduler_new();
     _fed_mgr = fed_mgr_new(SCHED_BALANCED);
     _edge_fleet = edge_fleet_new(edge_fleet_config_default());

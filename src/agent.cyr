@@ -292,6 +292,7 @@ fn agent_start(h, executable) {
     agent_set_pid(h, pid);
     agent_set_started_at(h, clock_epoch_secs());
     agent_set_status(h, AGENT_RUNNING);
+    daimon_audit_agent(SEV_INFO, "agent", "agent.spawn", "agent process started", str_data(name));
     return Ok(pid);
 }
 
@@ -324,6 +325,7 @@ fn agent_stop(h, reason) {
         }
     }
     agent_set_status(h, AGENT_STOPPED);
+    daimon_audit_agent(SEV_INFO, "agent", "agent.stop", "agent stopped", str_data(agent_name(h)));
     return Ok(0);
 }
 

@@ -19,20 +19,11 @@
 # (agent lifecycle, MCP calls) into the chain is a follow-up once the
 # audit-event source is settled (see roadmap v1.3.0 arc).
 
-# The libro audit chain daimon exposes. Set in mcp_libro_init, shared with
-# bote's libro_tools module via libro_tools_init.
-var _libro_chain = 0;
-
-fn mcp_libro_chain() { return _libro_chain; }
-
-# Register the five libro tools as builtins + bind bote's libro_tools to a
-# fresh chain. Call once from app_init after the MCP registry exists.
+# Register the five libro tools as builtins + bind bote's libro_tools to
+# daimon's audit chain (audit.cyr owns it; daimon_audit_init must run first).
+# Call once from app_init after the MCP registry exists.
 fn mcp_libro_init(reg) {
-    _libro_chain = chain_new();
-    chain_append(_libro_chain, SEV_INFO, str_from("daimon"),
-    str_from("mcp.host.init"),
-    str_from("daimon MCP host initialized; libro audit tools online"));
-    libro_tools_init(_libro_chain);
+    libro_tools_init(daimon_audit_chain());
 
     var schema = str_from("{\"type\":\"object\"}");
     mcp_register_builtin(reg, mcp_tool_new(str_from("libro_query"),

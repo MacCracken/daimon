@@ -57,7 +57,7 @@ cyrius build tests/daimon.bcyr build/daimon_bench && build/daimon_bench
 ## Project Structure
 
 ```
-src/                  Source (27 modules, entry src/main.cyr)
+src/                  Source (28 modules, entry src/main.cyr)
 tests/daimon.tcyr     Test suite (225 assertions)
 tests/daimon.bcyr     Benchmarks (17)
 fuzz/                 Fuzz harnesses (5)

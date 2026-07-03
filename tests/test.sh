@@ -30,6 +30,11 @@ LIBRO_MANIFEST=$(curl -s --max-time 2 "http://localhost:$LIBRO_PORT/v1/mcp/tools
 LIBRO_EXPORT=$(curl -s --max-time 2 -X POST "http://localhost:$LIBRO_PORT/v1/mcp/call" -d '{"name":"libro_export","arguments":{}}' || true)
 LIBRO_VERIFY=$(curl -s --max-time 2 -X POST "http://localhost:$LIBRO_PORT/v1/mcp/call" -d '{"name":"libro_verify","arguments":{}}' || true)
 LIBRO_QUERY=$(curl -s --max-time 2 -X POST "http://localhost:$LIBRO_PORT/v1/mcp/call" -d '{"name":"libro_query","arguments":{"min_severity":1}}' || true)
+# Audit feed: an SSRF-rejected registration (file:// callback_url) must be
+# recorded on the chain as action "mcp.register.reject" — proves daimon's own
+# events reach the libro tools, not just the genesis entry.
+curl -s --max-time 2 -X POST "http://localhost:$LIBRO_PORT/v1/mcp/tools" -d '{"name":"evil","description":"x","callback_url":"file:///etc/passwd"}' >/dev/null 2>&1 || true
+LIBRO_AUDIT=$(curl -s --max-time 2 -X POST "http://localhost:$LIBRO_PORT/v1/mcp/call" -d '{"name":"libro_export","arguments":{}}' || true)
 kill $LIBRO_SRV 2>/dev/null || true
 libro_check() {
     printf "  %s: " "$2"
@@ -40,6 +45,7 @@ libro_check "$LIBRO_MANIFEST" "libro_query listed"          'libro_query'
 libro_check "$LIBRO_EXPORT"   "export returns genesis entry" 'mcp.host.init'
 libro_check "$LIBRO_VERIFY"   "verify: chain integrity ok"   '"ok":true'
 libro_check "$LIBRO_QUERY"    "query filters by severity"    'mcp.host.init'
+libro_check "$LIBRO_AUDIT"    "audit records SSRF-rejected registration" 'mcp.register.reject'
 if [ $LIBRO_OK -ne 1 ]; then echo "  libro smoke FAILED"; TEST_EXIT=1; fi
 
 echo ""

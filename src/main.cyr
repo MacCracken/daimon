@@ -44,6 +44,7 @@ var SYS_GETSOCKOPT = 55;
 # --- daimon modules (dependency order; split out of the former 4.1k-line main) ---
 include "src/error.cyr"
 include "src/config.cyr"
+include "src/audit.cyr"
 include "src/agent.cyr"
 include "src/supervisor.cyr"
 include "src/memory.cyr"

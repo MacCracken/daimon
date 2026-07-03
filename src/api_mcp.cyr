@@ -56,6 +56,7 @@ fn api_mcp_register(fd, body) {
     # Reject non-http(s) URLs at the boundary — SSRF guard + downstream
     # contract (sandhi_rpc_mcp_call requires an http:// or https:// URL).
     if (is_err_result(validate_callback_url(url)) == 1) {
+        daimon_audit(SEV_SECURITY, "mcp", "mcp.register.reject", "callback_url failed http(s) validation");
         http_bad_request(fd, str_from("invalid callback_url (must be http:// or https://)"));
         return 0;
     }
@@ -120,6 +121,7 @@ fn api_mcp_call(fd, body) {
     # the MCP `tools/call` params shape ({name, arguments}) so we hand
     # it through verbatim. sandhi_rpc_mcp_call wraps it as JSON-RPC 2.0
     # {jsonrpc, id, method:"tools/call", params:<body>}.
+    daimon_audit(SEV_INFO, "mcp", "mcp.call", name_c);
     var resp = sandhi_rpc_mcp_call(str_cstr(url), "tools/call", str_cstr(body));
     if (sandhi_rpc_ok(resp) == 0) {
         # Transport-level failure — connect / TLS / timeout / non-2xx.

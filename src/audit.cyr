@@ -1,0 +1,51 @@
+# =========================================================================
+# audit — daimon audit trail over a hash-linked libro chain
+# =========================================================================
+#
+# daimon records security- and lifecycle-relevant events onto a single
+# append-only, hash-linked libro chain (libro, via the bote MCP bundle). The
+# same chain backs the libro_* MCP tools (mcp_builtin.cyr), so an operator can
+# query / verify / export / prove / apply-retention over daimon's own audit
+# trail through the MCP surface.
+#
+# Event shape (libro entry): severity + source + action + details.
+#   severity  SEV_DEBUG(0) INFO(1) WARNING(2) ERROR(3) CRITICAL(4) SECURITY(5)
+#   source    subsystem tag  — "agent" | "ipc" | "http" | "mcp"
+#   action    dotted verb    — "agent.spawn" | "ipc.auth.deny" | "mcp.call" ...
+#   details   free text. NOTE: libro's tool JSON emits severity/source/action/
+#             agent_id, NOT details — keep security-sensitive or attacker-
+#             controlled data OUT of `details` (it is stored but not exported).
+#
+# All append helpers are no-ops until daimon_audit_init runs (from app_init),
+# so any instrumented code path exercised without a chain stays safe.
+
+var _audit_chain = 0;
+
+# The audit chain — also the chain the libro_* MCP tools read. 0 until init.
+fn daimon_audit_chain() { return _audit_chain; }
+
+# Create the chain + a genesis entry. Call once from app_init, before
+# mcp_libro_init binds the libro tools to it.
+fn daimon_audit_init() {
+    _audit_chain = chain_new();
+    chain_append(_audit_chain, SEV_INFO, str_from("daimon"),
+    str_from("mcp.host.init"),
+    str_from("daimon MCP host initialized; libro audit tools online"));
+    return 0;
+}
+
+# Append an audit event. source/action/details are cstrs (literals or dynamic)
+# wrapped as libro Str at the boundary. No-op if the chain is not up.
+fn daimon_audit(severity, source, action, details) {
+    if (_audit_chain == 0) { return 0; }
+    chain_append(_audit_chain, severity, str_from(source), str_from(action), str_from(details));
+    return 0;
+}
+
+# Agent-scoped audit event — records the agent identity on the entry.
+fn daimon_audit_agent(severity, source, action, details, agent_ident) {
+    if (_audit_chain == 0) { return 0; }
+    chain_append_with_agent(_audit_chain, severity, str_from(source),
+    str_from(action), str_from(details), str_from(agent_ident));
+    return 0;
+}

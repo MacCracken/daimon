@@ -230,6 +230,7 @@ fn agent_ipc_accept_one(fd, ipc) {
     if (peer_uid >= 0) {
         if (peer_uid != my_uid) {
             if (peer_uid != 0) {  # Allow root
+                daimon_audit(SEV_SECURITY, "ipc", "ipc.auth.deny", "peer uid mismatch on control socket");
                 syscall(SYS_CLOSE, cfd);
                 return Err(ERR_IPC_FAULT);
             }

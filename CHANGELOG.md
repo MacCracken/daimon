@@ -4,7 +4,9 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [1.3.1] - Unreleased
+
+Cut for follow-up work after the 1.3.0 arc. No changes recorded yet.
 
 ## [1.3.0] - 2026-07-03
 
@@ -27,12 +29,22 @@ in-process-dispatched tools.**
   daimon's existing builtin + external tools. `mcp_dispatch_builtin` returns 0
   for an unregistered builtin, preserving the 501 path for tool kinds with no
   in-process handler.
-- **Dependencies added** for the above: `bote 3.0.0` (full `dist/bote.cyr`
-  bundle — module-trimming to the reachable surface is a follow-up), its
-  transitive `libro 2.7.10` (audit chain) and `majra 2.5.0` (event sink, present
-  for compile-time resolution only), plus the stdlib modules they require
-  (`ct`, `keccak`, `random`, `slice`, `thread_local`, `sync`, `ws_server`).
-  `cyrius.lock` grew to 71 deps.
+- **daimon's own audit events feed the libro chain** (`src/audit.cyr`). The
+  chain owned by `audit.cyr` (genesis-seeded at `daimon_audit_init`) is the same
+  one the libro_* tools read, so `query`/`verify`/`export`/`proof`/`retention`
+  operate on a live audit trail. Instrumented events: `agent.spawn` /
+  `agent.stop` (INFO, agent-scoped), `ipc.auth.deny` (SECURITY — SO_PEERCRED UID
+  mismatch), `http.ratelimit` (WARNING — per-IP 429), `mcp.register.reject`
+  (SECURITY — SSRF-guard rejection), and `mcp.call` (INFO — external tool
+  forward). `daimon_audit*` is a no-op until the chain is up, so instrumented
+  paths are safe in unit contexts. Security-sensitive/attacker-controlled data
+  is kept out of the entry `details` field (libro's tool JSON emits
+  severity/source/action/agent_id, not details).
+- **Dependencies added** for the above: `bote 3.0.0` (the `dist/bote.cyr`
+  bundle), its transitive `libro 2.7.10` (audit chain) and `majra 2.5.0` (event
+  sink, present for compile-time resolution only), plus the stdlib modules they
+  require (`ct`, `keccak`, `random`, `slice`, `thread_local`, `sync`,
+  `ws_server`). `cyrius.lock` grew to 71 deps.
 - **Integration smoke** in `tests/test.sh` — starts the server and asserts the
   manifest advertises the five tools and that `libro_export` / `libro_verify` /
   `libro_query` dispatch correctly over the seeded chain (the `.tcyr` unit suite
@@ -82,8 +94,7 @@ in-process-dispatched tools.**
   passes (manifest lists 5 tools; `libro_export`/`verify`/`query` dispatch over
   the seeded chain) and all 5 fuzz harnesses build + pass. Two cross-bundle
   duplicate-fn warnings (`_sub_new`, `cancel_token_new` — majra/bote both bundle
-  shared code; "last wins", harmless) are expected artifacts of the full-bundle
-  approach and clear when the bundle is trimmed.
+  shared code; "last wins", harmless).
 
 ## [1.2.9] - 2026-06-15
 

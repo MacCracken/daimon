@@ -135,7 +135,7 @@ Next audit slot: at v1.3.0 cut, or sooner if a CVE pattern surfaces in daimon's 
 | File | Last touched | Status | Notes |
 |---|---|---|---|
 | `api.md` | 2026-07-03 | ✅ Fresh | 24-endpoint API reference. Verified current in the 1.3.0 pass — carries no cyrius-pin or version-tied example commands; no change needed. |
-| `quickstart.md` | 2026-07-03 | ✅ Fresh | Prereq → cyrius 6.3.43; build block adds `cyrius lib sync` + `cyrius deps` (lib/ gitignored); 225-test count; 27-module structure. |
+| `quickstart.md` | 2026-07-03 | ✅ Fresh | Prereq → cyrius 6.3.43; build block adds `cyrius lib sync` + `cyrius deps` (lib/ gitignored); 225-test count; 28-module structure. |
 
 ---
 
