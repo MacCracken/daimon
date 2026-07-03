@@ -6,6 +6,85 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-07-03
+
+**Toolchain to latest (`6.2.11` → `6.3.43`), VERSION established as the single
+source of truth for daimon's version, the doc surface refreshed to the current
+pins, and bote's libro audit tools wired into the MCP host as builtin,
+in-process-dispatched tools.**
+
+### Added
+
+- **bote libro audit tools hosted as builtin MCP tools** (`src/mcp_builtin.cyr`).
+  daimon owns a single hash-linked libro audit chain (`chain_new`, seeded with a
+  genesis entry at startup) and exposes bote's five `libro_*` tools —
+  `libro_query` / `libro_verify` / `libro_export` / `libro_proof` /
+  `libro_retention` — as builtins in its own MCP registry. `POST /v1/mcp/call`
+  now dispatches builtin tools **in-process** (previously **501 Not
+  Implemented**): it extracts the raw MCP `arguments` object and calls bote's
+  handler, returning the handler JSON verbatim (bote's own `resp_success(id,
+  result)` convention). `/v1/mcp/tools` advertises the five tools alongside
+  daimon's existing builtin + external tools. `mcp_dispatch_builtin` returns 0
+  for an unregistered builtin, preserving the 501 path for tool kinds with no
+  in-process handler.
+- **Dependencies added** for the above: `bote 3.0.0` (full `dist/bote.cyr`
+  bundle — module-trimming to the reachable surface is a follow-up), its
+  transitive `libro 2.7.10` (audit chain) and `majra 2.5.0` (event sink, present
+  for compile-time resolution only), plus the stdlib modules they require
+  (`ct`, `keccak`, `random`, `slice`, `thread_local`, `sync`, `ws_server`).
+  `cyrius.lock` grew to 71 deps.
+- **Integration smoke** in `tests/test.sh` — starts the server and asserts the
+  manifest advertises the five tools and that `libro_export` / `libro_verify` /
+  `libro_query` dispatch correctly over the seeded chain (the `.tcyr` unit suite
+  is self-contained and can't reach the linked bundle code).
+
+### Changed
+
+- **`DaimonError.ERR_IPC` (=5) renamed `ERR_IPC_FAULT` (=10)** across `error.cyr`
+  + the 13 `ipc.cyr` call sites. majra (via the bote bundle) defines its own
+  `ERR_IPC = 4`; cyrius's constant-collision guardrail flags a same-name /
+  different-value redefinition. Same class as the `ERR_IO` note in 1.2.9.
+
+- **cyrius pin `6.2.11` → `6.3.43`** (`cyrius.cyml`) — latest toolchain; drift
+  between the pin and the installed wrapper is cleared (`cyrius --version` now
+  reports `manifest-pin: 6.3.43`, no drift warning). Vendored stdlib resynced
+  from the 6.3.43 snapshot: **sandhi `1.6.2` → `1.7.0`**, **sigil `3.7.13` →
+  `3.10.0`**. `sakshi` git-pin `2.3.0` → `2.4.3`. `cyrius.lock` re-resolved to
+  61 deps.
+- **`sigil` added to `[deps].stdlib`.** 6.3.43's `tls_native_lowlevel` (pulled
+  in transitively by sandhi's bundle for compile-time symbol resolution) now
+  references `sha384_init_into`, which is defined in `sigil`. `cyrius lib sync`
+  vendors the *declared* stdlib subset, so sigil was left at its stale 3.7.13
+  copy (lacking the symbol) → a reachable-undefined build error until sigil was
+  declared. This is the same transitive-closure requirement already documented
+  for `tls`/`mmap`/`dynlib`/`fdlopen`; sigil is the next such entry. daimon
+  calls nothing in sigil directly — present for compile-time resolution only;
+  the crypto path is unreachable at runtime.
+- **VERSION is the single source of truth for daimon's version.** New
+  `daimon_version()` helper (`config.cyr`) is the only code path that produces
+  the version string, reading the `VERSION` file (the same file `cyrius.cyml`
+  reads via `${file:VERSION}` for `[package].version`). The two duplicated
+  read-`VERSION`-then-fall-back sites (`main.cyr` `version` command,
+  `server.cyr` banner) collapse to one call each. The stale, duplicated
+  `"1.1.0"` fallback literal is replaced by a single `"unknown"` sentinel —
+  deliberately not a real number, so a missing VERSION file can never
+  masquerade as a stale release. No daimon-version literal remains anywhere but
+  `VERSION`.
+- Documentation refreshed to the 6.3.43 / sandhi 1.7.0 / sakshi 2.4.3 / sigil
+  3.10.0 pins (quickstart, architecture overview, README, CONTRIBUTING,
+  guides/api, doc-health ledger); the v1.2.x doc-refresh backlog drained.
+
+### Verified
+
+- `cyrius build`: OK. `cyrius tests`: **225 / 225** pass. `cyrius fmt --check`
+  + `cyrius lint`: clean. `daimon version` and the serve banner both render the
+  VERSION-sourced string live. The `tests/test.sh` libro integration smoke
+  passes (manifest lists 5 tools; `libro_export`/`verify`/`query` dispatch over
+  the seeded chain) and all 5 fuzz harnesses build + pass. Two cross-bundle
+  duplicate-fn warnings (`_sub_new`, `cancel_token_new` — majra/bote both bundle
+  shared code; "last wins", harmless) are expected artifacts of the full-bundle
+  approach and clear when the bundle is trimmed.
+
 ## [1.2.9] - 2026-06-15
 
 **Toolchain + stdlib refresh: cyrius `6.2.2` → `6.2.11`, vendored sandhi

@@ -143,14 +143,7 @@ fn server_banner(port, mode) {
     sakshi_info("daimon listening", 16);
     var sb = str_builder_new();
     str_builder_add_cstr(sb, "daimon v");
-    var ver_buf = alloc(16);
-    var ver_n = file_read_all("VERSION", ver_buf, 15);
-    if (ver_n > 0) {
-        if (load8(ver_buf + ver_n - 1) == 10) { ver_n = ver_n - 1; }
-        store8(ver_buf + ver_n, 0);
-        str_builder_add_cstr(sb, ver_buf);
-    }
-    else { str_builder_add_cstr(sb, "1.1.0"); }
+    str_builder_add_cstr(sb, daimon_version());
     str_builder_add_cstr(sb, " listening on port ");
     str_builder_add_int(sb, port);
     str_builder_add_cstr(sb, " (");

@@ -90,11 +90,21 @@ fn api_mcp_call(fd, body) {
     if (tool == 0) { http_bad_request(fd, str_from("tool not found")); return 0; }
     var url = mcp_find_external_url(_mcp_registry, name_c);
     if (url == 0) {
-        # Builtin tools: no in-process dispatcher today. Distinct from
-        # "tool not found" — 501 signals the route exists but isn't
-        # implemented for this tool kind.
-        var b = error_json(501, str_from("builtin tool dispatch not implemented"));
-        http_send_response(fd, 501, str_data(b), str_len(b));
+        # Builtin tools dispatch in-process. Extract the raw MCP `arguments`
+        # object (verbatim, so nested structure survives) and hand it to the
+        # builtin handler; it returns its JSON result verbatim (bote
+        # convention — dispatch.cyr resp_success(id, result)).
+        var args = jsonx_get_raw(str_cstr(body), "arguments");
+        if (args == 0) { args = "{}"; }
+        var result = mcp_dispatch_builtin(name_c, args);
+        if (result == 0) {
+            # Registered builtin with no in-process handler — 501 (the route
+            # exists but isn't implemented for this tool kind).
+            var b = error_json(501, str_from("builtin tool dispatch not implemented"));
+            http_send_response(fd, 501, str_data(b), str_len(b));
+            return 0;
+        }
+        http_ok(fd, str_from(result));
         return 0;
     }
     # Re-validate the stored URL at dispatch time. Registration already runs

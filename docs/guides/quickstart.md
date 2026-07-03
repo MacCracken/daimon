@@ -2,13 +2,15 @@
 
 ## Prerequisites
 
-- [Cyrius](https://github.com/MacCracken/cyrius) 4.2.0+
+- [Cyrius](https://github.com/MacCracken/cyrius) 6.3.43+
 - Linux x86_64 or aarch64
 
 ## Build
 
 ```bash
-cyrius deps
+# lib/ is gitignored — repopulate it before building:
+cyrius lib sync   # vendors the stdlib subset from the cyrius pin
+cyrius deps       # resolves git deps (e.g. sakshi) into lib/
 cyrius build src/main.cyr build/daimon
 ```
 
@@ -43,7 +45,7 @@ curl -X POST http://localhost:8090/v1/agents -d '{"name":"my-first-agent"}'
 
 ```bash
 cyrius build tests/daimon.tcyr build/daimon_test && build/daimon_test
-# → 200 passed, 0 failed (200 total)
+# → 225 passed, 0 failed (225 total)
 ```
 
 ## Run Benchmarks
@@ -55,9 +57,9 @@ cyrius build tests/daimon.bcyr build/daimon_bench && build/daimon_bench
 ## Project Structure
 
 ```
-src/main.cyr          Source (4,141 LOC)
-tests/daimon.tcyr     Test suite (200 assertions)
-tests/daimon.bcyr     Benchmarks (16)
+src/                  Source (27 modules, entry src/main.cyr)
+tests/daimon.tcyr     Test suite (225 assertions)
+tests/daimon.bcyr     Benchmarks (17)
 fuzz/                 Fuzz harnesses (5)
 build/daimon          Binary (181 KB)
 docs/                 Architecture, guides, ADRs, audit reports

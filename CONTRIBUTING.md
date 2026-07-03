@@ -6,20 +6,24 @@ to get involved.
 ## Getting Started
 
 1. Fork the repository and clone your fork
-2. Install [Cyrius](https://github.com/MacCracken/cyrius) 5.7.12+ (see `cyrius.cyml` `[package].cyrius`)
+2. Install [Cyrius](https://github.com/MacCracken/cyrius) 6.3.43+ (see `cyrius.cyml` `[package].cyrius`)
 3. Run `cyrius check` to verify your environment
 
 ## Development Workflow
 
 ```bash
-cyrius deps                          # Resolve dependencies
-cyrius build                         # Build (reads cyrius.cyml)
+cyrius lib sync                      # Vendor the stdlib subset from the pin
+cyrius deps                          # Resolve git dependencies (e.g. sakshi)
+cyrius build src/main.cyr build/daimon  # Build
 cyrius check                         # Format + lint + test + build
-cyrius test tests/daimon.tcyr        # Run test suite
+cyrius tests                         # Run test suite
 cyrius bench tests/daimon.bcyr       # Run benchmarks
 sh tests/test.sh                     # Tests + fuzz harnesses
 ./scripts/bench-history.sh           # Append benchmark baseline
 ```
+
+`lib/` is gitignored — it is repopulated by `cyrius lib sync` (stdlib subset from
+the pin) and `cyrius deps` (git deps like sakshi). Run both after cloning.
 
 ## Pull Requests
 
@@ -38,7 +42,7 @@ sh tests/test.sh                     # Tests + fuzz harnesses
 
 ## Adding a New Module
 
-1. Add the module code to `src/main.cyr`
+1. Add the module code under `src/` (a new `src/*.cyr` module)
 2. Add tests in `tests/daimon.tcyr`
 3. Add benchmarks in `tests/daimon.bcyr` if performance-relevant
 4. Add fuzz harnesses in `fuzz/` for security-critical code

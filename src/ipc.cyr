@@ -177,7 +177,7 @@ fn agent_ipc_bind(ipc) {
 
     # Create Unix domain socket (AF_UNIX=1, SOCK_STREAM=1)
     var fd = syscall(SYS_SOCKET, 1, 1, 0);
-    if (fd < 0) { return Err(ERR_IPC); }
+    if (fd < 0) { return Err(ERR_IPC_FAULT); }
 
     # Build sockaddr_un: {sa_family=1, sun_path=...}
     var addr_buf = alloc(112);  # sizeof(sockaddr_un) = 110
@@ -190,7 +190,7 @@ fn agent_ipc_bind(ipc) {
     var br = syscall(SYS_BIND, fd, addr_buf, 2 + plen + 1);
     if (br < 0) {
         syscall(SYS_CLOSE, fd);
-        return Err(ERR_IPC);
+        return Err(ERR_IPC_FAULT);
     }
 
     # Set socket permissions (owner only: 0700)
@@ -200,7 +200,7 @@ fn agent_ipc_bind(ipc) {
     var lr = syscall(SYS_LISTEN, fd, MAX_CONCURRENT_CONNECTIONS);
     if (lr < 0) {
         syscall(SYS_CLOSE, fd);
-        return Err(ERR_IPC);
+        return Err(ERR_IPC_FAULT);
     }
 
     return Ok(fd);
@@ -222,7 +222,7 @@ fn ipc_get_peer_uid(cfd) {
 
 fn agent_ipc_accept_one(fd, ipc) {
     var cfd = syscall(SYS_ACCEPT, fd, 0, 0);
-    if (cfd < 0) { return Err(ERR_IPC); }
+    if (cfd < 0) { return Err(ERR_IPC_FAULT); }
 
     # VULN-006: Verify peer credentials
     var peer_uid = ipc_get_peer_uid(cfd);
@@ -231,14 +231,14 @@ fn agent_ipc_accept_one(fd, ipc) {
         if (peer_uid != my_uid) {
             if (peer_uid != 0) {  # Allow root
                 syscall(SYS_CLOSE, cfd);
-                return Err(ERR_IPC);
+                return Err(ERR_IPC_FAULT);
             }
         }
     }
 
     if (_global_active_connections >= MAX_GLOBAL_FD_LIMIT) {
         syscall(SYS_CLOSE, cfd);
-        return Err(ERR_IPC);
+        return Err(ERR_IPC_FAULT);
     }
     _global_active_connections = _global_active_connections + 1;
 
@@ -248,7 +248,7 @@ fn agent_ipc_accept_one(fd, ipc) {
     if (nr != 4) {
         syscall(SYS_CLOSE, cfd);
         _global_active_connections = _global_active_connections - 1;
-        return Err(ERR_IPC);
+        return Err(ERR_IPC_FAULT);
     }
 
     # Parse big-endian u32
@@ -263,7 +263,7 @@ fn agent_ipc_accept_one(fd, ipc) {
         syscall(SYS_WRITE, cfd, &len_buf, 1);
         syscall(SYS_CLOSE, cfd);
         _global_active_connections = _global_active_connections - 1;
-        return Err(ERR_IPC);
+        return Err(ERR_IPC_FAULT);
     }
 
     # Read message body
@@ -296,7 +296,7 @@ fn agent_ipc_send(target_socket_path, message_str) {
 
     # Connect to Unix socket
     var fd = syscall(SYS_SOCKET, 1, 1, 0);
-    if (fd < 0) { return Err(ERR_IPC); }
+    if (fd < 0) { return Err(ERR_IPC_FAULT); }
 
     var addr_buf = alloc(112);
     store16(addr_buf, 1);  # AF_UNIX
@@ -308,7 +308,7 @@ fn agent_ipc_send(target_socket_path, message_str) {
     var cr = syscall(SYS_CONNECT, fd, addr_buf, 2 + plen + 1);
     if (cr < 0) {
         syscall(SYS_CLOSE, fd);
-        return Err(ERR_IPC);
+        return Err(ERR_IPC_FAULT);
     }
 
     # Write length prefix (big-endian u32) + message
@@ -329,8 +329,8 @@ fn agent_ipc_send(target_socket_path, message_str) {
     syscall(SYS_CLOSE, fd);
 
     if (ack == ACK) { return Ok(0); }
-    if (ack == NACK_QUEUE_FULL) { return Err(ERR_IPC); }
-    return Err(ERR_IPC);
+    if (ack == NACK_QUEUE_FULL) { return Err(ERR_IPC_FAULT); }
+    return Err(ERR_IPC_FAULT);
 }
 
 # Cleanup: remove socket file

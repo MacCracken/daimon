@@ -5,7 +5,7 @@ description = "daimon — AGNOS agent orchestrator"
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/daimon"
 language = "cyrius"
-cyrius = "6.2.11"
+cyrius = "6.3.43"
 
 [build]
 entry = "src/main.cyr"
@@ -30,6 +30,7 @@ stdlib = [
     "dynlib",
     "fdlopen",
     "tls",
+    "sigil",
     "sandhi",
     "args",
     "chrono",
@@ -41,12 +42,47 @@ stdlib = [
     "assert",
     "bench",
     "freelist",
+    # Pulled in by the bote MCP bundle (1.3.0): libro's audit-chain crypto
+    # (ct/keccak), majra/libro concurrency + collections (thread_local/slice/
+    # random), and bote's ws transport (ws_server). Full-bundle for now; a
+    # later cycle trims to only the modules the reachable tool surface needs.
+    "ct",
+    "keccak",
+    "random",
+    "slice",
+    "thread_local",
+    "ws_server",
+    "sync",
 ]
 
 [deps.sakshi]
 git = "https://github.com/MacCracken/sakshi.git"
-tag = "2.3.0"
+tag = "2.4.3"
 modules = ["dist/sakshi.cyr"]
+
+# --- bote MCP tool host + its audit-chain backend (1.3.0) ---
+# daimon hosts bote's dispatcher + libro audit tools as builtin MCP tools.
+# bote's dist bundle references libro + majra symbols but does NOT bundle
+# them, so both are declared explicitly. Declared before bote so the
+# auto-include order resolves libro/majra definitions ahead of bote's
+# references (Cyrius single-pass forward-reference resolution). sigil (bote's
+# other git dep) is already provided via [deps].stdlib at 3.10.0.
+# Full bundles for now; module-trimming to the reachable surface is a
+# follow-up per the 1.3.0 arc plan.
+[deps.libro]
+git = "https://github.com/MacCracken/libro.git"
+tag = "2.7.10"
+modules = ["dist/libro.cyr"]
+
+[deps.majra]
+git = "https://github.com/MacCracken/majra.git"
+tag = "2.5.0"
+modules = ["dist/majra.cyr"]
+
+[deps.bote]
+git = "https://github.com/MacCracken/bote.git"
+tag = "3.0.0"
+modules = ["dist/bote.cyr"]
 
 # Distribution manifest. Single binary today (`daimon`), with a best-effort
 # aarch64 cross-build; release.yml ships both when cc5_aarch64 is available

@@ -6,18 +6,19 @@ The core runtime for the AGNOS ecosystem: agent lifecycle, HTTP API (port 8090),
 
 ## Building
 
-Requires [Cyrius](https://github.com/MacCracken/cyrius) 5.7.12+ (pinned in `cyrius.cyml`).
+Requires [Cyrius](https://github.com/MacCracken/cyrius) 6.3.43+ (pinned in `cyrius.cyml`).
 
 ```bash
-cyrius deps           # resolve dependencies (writes cyrius.lock)
-cyrius build          # build from cyrius.cyml
-./build/daimon serve  # start server on port 8090
+cyrius lib sync                        # vendor stdlib subset from the pin (lib/ is gitignored)
+cyrius deps                            # resolve git deps (e.g. sakshi), writes cyrius.lock
+cyrius build src/main.cyr build/daimon # build
+./build/daimon serve                   # start server on port 8090
 ```
 
 ## Testing
 
 ```bash
-cyrius test tests/daimon.tcyr       # 200 assertions / 26 groups
+cyrius test tests/daimon.tcyr       # 225 assertions / 26 groups
 cyrius bench tests/daimon.bcyr      # 16 benchmarks
 sh tests/test.sh                    # tests + fuzz harnesses
 ```

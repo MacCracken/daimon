@@ -23,3 +23,24 @@ fn config_set_port(c, port) { store64(c + 8, port); }
 fn config_set_data_dir(c, dir) { store64(c + 16, dir); }
 fn config_set_max_agents(c, n) { store64(c + 24, n); }
 
+# --- Version: single source of truth ---
+#
+# daimon's version lives in exactly one place: the VERSION file at the deploy
+# root — the same file cyrius.cyml reads via `${file:VERSION}` for
+# [package].version. This helper is the ONLY code path that produces the
+# version string, so no daimon-version literal is duplicated across the tree.
+# Returns a NUL-terminated cstr (an alloc'd copy of VERSION's contents, sans
+# trailing newline). If VERSION can't be read (e.g. launched from a CWD that
+# doesn't hold it), returns the sentinel "unknown" — deliberately not a real
+# number, so it can never masquerade as a stale release.
+fn daimon_version() {
+    var buf = alloc(16);
+    var n = file_read_all("VERSION", buf, 15);
+    if (n > 0) {
+        if (load8(buf + n - 1) == 10) { n = n - 1; }
+        store8(buf + n, 0);
+        return buf;
+    }
+    return "unknown";
+}
+

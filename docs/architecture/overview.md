@@ -51,6 +51,9 @@ main.cyr   Preamble (syscall constants) + module includes + the `main` serve loo
 │   ├── mcp_tool_new       Tool descriptor (name, description, schema)
 │   ├── validate_callback_url   SSRF protection
 │   └── json_escape_str    Response injection prevention
+├── mcp_builtin.cyr    Builtin in-process MCP dispatch (bote libro audit tools)
+│   ├── mcp_libro_init     Seed a libro chain + register the 5 libro_* tools
+│   └── mcp_dispatch_builtin   Route builtin calls to bote handlers
 │
 ├── screen.cyr         Capture management
 │   ├── CapturePermissionManager   Per-agent permissions + rate limiting
@@ -142,9 +145,9 @@ Every AGNOS agent, hoosh, agnoshi, aethersafha, and any consumer app that talks 
 
 ## Key Design Decisions
 
-1. **Single compilation unit, multi-file source** — `src/main.cyr` `include`s 25 per-domain `src/*.cyr` modules (split from the former 4.1k-line monolith in 1.2.8; none over ~350 LOC). Cyrius flattens the includes into one global scope and compiles in one pass; no separate library crate. Contiguous module splits preserve original source order (byte-identical); the HTTP route handlers were regrouped by domain (pure functions, so order-independent), keeping behavior identical.
-2. **Synchronous HTTP** — single-threaded TCP accept loop. No async runtime. Sufficient for orchestrator workloads; async deferred to future Cyrius stdlib maturity.
+1. **Single compilation unit, multi-file source** — `src/main.cyr` `include`s 26 per-domain `src/*.cyr` modules (split from the former 4.1k-line monolith in 1.2.8, + `mcp_builtin.cyr` added at 1.3.0; none over ~350 LOC). Cyrius flattens the includes into one global scope and compiles in one pass; no separate library crate. Contiguous module splits preserve original source order (byte-identical); the HTTP route handlers were regrouped by domain (pure functions, so order-independent), keeping behavior identical.
+2. **Sync + async HTTP, both sandhi-backed** — `serve` (sync) drives sandhi's `sandhi_server_run_opts` accept loop; `serve --async` drives `sandhi_server_run_async` (epoll-cooperative, on `lib/async.cyr`; shipped 1.1.0, collapsed onto sandhi's loop at 1.2.6). Both apply a per-connection `SO_RCVTIMEO` and RFC 7230 request-smuggling rejection via sandhi. Single trust domain.
 3. **Bump allocator** — fast allocation, no individual free. Single trust domain (see VULN-007 security gate for multi-tenant).
 4. **Everything is i64** — Cyrius type system. Structs are manually laid out with `alloc()` + `store64()`/`load64()` at fixed offsets.
 5. **pidfd for signals** — race-free process management on Linux 5.3+, with `kill()` fallback.
-6. **No external dependencies** — 17 Cyrius stdlib modules, zero external crates.
+6. **Dependencies** — a Cyrius stdlib subset plus a small set of external deps. `[deps].stdlib` (in dependency order): `string, fmt, math, alloc, vec, str, syscalls, io, fs, hashmap, tagged, bayan, net, mmap, dynlib, fdlopen, tls, sigil, sandhi, args, chrono, fnptr, process, async, thread, callback, assert, bench, freelist`. `sigil` is declared here because 6.3.43's `tls_native_lowlevel` references `sha384_init_into` (defined in sigil); `tls`/`mmap`/`dynlib`/`fdlopen` are present for compile-time symbol resolution only (pulled in transitively by sandhi's bundle). Vendored stdlib from the cyrius pin via `cyrius lib sync`: sandhi 1.7.0, sigil 3.10.0. External git dep via `cyrius deps`: sakshi 2.4.3 (structured logging/tracing). `lib/` is gitignored and repopulated by `cyrius lib sync` + `cyrius deps`; `cyrius.lock` locks 61 deps.

@@ -50,6 +50,7 @@ include "src/memory.cyr"
 include "src/vector_store.cyr"
 include "src/rag.cyr"
 include "src/mcp.cyr"
+include "src/mcp_builtin.cyr"
 include "src/screen.cyr"
 include "src/scheduler.cyr"
 include "src/cron.cyr"
@@ -104,13 +105,7 @@ fn main() {
             return serve(port);
         }
         if (streq(cmd, "version") == 1) {
-            var ver_buf = alloc(16);
-            var ver_n = file_read_all("VERSION", ver_buf, 15);
-            if (ver_n > 0) {
-                store8(ver_buf + ver_n, 0);
-                println(ver_buf);
-            }
-            else { println("1.1.0"); }
+            println(daimon_version());
             return 0;
         }
         if (streq(cmd, "help") == 1) {

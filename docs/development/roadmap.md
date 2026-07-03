@@ -83,24 +83,28 @@
 - [x] **MCP `inputSchema` on registration + manifest** (the MEDIUM consumer gap, filed by thoth — `docs/development/issues/archive/2026-06-11-mcp-manifest-omits-tool-input-schema.md`). `api_mcp_register` reads an optional `inputSchema` (alias `input_schema`) and stores it verbatim; `api_mcp_manifest` emits it as raw JSON per tool (permissive `{"type":"object"}` fallback when unset). Nested-object value extracted via bayan's typed engine (`bayan_json_v_parse`→`obj_get`→`build`) since the flat `jget` path mangles nested values; ~1 µs/registration. Backward-compatible (absent → `{}`). 225/225 tests (+8), live round-trip verified.
 - [x] **Toolchain pin `6.1.40` → `6.2.2` + adopted cyrius 6.2.1 element-typed arrays.** The compiler bug (`docs/development/issues/archive/2026-06-11-cyrius-addr-taken-local-array-static-overlap.md`) was fixed upstream as a **language change**: bare `var a[N]` is now N **bytes** in a fn, and the slot form is `var a: i64[N]` (full `N*8` bytes). Swept every daimon-class site in `src/main.cyr` — `argv_buf: i64[4]`, two `status_names: i64[N]`, plus sized syscall buffers (`status_buf: i32[1]`, `cred_len: u32[1]`, `len_buf`/`hdr: u8[4]`). `ip_to_cstr` keeps its inline form. Sakshi pin `2.2.10` → `2.3.0` (re-folded daimon-class fix). **Lesson: read the upstream language CHANGELOG before re-testing a "fixed" footgun.** 225/225 tests, 0 lint, live edge-status render verified.
 
-## v1.2.x — Current work arc
+## Completed (v1.3.0)
 
-Open items on the current arc, severity-tagged. The arc closes when the P2s land + the P3s drain (no hard cap; per the working-loop convention, ship when ready).
+- [x] **Toolchain to latest — cyrius `6.2.11` → `6.3.43`.** Vendored stdlib resynced from the 6.3.43 snapshot: sandhi `1.6.2` → `1.7.0`, sigil `3.7.13` → `3.10.0`; sakshi git-pin `2.3.0` → `2.4.3`. `cyrius.lock` re-resolved to 61 deps. Toolchain drift cleared (`cyrius --version` → `manifest-pin: 6.3.43`, no warning). **`sigil` added to `[deps].stdlib`** — 6.3.43's `tls_native_lowlevel` references `sha384_init_into` (defined in sigil), which `cyrius lib sync` left at a stale copy until sigil was declared (same transitive-closure reason as tls/mmap/dynlib/fdlopen). 225/225 tests, 0 lint, live `version` + banner verified.
+- [x] **VERSION established as the single source of truth for daimon's version.** New `daimon_version()` helper (`src/config.cyr`) is the only code path that produces the version string; the two duplicated read-`VERSION`-then-fall-back sites (`main.cyr` `version` command, `server.cyr` banner) collapse to one call each. The stale duplicated `"1.1.0"` fallback literal is replaced by a single `"unknown"` sentinel — deliberately not a real number, so a missing VERSION file can never masquerade as a stale release. No daimon-version literal remains anywhere but `VERSION`.
+- [x] **Doc-refresh backlog drained** (the former v1.2.x P2/P3 doc items). `guides/quickstart.md`, `docs/architecture/overview.md`, `README.md`, `CONTRIBUTING.md`, `guides/api.md` (verified current — no change needed), `docs/doc-health.md` refreshed to the 6.3.43 / sandhi 1.7.0 / sakshi 2.4.3 / sigil 3.10.0 pins + the `cyrius lib sync` + `cyrius deps` workflow; `BENCHMARKS.md` re-baselined under 6.3.43; CLAUDE.md stdlib table refreshed. overview design-decision #2 corrected (sync **and** async HTTP, both sandhi-backed).
+- [x] **Upstream cyrius addr-taken-array bug — closed.** Fixed upstream as a language change (6.2.1: bare `var a[N]` = N bytes, slot form `var a: i64[N]`), adopted daimon-side at 1.2.7; daimon carries no exposed address-taken-local-array pattern. No longer an open exposure.
+- [x] **Wired bote's libro audit tools into the MCP host** (the P1). Added `bote 3.0.0` (+ transitive `libro 2.7.10` / `majra 2.5.0` + `ct`/`keccak`/`random`/`slice`/`thread_local`/`sync`/`ws_server` stdlib). daimon owns one libro chain (`chain_new`, genesis-seeded at `mcp_libro_init`) and registers bote's five `libro_*` tools as builtins in its own MCP registry (`src/mcp_builtin.cyr`). `POST /v1/mcp/call` now dispatches builtin tools in-process (was 501) by calling the bote handlers with the raw MCP `arguments` and returning their JSON verbatim (bote convention). One collision resolved: `DaimonError.ERR_IPC` → `ERR_IPC_FAULT` (majra owns `ERR_IPC=4`). 225/225 unit tests + a new `tests/test.sh` integration smoke (manifest lists 5 tools; export/verify/query dispatch over the seeded chain) + 5 fuzz harnesses all pass.
 
-- [ ] **P2** — `guides/quickstart.md` refresh — install one-liner references the 5.7.12 / sakshi 2.0.0 era (versioned toolchain layout + `cyrius deps` workflow + `lib/` gitignored). Load-bearing for new-user onboarding; an incorrect install command actively breaks first-run.
-- [ ] **P2** — `docs/architecture/overview.md` refresh — stdlib deps list adds tls/mmap/dynlib/fdlopen (1.2.0 transitive add via sandhi 1.3.3); sandhi 1.3.3 notes; `lib/` gitignored. Reference doc consulted on every architectural decision; staleness propagates downstream.
-- [ ] **P3** — `README.md` footprint block — cyrius 6.1.24, sakshi 2.2.10, ~1.43 MB binary (6.x DCE keeps NOPed-but-unstripped dead code; see 1.2.4 CHANGELOG), refreshed dep list. Marketing-surface, not load-bearing for correctness.
-- [ ] **P3** — `CONTRIBUTING.md` workflow steps — cyrius pin, `cyrius deps` workflow, lib/ gitignored expectation, fmt-via-diff gate + lint-fail-on-warn posture. Onboarding refinement; not blocking.
-- [ ] **P3** — `BENCHMARKS.md` re-baseline under 5.10.34. Within-noise expected — no microbenchmark touches HTTP. Useful for the "prove the wins" discipline but no consumer pressure.
-- [ ] **P3** — `guides/api.md` cyrius pin + example commands refresh.
+## v1.3.0 — Current work arc
+
+Follow-ups now that the libro tools are wired (none blocking the 1.3.0 close):
+
+- [ ] **P2 — Trim the bote bundle to the reachable surface.** daimon vendors the full `dist/bote.cyr` (27-module MCP core: JSON-RPC, six transports, auth, sandbox) but reaches only the libro-tool handlers + jsonx. A lean profile (`cyrius distlib`-style sub-bundle, or a libro-tools-only fold) drops the unused transports/auth/sandbox and the two cross-bundle duplicate-fn warnings (`_sub_new`, `cancel_token_new`). No consumer pressure; scheduling opportunistically.
+- [ ] **P2 — Feed daimon's audit events into the libro chain.** The chain is genesis-seeded only, so the tools operate on a near-empty log. Appending daimon's own audit events (agent spawn/stop, MCP calls, IPC auth failures, rate-limit/SSRF rejections) via `chain_append` makes the query/verify/export/proof/retention surface meaningful. Requires deciding the event taxonomy + severities; its own cycle.
 
 **Upstream-blocker items** (not in daimon's hands; tracked for visibility):
 
-- [ ] **HIGH (upstream cyrius)** — address-taken fixed local array under-reserves static backing (`var a[N]` → `(N-1)*8` bytes), corrupting the adjacent static object on a last-element write. daimon shipped a workaround at 1.2.6 (`ip_to_cstr` no longer takes `&` of a local array), but any other such pattern stays exposed. Minimal repro + write-up filed at [docs/development/issues/2026-06-11-cyrius-addr-taken-local-array-static-overlap.md](issues/2026-06-11-cyrius-addr-taken-local-array-static-overlap.md). Clears when cycc reserves the full `N*8` bytes.
+- [ ] **Low (upstream nein)** — firewall MCP tools. nein's Cyrius port still has **no `mcp.cyr`** (firewall/mesh/nat/… ported; the Rust `mcp.rs` unported). No consumer demand; bumps to P2 when a consumer asks for firewall control via daimon's MCP surface.
 
-## Future (v1.3.0+)
+## Future (v1.4.0+)
 
-Severity assigned at v1.3.0 cut once the next arc's shape is chosen. Today these are unsequenced — none are blocking the v1.2.x close.
+Severity assigned at the v1.4.0 cut once the next arc's shape is chosen. Today these are unsequenced.
 
 - [ ] jnana integration — grounded knowledge queries backed by verified AGNOS science data
 - [ ] gRPC transport option alongside HTTP
@@ -112,7 +116,7 @@ Severity assigned at v1.3.0 cut once the next arc's shape is chosen. Today these
 
 - [x] All modules ported to Cyrius
 - [x] Full HTTP API parity with Rust (24/24 endpoints)
-- [x] Test coverage for all ported modules (200 assertions)
+- [x] Test coverage for all ported modules (225 assertions)
 - [x] Benchmark baselines established
 - [x] Security audit remediation complete (9/10 fixed, 1 gated)
 - [x] Documentation complete (architecture overview, API guide, quickstart, 3 ADRs, security audit)

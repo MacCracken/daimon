@@ -3,6 +3,34 @@
 - **Rust**: v0.6.0, rustc 1.89, criterion, x86_64. Final benchmark run before port.
 - **Cyrius**: v1.0.1, cyrius 4.2.0 (cc3 compiler, single-pass, no LLVM), lib/bench.cyr, `tests/daimon.bcyr`. Same machine.
 
+> The Rust-vs-Cyrius tables below are the **frozen v1.0.1 port-era snapshot** (cyrius 4.2.0). The current toolchain baseline is captured separately just below.
+
+## Current baseline — daimon 1.3.0 / cyrius 6.3.43 (2026-07-03)
+
+Re-baselined under the 6.3.43 toolchain (`./scripts/bench-history.sh` → `tests/daimon.bcyr`). Averages over the iteration counts shown; no microbenchmark touches HTTP, so these are pure in-memory op costs.
+
+| Benchmark | avg | min | iters |
+|---|---:|---:|---:|
+| config_default | 1.510µs | 907ns | 10000 |
+| cosine_128d | 2.068µs | 908ns | 10000 |
+| vector_insert_100x128d | 58.548µs | 53.917µs | 100 |
+| vector_search_1k_64d | 325.916µs | 316.032µs | 100 |
+| rag_ingest_5k_chars | 7.629µs | 5.657µs | 1000 |
+| scheduler_100_tasks | 194.797µs | 189.339µs | 100 |
+| supervisor_register_1000 | 399.205µs | 382.590µs | 10 |
+| mcp_register_100_tools | 70.228µs | 67.257µs | 100 |
+| mcp_manifest_100_tools | 69.505µs | 66.349µs | 1000 |
+| mcp_find_tool_in_100 | 1.456µs | 907ns | 100000 |
+| mcp_extract_input_schema | 2.216µs | 908ns | 10000 |
+| edge_register_100 | 197.444µs | 190.877µs | 100 |
+| edge_heartbeat_100 | 721.560µs | 668.032µs | 1000 |
+| edge_stats_500 | 49.119µs | 45.816µs | 1000 |
+| circuit_breaker_cycle | 5.372µs | 4.260µs | 100000 |
+| hashmap_1000_insert_lookup | 489.127µs | 471.499µs | 100 |
+| json_parse | 1.976µs | 908ns | 10000 |
+
+The stdlib hot-path shapes are unchanged from the port-era analysis below (hashmap value-iteration and compute-loop vectorization remain the standing optimization opportunities).
+
 ## Core Operations
 
 | Benchmark | Rust (ns) | Cyrius (ns) | Ratio | Winner |
@@ -105,7 +133,7 @@ Scheduler scheduling (1.5x), supervisor registration (2.5x), MCP registration (1
 | memory | Complete | Complete | CRUD, list_keys, list_by_tag, clear, usage_bytes |
 | vector_store | Complete | Complete | Cosine similarity, search, normalize |
 | rag | Complete | Complete | Chunk, embed, ingest, query, context format |
-| mcp | Complete | Complete (stubs) | Registry + types; bote re-exports blocked upstream |
+| mcp | Complete | Complete | Registry + types; external forwarding via sandhi_rpc_mcp_call (1.2.1); bote libro-tool re-exports being wired (1.3.0) |
 | screen | Complete | Complete | Permissions, rate limiting, recording sessions |
 | scheduler | Complete | Complete | NodeCapacity, scheduling, cron, preemption, stats |
 | federation | Complete | Complete | Cluster, election, scoring, placement, vector store |
@@ -114,14 +142,14 @@ Scheduler scheduling (1.5x), supervisor registration (2.5x), MCP registration (1
 | api | Complete | Complete | 24/24 endpoints |
 | logging | Complete | Complete | sakshi integration |
 | firewall | Complete | **Blocked** | Requires nein Cyrius port |
-| http-forward | Complete | **Blocked** | Requires bote + HTTP client |
+| http-forward | Complete | Complete | External MCP forwarding via sandhi_rpc_mcp_call (1.2.1) |
 
 ### Test Coverage
 
 | | Rust | Cyrius |
 |---|---|---|
 | Unit tests | 305 | — (inline in test groups) |
-| Integration tests | 28 | 200 assertions / 26 groups |
-| Benchmarks | 19 | 16 |
+| Integration tests | 28 | 225 assertions / 26 groups |
+| Benchmarks | 19 | 17 |
 | Fuzz harnesses | 0 | 5 |
 | Security audit | — | 10 findings, 9 fixed, 1 gated |

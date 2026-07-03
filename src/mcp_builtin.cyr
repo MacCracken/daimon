@@ -1,0 +1,61 @@
+# =========================================================================
+# mcp_builtin — in-process builtin MCP tool dispatch (bote libro tools)
+# =========================================================================
+#
+# Hosts bote's five libro audit-chain tools as daimon MCP builtins:
+#   libro_query  libro_verify  libro_export  libro_proof  libro_retention
+#
+# daimon owns one libro chain (chain_new — libro, via the bote MCP bundle);
+# bote's libro_tools handlers (lib/bote.cyr) read / verify / export it after
+# libro_tools_init binds it. The five tools are registered in daimon's own
+# MCP registry (so /v1/mcp/tools lists them alongside builtins + external
+# tools) and dispatched here by calling the bote handlers directly with the
+# raw MCP `arguments` object. bote's own dispatcher returns the handler JSON
+# verbatim as the tools/call result (dispatch.cyr `resp_success(id, result)`);
+# daimon mirrors that convention rather than re-wrapping.
+#
+# The chain is seeded with one genesis entry at init so verify / export /
+# query return real data on a fresh host. Feeding daimon's own audit events
+# (agent lifecycle, MCP calls) into the chain is a follow-up once the
+# audit-event source is settled (see roadmap v1.3.0 arc).
+
+# The libro audit chain daimon exposes. Set in mcp_libro_init, shared with
+# bote's libro_tools module via libro_tools_init.
+var _libro_chain = 0;
+
+fn mcp_libro_chain() { return _libro_chain; }
+
+# Register the five libro tools as builtins + bind bote's libro_tools to a
+# fresh chain. Call once from app_init after the MCP registry exists.
+fn mcp_libro_init(reg) {
+    _libro_chain = chain_new();
+    chain_append(_libro_chain, SEV_INFO, str_from("daimon"),
+    str_from("mcp.host.init"),
+    str_from("daimon MCP host initialized; libro audit tools online"));
+    libro_tools_init(_libro_chain);
+
+    var schema = str_from("{\"type\":\"object\"}");
+    mcp_register_builtin(reg, mcp_tool_new(str_from("libro_query"),
+    str_from("Search the libro audit chain (filter by source/agent/severity/time + paginate)"), schema));
+    mcp_register_builtin(reg, mcp_tool_new(str_from("libro_verify"),
+    str_from("Verify the libro chain's hash-link integrity"), schema));
+    mcp_register_builtin(reg, mcp_tool_new(str_from("libro_export"),
+    str_from("Return every entry on the libro chain as a JSON array"), schema));
+    mcp_register_builtin(reg, mcp_tool_new(str_from("libro_proof"),
+    str_from("Generate a Merkle inclusion proof for the entry at the given index"), schema));
+    mcp_register_builtin(reg, mcp_tool_new(str_from("libro_retention"),
+    str_from("Apply a retention policy to the libro chain, archive old entries"), schema));
+    return 0;
+}
+
+# Dispatch a builtin tool in-process. name_c: tool name (cstr). args: the raw
+# MCP `arguments` object (cstr). Returns the handler's JSON result (cstr), or
+# 0 if name_c is not a known builtin (the caller falls back to 501).
+fn mcp_dispatch_builtin(name_c, args) {
+    if (streq(name_c, "libro_query") == 1) { return libro_tool_query(args, 0); }
+    if (streq(name_c, "libro_verify") == 1) { return libro_tool_verify(args, 0); }
+    if (streq(name_c, "libro_export") == 1) { return libro_tool_export(args, 0); }
+    if (streq(name_c, "libro_proof") == 1) { return libro_tool_proof(args, 0); }
+    if (streq(name_c, "libro_retention") == 1) { return libro_tool_retention(args, 0); }
+    return 0;
+}
