@@ -52,6 +52,14 @@ POST /v1/mcp/call
 # Deregister
 DELETE /v1/mcp/tools/scan
 → {"ok":true}
+
+# Built-in tools — five libro audit-chain tools ship as builtins
+# (libro_query / libro_verify / libro_export / libro_proof / libro_retention),
+# listed by GET /v1/mcp/tools alongside any external tools. They dispatch
+# in-process over daimon's audit chain and return the tool's JSON verbatim.
+POST /v1/mcp/call
+{"name":"libro_verify","arguments":{}}
+→ {"ok":true}
 ```
 
 ## RAG Pipeline

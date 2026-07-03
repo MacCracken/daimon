@@ -6,8 +6,8 @@ type: state
 
 # Documentation Health — daimon
 
-> **Last refresh**: 2026-07-03 (1.3.0 arc — cyrius 6.3.43 toolchain bump, VERSION single-source-of-truth, full doc-currency pass; earlier-cycle context preserved below).
-> **Refresh cadence**: when docs are touched, update the affected row. Full re-audit at each minor (1.2.x → 1.3.0) cut.
+> **Last refresh**: 2026-07-03 (1.3.1 sweep — roadmap trimmed to open-work-only, README expanded, SECURITY supported-versions rolled; 1.3.0 arc context preserved below).
+> **Refresh cadence**: when docs are touched, update the affected row. Full re-audit at each minor cut.
 > **Scope**: this repo only (`daimon`) — root-level files plus the entire `docs/` tree.
 
 This is a **ledger**, not a one-time audit. Rewrite-in-place as docs change. Pattern lifted from [agnosys/docs/doc-health.md](https://github.com/MacCracken/agnosys/blob/main/docs/doc-health.md) and [cyrius/docs/doc-health.md](https://github.com/MacCracken/cyrius/blob/main/docs/doc-health.md) — same buckets, daimon-shaped tiers.
@@ -18,13 +18,13 @@ Daimon is the AGNOS agent orchestrator — every consumer (hoosh, agnoshi, aethe
 
 ## At a glance — 2026-07-03 inventory
 
-**~15 markdown files** total (7 root + 8 under `docs/`). Bucket counts after the 1.3.0 doc-currency pass:
+**~15 markdown files** total (7 root + 8 under `docs/`). Bucket counts after the 1.3.1 doc sweep:
 
 | Bucket | Count | What it means |
 |---|---|---|
-| ✅ **Fresh — refreshed in 1.3.0 cycle** | ~12 | CHANGELOG (1.3.0 entry), VERSION (1.3.0), CLAUDE.md (6.3.43 / sandhi 1.7.0 / sakshi 2.4.3 / sigil), README, CONTRIBUTING, architecture/overview.md, guides/quickstart.md, guides/api.md (verified current), BENCHMARKS.md (re-baselined under 6.3.43), roadmap, this file. |
-| 🟡 **Stale — refresh in place** | 0 | Cleared in the 1.3.0 pass — the v1.2.x doc-refresh backlog (README / CONTRIBUTING / overview / quickstart / BENCHMARKS) is drained. |
-| 🔵 **Probably evergreen** | 3 | `CODE_OF_CONDUCT.md`, `LICENSE`, `SECURITY.md`. No version-tied claims. Re-read pass annually. |
+| ✅ **Fresh — refreshed in the 1.3.0 / 1.3.1 cycle** | ~13 | CHANGELOG (1.3.1 cut), VERSION (1.3.1), CLAUDE.md (6.3.43 / sandhi 1.7.0 / sakshi 2.4.3 / sigil / bote-libro rows), README (expanded), CONTRIBUTING, architecture/overview.md, guides/quickstart.md, guides/api.md (verified current), BENCHMARKS.md (re-baselined under 6.3.43), roadmap (trimmed to open-work-only), SECURITY.md (supported-versions rolled), this file. |
+| 🟡 **Stale — refresh in place** | 0 | Cleared — the v1.2.x doc-refresh backlog is drained and the 1.3.1 sweep caught the roadmap / README / SECURITY drift. |
+| 🔵 **Probably evergreen** | 2 | `CODE_OF_CONDUCT.md`, `LICENSE`. No version-tied claims. Re-read pass annually. |
 | 📦 **Archive / frozen by design** | ~4 | The 3 ADRs (point-in-time decisions); audit/2026-04-13 + audit/2026-04-27 reports (frozen by audit convention). |
 | ❓ **Open strategic question** | 0 | None outstanding. See [Open questions](#open-strategic-questions) below for what would re-open it. |
 
@@ -56,7 +56,13 @@ Daimon is the AGNOS agent orchestrator — every consumer (hoosh, agnoshi, aethe
 - ✅ `docs/guides/api.md` — verified current (24-endpoint reference carries no version-tied claims; no change needed).
 - ✅ `VERSION` — 1.2.9 → 1.3.0.
 
-**Stale set:** cleared in the 1.3.0 pass. Next full re-audit at the v1.3.0 → v1.4.0 cut (or sooner if a subsystem doc drifts).
+**Doc work shipped in 1.3.1 (2026-07-03):**
+- ✅ `docs/development/roadmap.md` — **trimmed to open-work-only**: all completed (`[x]`) sections removed (they live in CHANGELOG), the met v1.0-criteria block dropped, and the overlapping "Blocked on Upstream Ports" / current-arc sections consolidated. Now holds just the VULN-007 security gate, the nein firewall-MCP blocker, and the v1.4.0+ backlog, under a lean status header.
+- ✅ `README.md` — expanded: intro notes the libro audit trail; deps example lists sakshi/bote/libro/majra; benchmark count 16 → 17; added an "MCP audit tools" section and a "Documentation" link block. (Footprint line left as-is.)
+- ✅ `SECURITY.md` — supported-versions table rolled `1.0.x` → `1.3.x` (+ `< 1.3` unsupported).
+- ✅ `CHANGELOG.md` / `VERSION` — 1.3.1 cut (`## [1.3.1] - Unreleased` opened; VERSION 1.3.0 → 1.3.1).
+
+**Stale set:** cleared. Next full re-audit at the 1.3 → 1.4 cut (or sooner if a subsystem doc drifts).
 
 ---
 
@@ -64,11 +70,11 @@ Daimon is the AGNOS agent orchestrator — every consumer (hoosh, agnoshi, aethe
 
 | File | Last touched | Status | Notes |
 |---|---|---|---|
-| `README.md` | 2026-07-03 | ✅ Fresh | Cyrius pin → 6.3.43; build block updated to `cyrius lib sync` + `cyrius deps` + explicit build; 225-test count. Binary-size / LOC figures left as-is. |
+| `README.md` | 2026-07-03 | ✅ Fresh | Cyrius pin → 6.3.43; `cyrius lib sync` + `cyrius deps` build block; deps example lists sakshi/bote/libro/majra; 225 tests / 17 benchmarks; added MCP-audit-tools + Documentation-links sections (1.3.1). Footprint line left as-is. |
 | `CHANGELOG.md` | 2026-05-10 | ✅ Fresh | Source of truth for shipped work. 1.2.0 entry covers toolchain bump, sakshi bump, CI/release modernization, /lib/ gitignored, lint-clean, fmt re-enabled. |
 | `CLAUDE.md` | 2026-05-10 | ✅ Fresh | Durable rules. 1.2.0 pin refreshes: cyrius 6.3.43, sakshi 2.4.3. |
 | `CONTRIBUTING.md` | 2026-07-03 | ✅ Fresh | Cyrius pin → 6.3.43; workflow updated (`cyrius lib sync` + `cyrius deps`, explicit build, `cyrius tests`); lib/ gitignored note; module-split note. |
-| `SECURITY.md` | 2026-04-13 | 🔵 Evergreen | Supported-versions table + reporting policy. Reread at v1.3.0. |
+| `SECURITY.md` | 2026-07-03 | ✅ Fresh | Supported-versions table rolled `1.0.x` → `1.3.x` (+ `< 1.3` unsupported) in the 1.3.1 sweep. Reporting policy + scope (incl. bump-allocator memory safety, VULN-007) unchanged. |
 | `CODE_OF_CONDUCT.md` | (initial) | 🔵 Evergreen | Standard. |
 | `BENCHMARKS.md` | 2026-07-03 | ✅ Fresh | Re-baselined under cyrius 6.3.43 (17-benchmark current-baseline table added); frozen Rust-vs-Cyrius v1.0.1 port comparison preserved; mcp / http-forward status rows updated. |
 | `VERSION` | 2026-05-10 | ✅ Fresh | `1.3.0` — single source of truth, read into `cyrius.cyml` via `${file:VERSION}`. |
@@ -88,7 +94,7 @@ Daimon is the AGNOS agent orchestrator — every consumer (hoosh, agnoshi, aethe
 
 | File | Last touched | Status | Notes |
 |---|---|---|---|
-| `roadmap.md` | 2026-05-10 | ✅ Fresh | 1.1.5 sandhi follow-ups rescoped to 1.2.1 / 1.2.2; "Future (v1.2.0+)" renamed to "Future (v1.3.0+)"; 1.2.0 ship marked complete. |
+| `roadmap.md` | 2026-07-03 | ✅ Fresh | **Trimmed to open-work-only (1.3.1)**: all completed `[x]` sections + met v1.0-criteria removed (history lives in CHANGELOG); consolidated to the VULN-007 gate, the nein firewall-MCP blocker, and the v1.4.0+ backlog. |
 
 **Missing today (file in 1.2.x cleanup):**
 - `development/state.md` — agnosys convention for the live volatile state file (pin / build sizes / test count / consumer table / recent releases / slot ledger). Daimon's roadmap.md partially covers this; consider splitting in 1.2.x if scope grows.
