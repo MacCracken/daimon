@@ -172,6 +172,10 @@ fn memory_store_list_by_tag(ms, agent_id_str, tag) {
                     var stem = str_sub(name_s, 0, str_len(name_s) - 5);
                     vec_push(matching, stem);
                 }
+                # VULN-007 hygiene: the read buffer held this agent's full
+                # memory value; only `stem` (a filename slice) is kept. Scrub
+                # the value so it does not linger in the never-freed bump heap.
+                secure_zero(fbuf, frd);
             }
         }
         mi = mi + 1;
@@ -195,6 +199,8 @@ fn memory_store_usage_bytes(ms, agent_id_str) {
         var rbuf = alloc(65536);
         var rn = file_read_all(str_data(fpath), rbuf, 65535);
         if (rn > 0) { total = total + rn; }
+        # VULN-007 hygiene: rbuf held the agent value; only its length is used.
+        secure_zero(rbuf, rn);
         ui = ui + 1;
     }
     return total;

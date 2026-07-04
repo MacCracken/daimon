@@ -401,6 +401,20 @@ fn mcp_tool_new(name, desc, schema) {
     return t;
 }
 
+# secure_zero (src/secmem.cyr) — VULN-007 sensitive-memory scrub
+var _secmem_sink = 0;
+fn secure_zero(ptr, len): i64 {
+    if (ptr == 0) { return 0; }
+    if (len <= 0) { return 0; }
+    var i = 0;
+    while (i < len) {
+        store8(ptr + i, 0);
+        i = i + 1;
+    }
+    _secmem_sink = _secmem_sink + load8(ptr + len - 1);
+    return 0;
+}
+
 fn mcp_registry_new() {
     var reg = alloc(16);
     store64(reg, map_new());
@@ -1656,6 +1670,34 @@ fn main() {
 
     edge_node_set_status(n1, EDGE_DECOMMISSIONED);
     assert_eq(edge_node_status(n1), EDGE_DECOMMISSIONED, "set decommissioned");
+
+    # =============================================================
+    # secure_zero — VULN-007 sensitive-memory scrub
+    # =============================================================
+    test_group("secure_zero");
+
+    var sz_buf = alloc(64);
+    var szi = 0;
+    while (szi < 64) { store8(sz_buf + szi, 170); szi = szi + 1; }  # 0xAA pattern
+    secure_zero(sz_buf, 64);
+    var sz_ok = 1;
+    szi = 0;
+    while (szi < 64) { if (load8(sz_buf + szi) != 0) { sz_ok = 0; } szi = szi + 1; }
+    assert_eq(sz_ok, 1, "secure_zero clears all bytes");
+
+    # Only the requested length is scrubbed; the byte past `len` is untouched.
+    var sz_buf2 = alloc(16);
+    var szj = 0;
+    while (szj < 16) { store8(sz_buf2 + szj, 187); szj = szj + 1; }  # 0xBB
+    secure_zero(sz_buf2, 8);
+    assert_eq(load8(sz_buf2 + 0), 0, "scrubbed byte 0");
+    assert_eq(load8(sz_buf2 + 7), 0, "scrubbed byte 7 (last in range)");
+    assert_eq(load8(sz_buf2 + 8), 187, "byte past len untouched");
+
+    # Guards: null pointer and non-positive length are no-ops (no crash).
+    assert_eq(secure_zero(0, 64), 0, "null ptr no-ops");
+    assert_eq(secure_zero(sz_buf2, 0), 0, "zero len no-ops");
+    assert_eq(load8(sz_buf2 + 8), 187, "zero-len leaves buffer intact");
 
     # =============================================================
     # recording manager

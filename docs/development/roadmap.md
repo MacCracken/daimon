@@ -8,7 +8,7 @@
 
 ## Security Gates (trigger-based)
 
-- [ ] **P0 (gated)** — **VULN-007: Bump allocator memory zeroing.** **MUST fix before enabling any of**: multi-tenant hosting, kavach sandboxing, untrusted federation, external MCP callbacks (bote). Remediation: per-agent arena allocators with zero-on-reset. Severity is **P0 when triggered**, dormant today because no consumer has flipped any of the gating conditions. Re-evaluate at every v1.x.0 cut.
+- [ ] **P0 (gated)** — **VULN-007: Bump allocator memory zeroing.** **MUST fix before enabling any of**: multi-tenant hosting, kavach sandboxing, untrusted federation, external MCP callbacks (bote). Two halves: (a) the **structural** fix is upstream — the cyrius bump allocator's `alloc_reset()` rewinds without zeroing the reclaimed span (filed [2026-07-03-cyrius-alloc-reset-no-zero-reused-memory.md](issues/2026-07-03-cyrius-alloc-reset-no-zero-reused-memory.md)); `lib/alloc.cyr` is vendored stdlib so daimon can't own it. (b) the **consumer-side** secret-hygiene layer shipped at **1.3.2** — `secure_zero` / `secure_zero_str` (`src/secmem.cyr`) + scrubbing the memory store's transient value buffers so sensitive agent data doesn't linger in the never-freed heap. Still open on the consumer side: **per-agent arena isolation**, the hard prerequisite before any multi-tenant / sandbox / untrusted-federation gate flips (secret-hygiene reduces exposure but does not isolate trust domains). Severity is **P0 when triggered**, dormant today because no consumer has flipped any of the gating conditions. Re-evaluate at every v1.x.0 cut.
 
 ## Blocked on Upstream Ports
 

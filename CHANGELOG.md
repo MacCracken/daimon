@@ -4,9 +4,78 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [1.3.1] - Unreleased
+## [1.3.2] - 2026-07-03
 
-Cut for follow-up work after the 1.3.0 arc. No changes recorded yet.
+**VULN-007 (bump-allocator memory reuse) — consumer-side secret-hygiene
+mitigation, plus the structural fix filed upstream.** Investigation confirmed
+the reuse channel lives entirely in vendored stdlib (the cyrius bump allocator's
+`alloc_reset()` rewinds without zeroing, and it is *sandhi* — not daimon — that
+resets between request batches). daimon's own global allocator is never reset
+during operation, so daimon-allocated data is never handed to a new owner via
+address reuse. What daimon *can* own is secret hygiene: scrubbing sensitive
+buffers so they don't linger in the never-freed bump heap (core-dump /
+`/proc/<pid>/mem` exposure). Full multi-tenant isolation remains gated on the
+upstream fix + per-agent arenas.
+
+### Added
+
+- **`secure_zero(ptr, len)` / `secure_zero_str(s)`** (`src/secmem.cyr`) —
+  DSE-resistant zeroing of sensitive bytes at end-of-life. Cyrius has no
+  `volatile` keyword and does no cross-function dead-store elimination, so the
+  scrub gets its resistance from function-boundary opacity plus a sink read-back
+  (belt-and-suspenders / future-proofing). ~6.7 µs to scrub 4 KiB
+  (`secure_zero_4k` benchmark). New `secure_zero` test group (+7 assertions;
+  225 → 232).
+
+### Changed
+
+- **Memory store scrubs its transient value buffers** (`src/memory.cyr`).
+  `memory_store_list_by_tag` and `memory_store_usage_bytes` each read an agent's
+  full memory value into a heap buffer, examine it (tag match / byte count), and
+  discard it — leaving the value resident in the never-freed heap. Both now
+  `secure_zero` the buffer once the value is consumed. Negligible cost (one pass
+  over already-file-read bytes).
+
+### Security
+
+- **VULN-007 upstream fix filed** —
+  [`docs/development/issues/2026-07-03-cyrius-alloc-reset-no-zero-reused-memory.md`](docs/development/issues/2026-07-03-cyrius-alloc-reset-no-zero-reused-memory.md)
+  (mirrored to the cyrius repo). `alloc_reset()` rewinds the bump pointer to the
+  first chunk without zeroing the reclaimed span, so reset-then-reallocate reuses
+  addresses holding the prior occupant's bytes (CVE-2026-34988 / Wasmtime class).
+  daimon can't fix it (vendored stdlib; the reset is driven by sandhi); proposed
+  fix is zero-on-reset (`memset` the used span, or `MADV_DONTNEED`).
+- **Scope is honest defense-in-depth, not a complete VULN-007 fix.** It does not
+  close the reuse channel (upstream) and does not provide multi-tenant isolation
+  (still requires per-agent arenas — gated). It reduces how long sensitive agent
+  data is resident in the heap. IPC message payloads (fanned out to multiple
+  subscriber queues) and external MCP response data (sandhi-owned) are
+  deliberately NOT scrubbed — doing so would corrupt live/shared memory.
+
+### Verified
+
+- `cyrius build`: OK. `cyrius tests`: **232 / 232**. `cyrius fmt --check` +
+  `cyrius lint`: clean. `secure_zero_4k` benchmark added.
+
+## [1.3.1] - 2026-07-03
+
+**Documentation sweep.** Roadmap trimmed to open-work-only; README expanded; the
+doc surface reconciled to the 1.3.x state.
+
+### Changed
+
+- **`docs/development/roadmap.md` trimmed to open work only** — all completed
+  (`[x]`) sections removed (that history is the CHANGELOG's job) and the met
+  v1.0-criteria block dropped; consolidated to the VULN-007 security gate, the
+  nein firewall-MCP upstream blocker, and the v1.4.0+ backlog under a lean status
+  header.
+- **`README.md` expanded** — intro notes the libro audit trail; deps example
+  lists sakshi/bote/libro/majra; benchmark count corrected; added an "MCP audit
+  tools" section and a "Documentation" link block.
+- **`SECURITY.md`** supported-versions rolled `1.0.x` → `1.3.x` (+ `< 1.3`
+  unsupported). **`docs/guides/api.md`** documents the built-in libro tools
+  alongside the external-tool examples. **`docs/doc-health.md`** ledger rolled to
+  the 1.3.1 sweep.
 
 ## [1.3.0] - 2026-07-03
 

@@ -1,0 +1,54 @@
+# =========================================================================
+# secmem — sensitive-memory scrubbing (VULN-007 consumer-side mitigation)
+# =========================================================================
+#
+# daimon runs on the cyrius bump allocator, which never frees: a buffer that
+# once held sensitive bytes (agent memory values, decrypted payloads,
+# third-party MCP response data) keeps those bytes resident for the whole
+# process lifetime, exposed to a core dump or a /proc/<pid>/mem read. These
+# helpers scrub such buffers at end-of-life so the secret does not linger.
+#
+# SCOPE — what this is and is NOT:
+#  - IS: defense-in-depth "secret hygiene" — clear sensitive data promptly so
+#    it is not resident in the heap longer than needed.
+#  - IS NOT: a fix for the bump allocator's reuse-leak (VULN-007's structural
+#    half). daimon's global allocator is never reset during operation, so
+#    daimon-allocated data is never handed to a new owner via address reuse;
+#    the reuse boundary that IS unsafe (`alloc_reset()` rewinds without
+#    zeroing) lives in vendored stdlib and must be fixed upstream — see
+#    docs/development/issues/2026-07-03-cyrius-alloc-reset-no-zero-reused-memory.md.
+#    Multi-tenant / sandbox / untrusted-federation isolation additionally
+#    requires per-agent arenas (VULN-007 gate, still gated).
+#
+# DSE resistance: Cyrius is single-pass and does no cross-function dead-store
+# elimination today, so a plain store loop in its own function is already
+# safe. The sink read-back below is belt-and-suspenders — it makes the scrub
+# observably read so a future optimizer cannot prove the writes dead. (There
+# is no `volatile` keyword in Cyrius to lean on.)
+
+# A value a future optimizer cannot prove is dead: the scrub reads the last
+# zeroed byte back into it, so the store loop it depends on can't be elided.
+var _secmem_sink = 0;
+
+# Zero `len` bytes at `ptr`. No-op on a null pointer or non-positive length.
+fn secure_zero(ptr, len): i64 {
+    if (ptr == 0) { return 0; }
+    if (len <= 0) { return 0; }
+    var i = 0;
+    while (i < len) {
+        store8(ptr + i, 0);
+        i = i + 1;
+    }
+    # Observe the scrub so it cannot be dead-store-eliminated.
+    _secmem_sink = _secmem_sink + load8(ptr + len - 1);
+    return 0;
+}
+
+# Scrub a Str's backing bytes in place (data pointer + length). Use on a Str
+# holding sensitive content once the caller is done with it and no other
+# reference remains (the bump allocator never frees, so the backing is
+# orphaned but still resident).
+fn secure_zero_str(s): i64 {
+    if (s == 0) { return 0; }
+    return secure_zero(str_data(s), str_len(s));
+}

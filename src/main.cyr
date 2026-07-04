@@ -45,6 +45,7 @@ var SYS_GETSOCKOPT = 55;
 include "src/error.cyr"
 include "src/config.cyr"
 include "src/audit.cyr"
+include "src/secmem.cyr"
 include "src/agent.cyr"
 include "src/supervisor.cyr"
 include "src/memory.cyr"
