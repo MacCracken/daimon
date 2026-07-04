@@ -4,7 +4,7 @@
 >
 > **Severity legend**: **P0** blocking (security / correctness — must-fix before ship) · **P1** high (must-have for the current arc) · **P2** medium (schedule when capacity opens) · **P3 / Low** nice-to-have, no urgency. Upstream-blocker items quote the upstream tracker's own severity.
 
-**Current status** — `1.3.1` (development). The 1.3.0 arc shipped (cyrius 6.3.43 toolchain, VERSION single-source-of-truth, doc refresh, bote `libro_*` audit tools wired into the MCP host + a daimon audit-event feed). No open work is scheduled on the current arc; v1.0 criteria are all met.
+**Current status** — `1.3.3` (development). Recent ships: 1.3.0 (cyrius 6.3.43 toolchain, VERSION single-source-of-truth, bote `libro_*` audit tools + audit-event feed), 1.3.1 (doc sweep), 1.3.2 (VULN-007 consumer-side secret-hygiene), 1.3.3 (distributed tracing over sakshi, `serve --trace`). No open feature work is scheduled on the current arc; v1.0 criteria are all met. See CHANGELOG for detail.
 
 ## Security Gates (trigger-based)
 
@@ -21,5 +21,4 @@ Unsequenced; severity is assigned at the v1.4.0 cut once the arc's shape is chos
 - [ ] jnana integration — grounded knowledge queries backed by verified AGNOS science data
 - [ ] gRPC transport option alongside HTTP
 - [ ] WebSocket streaming for real-time agent events
-- [ ] Distributed tracing integration (sakshi)
 - [ ] Agent migration between nodes

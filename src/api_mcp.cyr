@@ -97,7 +97,9 @@ fn api_mcp_call(fd, body) {
         # convention — dispatch.cyr resp_success(id, result)).
         var args = jsonx_get_raw(str_cstr(body), "arguments");
         if (args == 0) { args = "{}"; }
+        trace_span_enter("mcp.builtin", 11);
         var result = mcp_dispatch_builtin(name_c, args);
+        trace_span_exit();
         if (result == 0) {
             # Registered builtin with no in-process handler — 501 (the route
             # exists but isn't implemented for this tool kind).
@@ -122,7 +124,13 @@ fn api_mcp_call(fd, body) {
     # it through verbatim. sandhi_rpc_mcp_call wraps it as JSON-RPC 2.0
     # {jsonrpc, id, method:"tools/call", params:<body>}.
     daimon_audit(SEV_INFO, "mcp", "mcp.call", name_c);
+    # Outbound span times the external forward. NOTE: sandhi_rpc_mcp_call takes
+    # no custom request headers, so the trace id is NOT propagated downstream
+    # via `traceparent` — the span is local-only until sandhi's rpc gains
+    # header support.
+    trace_span_enter("mcp.forward", 11);
     var resp = sandhi_rpc_mcp_call(str_cstr(url), "tools/call", str_cstr(body));
+    trace_span_exit();
     if (sandhi_rpc_ok(resp) == 0) {
         # Transport-level failure — connect / TLS / timeout / non-2xx.
         # Map to 502 with the upstream error message.

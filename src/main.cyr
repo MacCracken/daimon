@@ -46,6 +46,7 @@ include "src/error.cyr"
 include "src/config.cyr"
 include "src/audit.cyr"
 include "src/secmem.cyr"
+include "src/trace.cyr"
 include "src/agent.cyr"
 include "src/supervisor.cyr"
 include "src/memory.cyr"
@@ -92,6 +93,7 @@ fn main() {
             while (argi < argc()) {
                 var arg = argv(argi);
                 if (streq(arg, "--async") == 1) { use_async = 1; }
+                elif (streq(arg, "--trace") == 1) { trace_set_enabled(1); }
                 else {
                     # Parse as port number
                     port = 0;

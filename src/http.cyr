@@ -110,8 +110,9 @@ fn _http_reason(status) {
 # Content-Type: application/json + Connection: close, matching
 # daimon original behaviour.
 fn http_send_response(fd, status, body_data, body_len) {
+    # extra_headers echoes X-Trace-Id when `serve --trace` is on (else 0).
     sandhi_server_send_response(fd, status, _http_reason(status),
-    "application/json", body_data, body_len, 0);
+    "application/json", body_data, body_len, trace_response_header());
 }
 
 fn http_ok(fd, body) {

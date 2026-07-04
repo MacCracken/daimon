@@ -131,7 +131,13 @@ fn handle_request(ctx, cfd, buf, blen) {
 
     var method = http_parse_method(buf, blen);
     var path = http_parse_path(buf, blen);
+    # Root request span: adopts/generates the trace id (from traceparent /
+    # X-Trace-Id) and correlates every span + log emitted during routing.
+    # No-op unless `serve --trace`. Single enter/exit around http_route so the
+    # span stack stays balanced (the early rejections above are untraced).
+    trace_begin(buf, blen, "http.request", 12);
     http_route(cfd, method, path, buf, blen);
+    trace_end();
     return 0;
 }
 

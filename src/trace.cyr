@@ -1,0 +1,141 @@
+# =========================================================================
+# trace — distributed tracing over sakshi (span stack + i64 trace-id)
+# =========================================================================
+#
+# daimon participates in a distributed trace: it adopts an inbound trace id
+# (W3C `traceparent` or `X-Trace-Id`), correlates all sakshi spans/events
+# under it, spans key operations, and echoes the id back (`X-Trace-Id`) so a
+# caller can stitch daimon's spans into its own trace.
+#
+# sakshi's tracing model is a span stack + a single i64 trace id
+# (sakshi_span_enter/exit + sakshi_trace_set/id), so daimon's trace id is
+# 64-bit.
+#
+# LIMITATIONS (honest):
+#  - i64 trace id — a W3C 128-bit trace-id is folded to its low 64 bits (that
+#    is all sakshi holds). Correlation inside a daimon-rooted trace is exact; a
+#    full 128-bit round-trip is not preserved.
+#  - No outbound HTTP propagation — `sandhi_rpc_mcp_call` takes no custom
+#    request headers, so daimon cannot inject `traceparent` on external MCP
+#    forwards. The id reaches downstream only if sandhi's rpc gains header
+#    support (see the note in api_mcp.cyr).
+#
+# Opt-in: `daimon serve --trace`. Off by default — per-request span emission
+# is noisy for production — and when off every helper is a cheap no-op.
+
+var _trace_enabled = 0;
+
+fn trace_set_enabled(on) { _trace_enabled = on; return 0; }
+fn trace_enabled() { return _trace_enabled; }
+
+# Parse up to `n` hex chars at data+off into an i64. Stops at the first
+# non-hex char.
+fn _trace_parse_hex(data, off, n): i64 {
+    var v = 0;
+    var i = 0;
+    while (i < n) {
+        var c = load8(data + off + i);
+        var d = 0 - 1;
+        if (c >= 48) { if (c <= 57) { d = c - 48; } }    # 0-9
+        if (c >= 97) { if (c <= 102) { d = c - 87; } }   # a-f
+        if (c >= 65) { if (c <= 70) { d = c - 55; } }    # A-F
+        if (d < 0) { return v; }
+        v = v * 16 + d;
+        i = i + 1;
+    }
+    return v;
+}
+
+# Generate a random, non-zero trace id (positive 63-bit).
+fn _trace_gen_id(): i64 {
+    var b = alloc(8);
+    random_bytes(b, 8);
+    var id = load64(b);
+    if (id < 0) { id = 0 - id; }
+    if (id <= 0) { id = clock_now_ns(); }
+    return id;
+}
+
+# Extract a trace id from the request headers, or generate a fresh one.
+# Priority: W3C `traceparent` trace-id (low 64 bits) > `X-Trace-Id` (hex) >
+# generated. Never returns 0 (0 means "no trace" to sakshi).
+fn trace_extract_or_new(buf, blen): i64 {
+    # W3C traceparent: "00-<32hex trace-id>-<16hex span-id>-<2hex flags>".
+    # trace-id occupies chars 3..34; its low 64 bits are chars 19..34.
+    # sandhi_server_find_header returns a NUL-terminated cstr (the header
+    # value) or 0 — not a Str. Use strlen / the raw pointer.
+    var tp = sandhi_server_find_header(buf, blen, "traceparent");
+    if (tp != 0) {
+        if (strlen(tp) >= 35) {
+            var id = _trace_parse_hex(tp, 19, 16);
+            if (id != 0) { return id; }
+        }
+    }
+    var xt = sandhi_server_find_header(buf, blen, "X-Trace-Id");
+    if (xt != 0) {
+        var id2 = _trace_parse_hex(xt, 0, 16);
+        if (id2 != 0) { return id2; }
+    }
+    return _trace_gen_id();
+}
+
+# Begin a request trace: adopt/generate the id, set it on sakshi, enter the
+# root span. Returns the trace id (0 when tracing is disabled).
+fn trace_begin(buf, blen, name, name_len): i64 {
+    if (_trace_enabled == 0) { return 0; }
+    var id = trace_extract_or_new(buf, blen);
+    sakshi_trace_set(id);
+    sakshi_span_enter(name, name_len);
+    return id;
+}
+
+fn trace_end(): i64 {
+    if (_trace_enabled == 0) { return 0; }
+    return sakshi_span_exit();
+}
+
+# Nested span around a sub-operation (MCP dispatch, agent op). No-op when off.
+fn trace_span_enter(name, name_len): i64 {
+    if (_trace_enabled == 0) { return 0; }
+    return sakshi_span_enter(name, name_len);
+}
+
+fn trace_span_exit(): i64 {
+    if (_trace_enabled == 0) { return 0; }
+    return sakshi_span_exit();
+}
+
+# Format an i64 trace id as exactly 16 lowercase hex chars into `buf` (needs
+# >= 17 bytes), NUL-terminated. Returns buf. Used for the X-Trace-Id echo.
+fn trace_id_hex(id, buf): i64 {
+    var i = 0;
+    while (i < 16) {
+        var shift = (15 - i) * 4;
+        var nib = (id >> shift) & 15;
+        var c = 48 + nib;             # 0-9
+        if (nib >= 10) { c = 87 + nib; }  # a-f
+        store8(buf + i, c);
+        i = i + 1;
+    }
+    store8(buf + 16, 0);
+    return buf;
+}
+
+# Extra-header cstr echoing the active trace id ("X-Trace-Id: <hex>\r\n"), for
+# the http_send_response `extra_headers` slot — lets a caller stitch daimon's
+# spans into its trace. Returns 0 when tracing is off or no trace is active
+# (so the common path pays only one comparison).
+fn trace_response_header(): i64 {
+    if (_trace_enabled == 0) { return 0; }
+    var id = sakshi_trace_id();
+    if (id == 0) { return 0; }
+    var hbuf = alloc(17);
+    trace_id_hex(id, hbuf);
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "X-Trace-Id: ");
+    str_builder_add_cstr(sb, hbuf);
+    str_builder_add_cstr(sb, "\r\n");
+    # str_cstr (not str_data) — sandhi appends extra_headers as a NUL-terminated
+    # cstr; the builder's raw data is not NUL-terminated.
+    return str_cstr(str_builder_build(sb));
+}

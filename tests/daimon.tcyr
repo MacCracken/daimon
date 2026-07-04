@@ -415,6 +415,36 @@ fn secure_zero(ptr, len): i64 {
     return 0;
 }
 
+# trace (src/trace.cyr) — hex parse + format for i64 trace ids
+fn _trace_parse_hex(data, off, n): i64 {
+    var v = 0;
+    var i = 0;
+    while (i < n) {
+        var c = load8(data + off + i);
+        var d = 0 - 1;
+        if (c >= 48) { if (c <= 57) { d = c - 48; } }
+        if (c >= 97) { if (c <= 102) { d = c - 87; } }
+        if (c >= 65) { if (c <= 70) { d = c - 55; } }
+        if (d < 0) { return v; }
+        v = v * 16 + d;
+        i = i + 1;
+    }
+    return v;
+}
+fn trace_id_hex(id, buf): i64 {
+    var i = 0;
+    while (i < 16) {
+        var shift = (15 - i) * 4;
+        var nib = (id >> shift) & 15;
+        var c = 48 + nib;
+        if (nib >= 10) { c = 87 + nib; }
+        store8(buf + i, c);
+        i = i + 1;
+    }
+    store8(buf + 16, 0);
+    return buf;
+}
+
 fn mcp_registry_new() {
     var reg = alloc(16);
     store64(reg, map_new());
@@ -1698,6 +1728,25 @@ fn main() {
     assert_eq(secure_zero(0, 64), 0, "null ptr no-ops");
     assert_eq(secure_zero(sz_buf2, 0), 0, "zero len no-ops");
     assert_eq(load8(sz_buf2 + 8), 187, "zero-len leaves buffer intact");
+
+    # =============================================================
+    # trace — distributed-tracing id parse/format (src/trace.cyr)
+    # =============================================================
+    test_group("trace_id");
+
+    assert_eq(_trace_parse_hex(str_data(str_from("ff")), 0, 2), 255, "parse ff = 255");
+    assert_eq(_trace_parse_hex(str_data(str_from("cafe")), 0, 4), 51966, "parse cafe = 0xcafe");
+    # Parsing stops at the first non-hex char (space): "ab cd" yields just "ab".
+    assert_eq(_trace_parse_hex(str_data(str_from("ab cd")), 0, 5), 171, "parse stops at non-hex");
+    # W3C traceparent: the trace-id's low 64 bits are the 16 hex at offset 19.
+    var tp_s = str_data(str_from("00-aaaaaaaabbbbbbbbccccccccdddddddd-5566778899aabbcc-01"));
+    var exp_s = str_data(str_from("ccccccccdddddddd"));
+    assert_eq(_trace_parse_hex(tp_s, 19, 16), _trace_parse_hex(exp_s, 0, 16),
+    "traceparent low-64 extracted at offset 19");
+    # trace_id_hex formats an i64 that _trace_parse_hex reads back identically.
+    var rt_buf = alloc(17);
+    trace_id_hex(305419896, rt_buf);  # 0x12345678
+    assert_eq(_trace_parse_hex(rt_buf, 0, 16), 305419896, "trace_id_hex round-trips");
 
     # =============================================================
     # recording manager

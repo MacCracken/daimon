@@ -384,6 +384,27 @@ fn bench_secure_zero() {
     return 0;
 }
 
+# trace_id_hex (src/trace.cyr) — format an i64 trace id as 16 hex chars
+fn trace_id_hex(id, buf): i64 {
+    var i = 0;
+    while (i < 16) {
+        var shift = (15 - i) * 4;
+        var nib = (id >> shift) & 15;
+        var c = 48 + nib;
+        if (nib >= 10) { c = 87 + nib; }
+        store8(buf + i, c);
+        i = i + 1;
+    }
+    store8(buf + 16, 0);
+    return buf;
+}
+var _bench_tid_buf = 0;
+fn bench_trace_id_hex() {
+    if (_bench_tid_buf == 0) { _bench_tid_buf = alloc(17); }
+    trace_id_hex(305419896, _bench_tid_buf);
+    return 0;
+}
+
 # Helper for strcmp
 fn strcmp(a, b) {
     var i = 0;
@@ -547,6 +568,10 @@ fn main() {
     var b17 = bench_new("secure_zero_4k");
     bench_run(b17, &bench_secure_zero, 100000);
     vec_push(benches, b17);
+
+    var b18 = bench_new("trace_id_hex");
+    bench_run(b18, &bench_trace_id_hex, 100000);
+    vec_push(benches, b18);
 
     bench_report_all(benches);
     return 0;

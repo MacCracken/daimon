@@ -6,7 +6,7 @@ type: state
 
 # Documentation Health — daimon
 
-> **Last refresh**: 2026-07-03 (1.3.1 sweep — roadmap trimmed to open-work-only, README expanded, SECURITY supported-versions rolled; 1.3.0 arc context preserved below).
+> **Last refresh**: 2026-07-03 (through 1.3.3 — 1.3.1 doc sweep, 1.3.2 VULN-007 secret-hygiene, 1.3.3 distributed tracing; api.md gained tracing + libro-tool sections; 1.3.0 arc context preserved below).
 > **Refresh cadence**: when docs are touched, update the affected row. Full re-audit at each minor cut.
 > **Scope**: this repo only (`daimon`) — root-level files plus the entire `docs/` tree.
 

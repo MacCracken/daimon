@@ -49,6 +49,26 @@ libro_check "$LIBRO_AUDIT"    "audit records SSRF-rejected registration" 'mcp.re
 if [ $LIBRO_OK -ne 1 ]; then echo "  libro smoke FAILED"; TEST_EXIT=1; fi
 
 echo ""
+echo "=== distributed tracing smoke (serve --trace) ==="
+# `--trace` must adopt an inbound W3C traceparent and echo its low-64 bits
+# back as X-Trace-Id (127.0.0.1 forces IPv4 — localhost's IPv6 first-try is
+# flaky against daimon's IPv4 bind).
+TRACE_PORT=18078
+TRACE_OK=1
+./build/daimon serve $TRACE_PORT --trace >/dev/null 2>&1 &
+TRACE_SRV=$!
+i=0
+while [ $i -lt 25 ]; do
+    if curl -s --max-time 1 "http://127.0.0.1:$TRACE_PORT/v1/health" >/dev/null 2>&1; then break; fi
+    i=$((i + 1)); sleep 0.1
+done
+TRACE_ADOPT=$(curl -sv --max-time 2 -H "traceparent: 00-aaaaaaaabbbbbbbbccccccccdddddddd-5566778899aabbcc-01" "http://127.0.0.1:$TRACE_PORT/v1/health" 2>&1 | grep -i "^< X-Trace-Id")
+kill $TRACE_SRV 2>/dev/null || true
+printf "  %s: " "traceparent adopted + echoed as X-Trace-Id"
+if printf '%s' "$TRACE_ADOPT" | grep -qi "ccccccccdddddddd"; then echo "PASS"; else echo "FAIL"; TRACE_OK=0; fi
+if [ $TRACE_OK -ne 1 ]; then echo "  trace smoke FAILED"; TEST_EXIT=1; fi
+
+echo ""
 echo "=== fuzz harnesses ==="
 for f in fuzz/*.fcyr; do
     name=$(basename "$f" .fcyr)

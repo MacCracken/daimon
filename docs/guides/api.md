@@ -4,6 +4,27 @@ Daimon exposes a REST API on port 8090 (configurable via `serve [port]`).
 
 All responses are JSON. All POST bodies are JSON. Connection is closed after each response.
 
+## Distributed tracing
+
+When started with `serve --trace`, daimon participates in a distributed trace on
+every request:
+
+- **Inbound** — it adopts a trace id from a W3C `traceparent` header (the
+  trace-id's low 64 bits) or an `X-Trace-Id` header, generating one if neither
+  is present.
+- **Outbound** — it echoes `X-Trace-Id: <16 hex>` on the response, and emits
+  timed sakshi spans (`http.request`, `mcp.builtin` / `mcp.forward`) correlated
+  under that id.
+
+```
+curl -i -H "traceparent: 00-<32hex trace-id>-<16hex span-id>-01" http://localhost:8090/v1/health
+→ ... X-Trace-Id: <low 64 bits of the trace-id>
+```
+
+Tracing is off by default (no `X-Trace-Id`, no span emission). Note: the id is
+64-bit (sakshi's model), and it is not propagated to external MCP endpoints
+(`sandhi_rpc` takes no custom request headers).
+
 ## Health
 
 ```

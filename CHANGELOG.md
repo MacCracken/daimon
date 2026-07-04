@@ -4,6 +4,47 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.3.3] - 2026-07-03
+
+**Distributed tracing over sakshi.** daimon now participates in a distributed
+trace: it adopts an inbound trace id, correlates its sakshi spans under it,
+spans key operations, and echoes the id back so a caller can stitch daimon's
+work into its own trace. Opt-in (`serve --trace`); off by default and a no-op
+when off.
+
+### Added
+
+- **`src/trace.cyr`** — trace context over sakshi's span stack + i64 trace id.
+  - **Inbound adoption**: at the request boundary, extract the trace id from a
+    W3C `traceparent` (the trace-id's low 64 bits) or `X-Trace-Id` header, else
+    generate a random one (`random_bytes`). Set via `sakshi_trace_set`.
+  - **Spans**: a root `http.request` span per request (single balanced
+    enter/exit around routing) + nested `mcp.builtin` / `mcp.forward` spans
+    around MCP dispatch. Timed and emitted by sakshi.
+  - **Outbound echo**: `X-Trace-Id: <16 hex>` on every response (added centrally
+    in `http_send_response` via sandhi's `extra_headers` slot).
+  - `--trace` flag on the `serve` command toggles it; when off, every helper is
+    a cheap guard-and-return and no header is emitted.
+  - New `trace_id` test group (+5 assertions; 232 → 237: hex parse/format
+    round-trip, traceparent low-64 extraction, non-hex stop) and a `test.sh`
+    integration smoke (traceparent adopted → echoed). `trace_id_hex` benchmark
+    (~1.4 µs).
+
+### Notes
+
+- **Limits (honest).** sakshi holds a single **i64** trace id, so a W3C 128-bit
+  trace-id is folded to its low 64 bits — correlation within a daimon-rooted
+  trace is exact, but a full 128-bit round-trip is not preserved. And
+  `sandhi_rpc_mcp_call` takes **no custom request headers**, so daimon cannot
+  inject `traceparent` on external MCP forwards — the `mcp.forward` span is
+  local-only until sandhi's rpc gains header support.
+
+### Verified
+
+- `cyrius build`: OK. `cyrius tests`: **237 / 237**. `cyrius fmt --check` +
+  `cyrius lint`: clean. `test.sh` tracing smoke passes (W3C `traceparent`
+  adopted and echoed as `X-Trace-Id`); span emission verified live.
+
 ## [1.3.2] - 2026-07-03
 
 **VULN-007 (bump-allocator memory reuse) — consumer-side secret-hygiene
