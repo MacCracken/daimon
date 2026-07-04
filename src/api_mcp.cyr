@@ -124,12 +124,12 @@ fn api_mcp_call(fd, body) {
     # it through verbatim. sandhi_rpc_mcp_call wraps it as JSON-RPC 2.0
     # {jsonrpc, id, method:"tools/call", params:<body>}.
     daimon_audit(SEV_INFO, "mcp", "mcp.call", name_c);
-    # Outbound span times the external forward. NOTE: sandhi_rpc_mcp_call takes
-    # no custom request headers, so the trace id is NOT propagated downstream
-    # via `traceparent` — the span is local-only until sandhi's rpc gains
-    # header support.
+    # Outbound span times the external forward AND propagates the trace context:
+    # trace_mcp_forward injects a W3C `traceparent` header (via
+    # sandhi_rpc_mcp_call_with_headers) so the downstream endpoint joins this
+    # trace. Falls back to a headerless call when tracing is off.
     trace_span_enter("mcp.forward", 11);
-    var resp = sandhi_rpc_mcp_call(str_cstr(url), "tools/call", str_cstr(body));
+    var resp = trace_mcp_forward(str_cstr(url), str_cstr(body));
     trace_span_exit();
     if (sandhi_rpc_ok(resp) == 0) {
         # Transport-level failure — connect / TLS / timeout / non-2xx.

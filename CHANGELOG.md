@@ -4,6 +4,48 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.3.4] - 2026-07-03
+
+**Toolchain → cyrius `6.4.1` + sakshi `2.4.4`, which land the two upstream fixes
+daimon was waiting on — the VULN-007 structural fix and 128-bit trace-ids — so
+the 1.3.2 gate and both 1.3.3 tracing limitations close.**
+
+### Changed
+
+- **cyrius pin `6.3.43` → `6.4.1`** (`cyrius.cyml`); **`[deps.sakshi]` `2.4.3` →
+  `2.4.4`**. `cyrius lib sync` + `cyrius deps` re-vendored (`cyrius.lock` 72
+  deps). No daimon source breakage from the 6.4.0 `CYRIUS_MONOMORPH` default-on
+  flip (daimon uses no generics; it was decoupled from general inlining +
+  verified byte-identical upstream). 240/240 tests.
+- **Full 128-bit trace-id adoption** (`src/trace.cyr`). Now that sakshi 2.4.4
+  ships `sakshi_trace_set_128` / `_hi` / `_lo`, daimon adopts the **whole** W3C
+  `traceparent` trace-id (high 64 bits at offset 3, low at 19) instead of
+  folding to the low half; `X-Trace-Id` accepts 32-hex (128-bit) or 16-hex
+  (64-bit). The `X-Trace-Id` response echo is now the full 32-hex id. Closes the
+  1.3.3 "i64-only" limitation. (+3 test assertions; 237 → 240.)
+- **Outbound trace-context propagation** (`src/trace.cyr`, `api_mcp.cyr`). The
+  external MCP forward now injects a W3C `traceparent` header (active trace id +
+  a fresh span id) via `sandhi_rpc_mcp_call_with_headers`, so the downstream
+  endpoint joins the trace. Closes the 1.3.3 "no outbound propagation"
+  limitation. (The header API already existed in sandhi 1.7.0 — the 1.3.3 note
+  had misread the API; no sandhi change was needed.)
+
+### Security
+
+- **VULN-007 structural half — CLOSED upstream.** cyrius 6.4.1 landed
+  zero-on-reset in `alloc_reset()` across all four allocator backends (the
+  `_alloc_zero` scrub before the bump-pointer rewind), which daimon now vendors.
+  The bump-allocator reuse channel is closed at the source. daimon's 1.3.2
+  consumer-side secret-hygiene stands as defense-in-depth; **per-agent arena
+  isolation remains the only open half**, still gated for multi-tenant.
+
+### Verified
+
+- `cyrius build`: OK. `cyrius tests`: **240 / 240**. `cyrius fmt --check` +
+  `cyrius lint`: clean. `test.sh`: libro smoke 6/6, tracing smoke passes now
+  asserting the **full 128-bit** `traceparent` round-trips through `X-Trace-Id`,
+  5/5 fuzz. Vendored `alloc.cyr` confirmed carrying the zero-on-reset scrub.
+
 ## [1.3.3] - 2026-07-03
 
 **Distributed tracing over sakshi.** daimon now participates in a distributed

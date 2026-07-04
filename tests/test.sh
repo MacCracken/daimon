@@ -64,8 +64,10 @@ while [ $i -lt 25 ]; do
 done
 TRACE_ADOPT=$(curl -sv --max-time 2 -H "traceparent: 00-aaaaaaaabbbbbbbbccccccccdddddddd-5566778899aabbcc-01" "http://127.0.0.1:$TRACE_PORT/v1/health" 2>&1 | grep -i "^< X-Trace-Id")
 kill $TRACE_SRV 2>/dev/null || true
-printf "  %s: " "traceparent adopted + echoed as X-Trace-Id"
-if printf '%s' "$TRACE_ADOPT" | grep -qi "ccccccccdddddddd"; then echo "PASS"; else echo "FAIL"; TRACE_OK=0; fi
+printf "  %s: " "traceparent adopted + echoed as full 128-bit X-Trace-Id"
+# 1.3.4: the WHOLE 128-bit trace-id must echo (high half aaaaaaaabbbbbbbb + low
+# ccccccccdddddddd) — 1.3.3 dropped the high half.
+if printf '%s' "$TRACE_ADOPT" | grep -qi "aaaaaaaabbbbbbbbccccccccdddddddd"; then echo "PASS"; else echo "FAIL"; TRACE_OK=0; fi
 if [ $TRACE_OK -ne 1 ]; then echo "  trace smoke FAILED"; TEST_EXIT=1; fi
 
 echo ""

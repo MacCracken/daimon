@@ -9,21 +9,22 @@ All responses are JSON. All POST bodies are JSON. Connection is closed after eac
 When started with `serve --trace`, daimon participates in a distributed trace on
 every request:
 
-- **Inbound** — it adopts a trace id from a W3C `traceparent` header (the
-  trace-id's low 64 bits) or an `X-Trace-Id` header, generating one if neither
-  is present.
-- **Outbound** — it echoes `X-Trace-Id: <16 hex>` on the response, and emits
+- **Inbound** — it adopts the full 128-bit trace-id from a W3C `traceparent`
+  header (or an `X-Trace-Id` header: 32-hex = 128-bit, 16-hex = 64-bit),
+  generating one if neither is present.
+- **Response** — it echoes `X-Trace-Id: <32 hex>` (the full trace-id) and emits
   timed sakshi spans (`http.request`, `mcp.builtin` / `mcp.forward`) correlated
   under that id.
+- **Outbound** — on an external MCP forward it propagates the trace context
+  downstream as a fresh `traceparent` request header, so that endpoint joins the
+  trace.
 
 ```
 curl -i -H "traceparent: 00-<32hex trace-id>-<16hex span-id>-01" http://localhost:8090/v1/health
-→ ... X-Trace-Id: <low 64 bits of the trace-id>
+→ ... X-Trace-Id: <32-hex trace-id>
 ```
 
-Tracing is off by default (no `X-Trace-Id`, no span emission). Note: the id is
-64-bit (sakshi's model), and it is not propagated to external MCP endpoints
-(`sandhi_rpc` takes no custom request headers).
+Tracing is off by default (no `X-Trace-Id`, no span emission).
 
 ## Health
 
