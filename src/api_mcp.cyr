@@ -75,12 +75,33 @@ fn api_mcp_deregister(fd, name_cstr) {
     return 0;
 }
 
+# _mcp_wrap_builtin: wrap a builtin tool's raw JSON result in a conformant MCP
+# `tools/call` result envelope — {"content":[{"type":"text","text":"<result>"}],
+# "isError":<bool>}. The builtin libro_* tools return bare daimon JSON
+# ({"ok":true,...} / {"ok":false,"error":...}), which is NOT a valid MCP result:
+# a strict client (thoth) that reads content[0].text found none and rendered
+# "no text content could be parsed". We embed the raw result JSON as the text
+# block and derive isError from its `ok` field (ok:false -> isError:true). External
+# tools already return conformant results and pass through verbatim below, so this
+# wrapping is builtin-only.
+fn _mcp_wrap_builtin(result) {
+    var is_err = 0;
+    var okraw = jsonx_get_raw(result, "ok");
+    if (okraw != 0) { if (streq(okraw, "false") == 1) { is_err = 1; } }
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"content\":[{\"type\":\"text\",\"text\":\"");
+    str_builder_add(sb, json_escape_str(str_from(result)));
+    str_builder_add_cstr(sb, "\"}],\"isError\":");
+    if (is_err == 1) { str_builder_add_cstr(sb, "true}"); } else { str_builder_add_cstr(sb, "false}"); }
+    return str_builder_build(sb);
+}
+
 # POST /v1/mcp/call
 # Body: {"name": "<tool-name>", "arguments": {…}} — MCP `tools/call`
 # params shape. For external tools the body is forwarded verbatim as
-# the JSON-RPC params to the registered callback URL via
-# sandhi_rpc_mcp_call. Builtin tools have no dispatcher today and
-# return 501.
+# the JSON-RPC params to the registered callback URL via sandhi_rpc_mcp_call.
+# Builtin tools dispatch in-process; their raw JSON result is wrapped in an MCP
+# content-block envelope (_mcp_wrap_builtin) so strict clients can read it.
 fn api_mcp_call(fd, body) {
     if (body == 0) { http_bad_request(fd, str_from("missing body")); return 0; }
     var pairs = json_parse(body);
@@ -107,7 +128,7 @@ fn api_mcp_call(fd, body) {
             http_send_response(fd, 501, str_data(b), str_len(b));
             return 0;
         }
-        http_ok(fd, str_from(result));
+        http_ok(fd, _mcp_wrap_builtin(result));   # wrap the bare builtin JSON in an MCP result envelope
         return 0;
     }
     # Re-validate the stored URL at dispatch time. Registration already runs

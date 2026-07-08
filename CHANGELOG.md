@@ -4,6 +4,34 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.3.5] - 2026-07-07
+
+**Built-in `libro_*` tools now return MCP-conformant results, plus a toolchain refresh to cyrius `6.4.20`.**
+The five built-in audit tools (`libro_query` / `libro_verify` / `libro_export` / `libro_proof` /
+`libro_retention`) dispatched in-process and returned their bare daimon JSON (`{"ok":true,...}` /
+`{"ok":false,"error":...}`) straight out of `/v1/mcp/call` — which is NOT a conformant MCP `tools/call`
+result. A strict MCP client that reads `content[0].text` (e.g. thoth's `/call` and its agentic tool loop)
+found none and rendered "no text content could be parsed", so the tools appeared to return nothing.
+Externally-hosted tools were unaffected (they already return conformant results and pass through verbatim).
+240 unit assertions + the libro/tracing smokes pass on the new toolchain.
+
+### Fixed
+- **Built-in tool results are wrapped in an MCP content-block envelope** (`src/api_mcp.cyr`, new
+  `_mcp_wrap_builtin`): `POST /v1/mcp/call` for a built-in tool now returns
+  `{"content":[{"type":"text","text":"<raw result JSON>"}],"isError":<bool>}`, with `isError` derived from
+  the result's `ok` field (`ok:false` → `isError:true`). The `libro_tool_*` functions (vendored
+  `lib/bote.cyr`) are unchanged — the wrapping happens at the dispatch site, so the audit-chain output is
+  preserved verbatim inside the text block. Verified live: `libro_query` → `isError:false`,
+  `libro_retention` (missing arg) → `isError:true`.
+
+### Changed
+- **Toolchain pin `6.4.1 → 6.4.20`** (`cyrius.cyml` + `cyrius lib sync` — 64 floor modules; `cyrius deps`
+  re-locked the 6 git deps). Clears the drift warning; the binary builds and the full suite passes.
+
+### Release
+- VERSION `1.3.4 → 1.3.5`; `cyrius.cyml` tracks it via `${file:VERSION}`. The zugot marketplace recipe
+  pin (`marketplace/daimon.cyml`) and the git tag are the user's release steps.
+
 ## [1.3.4] - 2026-07-03
 
 **Toolchain → cyrius `6.4.1` + sakshi `2.4.4`, which land the two upstream fixes
