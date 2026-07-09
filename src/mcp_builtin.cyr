@@ -39,6 +39,18 @@ fn mcp_libro_init(reg) {
     return 0;
 }
 
+# mcp_web_init: register bote's web tools (web_fetch / web_search) as builtin MCP tools. web_search targets
+# the SearXNG instance at BOTE_SEARXNG_URL (unset -> the tool reports it, never faked). The handlers live in
+# bote (lib/bote.cyr); daimon only hosts + dispatches them. Call from app_init after the registry exists.
+fn mcp_web_init(reg) {
+    var schema = str_from("{\"type\":\"object\"}");
+    mcp_register_builtin(reg, mcp_tool_new(str_from("web_fetch"),
+    str_from("Fetch a web page and return its readable text; args {url} (http/https only)"), schema));
+    mcp_register_builtin(reg, mcp_tool_new(str_from("web_search"),
+    str_from("Search the web via SearXNG and return the top results; args {query, count?}"), schema));
+    return 0;
+}
+
 # Dispatch a builtin tool in-process. name_c: tool name (cstr). args: the raw
 # MCP `arguments` object (cstr). Returns the handler's JSON result (cstr), or
 # 0 if name_c is not a known builtin (the caller falls back to 501).
@@ -48,5 +60,7 @@ fn mcp_dispatch_builtin(name_c, args) {
     if (streq(name_c, "libro_export") == 1) { return libro_tool_export(args, 0); }
     if (streq(name_c, "libro_proof") == 1) { return libro_tool_proof(args, 0); }
     if (streq(name_c, "libro_retention") == 1) { return libro_tool_retention(args, 0); }
+    if (streq(name_c, "web_fetch") == 1) { return web_fetch_handler(args, 0); }
+    if (streq(name_c, "web_search") == 1) { return web_search_handler(args, 0); }
     return 0;
 }

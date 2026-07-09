@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.4.0] - 2026-07-09
+
+**Web tools hosted (`web_fetch` / `web_search`).** daimon now registers bote's new web tool family (bote
+`3.1.0`) as built-in MCP tools, so an MCP client (thoth, via its agentic loop) can fetch pages and search the
+web through the spine — t-ron-gated, no reimplementation in the consumer. The handlers live in bote; daimon
+hosts + dispatches them (the same in-process builtin path as `libro_*`). Verified end-to-end: `web_fetch
+http://example.com` returns clean readable text; `web_search` degrades honestly with no `BOTE_SEARXNG_URL`.
+
+### Added
+- **`mcp_web_init`** (`src/mcp_builtin.cyr`) registers `web_fetch` + `web_search`; `mcp_dispatch_builtin`
+  routes them to bote's `web_fetch_handler` / `web_search_handler`; `app_init` calls it after `mcp_libro_init`.
+- `[deps.bote]` bumped to `3.1.0` (the release carrying `src/web_tools.cyr`).
+
+### Fixed
+- `_mcp_wrap_builtin` no longer double-wraps an already-conformant result: a builtin that returns a full MCP
+  content block (bote's `fs_*` / `web_*` tools) now passes through verbatim, while bare builtin JSON (libro's
+  `{"ok":...}`) is still wrapped. Previously a web result came back as a content block nested inside another.
+
 ## [1.3.5] - 2026-07-07
 
 **Built-in `libro_*` tools now return MCP-conformant results, plus a toolchain refresh to cyrius `6.4.20`.**

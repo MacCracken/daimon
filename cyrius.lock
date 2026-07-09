@@ -1,7 +1,6 @@
 commit	2a4f5027478ff2feda2262dca13ef18343672f14	sakshi	https://github.com/MacCracken/sakshi.git	2.4.4
 commit	586e160d2fa1314a44d238326e66c20d60fb6e02	libro	https://github.com/MacCracken/libro.git	2.7.10
 commit	a504bad19319c4e61d3f784efbfeb14c35a0465d	majra	https://github.com/MacCracken/majra.git	2.5.0
-commit	8bd9db47bc44ee6accbaf260032be482572a74cc	bote	https://github.com/MacCracken/bote.git	3.0.0
 commit	b6022b235d5370ad2bcf5672620c6d22b2da02c5	sigil	https://github.com/MacCracken/sigil.git	3.9.8
 commit	44b18c6f2a45a24c54ca52f04bea6e54843a2731	patra	https://github.com/MacCracken/patra.git	1.12.7
 d9f3b17ddbbe1bba48917c3a679807b01c39c4a1ce776efdbdfbb7a1680e86e4  lib/tagged.cyr
@@ -55,7 +54,7 @@ f7b9d52f29de6d3d633962ccc765a76637091a7256eebc1da5547530eed2c44b  lib/args_win.c
 de007db716c765556beff5293726d099a7368fb0b48cfa23423e25b070d4bbc3  lib/syscalls_aarch64_linux.cyr
 2907e90cae9f66370dce6e9567e24b03dab31221cb4f0e505a5c5745232d5de4  lib/sha1.cyr
 8af62caaa9cdd96bca338a5587526a275a0e36dbfc33066febf81498321f9bb1  lib/bench.cyr
-f3e2f4e8f0de7d2cbb845802cc8ca1a5c3991f3629289a1b21324c4060ed7178  lib/bote.cyr
+30681a4e7db004f2fbdffa2cf0e5f42bf2f27075c8c8a130918f729b7e5ea014  lib/bote.cyr
 aea2383e6fd828de155879b55ab954732f0e45eb6febaebdc03650e952c4d093  lib/async_agnos.cyr
 543be460c6d2a9922e47f4dafb4fae981802f74827b935d4ec9dadb35870cb43  lib/keccak.cyr
 19bcb006802c5d158ce1b9e0090a07da7e4d1092236f9850c61ebcbf294021c4  lib/vec.cyr

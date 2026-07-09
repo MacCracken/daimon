@@ -85,6 +85,9 @@ fn api_mcp_deregister(fd, name_cstr) {
 # tools already return conformant results and pass through verbatim below, so this
 # wrapping is builtin-only.
 fn _mcp_wrap_builtin(result) {
+    # Already-conformant results (a "content" array — bote's fs_* / web_* tools return a full MCP block) pass
+    # through verbatim; only BARE builtin JSON (libro's {"ok":...}) is wrapped, so a client never double-wraps.
+    if (jsonx_get_raw(result, "content") != 0) { return str_from(result); }
     var is_err = 0;
     var okraw = jsonx_get_raw(result, "ok");
     if (okraw != 0) { if (streq(okraw, "false") == 1) { is_err = 1; } }

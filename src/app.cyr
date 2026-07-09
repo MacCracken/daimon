@@ -27,6 +27,7 @@ fn app_init() {
     _mcp_registry = mcp_registry_new();
     daimon_audit_init();            # create the libro audit chain + genesis entry
     mcp_libro_init(_mcp_registry);  # register bote libro audit tools as builtins (over that chain)
+    mcp_web_init(_mcp_registry);    # register bote web_fetch / web_search as builtins (bote 3.1.0)
     _scheduler = task_scheduler_new();
     _fed_mgr = fed_mgr_new(SCHED_BALANCED);
     _edge_fleet = edge_fleet_new(edge_fleet_config_default());
