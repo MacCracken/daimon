@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.4.1] - 2026-07-09
+
+**Native HTTPS large responses fixed via a toolchain bump — no daimon source change.** The `web_fetch` /
+`web_search` tools hosted in 1.4.0 call the sandhi client over its default **native** TLS backend, which had a
+size-dependent record-layer bug in the stdlib: any response whose body arrived in a full 16 KB TLS record
+failed (small pages like `example.com` slipped through). Fixed in the toolchain's stdlib TLS module and picked
+up here by the pin bump.
+
+### Changed
+- **cyrius pin `6.4.20` → `6.4.34`** — carries the native TLS record-layer fix (decrypt-buffer off-by-one +
+  `tls_native_read` partial-record delivery). `web_fetch` now works over the sovereign native backend against
+  real hosts (anthropic.com / cyriusb.com / secureyeoman.ai / robertmaccracken.com), byte-identical to libssl.
+- **`[deps.bote]` `3.1.0` → `3.1.1`** — bote re-cut onto the same toolchain (its web-tools source is unchanged;
+  a local libssl-fallback workaround for this now-fixed root cause was dropped, never released).
+
 ## [1.4.0] - 2026-07-09
 
 **Web tools hosted (`web_fetch` / `web_search`).** daimon now registers bote's new web tool family (bote
