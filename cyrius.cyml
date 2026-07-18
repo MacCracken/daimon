@@ -5,7 +5,7 @@ description = "daimon — AGNOS agent orchestrator"
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/daimon"
 language = "cyrius"
-cyrius = "6.4.34"
+cyrius = "6.4.66"
 
 [build]
 entry = "src/main.cyr"
@@ -30,7 +30,6 @@ stdlib = [
     "dynlib",
     "fdlopen",
     "tls",
-    "sigil",
     "sandhi",
     "args",
     "chrono",
@@ -57,7 +56,7 @@ stdlib = [
 
 [deps.sakshi]
 git = "https://github.com/MacCracken/sakshi.git"
-tag = "2.4.4"
+tag = "2.4.6"
 modules = ["dist/sakshi.cyr"]
 
 # --- bote MCP tool host + its audit-chain backend (1.3.0) ---
@@ -65,23 +64,39 @@ modules = ["dist/sakshi.cyr"]
 # bote's dist bundle references libro + majra symbols but does NOT bundle
 # them, so both are declared explicitly. Declared before bote so the
 # auto-include order resolves libro/majra definitions ahead of bote's
-# references (Cyrius single-pass forward-reference resolution). sigil (bote's
-# other git dep) is already provided via [deps].stdlib at 3.10.0.
+# references (Cyrius single-pass forward-reference resolution).
 # Full bundles for now; module-trimming to the reachable surface is a
 # follow-up per the 1.3.0 arc plan.
+#
+# sigil (bote's + libro's crypto dep) is pinned explicitly here rather than
+# via [deps].stdlib as of 1.4.2. libro 2.8.x's .deps sidecar pulls sigil as
+# MODULAR component files (dist/sigil-mldsa.cyr, dist/sigil-sha.cyr, ...),
+# which collided with the monolithic dist/sigil.cyr the stdlib snapshot
+# vendored — 227 "duplicate fn (last definition wins)" warnings between the
+# two packagings of the SAME sigil 3.12.1. An explicit top-level pin at
+# modules=["dist/sigil.cyr"] (the self-contained umbrella; supplies every
+# symbol incl. the tls_native_lowlevel sha384_init_into path that motivated
+# the original stdlib entry) overrides the transitive modular selection, so
+# exactly one sigil packaging is vendored. Mirrors bote/libro/majra, which
+# all pin sigil explicitly for the same registry-lag / packaging reason.
+[deps.sigil]
+git = "https://github.com/MacCracken/sigil.git"
+tag = "3.12.1"
+modules = ["dist/sigil.cyr"]
+
 [deps.libro]
 git = "https://github.com/MacCracken/libro.git"
-tag = "2.7.10"
+tag = "2.8.2"
 modules = ["dist/libro.cyr"]
 
 [deps.majra]
 git = "https://github.com/MacCracken/majra.git"
-tag = "2.5.0"
+tag = "2.5.1"
 modules = ["dist/majra.cyr"]
 
 [deps.bote]
 git = "https://github.com/MacCracken/bote.git"
-tag = "3.1.1"
+tag = "3.1.4"
 modules = ["dist/bote.cyr"]
 
 # Distribution manifest. Single binary today (`daimon`), with a best-effort

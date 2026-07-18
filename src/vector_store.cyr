@@ -74,14 +74,14 @@ fn vindex_dimension(vi) { return load64(vi + 8); }
 
 fn vindex_insert(vi, entry) {
     var dim = vec_entry_dim(entry);
-    if (dim == 0) { return Err(ERR_INVALID_PARAM); }
+    if (dim == 0) { return Err(DAIMON_ERR_INVALID_PARAM); }
 
     var idx_dim = load64(vi + 8);
     if (idx_dim == 0) {
         store64(vi + 8, dim);
     }
     elif (idx_dim != dim) {
-        return Err(ERR_INVALID_PARAM);
+        return Err(DAIMON_ERR_INVALID_PARAM);
     }
 
     vec_push(load64(vi), entry);

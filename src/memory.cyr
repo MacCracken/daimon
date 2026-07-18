@@ -8,13 +8,13 @@ var MAX_VALUE_SIZE = 1048576;
 # Validate a memory key
 fn validate_key(key) {
     var klen = str_len(key);
-    if (klen == 0) { return Err(ERR_INVALID_PARAM); }
-    if (klen > MAX_KEY_LENGTH) { return Err(ERR_INVALID_PARAM); }
+    if (klen == 0) { return Err(DAIMON_ERR_INVALID_PARAM); }
+    if (klen > MAX_KEY_LENGTH) { return Err(DAIMON_ERR_INVALID_PARAM); }
 
     # Check for path traversal
-    if (str_contains(key, str_from("..")) == 1) { return Err(ERR_INVALID_PARAM); }
-    if (str_contains(key, str_from("/")) == 1) { return Err(ERR_INVALID_PARAM); }
-    if (str_contains(key, str_from("\\")) == 1) { return Err(ERR_INVALID_PARAM); }
+    if (str_contains(key, str_from("..")) == 1) { return Err(DAIMON_ERR_INVALID_PARAM); }
+    if (str_contains(key, str_from("/")) == 1) { return Err(DAIMON_ERR_INVALID_PARAM); }
+    if (str_contains(key, str_from("\\")) == 1) { return Err(DAIMON_ERR_INVALID_PARAM); }
     return Ok(0);
 }
 

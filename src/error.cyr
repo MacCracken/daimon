@@ -3,36 +3,36 @@
 # =========================================================================
 
 enum DaimonError {
-    ERR_NONE = 0;
-    ERR_INVALID_PARAM = 1;
-    ERR_AGENT_NOT_FOUND = 2;
-    ERR_AGENT_EXISTS = 3;
-    ERR_SUPERVISOR = 4;
-    ERR_IPC = 5;
-    ERR_SCHEDULER = 6;
-    ERR_FEDERATION = 7;
-    ERR_API = 8;
-    ERR_STORAGE = 9;
-    # ERR_IPC_FAULT (=10) is daimon's IPC-failure code. It is deliberately
-    # NOT named `ERR_IPC`: majra (pulled in transitively via the bote MCP
-    # bundle, 1.3.0) defines its own `ERR_IPC = 4`, and cyrius's
-    # constant-collision guardrail flags a same-name / different-value
-    # redefinition ("last definition wins" — would silently corrupt majra's
-    # code). Renamed from `ERR_IPC = 5` at 1.3.0; see ipc.cyr usages.
-    ERR_IPC_FAULT = 10;
-    # NB: no ERR_IO here — the name collides with sigil's SigilError.ERR_IO
-    # (=6, used internally by lib/sigil.cyr), which is pulled in transitively
-    # via tls. cyrius's constant-collision guardrail flags it
-    # ("last definition wins"), and a stray daimon def would silently
-    # corrupt sigil's I/O error code. daimon never used ERR_IO; reintroduce
-    # only under a non-colliding name (e.g. ERR_IO_FAULT).
+    DAIMON_ERR_NONE = 0;
+    DAIMON_ERR_INVALID_PARAM = 1;
+    DAIMON_ERR_AGENT_NOT_FOUND = 2;
+    DAIMON_ERR_AGENT_EXISTS = 3;
+    DAIMON_ERR_SUPERVISOR = 4;
+    DAIMON_ERR_IPC = 5;
+    DAIMON_ERR_SCHEDULER = 6;
+    DAIMON_ERR_FEDERATION = 7;
+    DAIMON_ERR_API = 8;
+    DAIMON_ERR_STORAGE = 9;
+    # Every daimon error constant carries the `DAIMON_` prefix as of 1.4.2, so
+    # none can collide with a vendored library's flat-global `ERR_*` under
+    # cyrius's single-pass, last-definition-wins link — and the set satisfies
+    # cyrlint's `lint_error_enum_namespace` rule (6.4.51: leaf projects must
+    # namespace their ERR_* codes; the canonical unprefixed set is sakshi's).
+    # This retires the earlier per-name workarounds: `DAIMON_ERR_IPC_FAULT`
+    # (=10) was introduced at 1.3.0 as `ERR_IPC_FAULT` purely to dodge majra's
+    # `ERR_IPC = 4` (pulled in via the bote MCP bundle); with the prefix that
+    # collision is structurally impossible, but the code is kept for
+    # backward-compatible numbering alongside `DAIMON_ERR_IPC` (=5). Likewise
+    # daimon may now define a `DAIMON_ERR_IO` without colliding with sigil's
+    # `SIGIL_ERR_IO`.
+    DAIMON_ERR_IPC_FAULT = 10;
 }
 
 # Map error code to HTTP status code
 fn error_to_status(err) {
-    if (err == ERR_INVALID_PARAM) { return 400; }
-    if (err == ERR_AGENT_NOT_FOUND) { return 404; }
-    if (err == ERR_AGENT_EXISTS) { return 409; }
+    if (err == DAIMON_ERR_INVALID_PARAM) { return 400; }
+    if (err == DAIMON_ERR_AGENT_NOT_FOUND) { return 404; }
+    if (err == DAIMON_ERR_AGENT_EXISTS) { return 409; }
     return 500;
 }
 

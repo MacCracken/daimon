@@ -238,7 +238,7 @@ fn agent_spawn_with_limits(cmd, arg1, arg2, mem_limit, cpu_limit) {
     # via SYS_CLONE. Both return child-pid-in-parent / 0-in-child / -1-on-error.
     # Unblocks the aarch64 cross-build (cyrius 6.1.39 ships the aarch64 shim).
     var pid = sys_fork();
-    if (pid < 0) { return Err(ERR_SUPERVISOR); }
+    if (pid < 0) { return Err(DAIMON_ERR_SUPERVISOR); }
     if (pid == 0) {
         # Child: apply rlimits before exec
         if (mem_limit > 0) {
@@ -269,7 +269,7 @@ fn agent_start(h, executable) {
     var status = agent_status(h);
     if (status != AGENT_PENDING) {
         if (status != AGENT_STOPPED) {
-            return Err(ERR_SUPERVISOR);
+            return Err(DAIMON_ERR_SUPERVISOR);
         }
     }
     agent_set_status(h, AGENT_STARTING);
@@ -286,7 +286,7 @@ fn agent_start(h, executable) {
     var pid_result = spawn(str_data(executable), str_data(id_str), str_data(name));
     if (is_err_result(pid_result) == 1) {
         agent_set_status(h, AGENT_FAILED);
-        return Err(ERR_SUPERVISOR);
+        return Err(DAIMON_ERR_SUPERVISOR);
     }
     var pid = payload(pid_result);
     agent_set_pid(h, pid);
@@ -331,7 +331,7 @@ fn agent_stop(h, reason) {
 
 # Pause (SIGSTOP)
 fn agent_pause(h) {
-    if (agent_status(h) != AGENT_RUNNING) { return Err(ERR_SUPERVISOR); }
+    if (agent_status(h) != AGENT_RUNNING) { return Err(DAIMON_ERR_SUPERVISOR); }
     agent_send_signal(agent_pid(h), 19);  # SIGSTOP
     agent_set_status(h, AGENT_PAUSED);
     return Ok(0);
@@ -339,7 +339,7 @@ fn agent_pause(h) {
 
 # Resume (SIGCONT)
 fn agent_resume(h) {
-    if (agent_status(h) != AGENT_PAUSED) { return Err(ERR_SUPERVISOR); }
+    if (agent_status(h) != AGENT_PAUSED) { return Err(DAIMON_ERR_SUPERVISOR); }
     agent_send_signal(agent_pid(h), 18);  # SIGCONT
     agent_set_status(h, AGENT_RUNNING);
     return Ok(0);

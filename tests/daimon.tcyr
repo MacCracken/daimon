@@ -31,23 +31,23 @@ var SYS_RENAME = 82;
 # --- error ---
 
 enum DaimonError {
-    ERR_NONE = 0;
-    ERR_INVALID_PARAM = 1;
-    ERR_AGENT_NOT_FOUND = 2;
-    ERR_AGENT_EXISTS = 3;
-    ERR_SUPERVISOR = 4;
-    ERR_IPC = 5;
-    ERR_SCHEDULER = 6;
-    ERR_FEDERATION = 7;
-    ERR_API = 8;
-    ERR_STORAGE = 9;
-    ERR_IO = 10;
+    DAIMON_ERR_NONE = 0;
+    DAIMON_ERR_INVALID_PARAM = 1;
+    DAIMON_ERR_AGENT_NOT_FOUND = 2;
+    DAIMON_ERR_AGENT_EXISTS = 3;
+    DAIMON_ERR_SUPERVISOR = 4;
+    DAIMON_ERR_IPC = 5;
+    DAIMON_ERR_SCHEDULER = 6;
+    DAIMON_ERR_FEDERATION = 7;
+    DAIMON_ERR_API = 8;
+    DAIMON_ERR_STORAGE = 9;
+    DAIMON_ERR_IO = 10;
 }
 
 fn error_to_status(err) {
-    if (err == ERR_INVALID_PARAM) { return 400; }
-    if (err == ERR_AGENT_NOT_FOUND) { return 404; }
-    if (err == ERR_AGENT_EXISTS) { return 409; }
+    if (err == DAIMON_ERR_INVALID_PARAM) { return 400; }
+    if (err == DAIMON_ERR_AGENT_NOT_FOUND) { return 404; }
+    if (err == DAIMON_ERR_AGENT_EXISTS) { return 409; }
     return 500;
 }
 
@@ -251,11 +251,11 @@ var MAX_KEY_LENGTH = 256;
 
 fn validate_key(key) {
     var klen = str_len(key);
-    if (klen == 0) { return Err(ERR_INVALID_PARAM); }
-    if (klen > MAX_KEY_LENGTH) { return Err(ERR_INVALID_PARAM); }
-    if (str_contains(key, str_from("..")) == 1) { return Err(ERR_INVALID_PARAM); }
-    if (str_contains(key, str_from("/")) == 1) { return Err(ERR_INVALID_PARAM); }
-    if (str_contains(key, str_from("\\")) == 1) { return Err(ERR_INVALID_PARAM); }
+    if (klen == 0) { return Err(DAIMON_ERR_INVALID_PARAM); }
+    if (klen > MAX_KEY_LENGTH) { return Err(DAIMON_ERR_INVALID_PARAM); }
+    if (str_contains(key, str_from("..")) == 1) { return Err(DAIMON_ERR_INVALID_PARAM); }
+    if (str_contains(key, str_from("/")) == 1) { return Err(DAIMON_ERR_INVALID_PARAM); }
+    if (str_contains(key, str_from("\\")) == 1) { return Err(DAIMON_ERR_INVALID_PARAM); }
     return Ok(0);
 }
 
@@ -386,7 +386,7 @@ fn sched_task_transition(t, new_status) {
     if (from == TASK_PREEMPTED) {
         if (new_status == TASK_QUEUED) { valid = 1; }
     }
-    if (valid == 0) { return Err(ERR_SCHEDULER); }
+    if (valid == 0) { return Err(DAIMON_ERR_SCHEDULER); }
     store64(t + 40, new_status);
     return Ok(0);
 }
@@ -520,11 +520,11 @@ fn mcp_deregister(reg, name_cstr) {
 }
 
 fn validate_callback_url(url) {
-    if (url == 0) { return Err(ERR_INVALID_PARAM); }
-    if (str_len(url) == 0) { return Err(ERR_INVALID_PARAM); }
+    if (url == 0) { return Err(DAIMON_ERR_INVALID_PARAM); }
+    if (str_len(url) == 0) { return Err(DAIMON_ERR_INVALID_PARAM); }
     if (str_starts_with(url, str_from("http://")) == 0) {
         if (str_starts_with(url, str_from("https://")) == 0) {
-            return Err(ERR_INVALID_PARAM);
+            return Err(DAIMON_ERR_INVALID_PARAM);
         }
     }
     return Ok(0);
@@ -574,20 +574,20 @@ fn recording_session_new(agent_id) {
 }
 
 fn recording_add_frame(s) {
-    if (load64(s + 8) != REC_ACTIVE) { return Err(ERR_INVALID_PARAM); }
+    if (load64(s + 8) != REC_ACTIVE) { return Err(DAIMON_ERR_INVALID_PARAM); }
     var fc = load64(s + 16) + 1;
     store64(s + 16, fc);
     return Ok(fc);
 }
 
 fn recording_pause(s) {
-    if (load64(s + 8) != REC_ACTIVE) { return Err(ERR_INVALID_PARAM); }
+    if (load64(s + 8) != REC_ACTIVE) { return Err(DAIMON_ERR_INVALID_PARAM); }
     store64(s + 8, REC_PAUSED);
     return Ok(0);
 }
 
 fn recording_resume(s) {
-    if (load64(s + 8) != REC_PAUSED) { return Err(ERR_INVALID_PARAM); }
+    if (load64(s + 8) != REC_PAUSED) { return Err(DAIMON_ERR_INVALID_PARAM); }
     store64(s + 8, REC_ACTIVE);
     return Ok(0);
 }
@@ -823,7 +823,7 @@ fn scheduler_stats(ts) {
 fn scheduler_get(ts, id_cstr) { return map_get(load64(ts), id_cstr); }
 fn scheduler_cancel(ts, id_cstr) {
     var task = map_get(load64(ts), id_cstr);
-    if (task == 0) { return Err(ERR_SCHEDULER); }
+    if (task == 0) { return Err(DAIMON_ERR_SCHEDULER); }
     return sched_task_transition(task, TASK_CANCELLED);
 }
 
@@ -851,11 +851,11 @@ fn cron_scheduler_new() {
 
 fn cron_add_entry(cs, entry) {
     var name = load64(entry);
-    if (str_len(name) == 0) { return Err(ERR_SCHEDULER); }
+    if (str_len(name) == 0) { return Err(DAIMON_ERR_SCHEDULER); }
     var hour = load64(entry + 16);
-    if (hour >= 0) { if (hour > 23) { return Err(ERR_SCHEDULER); } }
+    if (hour >= 0) { if (hour > 23) { return Err(DAIMON_ERR_SCHEDULER); } }
     var minute = load64(entry + 24);
-    if (minute >= 0) { if (minute > 59) { return Err(ERR_SCHEDULER); } }
+    if (minute >= 0) { if (minute > 59) { return Err(DAIMON_ERR_SCHEDULER); } }
     map_set(load64(cs), str_cstr(name), entry);
     return Ok(0);
 }
@@ -913,7 +913,7 @@ fn fed_mgr_live_nodes(fm) {
 
 fn fed_mgr_start_election(fm, local_id_cstr) {
     var node = map_get(load64(fm), local_id_cstr);
-    if (node == 0) { return Err(ERR_FEDERATION); }
+    if (node == 0) { return Err(DAIMON_ERR_FEDERATION); }
     store64(node + 16, ROLE_CANDIDATE);
     var term = load64(node + 40) + 1;
     store64(node + 40, term);
@@ -922,7 +922,7 @@ fn fed_mgr_start_election(fm, local_id_cstr) {
 
 fn fed_mgr_become_coordinator(fm, id_cstr) {
     var node = map_get(load64(fm), id_cstr);
-    if (node == 0) { return Err(ERR_FEDERATION); }
+    if (node == 0) { return Err(DAIMON_ERR_FEDERATION); }
     store64(node + 16, ROLE_COORDINATOR);
     return Ok(0);
 }
@@ -968,14 +968,14 @@ fn edge_fleet_register(ef, node) {
     var nodes = load64(ef + 8);
     var config = load64(ef);
     var max_nodes = load64(config + 16);
-    if (map_count(nodes) >= max_nodes) { return Err(ERR_INVALID_PARAM); }
+    if (map_count(nodes) >= max_nodes) { return Err(DAIMON_ERR_INVALID_PARAM); }
     var name = load64(node + 8);
-    if (str_len(name) == 0) { return Err(ERR_INVALID_PARAM); }
+    if (str_len(name) == 0) { return Err(DAIMON_ERR_INVALID_PARAM); }
     var keys = map_keys(nodes);
     var di = 0;
     while (di < vec_len(keys)) {
         var existing = map_get(nodes, vec_get(keys, di));
-        if (str_eq(load64(existing + 8), name) == 1) { return Err(ERR_INVALID_PARAM); }
+        if (str_eq(load64(existing + 8), name) == 1) { return Err(DAIMON_ERR_INVALID_PARAM); }
         di = di + 1;
     }
     map_set(nodes, str_cstr(edge_node_id(node)), node);
@@ -987,8 +987,8 @@ fn edge_fleet_node_count(ef) { return map_count(load64(ef + 8)); }
 
 fn edge_fleet_heartbeat(ef, id_cstr, active_tasks, tasks_completed) {
     var node = map_get(load64(ef + 8), id_cstr);
-    if (node == 0) { return Err(ERR_AGENT_NOT_FOUND); }
-    if (edge_node_status(node) == EDGE_DECOMMISSIONED) { return Err(ERR_INVALID_PARAM); }
+    if (node == 0) { return Err(DAIMON_ERR_AGENT_NOT_FOUND); }
+    if (edge_node_status(node) == EDGE_DECOMMISSIONED) { return Err(DAIMON_ERR_INVALID_PARAM); }
     store64(node + 64, clock_epoch_secs());
     edge_node_set_status(node, EDGE_ONLINE);
     store64(node + 72, active_tasks);
@@ -998,7 +998,7 @@ fn edge_fleet_heartbeat(ef, id_cstr, active_tasks, tasks_completed) {
 
 fn edge_fleet_decommission(ef, id_cstr) {
     var node = map_get(load64(ef + 8), id_cstr);
-    if (node == 0) { return Err(ERR_AGENT_NOT_FOUND); }
+    if (node == 0) { return Err(DAIMON_ERR_AGENT_NOT_FOUND); }
     edge_node_set_status(node, EDGE_DECOMMISSIONED);
     return Ok(0);
 }
@@ -1072,9 +1072,9 @@ fn msg_bus_publish(mb, msg) {
 
 fn msg_bus_send_to_name(mb, name_cstr, msg) {
     var id = map_get(load64(mb + 8), name_cstr);
-    if (id == 0) { return Err(ERR_AGENT_NOT_FOUND); }
+    if (id == 0) { return Err(DAIMON_ERR_AGENT_NOT_FOUND); }
     var queue = map_get(load64(mb), id);
-    if (queue == 0) { return Err(ERR_AGENT_NOT_FOUND); }
+    if (queue == 0) { return Err(DAIMON_ERR_AGENT_NOT_FOUND); }
     vec_push(queue, msg);
     return Ok(0);
 }
@@ -1320,15 +1320,15 @@ fn main() {
     # error — status mapping
     # =============================================================
     test_group("error");
-    assert_eq(error_to_status(ERR_INVALID_PARAM), 400, "invalid_param -> 400");
-    assert_eq(error_to_status(ERR_AGENT_NOT_FOUND), 404, "not_found -> 404");
-    assert_eq(error_to_status(ERR_AGENT_EXISTS), 409, "exists -> 409");
-    assert_eq(error_to_status(ERR_SUPERVISOR), 500, "supervisor -> 500");
-    assert_eq(error_to_status(ERR_IPC), 500, "ipc -> 500");
-    assert_eq(error_to_status(ERR_SCHEDULER), 500, "scheduler -> 500");
-    assert_eq(error_to_status(ERR_FEDERATION), 500, "federation -> 500");
-    assert_eq(error_to_status(ERR_API), 500, "api -> 500");
-    assert_eq(error_to_status(ERR_STORAGE), 500, "storage -> 500");
+    assert_eq(error_to_status(DAIMON_ERR_INVALID_PARAM), 400, "invalid_param -> 400");
+    assert_eq(error_to_status(DAIMON_ERR_AGENT_NOT_FOUND), 404, "not_found -> 404");
+    assert_eq(error_to_status(DAIMON_ERR_AGENT_EXISTS), 409, "exists -> 409");
+    assert_eq(error_to_status(DAIMON_ERR_SUPERVISOR), 500, "supervisor -> 500");
+    assert_eq(error_to_status(DAIMON_ERR_IPC), 500, "ipc -> 500");
+    assert_eq(error_to_status(DAIMON_ERR_SCHEDULER), 500, "scheduler -> 500");
+    assert_eq(error_to_status(DAIMON_ERR_FEDERATION), 500, "federation -> 500");
+    assert_eq(error_to_status(DAIMON_ERR_API), 500, "api -> 500");
+    assert_eq(error_to_status(DAIMON_ERR_STORAGE), 500, "storage -> 500");
 
     # =============================================================
     # config — defaults and modification

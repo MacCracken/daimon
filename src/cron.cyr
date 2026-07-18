@@ -34,15 +34,15 @@ fn cron_scheduler_new() {
 
 fn cron_add_entry(cs, entry) {
     var name = cron_entry_name(entry);
-    if (str_len(name) == 0) { return Err(ERR_SCHEDULER); }
+    if (str_len(name) == 0) { return Err(DAIMON_ERR_SCHEDULER); }
     # Validate hour/minute if specified
     var hour = load64(entry + 16);
     if (hour >= 0) {
-        if (hour > 23) { return Err(ERR_SCHEDULER); }
+        if (hour > 23) { return Err(DAIMON_ERR_SCHEDULER); }
     }
     var minute = load64(entry + 24);
     if (minute >= 0) {
-        if (minute > 59) { return Err(ERR_SCHEDULER); }
+        if (minute > 59) { return Err(DAIMON_ERR_SCHEDULER); }
     }
     map_set(load64(cs), str_data(name), entry);
     return Ok(0);

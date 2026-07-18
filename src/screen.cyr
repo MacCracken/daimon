@@ -33,20 +33,20 @@ fn recording_status(s) { return load64(s + 8); }
 fn recording_frame_count(s) { return load64(s + 16); }
 
 fn recording_add_frame(s) {
-    if (load64(s + 8) != REC_ACTIVE) { return Err(ERR_INVALID_PARAM); }
+    if (load64(s + 8) != REC_ACTIVE) { return Err(DAIMON_ERR_INVALID_PARAM); }
     var fc = load64(s + 16) + 1;
     store64(s + 16, fc);
     return Ok(fc);
 }
 
 fn recording_pause(s) {
-    if (load64(s + 8) != REC_ACTIVE) { return Err(ERR_INVALID_PARAM); }
+    if (load64(s + 8) != REC_ACTIVE) { return Err(DAIMON_ERR_INVALID_PARAM); }
     store64(s + 8, REC_PAUSED);
     return Ok(0);
 }
 
 fn recording_resume(s) {
-    if (load64(s + 8) != REC_PAUSED) { return Err(ERR_INVALID_PARAM); }
+    if (load64(s + 8) != REC_PAUSED) { return Err(DAIMON_ERR_INVALID_PARAM); }
     store64(s + 8, REC_ACTIVE);
     return Ok(0);
 }
@@ -105,12 +105,12 @@ fn cap_mgr_revoke(cm, agent_id_cstr) {
 
 fn cap_mgr_check(cm, agent_id_cstr) {
     var perm = map_get(load64(cm), agent_id_cstr);
-    if (perm == 0) { return Err(ERR_INVALID_PARAM); }
+    if (perm == 0) { return Err(DAIMON_ERR_INVALID_PARAM); }
 
     # Check expiry
     var expires = load64(perm + 16);
     if (expires > 0) {
-        if (clock_epoch_secs() > expires) { return Err(ERR_INVALID_PARAM); }
+        if (clock_epoch_secs() > expires) { return Err(DAIMON_ERR_INVALID_PARAM); }
     }
 
     # Check rate limit
@@ -127,7 +127,7 @@ fn cap_mgr_check(cm, agent_id_cstr) {
     store64(perm + 24, new_ts);
 
     var max = load64(perm + 8);
-    if (vec_len(new_ts) >= max) { return Err(ERR_INVALID_PARAM); }
+    if (vec_len(new_ts) >= max) { return Err(DAIMON_ERR_INVALID_PARAM); }
 
     vec_push(new_ts, now);
     return Ok(0);

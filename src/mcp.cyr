@@ -126,12 +126,12 @@ fn mcp_find_external_url(reg, name_cstr) {
 
 # Validate a callback URL (basic SSRF protection)
 fn validate_callback_url(url) {
-    if (url == 0) { return Err(ERR_INVALID_PARAM); }
-    if (str_len(url) == 0) { return Err(ERR_INVALID_PARAM); }
+    if (url == 0) { return Err(DAIMON_ERR_INVALID_PARAM); }
+    if (str_len(url) == 0) { return Err(DAIMON_ERR_INVALID_PARAM); }
     # Must start with http:// or https://
     if (str_starts_with(url, str_from("http://")) == 0) {
         if (str_starts_with(url, str_from("https://")) == 0) {
-            return Err(ERR_INVALID_PARAM);
+            return Err(DAIMON_ERR_INVALID_PARAM);
         }
     }
     return Ok(0);

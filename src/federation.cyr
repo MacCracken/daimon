@@ -74,7 +74,7 @@ fn fed_mgr_node_count(fm) { return map_count(load64(fm)); }
 
 fn fed_mgr_record_heartbeat(fm, id_cstr) {
     var node = map_get(load64(fm), id_cstr);
-    if (node == 0) { return Err(ERR_FEDERATION); }
+    if (node == 0) { return Err(DAIMON_ERR_FEDERATION); }
     store64(node + 32, clock_epoch_secs());
     store64(node + 24, FED_ONLINE);
     return Ok(0);
@@ -116,7 +116,7 @@ fn fed_mgr_live_nodes(fm) {
 # Start election — local node becomes candidate, increments term
 fn fed_mgr_start_election(fm, local_id_cstr) {
     var node = map_get(load64(fm), local_id_cstr);
-    if (node == 0) { return Err(ERR_FEDERATION); }
+    if (node == 0) { return Err(DAIMON_ERR_FEDERATION); }
     store64(node + 16, ROLE_CANDIDATE);
     var term = load64(node + 40) + 1;
     store64(node + 40, term);
@@ -149,7 +149,7 @@ fn fed_mgr_receive_vote(fm, vote_granted, total_nodes, votes_so_far) {
 # Step a node down to follower
 fn fed_mgr_step_down(fm, id_cstr, new_term) {
     var node = map_get(load64(fm), id_cstr);
-    if (node == 0) { return Err(ERR_FEDERATION); }
+    if (node == 0) { return Err(DAIMON_ERR_FEDERATION); }
     store64(node + 16, ROLE_FOLLOWER);
     store64(node + 40, new_term);
     store64(node + 48, 0);  # voted_for = none
@@ -159,7 +159,7 @@ fn fed_mgr_step_down(fm, id_cstr, new_term) {
 # Become coordinator
 fn fed_mgr_become_coordinator(fm, id_cstr) {
     var node = map_get(load64(fm), id_cstr);
-    if (node == 0) { return Err(ERR_FEDERATION); }
+    if (node == 0) { return Err(DAIMON_ERR_FEDERATION); }
     store64(node + 16, ROLE_COORDINATOR);
     return Ok(0);
 }
@@ -226,7 +226,7 @@ fn fed_place_agent(fm, req_cpu, req_mem, gpu_required, preferred_id) {
         }
         pi = pi + 1;
     }
-    if (best_node == 0) { return Err(ERR_FEDERATION); }
+    if (best_node == 0) { return Err(DAIMON_ERR_FEDERATION); }
     return Ok(best_node);
 }
 

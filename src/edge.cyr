@@ -69,18 +69,18 @@ fn edge_fleet_register(ef, node) {
     var nodes = load64(ef + 8);
     var config = load64(ef);
     var max_nodes = load64(config + 16);
-    if (map_count(nodes) >= max_nodes) { return Err(ERR_INVALID_PARAM); }
+    if (map_count(nodes) >= max_nodes) { return Err(DAIMON_ERR_INVALID_PARAM); }
 
     # Check for empty name
     var name = load64(node + 8);
-    if (str_len(name) == 0) { return Err(ERR_INVALID_PARAM); }
+    if (str_len(name) == 0) { return Err(DAIMON_ERR_INVALID_PARAM); }
 
     # Check for duplicate name
     var keys = map_keys(nodes);
     var di = 0;
     while (di < vec_len(keys)) {
         var existing = map_get(nodes, vec_get(keys, di));
-        if (str_eq(load64(existing + 8), name) == 1) { return Err(ERR_INVALID_PARAM); }
+        if (str_eq(load64(existing + 8), name) == 1) { return Err(DAIMON_ERR_INVALID_PARAM); }
         di = di + 1;
     }
 
@@ -96,8 +96,8 @@ fn edge_fleet_node_count(ef) { return map_count(load64(ef + 8)); }
 
 fn edge_fleet_heartbeat(ef, id_cstr, active_tasks, tasks_completed) {
     var node = map_get(load64(ef + 8), id_cstr);
-    if (node == 0) { return Err(ERR_AGENT_NOT_FOUND); }
-    if (edge_node_status(node) == EDGE_DECOMMISSIONED) { return Err(ERR_INVALID_PARAM); }
+    if (node == 0) { return Err(DAIMON_ERR_AGENT_NOT_FOUND); }
+    if (edge_node_status(node) == EDGE_DECOMMISSIONED) { return Err(DAIMON_ERR_INVALID_PARAM); }
     store64(node + 64, clock_epoch_secs());
     edge_node_set_status(node, EDGE_ONLINE);
     store64(node + 72, active_tasks);
@@ -131,7 +131,7 @@ fn edge_fleet_check_health(ef) {
 
 fn edge_fleet_decommission(ef, id_cstr) {
     var node = map_get(load64(ef + 8), id_cstr);
-    if (node == 0) { return Err(ERR_AGENT_NOT_FOUND); }
+    if (node == 0) { return Err(DAIMON_ERR_AGENT_NOT_FOUND); }
     edge_node_set_status(node, EDGE_DECOMMISSIONED);
     return Ok(0);
 }

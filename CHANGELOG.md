@@ -4,6 +4,47 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.4.2] - 2026-07-17
+
+**Toolchain + dependency refresh to the cyrius `6.4.66` matrix, and a project-wide
+error-constant namespacing (`ERR_*` → `DAIMON_ERR_*`).** The dependency set moves to exactly the
+versions bote `3.1.4` was cut and retested against (cyrius `6.4.66`, libro `2.8.2`, majra `2.5.1`,
+sakshi `2.4.6`, sigil `3.12.1`), and every daimon error constant is prefixed to satisfy cyrlint's new
+`lint_error_enum_namespace` rule. No daimon runtime source change was needed for the dep bumps; 240
+unit assertions pass, `cyrlint` reports 0 warnings, and `cyrius build --check-lib-sync` is clean.
+
+### Changed
+- **cyrius pin `6.4.34` → `6.4.66`.** Carries, among many fixes: the aarch64 epoll reactor fix
+  (`6.4.42` — the reactor had never worked on aarch64), close-on-exec for reactor fds across
+  fork/exec (`6.4.43`), a `net.sock_accept` bump-heap leak fix (`6.4.61`), and folds the bundled
+  sandhi to `1.9.0` + bayan to `1.2.0`. It is also the required floor (`≥ 6.4.65`) for
+  `thread_local_alloc`, which libro `2.8.2`'s transitive sigil `3.12.1` / patra `1.12.12` call.
+- **Dependencies bumped to bote `3.1.4`'s tested matrix:** `[deps.sakshi]` `2.4.4` → `2.4.6`,
+  `[deps.libro]` `2.7.10` → `2.8.2`, `[deps.majra]` `2.5.0` → `2.5.1`, `[deps.bote]` `3.1.1` →
+  `3.1.4`. No daimon `.cyr` change was required — every symbol daimon calls is unchanged across the
+  range (libro `chain_new` / `chain_append` / `chain_append_with_agent` / `SEV_*`; bote
+  `libro_tools_init` / `libro_tool_*` / `web_fetch_handler` / `web_search_handler`). libro and bote
+  each namespaced their *own* `ERR_*` → `LIBRO_ERR_*` / `BOTE_ERR_*` upstream, which also removes
+  latent collisions from daimon's flat single-pass link.
+- **All daimon error constants namespaced `ERR_*` → `DAIMON_ERR_*`** (`src/error.cyr`'s `DaimonError`
+  enum + every reference across `src/` and `tests/daimon.tcyr`). **Numeric values and the HTTP `code`
+  response field are unchanged** — this is a source-symbol rename, not a wire-contract change. It
+  satisfies cyrlint's new `lint_error_enum_namespace` rule (cyrius `6.4.51`: leaf projects must
+  namespace their `ERR_*` set; the canonical unprefixed set is sakshi's) and structurally retires the
+  earlier per-name workaround (`ERR_IPC_FAULT`, added at 1.3.0 to dodge majra's `ERR_IPC = 4`; now
+  `DAIMON_ERR_IPC_FAULT`).
+- **`sigil` moved from `[deps].stdlib` to an explicit `[deps.sigil]` git pin (`3.12.1`,
+  `modules = ["dist/sigil.cyr"]`)**, mirroring bote/libro/majra. See **Fixed** below.
+
+### Fixed
+- **227 `duplicate fn (last definition wins)` build warnings eliminated.** sigil `3.12.x` ships a
+  *modular* dist bundle (`dist/sigil-mldsa.cyr`, `dist/sigil-sha.cyr`, …) that libro `2.8.x`'s
+  `.deps` sidecar pulls; this collided with the monolithic `dist/sigil.cyr` the stdlib snapshot
+  vendored — two packagings of the *same* sigil release double-defining sha256 / ML-DSA / hex / … .
+  The explicit `[deps.sigil]` pin at `modules = ["dist/sigil.cyr"]` (self-contained umbrella)
+  overrides the transitive modular selection, so exactly one packaging is vendored. Build duplicate-fn
+  warnings drop **229 → 2** (the remaining two are unrelated cross-bundle majra/bote overlaps).
+
 ## [1.4.1] - 2026-07-09
 
 **Native HTTPS large responses fixed via a toolchain bump — no daimon source change.** The `web_fetch` /
