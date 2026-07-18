@@ -77,6 +77,20 @@ include "src/server.cyr"
 # =========================================================================
 
 fn main() {
+    # Ignore SIGPIPE process-wide before anything can touch a socket. A write to
+    # a peer that closed mid-response otherwise raises SIGPIPE, whose default
+    # disposition TERMINATES the process — an unauthenticated remote DoS on any
+    # flagsless socket write. The live HTTP path (serve / serve_async) already
+    # inherits sandhi's own SIG_IGN, installed at the top of each of its serve
+    # loops; this call is the daimon-owned belt-and-braces layer: it (a) uses the
+    # 6.4.51 stdlib `signal_ignore`/`Signal` helper directly instead of a raw
+    # syscall, (b) covers daimon's OWN flagsless `SYS_WRITE`s to sockets that do
+    # not route through sandhi (the ipc.cyr control-socket path), and (c) keeps
+    # the guarantee independent of sandhi's internal placement of its guard.
+    # Idempotent + no allocator/args dependency (stack buffer + one rt_sigaction),
+    # so it is safe as the very first statement. No-op on Windows/agnos.
+    signal_ignore(SIGPIPE);
+
     alloc_init();
     args_init();
 

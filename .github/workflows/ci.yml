@@ -128,6 +128,14 @@ jobs:
         #     (aarch64 has no plain epoll_wait). Kept here for older pins;
         #     tracked upstream at
         #     cyrius/docs/development/issues/2026-05-10-daimon-async-aarch64-sys-epoll-wait.md.
+        #   - SYS_OPEN: the vendored bote bundle reads /dev/urandom via
+        #     syscall(SYS_OPEN, "/dev/urandom", 0, 0) (lib/bote.cyr
+        #     _gen_session_id) — aarch64 Linux has no open(2) syscall
+        #     (openat/SYS_OPENAT only). Byte-identical across bote
+        #     3.1.0/3.1.1/3.1.4, so pre-existing since daimon 1.4.0, not a
+        #     regression. Upstream fix: open via SYS_OPENAT (AT_FDCWD) on
+        #     aarch64. Tracked at
+        #     docs/development/issues/2026-07-17-bote-aarch64-sys-open-urandom.md.
         #
         # Any other failure still fails the step — we want signal when a
         # daimon-side regression breaks the cross-build, just not when
@@ -144,8 +152,8 @@ jobs:
             exit 0
           fi
           # Build failed — check whether it's a known upstream stdlib gap.
-          if grep -qE "undefined variable 'SYS_(FORK|EPOLL_WAIT)'" /tmp/aarch64.log; then
-            echo "::warning::aarch64 cross-build blocked on an upstream stdlib gap (a SYS_* syscall not defined on aarch64 Linux — e.g. SYS_FORK / SYS_EPOLL_WAIT). Treated as non-fatal; x86_64 build remains authoritative."
+          if grep -qE "undefined variable 'SYS_(FORK|EPOLL_WAIT|OPEN)'" /tmp/aarch64.log; then
+            echo "::warning::aarch64 cross-build blocked on an upstream stdlib gap (a SYS_* syscall not defined on aarch64 Linux — e.g. SYS_FORK / SYS_EPOLL_WAIT / SYS_OPEN, the last from bote's /dev/urandom read). Treated as non-fatal; x86_64 build remains authoritative."
             exit 0
           fi
           echo "ERROR: aarch64 cross-build failed for a non-blocker reason"

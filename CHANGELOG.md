@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Security
+- **Process-wide `SIGPIPE` guard installed at startup (`signal_ignore(SIGPIPE)` in `main`).** A
+  flagsless socket write to a peer that closed mid-response raises `SIGPIPE`, whose default
+  disposition **terminates the process** — an unauthenticated remote DoS (cyrius `6.4.51` CHANGELOG).
+  Investigation of the 1.4.2 dep-bump review confirmed the **live HTTP path is already covered**:
+  daimon delegates both serve modes to sandhi `1.9.0`, and `sandhi_server_run_opts` /
+  `sandhi_server_run_async` each install `SIG_IGN` for `SIGPIPE` at the top of their accept loop
+  (`_sandhi_server_ignore_sigpipe`, sandhi 1.6.6), so the acute HTTP DoS was **not** present. This
+  adds a daimon-owned belt-and-braces layer as the first statement of `main`, which (a) uses the new
+  `6.4.51` stdlib `signal_ignore` / `Signal` helper directly rather than a raw `rt_sigaction`, (b)
+  covers daimon's **own** flagsless `SYS_WRITE`s to sockets that do not route through sandhi (the
+  `src/ipc.cyr` control-socket path), and (c) keeps the guarantee independent of sandhi's internal
+  guard placement. Idempotent, no allocator/args dependency, no-op on Windows/agnos. No `VERSION`
+  bump. Build clean; 240 unit assertions pass.
+
 ## [1.4.2] - 2026-07-17
 
 **Toolchain + dependency refresh to the cyrius `6.4.66` matrix, and a project-wide

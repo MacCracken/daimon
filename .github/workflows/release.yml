@@ -89,8 +89,8 @@ jobs:
             echo "daimon-aarch64: $(wc -c < build/daimon-aarch64) bytes"
             exit 0
           fi
-          if grep -qE "undefined variable 'SYS_(FORK|EPOLL_WAIT)'" /tmp/aarch64.log; then
-            echo "::warning::aarch64 cross-build blocked on an upstream stdlib gap (a SYS_* syscall not defined on aarch64 Linux — e.g. SYS_FORK / SYS_EPOLL_WAIT). x86_64 release ships without the aarch64 binary this tag."
+          if grep -qE "undefined variable 'SYS_(FORK|EPOLL_WAIT|OPEN)'" /tmp/aarch64.log; then
+            echo "::warning::aarch64 cross-build blocked on an upstream stdlib gap (a SYS_* syscall not defined on aarch64 Linux — e.g. SYS_FORK / SYS_EPOLL_WAIT / SYS_OPEN, the last from bote's /dev/urandom read). x86_64 release ships without the aarch64 binary this tag."
             exit 0
           fi
           echo "ERROR: aarch64 cross-build failed for a non-blocker reason"
