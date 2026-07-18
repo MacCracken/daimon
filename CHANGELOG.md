@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [1.4.3] - 2026-07-17
 
 ### Security
 - **Process-wide `SIGPIPE` guard installed at startup (`signal_ignore(SIGPIPE)` in `main`).** A
@@ -18,8 +18,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   `6.4.51` stdlib `signal_ignore` / `Signal` helper directly rather than a raw `rt_sigaction`, (b)
   covers daimon's **own** flagsless `SYS_WRITE`s to sockets that do not route through sandhi (the
   `src/ipc.cyr` control-socket path), and (c) keeps the guarantee independent of sandhi's internal
-  guard placement. Idempotent, no allocator/args dependency, no-op on Windows/agnos. No `VERSION`
-  bump. Build clean; 240 unit assertions pass.
+  guard placement. Idempotent, no allocator/args dependency, no-op on Windows/agnos. Build clean;
+  240 unit assertions pass.
 
 ## [1.4.2] - 2026-07-17
 
