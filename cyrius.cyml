@@ -5,7 +5,7 @@ description = "daimon — AGNOS agent orchestrator"
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/daimon"
 language = "cyrius"
-cyrius = "6.4.66"
+cyrius = "6.4.69"
 
 [build]
 entry = "src/main.cyr"
@@ -13,6 +13,7 @@ output = "build/daimon"
 
 [deps]
 stdlib = [
+    "atomic",
     "string",
     "fmt",
     "math",
@@ -58,6 +59,21 @@ stdlib = [
 git = "https://github.com/MacCracken/sakshi.git"
 tag = "2.4.6"
 modules = ["dist/sakshi.cyr"]
+
+[deps.ai-hwaccel]
+git = "https://github.com/MacCracken/ai-hwaccel.git"
+path = "../ai-hwaccel"
+tag = "2.3.15"
+modules = ["dist/ai-hwaccel.cyr"]
+
+# samay — task scheduler. daimon 2.0.0 REPLACES its own duplicated
+# scheduler.cyr/cron.cyr with this library (the extraction of daimon's
+# scheduler). path resolves the local checkout for dev; tag pins the release.
+[deps.samay]
+git = "https://github.com/MacCracken/samay.git"
+path = "../samay"
+tag = "1.0.1"
+modules = ["dist/samay.cyr"]
 
 # --- bote MCP tool host + its audit-chain backend (1.3.0) ---
 # daimon hosts bote's dispatcher + libro audit tools as builtin MCP tools.

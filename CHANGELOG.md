@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.0.0] - 2026-07-21
+
+**Scheduler extracted to samay.** daimon's `src/scheduler.cyr` and `src/cron.cyr` were a
+duplicate of the samay task-scheduler library (samay is literally samay's extraction of
+this code). daimon 2.0.0 **deletes both** and consumes samay (`[deps.samay]`,
+`dist/samay.cyr`) instead — the single source of truth for scheduling, now with real cron
+expressions, ai-hwaccel-aware placement, deterministic tie-breaks, JSON snapshot/restore,
+and a security-audited surface that daimon's local copy never had.
+
+### Changed — BREAKING
+- **`src/scheduler.cyr` + `src/cron.cyr` removed.** The scheduler API is now samay's:
+  `task_scheduler_*` / `scheduled_task_*` / `node_capacity_*` / `ResourceReq` /
+  `SchedulingDecision`. `src/api_sched.cyr` is rewired onto it — the HTTP `/v1/scheduler/*`
+  endpoints are behaviour-compatible except task IDs are now UUIDs (was a sequential
+  counter) and `POST /schedule` emits samay's `SchedulingDecision` JSON.
+- **Cyrius pin `6.4.66` → `6.4.69`** (samay's `#derive(Serialize)` f64 codec requires it).
+- `[deps]`: added `[deps.samay]` (1.0.1) + `[deps.ai-hwaccel]` (2.3.15) and the stdlib
+  `atomic`. samay's `uuid_v4` was renamed to `samay_uuid_v4` upstream (samay 1.0.1) to
+  resolve a last-def-wins collision with libro's incompatible `uuid_v4(buf)`.
+
+### Removed
+- daimon's duplicated scheduler/cron implementation and its local test copies. Scheduler
+  correctness is now covered authoritatively by samay's 296-assertion suite; daimon keeps
+  a `samay_integration` smoke test proving the wiring. Suite: **215 assertions**, green.
+
 ## [1.4.3] - 2026-07-17
 
 ### Security
