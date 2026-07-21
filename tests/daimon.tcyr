@@ -357,10 +357,6 @@ fn tokenize(text) {
     return tokens;
 }
 
-# --- scheduler ---
-
-
-
 # --- MCP registry ---
 
 fn mcp_tool_new(name, desc, schema) {
@@ -591,7 +587,6 @@ fn jget_int(pairs, key_cstr) {
     if (v == 0) { return 0; }
     return str_to_int(v);
 }
-
 
 # --- federation enums + types ---
 
