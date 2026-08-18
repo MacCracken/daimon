@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.0.1] - 2026-08-17
+
+### Changed
+
+- **Cyrius pin `6.4.69` -> `6.5.27`** (2026-08-17, ecosystem-wide ML/AI-arc realign ahead of
+  the arc reopening). `cyrius lib sync --full` re-vendored the version-matched stdlib snapshot.
+- **`[deps.bote]` `3.1.4` -> `3.3.1`** — required by the pin bump, and overdue on its own.
+  bayan 1.3.0 (shipped in cyrius 6.5.0) renamed the cstr+len JSON entry
+  `bayan_json_v_parse_str` -> `bayan_json_v_parse_buf`, so re-vendoring the 6.5.27 stdlib left
+  bote 3.1.4's dist calling a symbol that no longer exists — one *reachable* undefined
+  function, and `tests/daimon.tcyr` stopped compiling. bote fixed it upstream; 3.3.1 is the
+  head of that line, and it also carries the two auth-bypass fixes called out in bote's own
+  3.3.1 entry. Vendored `lib/bote.cyr` header confirmed moved to `# Version: 3.3.1`; suite
+  back to **215/215**, the same count as before the bump.
+
+### Known issues
+
+- **`samay` 1.0.1's dist still calls the removed `json_v_parse_str`** (`src/json.cyr:33`
+  upstream). It links today only because that call site is unreachable from daimon — the
+  build reports it as a warning, not the hard error bote's reachable call produced. Anything
+  that reaches samay's `Str`-taking JSON entry will fail to link until samay migrates to
+  `bayan_json_v_parse_buf`. Not fixable from here ([[feedback_never_fix_in_materialized_libs]])
+  — it needs a samay release, then a `[deps.samay]` tag bump.
+
 ## [2.0.0] - 2026-07-21
 
 **Scheduler extracted to samay.** daimon's `src/scheduler.cyr` and `src/cron.cyr` were a
