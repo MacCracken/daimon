@@ -1,9 +1,9 @@
-commit	bfc127f87489a483a6153f5e91194aed25d6a714	sakshi	https://github.com/MacCracken/sakshi.git	2.4.6
-commit	7f4aeaef5d4f301b7db085df0870b43879bc2b16	sigil	https://github.com/MacCracken/sigil.git	3.12.1
-commit	cfb52e02647af22a94b2a78db55de7d6542d7ddc	libro	https://github.com/MacCracken/libro.git	2.8.2
-commit	056e4b7c307f7c4b77d1b9969664a0c560c28d09	majra	https://github.com/MacCracken/majra.git	2.5.1
+commit	5815fa90d52a1f2b1e498f517273f9419786618e	sakshi	https://github.com/MacCracken/sakshi.git	2.4.10
+commit	538518d67116be88dea31a31a0c8aa7cf2c3b579	sigil	https://github.com/MacCracken/sigil.git	3.12.9
+commit	6ffdbd1b6877f9ff88b141840de92e7596e84e73	libro	https://github.com/MacCracken/libro.git	2.8.5
+commit	0c4485e62b6e0d40539a949f86fa5f4f53c961fb	majra	https://github.com/MacCracken/majra.git	2.6.6
 commit	8890e1da21a0f0ef1872f82b494004ac0a168274	bote	https://github.com/MacCracken/bote.git	3.3.1
-commit	f67aef0cc74c39e092d1d647e2f79d2756f196c2	patra	https://github.com/MacCracken/patra.git	1.12.12
+commit	9aed01733f5e4c4a210e4bde0e201b38df87f933	patra	https://github.com/MacCracken/patra.git	1.13.0
 7240760b1260fa06c53c5a139d1a2086fb439e21ac90e53eacd4bf486ac0e9ca  lib/tagged.cyr
 5978751906616997dc497d5ffaa5171c92611c5cb6f6466ada2c6c1dd0b83c79  lib/net.cyr
 e84c090fd0f8532700d967ca3190837780a52a42630f4c6a0a4567ad9a49ab6b  lib/cffi.cyr
@@ -16,14 +16,14 @@ e2f85560c94cd59e410e542b4992b21aafc84c746f28e07d8ee8ed759d67acc5  lib/bayan.cyr
 f13dde26ce0a3509dec70fe0d0965ec784dfda55a9f54730eb1762a8c7f1fc96  lib/dynlib.cyr
 8a3e4378e75eefbf7e6d8d098449dbe909f9b9b80a2a72624adb250eb4335c09  lib/str.cyr
 45bc29be9fc821d95903fc279c0d9276ce432fb2c87f5a1c11547577d11469f9  lib/fdlopen.cyr
-0fd0ff08a44c22023cb79f81f5ea4132926fec38a10ecb4d8bc3fea5da55e2ff  lib/libro.cyr
+ad03fe77af2b4ac4ae2afedc69e498bbf9f0f1a06b88b1ee7a30dbe30340cd93  lib/libro.cyr
 69e92cc4b67f1a936f94c92ce8a4c66673758b84dba385e96fbeaa46fa692b4c  lib/alloc_agnos.cyr
 2f6ba5bff77fb0ede06f4fcedde1b7d7443d8ec323074ff491eff84eab516409  lib/ganita.cyr
 c1111039c78e19c9404d8d296b3e88b588e735c21ae8a67a3852251d63199170  lib/grp.cyr
 eafb8751b765e5b5dc277e47e98ab46b728f049347c0b987f9f2cfeec4750cc9  lib/async.cyr
 1f96ccd5e7d46a49441aac6b00010b44b4470ef0319d5919f971bfe76effe0d1  lib/regression.cyr
 f421d9a99161a3f9afb945c384d4a0261f0e89d11390a354c5e15f94891dd925  lib/ws_server.cyr
-7d3d42af5aa5379e1c8969add8c8d61d0b8636d4c6ad48e5adba57729e40021e  lib/majra.cyr
+4bf3d29e450845056ac14c3d6ba09653dd58af9c21009473760c54a013193225  lib/majra.cyr
 81e04cb9d9dcf62655ecb8eaa318c0ad15215cf53d734431c0c12b97cfaf1c34  lib/pam.cyr
 3685581ab3dca17cb01b8e65a654ce4ca683ac67b1871b17b8bd9fb3c2cf8a02  lib/pwd.cyr
 f9d4d9f58fb1b177f90cfdd72172000567600b3e74dcf76024316681811d12e5  lib/thread_agnos.cyr
@@ -47,7 +47,7 @@ a90313240f49f1884f1bc0992daf4ee8538fe707c6998d04e163f775f4f3a1b2  lib/string.cyr
 d86e95aa17266cf10d634825da8a1ce3e13a8b654fec8178c684297c52b14cb6  lib/process.cyr
 73d6b8c364902daa50dc14abd7d3766aa72466e8165f9790f64e5d592ec663df  lib/niyama.cyr
 7328ec74c1b37e22094a0f22dbd2ecea4dce10700a6ba5122cf1d5bfff3a564e  lib/alloc.cyr
-292e0a2d8575f9fc4b74484c8dea531f7acc12026fae656278861eeb13bf35b5  lib/sigil.cyr
+719487f3d57fb5d5fc295da150d1c15bef3e2ebd8140f544f853817854735796  lib/sigil.cyr
 5ae13e5078c4ea581bf4a8ca622ee31f9cb19389a1b48fb2bc52a62876bfa587  lib/sandhi.cyr
 639aa6feb170319f983df4b39b827f29b26391b55de241c25e711f3880bce0a0  lib/flags.cyr
 0847964081b1998fa584e74c5ff2a27ad183fc8e251fb620fd1fcf6f2aa9e12e  lib/syscalls_x86_64_linux.cyr
@@ -59,7 +59,7 @@ ba46a0fb24daab438c0ab7de357010f7f43ad2eab2c5eda0f6c198d3e0f16688  lib/tls.cyr
 90435cb6921d382959101fcb5c6339f19a91ac3189333aadf66cc8e6848bbf52  lib/yukti.cyr
 09cf81bf4f10758da7967a5f6628b2feed53b0fb5e6e11cac0b273725465e6d8  lib/assert.cyr
 c88c2ab7f87fdbf63d8e8cb12d43471e7863315f8053341f295b2237788e6d78  lib/args.cyr
-7ca454e7255ee9f5ac655e553550feecf99f6df22e9e774463a8260e032d118a  lib/patra.cyr
+b21cfd17028696d0f365d1dbc945816cc2560f31f5f25f7d3fffb8e70492479c  lib/patra.cyr
 3a46495c11040db6f26872366ff528bfd50f0e8e033e5c0029d0f0684cfcd615  lib/protobuf.cyr
 e33d7d6782b2e310a4682d29be616947f5ad285cea0d6b9c446a034bf68f2f61  lib/samay.cyr
 cba1010deac9c8bdd87674b8291be02ee5b7daed65cd7d4109a4918f97488b9e  lib/vani.cyr

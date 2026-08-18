@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.0.2] - 2026-08-18
+
+### Changed
+
+- **Dependency set brought current: `sakshi` 2.4.6 -> 2.4.10, `ai-hwaccel` 2.3.15 -> 2.3.17,
+  `sigil` 3.12.1 -> 3.12.9, `libro` 2.8.2 -> 2.8.5, `majra` 2.5.1 -> 2.6.6.** All five were held
+  back from the 2.0.1 cut so daimon would take one edit rather than two while ai-hwaccel 2.3.17 was
+  still unpublished. The 2.0.1 release moved only `bote` 3.1.4 -> 3.3.1, which was forced (bayan's
+  `bayan_json_v_parse_str` -> `_buf` rename left the old bote dist calling a symbol that no longer
+  exists). Verified each bump took rather than merely built — every vendored `lib/<dep>.cyr` header
+  confirmed at the new version. Suite **215/215**, unchanged.
+
 ## [2.0.1] - 2026-08-17
 
 ### Changed
