@@ -59,19 +59,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   rather than a mode and its `sys_unlink` takes two arguments — daimon does not target AGNOS, but that
   arity difference is real.)
 
-- **The CI format gate, which could never pass.** It diffed `cyrius fmt`'s stdout against each file — but
-  `cyrius fmt <file>` rewrites in place and prints **nothing**, so the diff compared an empty stream
-  against every file and reported drift for all 35, unconditionally, including files that are perfectly
-  formatted. Bisected: `cyrius fmt` emitted the file to stdout up to **6.5.25** and stopped at **6.5.27**
-  — the exact pin this repo was on, so the gate went red the day that pin landed and stayed there. Now
-  uses `--check`, the purpose-built flag (exit 1 on real drift, no stdout by design), matching the shape
-  kavach adopted after diagnosing this independently. With a gate that can actually answer the question,
-  the real state turned out to be **4 files genuinely non-canonical** (`audit.cyr`, `http.cyr`,
-  `mcp_builtin.cyr`, `vector_store.cyr`) out of 35 — reformatted here, so the gate is green on its own
-  terms. The broken gate had been burying those 4 under a false 35-file failure, which is the precise
-  cost of a check that cannot distinguish "drifted" from "cannot tell". Filed upstream as
-  `cyrius/docs/development/issues/2026-08-24-cyrius-fmt-stopped-emitting-to-stdout.md`; **hoosh carries
-  the same broken idiom and is still red.**
+- **The CI format gate, which could never pass.** It diffed `cyrius fmt`'s stdout against each file, but
+  `cyrius fmt <file>` rewrites in place and prints nothing — so the diff compared an empty stream against
+  every file and reported drift for all 35, including correctly-formatted ones. Now uses `--check` (exit 1
+  on drift, names the file, no stdout by design), the same shape kavach uses. With a gate that can answer
+  the question, the real drift was **4 files** — `audit.cyr`, `http.cyr`, `mcp_builtin.cyr`,
+  `vector_store.cyr` — reformatted here. **hoosh carries the same broken idiom.**
 
 - **A stale `bayan` vendored at two different releases at once.** `lib/bayan.cyr` read `Version: 1.4.1`
   (the monolithic dist from the pinned toolchain's stdlib snapshot) while `lib/bayan-json.cyr` read

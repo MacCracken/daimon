@@ -73,21 +73,11 @@ jobs:
         run: cyrius vet src/main.cyr
 
       - name: Format check
-        # ⚠ The premise the old version of this step rested on was FALSE, and it
-        # inverted the outcome. `cyrius fmt <file>` does not write the formatted
-        # source to stdout — it rewrites the file IN PLACE and prints nothing.
-        # Diffing its empty stdout against the file therefore reported drift for
-        # EVERY file, unconditionally, including ones that are perfectly
-        # formatted: this gate could never pass and its output was pure noise.
-        # (Bisected: `cyrius fmt` emitted the file to stdout up to 6.5.25 and
-        # stopped at 6.5.27 — the exact pin this repo was on, so the gate went
-        # red the day the pin landed and stayed there.) Verified at the time of
-        # this fix: all 35 files are canonically formatted; there was no drift.
-        #
-        # `--check` is the purpose-built flag — exit 1 if not canonically
-        # formatted and name the file. It emits no stdout BY DESIGN, which is
-        # the property the old comment mistook for a defect. Same shape kavach
-        # uses after hitting and diagnosing this identically.
+        # `cyrius fmt <file>` rewrites the file IN PLACE and prints nothing.
+        # The old step diffed its (empty) stdout against the file, so it
+        # reported drift for every file including correctly-formatted ones.
+        # `--check` is the flag for this: exit 1 on drift, name the file, no
+        # stdout by design. Same shape kavach uses.
         run: |
           drift=0
           for f in src/*.cyr tests/*.tcyr tests/*.bcyr fuzz/*.fcyr; do
