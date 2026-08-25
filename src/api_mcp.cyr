@@ -195,3 +195,294 @@ fn api_mcp_call(fd, body) {
     http_send_response(fd, 200, rr, str_len(str_from(rr)));
     return 0;
 }
+
+# =========================================================================
+# api_mcp — MCP resources + prompts endpoints (2.1.0)
+# =========================================================================
+#
+# Modelled line-for-line on the tool endpoints above: list mirrors
+# api_mcp_manifest, register mirrors api_mcp_register, and read/get mirror
+# api_mcp_call's forwarding half. Keeping the shapes identical is the point —
+# a consumer that already speaks daimon's tool surface needs no new idioms.
+#
+# ⚠ THE URI TRAVELS IN THE BODY, NEVER IN THE PATH. An MCP resource URI contains
+# "://" and further "/" characters (bote publishes "bote://info"). Putting it in
+# a path segment would collide with the router's memeq-prefix arithmetic and with
+# query-stripping, and would need escaping nobody would get right twice. POST with
+# a JSON body is what /v1/mcp/call already does for tool names, so this is the
+# existing convention rather than a new one.
+
+# _mcp_forward_one: forward one MCP method to one registered host and relay the
+# result. Shared by resources/read and prompts/get — both are "address a single
+# host, pass params through verbatim, translate the JSON-RPC envelope back to
+# HTTP", which is exactly api_mcp_call's tail. Re-validates the stored URL at
+# dispatch time (cheap defense-in-depth, same as api_mcp_call).
+fn _mcp_forward_one(fd, url, method_cstr, body) {
+    if (is_err_result(validate_callback_url(url)) == 1) {
+        var bu = error_json(502, str_from("registered callback_url is not http(s)"));
+        http_send_response(fd, 502, str_data(bu), str_len(bu));
+        return 0;
+    }
+    trace_span_enter("mcp.forward", 11);
+    var resp = trace_mcp_forward_method(str_cstr(url), method_cstr, body);
+    trace_span_exit();
+    if (sandhi_rpc_ok(resp) == 0) {
+        var em = sandhi_rpc_err_message(resp);
+        var sbe = str_builder_new();
+        str_builder_add_cstr(sbe, "{\"error\":\"upstream MCP call failed\",\"code\":502,\"upstream\":\"");
+        if (em != 0) { str_builder_add(sbe, json_escape_str(str_from(em))); }
+        str_builder_add_cstr(sbe, "\"}");
+        var bb = str_builder_build(sbe);
+        http_send_response(fd, 502, str_data(bb), str_len(bb));
+        return 0;
+    }
+    var ec = sandhi_rpc_mcp_error_code(resp);
+    if (ec != 0) {
+        var em2 = sandhi_rpc_mcp_error_message(resp);
+        var sbm = str_builder_new();
+        str_builder_add_cstr(sbm, "{\"error\":\"");
+        if (em2 != 0) { str_builder_add(sbm, json_escape_str(str_from(em2))); }
+        else { str_builder_add_cstr(sbm, "upstream MCP error"); }
+        str_builder_add_cstr(sbm, "\",\"code\":");
+        str_builder_add_int(sbm, ec);
+        str_builder_add_cstr(sbm, "}");
+        http_send_response(fd, 502, str_data(str_builder_build(sbm)), str_len(str_builder_build(sbm)));
+        return 0;
+    }
+    var rr = sandhi_rpc_mcp_result_raw(resp);
+    if (rr == 0) { http_ok(fd, str_from("{}")); return 0; }
+    http_send_response(fd, 200, rr, str_len(str_from(rr)));
+    return 0;
+}
+
+# _mcp_v_str: read a TOP-LEVEL string field out of an already-parsed typed JSON
+# value, or 0 when absent / not a string.
+#
+# ⚠ This exists because the flat jget/json_parse scanner CANNOT be used on a body
+# that contains a nested array or object: it scans to the first `,` or `}`, so any
+# field sitting after a nested value is invisible to it. Live-caught — registering
+# a prompt whose body carried `"arguments":[{...}]` before `"callback_url"` failed
+# with "missing callback_url" even though the field was right there. Every handler
+# whose body can hold a nested value parses ONCE with the typed engine and reads
+# through here.
+# ⚠ `root` must come from bayan_json_v_parse(<Str>) — that entry point takes a Str
+# and calls str_data()/str_len() on it. Handing it a raw cstr (str_cstr(body))
+# reads a char pointer as a Str header and segfaults the whole server. Live-caught.
+fn _mcp_v_str(root, key) {
+    if (root == 0) { return 0; }
+    if (bayan_json_v_is_obj(root) == 0) { return 0; }
+    var v = bayan_json_v_obj_get(root, key);
+    if (v == 0) { return 0; }
+    if (bayan_json_v_is_str(v) == 0) { return 0; }
+    return bayan_json_v_str(v);
+}
+
+# GET /v1/mcp/resources — {"resources":[{uri,name,description,mimeType}],"count":N}
+# Field names are the MCP wire names (mimeType, not mime_type) so a client can
+# hand the array straight to code that already parses an MCP resources/list.
+fn api_mcp_resources_list(fd) {
+    var builtin = load64(_mcp_resources);
+    var external = load64(_mcp_resources + 8);
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"resources\":[");
+    var n = 0;
+    var keys = map_keys(builtin);
+    var i = 0;
+    while (i < vec_len(keys)) {
+        if (n > 0) { str_builder_add_cstr(sb, ","); }
+        _mcp_emit_resource(sb, map_get(builtin, vec_get(keys, i)));
+        n = n + 1;
+        i = i + 1;
+    }
+    var ekeys = map_keys(external);
+    var j = 0;
+    while (j < vec_len(ekeys)) {
+        if (n > 0) { str_builder_add_cstr(sb, ","); }
+        _mcp_emit_resource(sb, load64(map_get(external, vec_get(ekeys, j))));
+        n = n + 1;
+        j = j + 1;
+    }
+    str_builder_add_cstr(sb, "],\"count\":");
+    str_builder_add_int(sb, mcp_resource_count(_mcp_resources));
+    str_builder_add_cstr(sb, "}");
+    http_ok(fd, str_builder_build(sb));
+}
+
+fn _mcp_emit_resource(sb, r) {
+    str_builder_add_cstr(sb, "{\"uri\":\"");
+    str_builder_add(sb, json_escape_str(mcp_resource_uri(r)));
+    str_builder_add_cstr(sb, "\",\"name\":\"");
+    str_builder_add(sb, json_escape_str(mcp_resource_name(r)));
+    str_builder_add_cstr(sb, "\",\"description\":\"");
+    str_builder_add(sb, json_escape_str(mcp_resource_desc(r)));
+    str_builder_add_cstr(sb, "\",\"mimeType\":\"");
+    str_builder_add(sb, json_escape_str(mcp_resource_mime(r)));
+    str_builder_add_cstr(sb, "\"}");
+}
+
+fn _mcp_emit_prompt(sb, p) {
+    str_builder_add_cstr(sb, "{\"name\":\"");
+    str_builder_add(sb, json_escape_str(mcp_prompt_name(p)));
+    str_builder_add_cstr(sb, "\",\"description\":\"");
+    str_builder_add(sb, json_escape_str(mcp_prompt_desc(p)));
+    str_builder_add_cstr(sb, "\",\"arguments\":");
+    str_builder_add(sb, mcp_prompt_args_text(p));
+    str_builder_add_cstr(sb, "}");
+}
+
+# GET /v1/mcp/prompts — {"prompts":[{name,description,arguments}],"count":N}
+fn api_mcp_prompts_list(fd) {
+    var builtin = load64(_mcp_prompts);
+    var external = load64(_mcp_prompts + 8);
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"prompts\":[");
+    var n = 0;
+    var keys = map_keys(builtin);
+    var i = 0;
+    while (i < vec_len(keys)) {
+        if (n > 0) { str_builder_add_cstr(sb, ","); }
+        _mcp_emit_prompt(sb, map_get(builtin, vec_get(keys, i)));
+        n = n + 1;
+        i = i + 1;
+    }
+    var ekeys = map_keys(external);
+    var j = 0;
+    while (j < vec_len(ekeys)) {
+        if (n > 0) { str_builder_add_cstr(sb, ","); }
+        _mcp_emit_prompt(sb, load64(map_get(external, vec_get(ekeys, j))));
+        n = n + 1;
+        j = j + 1;
+    }
+    str_builder_add_cstr(sb, "],\"count\":");
+    str_builder_add_int(sb, mcp_prompt_count(_mcp_prompts));
+    str_builder_add_cstr(sb, "}");
+    http_ok(fd, str_builder_build(sb));
+}
+
+# POST /v1/mcp/resources — register an external resource.
+# Body: {"uri","name","description","mimeType","callback_url"}
+fn api_mcp_resource_register(fd, body) {
+    if (body == 0) { http_bad_request(fd, str_from("missing body")); return 0; }
+    var pairs = json_parse(body);
+    var uri = jget(pairs, "uri");
+    if (uri == 0) { http_bad_request(fd, str_from("missing uri")); return 0; }
+    var name = jget(pairs, "name");
+    if (name == 0) { name = str_from(""); }
+    var desc = jget(pairs, "description");
+    if (desc == 0) { desc = str_from(""); }
+    var mime = jget(pairs, "mimeType");
+    if (mime == 0) { mime = jget(pairs, "mime_type"); }
+    if (mime == 0) { mime = str_from("text/plain"); }
+    var url = jget(pairs, "callback_url");
+    if (url == 0) { http_bad_request(fd, str_from("missing callback_url")); return 0; }
+    if (is_err_result(validate_callback_url(url)) == 1) {
+        daimon_audit(SEV_SECURITY, "mcp", "mcp.resource.register.reject", "callback_url failed http(s) validation");
+        http_bad_request(fd, str_from("invalid callback_url (must be http:// or https://)"));
+        return 0;
+    }
+    mcp_register_resource_external(_mcp_resources, mcp_resource_new(uri, name, desc, mime), url);
+    daimon_audit(SEV_INFO, "mcp", "mcp.resource.register", str_cstr(uri));
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"registered\":\"");
+    str_builder_add(sb, json_escape_str(uri));
+    str_builder_add_cstr(sb, "\",\"count\":");
+    str_builder_add_int(sb, mcp_resource_count(_mcp_resources));
+    str_builder_add_cstr(sb, "}");
+    http_ok(fd, str_builder_build(sb));
+}
+
+# POST /v1/mcp/prompts — register an external prompt.
+# Body: {"name","description","arguments":[…],"callback_url"}
+fn api_mcp_prompt_register(fd, body) {
+    if (body == 0) { http_bad_request(fd, str_from("missing body")); return 0; }
+    # Typed parse, not jget — this body carries a nested `arguments` array (see _mcp_v_str).
+    var root = bayan_json_v_parse(body);
+    var name = _mcp_v_str(root, "name");
+    if (name == 0) { http_bad_request(fd, str_from("missing name")); return 0; }
+    var desc = _mcp_v_str(root, "description");
+    if (desc == 0) { desc = str_from(""); }
+    var url = _mcp_v_str(root, "callback_url");
+    if (url == 0) { http_bad_request(fd, str_from("missing callback_url")); return 0; }
+    if (is_err_result(validate_callback_url(url)) == 1) {
+        daimon_audit(SEV_SECURITY, "mcp", "mcp.prompt.register.reject", "callback_url failed http(s) validation");
+        http_bad_request(fd, str_from("invalid callback_url (must be http:// or https://)"));
+        return 0;
+    }
+    # arguments is a nested ARRAY — the typed engine, never the flat jget scanner.
+    var args = mcp_extract_prompt_arguments(body);
+    mcp_register_prompt_external(_mcp_prompts, mcp_prompt_new(name, desc, args), url);
+    daimon_audit(SEV_INFO, "mcp", "mcp.prompt.register", str_cstr(name));
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"registered\":\"");
+    str_builder_add(sb, json_escape_str(name));
+    str_builder_add_cstr(sb, "\",\"count\":");
+    str_builder_add_int(sb, mcp_prompt_count(_mcp_prompts));
+    str_builder_add_cstr(sb, "}");
+    http_ok(fd, str_builder_build(sb));
+}
+
+# POST /v1/mcp/resources/read — Body: {"uri":"…"}. Forwards MCP `resources/read`
+# to the host that registered that uri and relays its result verbatim.
+fn api_mcp_resource_read(fd, body) {
+    if (body == 0) { http_bad_request(fd, str_from("missing body")); return 0; }
+    var pairs = json_parse(body);
+    var uri = jget(pairs, "uri");
+    if (uri == 0) { http_bad_request(fd, str_from("missing uri")); return 0; }
+    var uri_c = str_cstr(uri);
+    if (mcp_find_resource(_mcp_resources, uri_c) == 0) {
+        http_bad_request(fd, str_from("resource not found"));
+        return 0;
+    }
+    var url = mcp_find_resource_url(_mcp_resources, uri_c);
+    if (url == 0) {
+        # Registered builtin with no in-process handler — 501, matching the tool path.
+        var b = error_json(501, str_from("builtin resource read not implemented"));
+        http_send_response(fd, 501, str_data(b), str_len(b));
+        return 0;
+    }
+    daimon_audit(SEV_INFO, "mcp", "mcp.resource.read", uri_c);
+    return _mcp_forward_one(fd, url, "resources/read", str_cstr(body));
+}
+
+# POST /v1/mcp/prompts/get — Body: {"name":"…","arguments":{…}}. Forwards MCP
+# `prompts/get` to the host that registered that prompt.
+fn api_mcp_prompt_get(fd, body) {
+    if (body == 0) { http_bad_request(fd, str_from("missing body")); return 0; }
+    # Typed parse — this body carries a nested `arguments` object (see _mcp_v_str).
+    var name = _mcp_v_str(bayan_json_v_parse(body), "name");
+    if (name == 0) { http_bad_request(fd, str_from("missing name")); return 0; }
+    var name_c = str_cstr(name);
+    if (mcp_find_prompt(_mcp_prompts, name_c) == 0) {
+        http_bad_request(fd, str_from("prompt not found"));
+        return 0;
+    }
+    var url = mcp_find_prompt_url(_mcp_prompts, name_c);
+    if (url == 0) {
+        var b = error_json(501, str_from("builtin prompt get not implemented"));
+        http_send_response(fd, 501, str_data(b), str_len(b));
+        return 0;
+    }
+    daimon_audit(SEV_INFO, "mcp", "mcp.prompt.get", name_c);
+    return _mcp_forward_one(fd, url, "prompts/get", str_cstr(body));
+}
+
+# DELETE /v1/mcp/resources/{uri} is NOT offered — a URI cannot ride a path
+# segment (see the header note). Deregistration takes the same POST-with-body
+# shape, on its own path so a read is never mistaken for a delete.
+fn api_mcp_resource_deregister(fd, body) {
+    if (body == 0) { http_bad_request(fd, str_from("missing body")); return 0; }
+    var uri = jget(json_parse(body), "uri");
+    if (uri == 0) { http_bad_request(fd, str_from("missing uri")); return 0; }
+    mcp_deregister_resource(_mcp_resources, str_cstr(uri));
+    daimon_audit(SEV_INFO, "mcp", "mcp.resource.deregister", str_cstr(uri));
+    http_ok(fd, str_from("{\"deregistered\":true}"));
+}
+
+fn api_mcp_prompt_deregister(fd, body) {
+    if (body == 0) { http_bad_request(fd, str_from("missing body")); return 0; }
+    var name = jget(json_parse(body), "name");
+    if (name == 0) { http_bad_request(fd, str_from("missing name")); return 0; }
+    mcp_deregister_prompt(_mcp_prompts, str_cstr(name));
+    daimon_audit(SEV_INFO, "mcp", "mcp.prompt.deregister", str_cstr(name));
+    http_ok(fd, str_from("{\"deregistered\":true}"));
+}

@@ -485,6 +485,106 @@ fn mcp_deregister(reg, name_cstr) {
     return map_delete(load64(reg + 8), name_cstr);
 }
 
+# --- MCP resources + prompts (2.1.0) — mirrors src/mcp.cyr ---
+fn mcp_resource_new(uri, name, desc, mime) {
+    var r = alloc(32);
+    store64(r, uri); store64(r + 8, name); store64(r + 16, desc); store64(r + 24, mime);
+    return r;
+}
+fn mcp_resource_uri(r)  { return load64(r); }
+fn mcp_resource_name(r) { return load64(r + 8); }
+fn mcp_resource_desc(r) { return load64(r + 16); }
+fn mcp_resource_mime(r) { return load64(r + 24); }
+
+fn mcp_prompt_new(name, desc, args) {
+    var p = alloc(24);
+    store64(p, name); store64(p + 8, desc); store64(p + 16, args);
+    return p;
+}
+fn mcp_prompt_name(p) { return load64(p); }
+fn mcp_prompt_desc(p) { return load64(p + 8); }
+fn mcp_prompt_args(p) { return load64(p + 16); }
+
+fn mcp_extract_prompt_arguments(body) {
+    if (body == 0) { return str_from("[]"); }
+    var root = bayan_json_v_parse(body);
+    if (root == 0) { return str_from("[]"); }
+    if (bayan_json_v_is_obj(root) == 0) { return str_from("[]"); }
+    var av = bayan_json_v_obj_get(root, "arguments");
+    if (av == 0) { return str_from("[]"); }
+    if (bayan_json_v_is_arr(av) == 0) { return str_from("[]"); }
+    return bayan_json_v_build(av);
+}
+
+fn mcp_prompt_args_text(p) {
+    var a = mcp_prompt_args(p);
+    if (a == 0) { return str_from("[]"); }
+    if (str_len(a) == 0) { return str_from("[]"); }
+    return a;
+}
+
+fn mcp_resource_registry_new() {
+    var reg = alloc(16);
+    store64(reg, map_new()); store64(reg + 8, map_new());
+    return reg;
+}
+fn mcp_prompt_registry_new() {
+    var reg = alloc(16);
+    store64(reg, map_new()); store64(reg + 8, map_new());
+    return reg;
+}
+
+fn mcp_register_resource_external(reg, res, callback_url) {
+    var uri  = str_clone(mcp_resource_uri(res));
+    var name = str_clone(mcp_resource_name(res));
+    var desc = str_clone(mcp_resource_desc(res));
+    var mime = str_clone(mcp_resource_mime(res));
+    var owned = mcp_resource_new(uri, name, desc, mime);
+    var ext = alloc(16);
+    store64(ext, owned); store64(ext + 8, str_clone(callback_url));
+    map_set(load64(reg + 8), str_data(uri), ext);
+}
+
+fn mcp_register_prompt_external(reg, p, callback_url) {
+    var name = str_clone(mcp_prompt_name(p));
+    var desc = str_clone(mcp_prompt_desc(p));
+    var args = str_clone(mcp_prompt_args(p));
+    var owned = mcp_prompt_new(name, desc, args);
+    var ext = alloc(16);
+    store64(ext, owned); store64(ext + 8, str_clone(callback_url));
+    map_set(load64(reg + 8), str_data(name), ext);
+}
+
+fn mcp_resource_count(reg) { return map_count(load64(reg)) + map_count(load64(reg + 8)); }
+fn mcp_prompt_count(reg)   { return map_count(load64(reg)) + map_count(load64(reg + 8)); }
+
+fn mcp_find_resource(reg, uri_cstr) {
+    var r = map_get(load64(reg), uri_cstr);
+    if (r != 0) { return r; }
+    var ext = map_get(load64(reg + 8), uri_cstr);
+    if (ext != 0) { return load64(ext); }
+    return 0;
+}
+fn mcp_find_resource_url(reg, uri_cstr) {
+    var ext = map_get(load64(reg + 8), uri_cstr);
+    if (ext == 0) { return 0; }
+    return load64(ext + 8);
+}
+fn mcp_find_prompt(reg, name_cstr) {
+    var p = map_get(load64(reg), name_cstr);
+    if (p != 0) { return p; }
+    var ext = map_get(load64(reg + 8), name_cstr);
+    if (ext != 0) { return load64(ext); }
+    return 0;
+}
+fn mcp_find_prompt_url(reg, name_cstr) {
+    var ext = map_get(load64(reg + 8), name_cstr);
+    if (ext == 0) { return 0; }
+    return load64(ext + 8);
+}
+fn mcp_deregister_resource(reg, uri_cstr) { return map_delete(load64(reg + 8), uri_cstr); }
+fn mcp_deregister_prompt(reg, name_cstr)  { return map_delete(load64(reg + 8), name_cstr); }
+
 fn validate_callback_url(url) {
     if (url == 0) { return Err(DAIMON_ERR_INVALID_PARAM); }
     if (str_len(url) == 0) { return Err(DAIMON_ERR_INVALID_PARAM); }
@@ -1334,11 +1434,11 @@ fn main() {
     var rb_url = mcp_find_external_url(reg, "buftool");
     assert(rb_url != 0, "buffer-backed tool survives source clobber (lookup)");
     assert(str_eq(rb_url, str_from("http://up.test/x")) == 1,
-    "callback_url deep-copied, not aliased to request buffer");
+      "callback_url deep-copied, not aliased to request buffer");
     var rb_tool = mcp_find_tool(reg, "buftool");
     assert(rb_tool != 0, "buffer-backed tool findable after clobber");
     assert(str_eq(load64(rb_tool), str_from("buftool")) == 1,
-    "tool name deep-copied, not aliased to request buffer");
+      "tool name deep-copied, not aliased to request buffer");
 
     # validate_callback_url — boundary cases for the SSRF guard.
     assert(is_err_result(validate_callback_url(0)) == 1, "null url rejected");
@@ -1364,17 +1464,17 @@ fn main() {
     # snake_case alias accepted.
     var body_alias = str_from("{\"name\":\"a\",\"input_schema\":{\"type\":\"object\"}}");
     assert(str_eq(mcp_extract_input_schema(body_alias), str_from("{\"type\":\"object\"}")) == 1,
-    "input_schema alias accepted");
+      "input_schema alias accepted");
 
     # Absent schema → {} (back-compatible default).
     var body_none = str_from("{\"name\":\"a\",\"description\":\"d\"}");
     assert(str_eq(mcp_extract_input_schema(body_none), str_from("{}")) == 1,
-    "absent inputSchema defaults to {}");
+      "absent inputSchema defaults to {}");
 
     # Non-object schema (e.g. a string) rejected → {}.
     var body_bad = str_from("{\"name\":\"a\",\"inputSchema\":\"not-an-object\"}");
     assert(str_eq(mcp_extract_input_schema(body_bad), str_from("{}")) == 1,
-    "non-object inputSchema rejected → {}");
+      "non-object inputSchema rejected → {}");
 
     # End-to-end: register with a schema, recover it from the stored tool.
     var sch_tool = mcp_tool_new(str_from("schematool"), str_from("d"), got_sch);
@@ -1386,8 +1486,62 @@ fn main() {
     # mcp_manifest_schema fallback: no schema → permissive {"type":"object"}.
     var no_sch_tool = mcp_tool_new(str_from("b"), str_from("d"), str_from(""));
     assert(str_eq(mcp_manifest_schema(no_sch_tool), str_from("{\"type\":\"object\"}")) == 1,
-    "empty schema falls back to permissive object");
+      "empty schema falls back to permissive object");
     assert(str_eq(mcp_manifest_schema(stored), schema_json) == 1, "manifest emits stored schema verbatim");
+
+    # =============================================================
+    # mcp resources + prompts (2.1.0)
+    # =============================================================
+    test_group("mcp_resources");
+    var rreg = mcp_resource_registry_new();
+    assert_eq(mcp_resource_count(rreg), 0, "empty resource registry");
+    var res1 = mcp_resource_new(str_from("bote://info"), str_from("bote-info"),
+      str_from("reference server info"), str_from("text/plain"));
+    mcp_register_resource_external(rreg, res1, str_from("http://127.0.0.1:9000/mcp"));
+    assert_eq(mcp_resource_count(rreg), 1, "one resource");
+    assert(mcp_find_resource(rreg, "bote://info") != 0, "resource findable by its URI");
+    assert(mcp_find_resource(rreg, "bote://missing") == 0, "missing URI is not found");
+    # A URI carries "://" and further slashes — the reason it travels in the request
+    # BODY and never in a path segment. Assert it survives the registry verbatim.
+    var got = mcp_find_resource(rreg, "bote://info");
+    assert(str_eq(mcp_resource_uri(got), str_from("bote://info")) == 1, "URI with :// roundtrips verbatim");
+    assert(str_eq(mcp_resource_mime(got), str_from("text/plain")) == 1, "mimeType roundtrips");
+    var rurl = mcp_find_resource_url(rreg, "bote://info");
+    assert(str_eq(rurl, str_from("http://127.0.0.1:9000/mcp")) == 1, "resource callback URL roundtrips");
+    assert(mcp_find_resource_url(rreg, "bote://missing") == 0, "missing URI has no callback URL");
+    mcp_deregister_resource(rreg, "bote://info");
+    assert_eq(mcp_resource_count(rreg), 0, "deregistered resource is gone");
+
+    test_group("mcp_prompts");
+    var preg = mcp_prompt_registry_new();
+    assert_eq(mcp_prompt_count(preg), 0, "empty prompt registry");
+    # The nested `arguments` ARRAY is why this body cannot go through the flat jget
+    # scanner: it stops at the first , or }, so every field after a nested value is
+    # invisible to it. Live-caught as "missing callback_url" on a body that had one.
+    var pbody = str_from("{\"n\":\"g\",\"arguments\":[{\"name\":\"who\",\"required\":true}],\"cb\":\"u\"}");
+    var pargs = mcp_extract_prompt_arguments(pbody);
+    assert(str_eq(pargs, str_from("[{\"name\":\"who\",\"required\":true}]")) == 1,
+      "nested arguments array survives the typed extractor");
+    var pnone = str_from("{\"name\":\"greet\"}");
+    assert(str_eq(mcp_extract_prompt_arguments(pnone), str_from("[]")) == 1,
+      "absent arguments -> []");
+    var pbad = str_from("{\"name\":\"greet\",\"arguments\":\"not-an-array\"}");
+    assert(str_eq(mcp_extract_prompt_arguments(pbad), str_from("[]")) == 1,
+      "non-array arguments -> [] (never emit invalid JSON)");
+    var p1 = mcp_prompt_new(str_from("greet"), str_from("a greeting"), pargs);
+    mcp_register_prompt_external(preg, p1, str_from("http://127.0.0.1:9000/mcp"));
+    assert_eq(mcp_prompt_count(preg), 1, "one prompt");
+    assert(mcp_find_prompt(preg, "greet") != 0, "prompt findable by name");
+    assert(mcp_find_prompt(preg, "nope") == 0, "missing prompt not found");
+    assert(str_eq(mcp_prompt_args_text(mcp_find_prompt(preg, "greet")), pargs) == 1,
+      "stored arguments emit verbatim");
+    var pempty = mcp_prompt_new(str_from("bare"), str_from("d"), 0);
+    assert(str_eq(mcp_prompt_args_text(pempty), str_from("[]")) == 1,
+      "a prompt with no arguments still emits valid JSON array text");
+    var purl = mcp_find_prompt_url(preg, "greet");
+    assert(str_eq(purl, str_from("http://127.0.0.1:9000/mcp")) == 1, "prompt callback URL roundtrips");
+    mcp_deregister_prompt(preg, "greet");
+    assert_eq(mcp_prompt_count(preg), 0, "deregistered prompt is gone");
 
     # =============================================================
     # edge fleet
@@ -1445,11 +1599,11 @@ fn main() {
     var tp_s = str_data(str_from("00-aaaaaaaabbbbbbbbccccccccdddddddd-5566778899aabbcc-01"));
     var exp_lo = str_data(str_from("ccccccccdddddddd"));
     assert_eq(_trace_parse_hex(tp_s, 19, 16), _trace_parse_hex(exp_lo, 0, 16),
-    "traceparent low-64 extracted at offset 19");
+      "traceparent low-64 extracted at offset 19");
     # 1.3.4: the high 64 bits are chars 3..18 — the half 1.3.3 dropped.
     var exp_hi = str_data(str_from("aaaaaaaabbbbbbbb"));
     assert_eq(_trace_parse_hex(tp_s, 3, 16), _trace_parse_hex(exp_hi, 0, 16),
-    "traceparent high-64 extracted at offset 3");
+      "traceparent high-64 extracted at offset 3");
     # trace_id_hex formats an i64 that _trace_parse_hex reads back identically.
     var rt_buf = alloc(17);
     trace_id_hex(305419896, rt_buf);  # 0x12345678

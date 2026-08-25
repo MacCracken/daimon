@@ -170,10 +170,17 @@ fn agent_ipc_bind(ipc) {
 
     # Ensure parent directory exists
     var dir = path_dirname(spath);
-    syscall(SYS_MKDIR, str_data(dir), 493);  # 0755
+    # ⚠ sys_* WRAPPER, never a raw syscall(SYS_MKDIR, ...). A bare `syscall(SYS_FOO, ...)` is a
+    # portability CLAIM that arm64 Linux does not honour: it has no legacy mkdir/unlink/chmod at all,
+    # only the *at forms, so the constants simply do not exist there and the cross-build fails to
+    # compile. This file and memory.cyr were the reason daimon's aarch64 CI lane was red. The wrapper
+    # resolves per target. (Note for anyone porting further: the AGNOS variant of these wrappers takes
+    # a pathlen rather than a mode and sys_unlink takes two args — daimon does not target AGNOS, but
+    # that arity difference is real and would need handling if it ever does.)
+    sys_mkdir(str_data(dir), 493);  # 0755
 
     # Remove stale socket if it exists
-    syscall(SYS_UNLINK, path_cstr);
+    sys_unlink(path_cstr);
 
     # Create Unix domain socket (AF_UNIX=1, SOCK_STREAM=1)
     var fd = syscall(SYS_SOCKET, 1, 1, 0);
@@ -194,7 +201,7 @@ fn agent_ipc_bind(ipc) {
     }
 
     # Set socket permissions (owner only: 0700)
-    syscall(SYS_CHMOD, path_cstr, 448);  # 0700
+    sys_chmod(path_cstr, 448);  # 0700
 
     # Listen
     var lr = syscall(SYS_LISTEN, fd, MAX_CONCURRENT_CONNECTIONS);
@@ -337,6 +344,6 @@ fn agent_ipc_send(target_socket_path, message_str) {
 # Cleanup: remove socket file
 fn agent_ipc_cleanup(ipc) {
     var spath = load64(ipc + 8);
-    syscall(SYS_UNLINK, str_data(spath));
+    sys_unlink(str_data(spath));
 }
 

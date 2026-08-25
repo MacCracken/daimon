@@ -63,7 +63,7 @@ fn memory_store_set(ms, agent_id_str, key, value_json) {
 
     var dir = memory_store_agent_dir(ms, agent_id_str);
     # Ensure directory exists (VULN-005: 0700 not 0755)
-    syscall(SYS_MKDIR, str_data(dir), 448);  # 0700
+    sys_mkdir(str_data(dir), 448);  # 0700
 
     var safe_key = sanitize_key(key);
     var fname = str_cat(safe_key, str_from(".json"));
@@ -107,7 +107,7 @@ fn memory_store_delete(ms, agent_id_str, key) {
     var fname = str_cat(safe_key, str_from(".json"));
     var fpath = path_join(str_data(dir), str_data(fname));
 
-    var r = syscall(SYS_UNLINK, str_data(fpath));
+    var r = sys_unlink(str_data(fpath));
     if (r == 0) { return Ok(1); }
     return Ok(0);
 }
@@ -143,7 +143,7 @@ fn memory_store_clear(ms, agent_id_str) {
         var name_s = str_from(name);
         if (str_ends_with(name_s, str_from(".json")) == 1) {
             var fpath = path_join(str_data(dir), name);
-            syscall(SYS_UNLINK, str_data(fpath));
+            sys_unlink(str_data(fpath));
             count = count + 1;
         }
         i = i + 1;

@@ -9,6 +9,8 @@ var _supervisor = 0;
 var _mem_store = 0;
 var _vindex = 0;
 var _mcp_registry = 0;
+var _mcp_resources = 0;   # 2.1.0: MCP resources registry (sibling of _mcp_registry)
+var _mcp_prompts = 0;     # 2.1.0: MCP prompts registry
 var _scheduler = 0;
 var _fed_mgr = 0;
 var _edge_fleet = 0;
@@ -25,6 +27,8 @@ fn app_init() {
     _mem_store = memory_store_new(str_from("/var/lib/agnos/agent-memory"));
     _vindex = vindex_new();
     _mcp_registry = mcp_registry_new();
+    _mcp_resources = mcp_resource_registry_new();   # 2.1.0
+    _mcp_prompts = mcp_prompt_registry_new();       # 2.1.0
     daimon_audit_init();            # create the libro audit chain + genesis entry
     mcp_libro_init(_mcp_registry);  # register bote libro audit tools as builtins (over that chain)
     mcp_web_init(_mcp_registry);    # register bote web_fetch / web_search as builtins (bote 3.1.0)

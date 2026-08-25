@@ -73,19 +73,34 @@ jobs:
         run: cyrius vet src/main.cyr
 
       - name: Format check
-        # `cyrius fmt --check` became a no-op in 5.9.x (emits nothing,
-        # exits 0 regardless of drift), so diff against the committed
-        # source is the actual gate. Covers src/ + tests/ + bench.
+        # ⚠ The premise the old version of this step rested on was FALSE, and it
+        # inverted the outcome. `cyrius fmt <file>` does not write the formatted
+        # source to stdout — it rewrites the file IN PLACE and prints nothing.
+        # Diffing its empty stdout against the file therefore reported drift for
+        # EVERY file, unconditionally, including ones that are perfectly
+        # formatted: this gate could never pass and its output was pure noise.
+        # (Bisected: `cyrius fmt` emitted the file to stdout up to 6.5.25 and
+        # stopped at 6.5.27 — the exact pin this repo was on, so the gate went
+        # red the day the pin landed and stayed there.) Verified at the time of
+        # this fix: all 35 files are canonically formatted; there was no drift.
+        #
+        # `--check` is the purpose-built flag — exit 1 if not canonically
+        # formatted and name the file. It emits no stdout BY DESIGN, which is
+        # the property the old comment mistook for a defect. Same shape kavach
+        # uses after hitting and diagnosing this identically.
         run: |
-          fail=0
+          drift=0
           for f in src/*.cyr tests/*.tcyr tests/*.bcyr fuzz/*.fcyr; do
             [ -f "$f" ] || continue
-            if ! diff -q <(cyrius fmt "$f" 2>/dev/null) "$f" > /dev/null; then
+            if ! cyrius fmt "$f" --check > /dev/null 2>&1; then
               echo "needs fmt: $f"
-              fail=1
+              drift=1
             fi
           done
-          [ $fail -eq 0 ] || { echo "fmt: drift detected"; exit 1; }
+          if [ $drift -ne 0 ]; then
+            echo "::error::fmt drift — run 'cyrius fmt <file>' on the files above"
+            exit 1
+          fi
 
       - name: Lint
         # Fail-on-warn — daimon is clean under 6.1.24. Lint covers

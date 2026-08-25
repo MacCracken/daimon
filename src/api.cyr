@@ -14,6 +14,10 @@ fn api_health(fd) {
     str_builder_add_int(sb, map_count(_agents));
     str_builder_add_cstr(sb, ",\"mcp_tools\":");
     str_builder_add_int(sb, mcp_tool_count(_mcp_registry));
+    str_builder_add_cstr(sb, ",\"mcp_resources\":");
+    str_builder_add_int(sb, mcp_resource_count(_mcp_resources));
+    str_builder_add_cstr(sb, ",\"mcp_prompts\":");
+    str_builder_add_int(sb, mcp_prompt_count(_mcp_prompts));
     str_builder_add_cstr(sb, ",\"edge_nodes\":");
     str_builder_add_int(sb, edge_fleet_node_count(_edge_fleet));
     str_builder_add_cstr(sb, "}");
@@ -26,6 +30,10 @@ fn api_metrics(fd) {
     str_builder_add_int(sb, map_count(_agents));
     str_builder_add_cstr(sb, ",\"mcp_tools\":");
     str_builder_add_int(sb, mcp_tool_count(_mcp_registry));
+    str_builder_add_cstr(sb, ",\"mcp_resources\":");
+    str_builder_add_int(sb, mcp_resource_count(_mcp_resources));
+    str_builder_add_cstr(sb, ",\"mcp_prompts\":");
+    str_builder_add_int(sb, mcp_prompt_count(_mcp_prompts));
     str_builder_add_cstr(sb, ",\"vector_entries\":");
     str_builder_add_int(sb, vindex_len(_vindex));
     str_builder_add_cstr(sb, ",\"edge_nodes\":");

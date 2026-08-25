@@ -5,7 +5,7 @@ description = "daimon — AGNOS agent orchestrator"
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/daimon"
 language = "cyrius"
-cyrius = "6.5.27"
+cyrius = "6.5.35"
 
 [build]
 entry = "src/main.cyr"
@@ -57,13 +57,13 @@ stdlib = [
 
 [deps.sakshi]
 git = "https://github.com/MacCracken/sakshi.git"
-tag = "2.4.10"
+tag = "2.4.11"
 modules = ["dist/sakshi.cyr"]
 
 [deps.ai-hwaccel]
 git = "https://github.com/MacCracken/ai-hwaccel.git"
 path = "../ai-hwaccel"
-tag = "2.3.17"
+tag = "2.3.19"
 modules = ["dist/ai-hwaccel.cyr"]
 
 # samay — task scheduler. daimon 2.0.0 REPLACES its own duplicated
@@ -95,6 +95,22 @@ modules = ["dist/samay.cyr"]
 # the original stdlib entry) overrides the transitive modular selection, so
 # exactly one sigil packaging is vendored. Mirrors bote/libro/majra, which
 # all pin sigil explicitly for the same registry-lag / packaging reason.
+# bayan (JSON/base64/etc) is pinned explicitly here for the SAME reason sigil
+# is, one line below. The stdlib snapshot vendors the monolithic
+# dist/bayan.cyr, while libro/bote/majra's .deps sidecars pull bayan as
+# MODULAR component files (dist/bayan-json.cyr, ...). Before this pin the two
+# were not even the same RELEASE -- lib/bayan.cyr read "Version: 1.4.1" while
+# lib/bayan-json.cyr read "Version: 1.5.2" -- producing 20 "duplicate fn (last
+# definition wins)" warnings plus an `undefined function 'json_v_parse_str'`,
+# because the 1.5.2 modular half called into a 1.4.1 monolith that no longer
+# exported it. An explicit top-level pin at modules=["dist/bayan.cyr"]
+# overrides the transitive modular selection so exactly one packaging, at one
+# version, is vendored.
+[deps.bayan]
+git = "https://github.com/MacCracken/bayan.git"
+tag = "1.5.2"
+modules = ["dist/bayan.cyr"]
+
 [deps.sigil]
 git = "https://github.com/MacCracken/sigil.git"
 tag = "3.12.9"
@@ -102,17 +118,17 @@ modules = ["dist/sigil.cyr"]
 
 [deps.libro]
 git = "https://github.com/MacCracken/libro.git"
-tag = "2.8.5"
+tag = "2.8.12"
 modules = ["dist/libro.cyr"]
 
 [deps.majra]
 git = "https://github.com/MacCracken/majra.git"
-tag = "2.6.6"
+tag = "2.7.0"
 modules = ["dist/majra.cyr"]
 
 [deps.bote]
 git = "https://github.com/MacCracken/bote.git"
-tag = "3.3.1"
+tag = "3.3.7"
 modules = ["dist/bote.cyr"]
 
 # Distribution manifest. Single binary today (`daimon`), with a best-effort

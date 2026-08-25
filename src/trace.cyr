@@ -164,12 +164,20 @@ fn trace_response_header(): i64 {
 # downstream endpoint joins this trace. Falls back to the plain (headerless)
 # call when tracing is off. url_cstr / body_cstr are NUL-terminated cstrs.
 fn trace_mcp_forward(url_cstr, body_cstr): i64 {
+    return trace_mcp_forward_method(url_cstr, "tools/call", body_cstr);
+}
+
+# 2.1.0: the same outbound hop for ANY MCP method. Resources and prompts forward
+# through here too ("resources/read", "prompts/get"), so tracing, header
+# injection and the sandhi entry points stay single-sourced — the method was
+# always a parameter of sandhi_rpc_mcp_call; only this wrapper had hardcoded it.
+fn trace_mcp_forward_method(url_cstr, method_cstr, body_cstr): i64 {
     if (_trace_enabled == 0) {
-        return sandhi_rpc_mcp_call(url_cstr, "tools/call", body_cstr);
+        return sandhi_rpc_mcp_call(url_cstr, method_cstr, body_cstr);
     }
     var hdrs = sandhi_headers_new();
     sandhi_headers_set(hdrs, "traceparent", _trace_build_traceparent());
-    return sandhi_rpc_mcp_call_with_headers(url_cstr, "tools/call", body_cstr, hdrs);
+    return sandhi_rpc_mcp_call_with_headers(url_cstr, method_cstr, body_cstr, hdrs);
 }
 
 # Build a W3C traceparent cstr for the active trace: "00-<32hex trace-id>-<16hex

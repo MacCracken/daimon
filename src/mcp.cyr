@@ -141,3 +141,164 @@ fn mcp_deregister(reg, name_cstr) {
     return map_delete(load64(reg + 8), name_cstr);
 }
 
+# =========================================================================
+# MCP resources + prompts registries (2.1.0)
+# =========================================================================
+#
+# Sibling registries to the tool registry above, deliberately built on the SAME
+# shape: a builtin map and an external map, the external entries wrapping a
+# {description, callback_url} pair. A consumer (thoth) reaches resources and
+# prompts through daimon exactly the way it reaches tools, so the spine has one
+# discovery surface rather than one per MCP noun.
+#
+# ⚠ WHY EXPLICIT REGISTRATION AND NOT FAN-OUT AGGREGATION. The obvious
+# alternative is to skip these registries entirely and answer `resources/list`
+# by asking every registered host at request time, since an MCP server already
+# knows its own resources and a registration can go stale. It was rejected on
+# BLOCKING behaviour: the forward path builds no options struct, so every sandhi
+# timeout getter returns 0 and a dropped-SYN host blocks the single sync worker
+# for as long as the OS takes to give up. Aggregation would put that cost on
+# every list, multiplied by the number of hosts, and one hung host would stall
+# a consumer's whole turn. With registration, listing is local and instant, and
+# only a read/get — one host, explicitly addressed — can block.
+#
+# ⚠ str_clone EVERY FIELD, exactly as mcp_register_external does. The Strs handed
+# in by an api_* handler point into the transient per-connection request buffer,
+# which sync mode REUSES for later requests: storing them raw lets a subsequent
+# request overwrite the registry, which is a documented CVE-class bug in this
+# very file (docs/development/issues/2026-06-11-mcp-registry-aliases-request-
+# buffer.md) — a clobbered callback_url sidesteps the registration-time SSRF
+# guard. The bump allocator never frees, so a plain str_clone is stable for the
+# process lifetime.
+
+# McpResourceDescription: {uri, name, description, mime_type} — 4 x 8 = 32 bytes
+fn mcp_resource_new(uri, name, desc, mime) {
+    var r = alloc(32);
+    store64(r, uri);
+    store64(r + 8, name);
+    store64(r + 16, desc);
+    store64(r + 24, mime);
+    return r;
+}
+
+fn mcp_resource_uri(r)  { return load64(r); }
+fn mcp_resource_name(r) { return load64(r + 8); }
+fn mcp_resource_desc(r) { return load64(r + 16); }
+fn mcp_resource_mime(r) { return load64(r + 24); }
+
+# McpPromptDescription: {name, description, arguments_json} — 3 x 8 = 24 bytes
+fn mcp_prompt_new(name, desc, args) {
+    var p = alloc(24);
+    store64(p, name);
+    store64(p + 8, desc);
+    store64(p + 16, args);
+    return p;
+}
+
+fn mcp_prompt_name(p) { return load64(p); }
+fn mcp_prompt_desc(p) { return load64(p + 8); }
+fn mcp_prompt_args(p) { return load64(p + 16); }
+
+# Extract an MCP prompt's `arguments` from a registration body as compact JSON
+# ARRAY text. Same reasoning as mcp_extract_input_schema — the flat jget scanner
+# stops at the first `,`/`}` and would mangle a nested array of argument objects
+# — but the required shape here is an ARRAY, not an object. Returns "[]" when the
+# field is absent or is not an array, so the emitted `arguments` is always valid
+# JSON for a registrant that sends none.
+fn mcp_extract_prompt_arguments(body) {
+    if (body == 0) { return str_from("[]"); }
+    var root = bayan_json_v_parse(body);
+    if (root == 0) { return str_from("[]"); }
+    if (bayan_json_v_is_obj(root) == 0) { return str_from("[]"); }
+    var av = bayan_json_v_obj_get(root, "arguments");
+    if (av == 0) { return str_from("[]"); }
+    if (bayan_json_v_is_arr(av) == 0) { return str_from("[]"); }
+    return bayan_json_v_build(av);
+}
+
+# Arguments text to emit for a prompt in a listing — always valid JSON array text.
+fn mcp_prompt_args_text(p) {
+    var a = mcp_prompt_args(p);
+    if (a == 0) { return str_from("[]"); }
+    if (str_len(a) == 0) { return str_from("[]"); }
+    return a;
+}
+
+fn mcp_resource_registry_new() {
+    var reg = alloc(16);
+    store64(reg, map_new());     # builtin:  uri_cstr -> McpResourceDescription
+    store64(reg + 8, map_new()); # external: uri_cstr -> {desc*, callback_url}
+    return reg;
+}
+
+fn mcp_prompt_registry_new() {
+    var reg = alloc(16);
+    store64(reg, map_new());     # builtin:  name_cstr -> McpPromptDescription
+    store64(reg + 8, map_new()); # external: name_cstr -> {desc*, callback_url}
+    return reg;
+}
+
+fn mcp_register_resource_builtin(reg, res) {
+    map_set(load64(reg), str_cstr(mcp_resource_uri(res)), res);
+}
+
+fn mcp_register_resource_external(reg, res, callback_url) {
+    var uri  = str_clone(mcp_resource_uri(res));
+    var name = str_clone(mcp_resource_name(res));
+    var desc = str_clone(mcp_resource_desc(res));
+    var mime = str_clone(mcp_resource_mime(res));
+    var owned = mcp_resource_new(uri, name, desc, mime);
+    var ext = alloc(16);
+    store64(ext, owned);
+    store64(ext + 8, str_clone(callback_url));
+    map_set(load64(reg + 8), str_cstr(uri), ext);
+}
+
+fn mcp_register_prompt_builtin(reg, p) {
+    map_set(load64(reg), str_cstr(mcp_prompt_name(p)), p);
+}
+
+fn mcp_register_prompt_external(reg, p, callback_url) {
+    var name = str_clone(mcp_prompt_name(p));
+    var desc = str_clone(mcp_prompt_desc(p));
+    var args = str_clone(mcp_prompt_args(p));
+    var owned = mcp_prompt_new(name, desc, args);
+    var ext = alloc(16);
+    store64(ext, owned);
+    store64(ext + 8, str_clone(callback_url));
+    map_set(load64(reg + 8), str_cstr(name), ext);
+}
+
+fn mcp_resource_count(reg) { return map_count(load64(reg)) + map_count(load64(reg + 8)); }
+fn mcp_prompt_count(reg)   { return map_count(load64(reg)) + map_count(load64(reg + 8)); }
+
+fn mcp_find_resource(reg, uri_cstr) {
+    var r = map_get(load64(reg), uri_cstr);
+    if (r != 0) { return r; }
+    var ext = map_get(load64(reg + 8), uri_cstr);
+    if (ext != 0) { return load64(ext); }
+    return 0;
+}
+
+fn mcp_find_resource_url(reg, uri_cstr) {
+    var ext = map_get(load64(reg + 8), uri_cstr);
+    if (ext == 0) { return 0; }
+    return load64(ext + 8);
+}
+
+fn mcp_find_prompt(reg, name_cstr) {
+    var p = map_get(load64(reg), name_cstr);
+    if (p != 0) { return p; }
+    var ext = map_get(load64(reg + 8), name_cstr);
+    if (ext != 0) { return load64(ext); }
+    return 0;
+}
+
+fn mcp_find_prompt_url(reg, name_cstr) {
+    var ext = map_get(load64(reg + 8), name_cstr);
+    if (ext == 0) { return 0; }
+    return load64(ext + 8);
+}
+
+fn mcp_deregister_resource(reg, uri_cstr) { return map_delete(load64(reg + 8), uri_cstr); }
+fn mcp_deregister_prompt(reg, name_cstr)  { return map_delete(load64(reg + 8), name_cstr); }

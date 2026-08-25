@@ -4,6 +4,117 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.1.0] - 2026-08-24
+
+### Added
+
+- **MCP resources and prompts reach the spine.** daimon hosted MCP *tools* and nothing else: a consumer
+  asking for `/v1/mcp/resources` or `/v1/mcp/prompts` got a 404, so server-published resources and prompts
+  were unreachable through daimon no matter what the downstream MCP server offered. bote has served
+  `resources/list`, `resources/read`, `prompts/list` and `prompts/get` for some time, and its reference
+  server publishes a real resource (`bote://info`) and a real prompt (`bote_greeting`) — daimon was the
+  missing hop. Six new endpoints, modelled line-for-line on the tool surface so a client that already
+  speaks daimon's tools needs no new idioms:
+
+  | | |
+  |---|---|
+  | `GET /v1/mcp/resources` | `{"resources":[{uri,name,description,mimeType}],"count":N}` |
+  | `POST /v1/mcp/resources` | register an external resource |
+  | `POST /v1/mcp/resources/read` | forward MCP `resources/read` to the registering host |
+  | `GET /v1/mcp/prompts` | `{"prompts":[{name,description,arguments}],"count":N}` |
+  | `POST /v1/mcp/prompts` | register an external prompt |
+  | `POST /v1/mcp/prompts/get` | forward MCP `prompts/get` to the registering host |
+
+  Plus `POST /v1/mcp/{resources,prompts}/deregister`, and `mcp_resources` / `mcp_prompts` counts on
+  `/v1/health` and the metrics endpoint. Verified end to end against a live bote: registration, listing,
+  a `resources/read` returning the resource body, and a `prompts/get` returning a rendered message.
+
+  ⚠ **The URI travels in the request BODY, never in a path segment.** An MCP resource URI contains `://`
+  and further slashes (`bote://info`), which would collide with the router's prefix arithmetic and with
+  query-stripping, and would need escaping nobody gets right twice. `POST` with a JSON body is what
+  `/v1/mcp/call` already does for tool names, so this follows the existing convention rather than adding
+  one. Deregistration takes the same shape, on its own path, so a read can never be parsed as a delete.
+
+  ⚠ **Registration, not fan-out aggregation.** The tempting alternative — answer `resources/list` by
+  asking every registered host at request time, since a server already knows its own resources — was
+  rejected on blocking behaviour. The forward path builds no options struct, so every sandhi timeout
+  getter returns 0 and a dropped-SYN host blocks the single sync worker for as long as the OS takes to
+  give up. Aggregation would put that cost on *every* list, multiplied by the number of hosts. With
+  registration, listing is local and instant and only a read/get — one host, explicitly addressed — can
+  block. The underlying unbounded-timeout issue is pre-existing and untouched here.
+
+- **`trace_mcp_forward_method`** — the outbound MCP hop generalized to any method. `sandhi_rpc_mcp_call`
+  always took the method as a parameter; only daimon's wrapper had hardcoded `"tools/call"`. Tracing and
+  `traceparent` injection stay single-sourced across tools, resources and prompts.
+
+### Fixed
+
+- **The aarch64 cross-build, which had been failing to COMPILE.** `src/ipc.cyr` and `src/memory.cyr`
+  called `syscall(SYS_MKDIR, …)`, `syscall(SYS_UNLINK, …)` and `syscall(SYS_CHMOD, …)` directly. arm64
+  Linux has no legacy `mkdir`/`unlink`/`chmod` at all — only the `*at` forms — so those constants do not
+  exist on that target and the lane died with 7 `undefined variable` errors. A raw `syscall(SYS_FOO, …)`
+  is a portability *claim*; the stdlib `sys_mkdir` / `sys_unlink` / `sys_chmod` wrappers are the thing
+  that actually resolves per target. Swapped, and the lane goes from 7 errors to **OK** with a valid
+  aarch64 ELF. (Noted in-source for future porters: the AGNOS variant of these wrappers takes a `pathlen`
+  rather than a mode and its `sys_unlink` takes two arguments — daimon does not target AGNOS, but that
+  arity difference is real.)
+
+- **The CI format gate, which could never pass.** It diffed `cyrius fmt`'s stdout against each file — but
+  `cyrius fmt <file>` rewrites in place and prints **nothing**, so the diff compared an empty stream
+  against every file and reported drift for all 35, unconditionally, including files that are perfectly
+  formatted. Bisected: `cyrius fmt` emitted the file to stdout up to **6.5.25** and stopped at **6.5.27**
+  — the exact pin this repo was on, so the gate went red the day that pin landed and stayed there. Now
+  uses `--check`, the purpose-built flag (exit 1 on real drift, no stdout by design), matching the shape
+  kavach adopted after diagnosing this independently. With a gate that can actually answer the question,
+  the real state turned out to be **4 files genuinely non-canonical** (`audit.cyr`, `http.cyr`,
+  `mcp_builtin.cyr`, `vector_store.cyr`) out of 35 — reformatted here, so the gate is green on its own
+  terms. The broken gate had been burying those 4 under a false 35-file failure, which is the precise
+  cost of a check that cannot distinguish "drifted" from "cannot tell". Filed upstream as
+  `cyrius/docs/development/issues/2026-08-24-cyrius-fmt-stopped-emitting-to-stdout.md`; **hoosh carries
+  the same broken idiom and is still red.**
+
+- **A stale `bayan` vendored at two different releases at once.** `lib/bayan.cyr` read `Version: 1.4.1`
+  (the monolithic dist from the pinned toolchain's stdlib snapshot) while `lib/bayan-json.cyr` read
+  `Version: 1.5.2` (modular component files pulled by libro/bote/majra's `.deps` sidecars). The result was
+  **134 `duplicate fn (last definition wins)` warnings** and an `undefined function 'json_v_parse_str'` —
+  the 1.5.2 half calling into a 1.4.1 monolith that no longer exported it. Fixed with an explicit
+  `[deps.bayan]` pin at `modules=["dist/bayan.cyr"]`, exactly the remedy the neighbouring `[deps.sigil]`
+  block documents for the identical collision. Warning count for the whole build: **137 → 3**, with a
+  before/after warning-set diff confirming **zero** new warnings. The three that remain (`_sub_new`,
+  `cancel_token_new`, `json_v_parse_str`) are pre-existing and unrelated: the last comes from a stale
+  `samay` still calling a name bayan removed at 1.3.0, which `ai-hwaccel` already fixed at 2.3.16.
+
+### Changed
+
+- **Toolchain pin `6.5.27` → `6.5.35`** and **every dependency brought current**: `sakshi` 2.4.10 →
+  2.4.11, `ai-hwaccel` 2.3.17 → 2.3.19, `libro` 2.8.5 → 2.8.12, `majra` 2.6.6 → 2.7.0, `bote`
+  3.3.1 → 3.3.7. daimon was the last first-party repo two pins behind. Each bump was verified by reading
+  the vendored `lib/<dep>.cyr` header rather than trusting the manifest, and `cyrius lib sync --full`
+  re-synced the 108-file snapshot. The `bote` bump is not cosmetic — it removed the
+  `duplicate fn 'cancel_token_new'` collision against `lib/async.cyr`. Build warnings are now down to
+  **two**: `_sub_new` (majra/libro) and an `undefined function 'json_v_parse_str'` from a stale `samay`
+  1.0.1 still calling a name bayan removed at 1.3.0 — the same fix `ai-hwaccel` already took at 2.3.16.
+  Both are upstream and pre-existing.
+
+### Notes
+
+- Suite **215 → 235**. Per house convention the test file mirrors each new registry function; the added
+  group covers URI-with-`://` round-tripping, callback-URL storage, deregistration, and the nested
+  `arguments` array — including the two cases that must never emit invalid JSON (absent, and present but
+  not an array).
+- ⚠ **`cyrius check <file>` REWRITES SOURCE IN PLACE.** Running it here reformatted four files this cut
+  never touched (`audit.cyr`, `http.cyr`, `mcp_builtin.cyr`, `vector_store.cyr`) using the *installed*
+  6.5.35 formatter rather than the pinned one; the changes were reverted. It is also the wrong gate for a
+  manifest project — it does not prepend the manifest's includes, so it reports ~92 phantom
+  "reachable undefined function" errors. Use `cyrius vet` + `cyrius build` + `cyrius test`, which is what
+  CI runs.
+- ⚠ **The nested-JSON trap this cut hit twice, recorded because it is not obvious.** The flat
+  `json_parse`/`jget` scanner stops at the first `,` or `}`, so *any* field positioned after a nested
+  value is invisible to it — registering a prompt whose body carried `"arguments":[…]` before
+  `"callback_url"` failed with "missing callback_url" while the field was plainly present. And
+  `bayan_json_v_parse` takes a **`Str`**, not a cstr: handing it `str_cstr(body)` reads a char pointer as
+  a `Str` header and **segfaults the server**. Both were caught by live testing, not by review.
+
 ## [2.0.2] - 2026-08-18
 
 ### Changed

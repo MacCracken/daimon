@@ -29,8 +29,8 @@ fn daimon_audit_chain() { return _audit_chain; }
 fn daimon_audit_init() {
     _audit_chain = chain_new();
     chain_append(_audit_chain, SEV_INFO, str_from("daimon"),
-    str_from("mcp.host.init"),
-    str_from("daimon MCP host initialized; libro audit tools online"));
+      str_from("mcp.host.init"),
+      str_from("daimon MCP host initialized; libro audit tools online"));
     return 0;
 }
 
@@ -46,6 +46,6 @@ fn daimon_audit(severity, source, action, details) {
 fn daimon_audit_agent(severity, source, action, details, agent_ident) {
     if (_audit_chain == 0) { return 0; }
     chain_append_with_agent(_audit_chain, severity, str_from(source),
-    str_from(action), str_from(details), str_from(agent_ident));
+      str_from(action), str_from(details), str_from(agent_ident));
     return 0;
 }

@@ -37,6 +37,38 @@ fn http_route(fd, method, path, buf, buf_len) {
         if (method == 3) { api_mcp_deregister(fd, path + 14); return 0; }
     }
 
+    # --- MCP resources + prompts (2.1.0) ---
+    #
+    # ⚠ ORDER MATTERS. The two-segment paths (/resources/read, /resources/deregister)
+    # are matched BEFORE the bare /resources, and every match is a full streq — no
+    # memeq prefix branch exists here on purpose. A resource URI contains "://" and
+    # further slashes, so it travels in the BODY; nothing about a resource ever rides
+    # a path segment, which is what makes plain equality sufficient and safe.
+    #
+    # ⚠ METHOD GUARD. http_parse_method maps ANY unrecognized verb to 0 (GET), so a
+    # route must never be written as "if not POST then GET". Each arm below tests its
+    # method explicitly and falls through otherwise.
+    if (streq(path, "/v1/mcp/resources/read") == 1) {
+        if (method == 1) { api_mcp_resource_read(fd, http_parse_body(buf, buf_len)); return 0; }
+    }
+    if (streq(path, "/v1/mcp/resources/deregister") == 1) {
+        if (method == 1) { api_mcp_resource_deregister(fd, http_parse_body(buf, buf_len)); return 0; }
+    }
+    if (streq(path, "/v1/mcp/resources") == 1) {
+        if (method == 0) { api_mcp_resources_list(fd); return 0; }
+        if (method == 1) { api_mcp_resource_register(fd, http_parse_body(buf, buf_len)); return 0; }
+    }
+    if (streq(path, "/v1/mcp/prompts/get") == 1) {
+        if (method == 1) { api_mcp_prompt_get(fd, http_parse_body(buf, buf_len)); return 0; }
+    }
+    if (streq(path, "/v1/mcp/prompts/deregister") == 1) {
+        if (method == 1) { api_mcp_prompt_deregister(fd, http_parse_body(buf, buf_len)); return 0; }
+    }
+    if (streq(path, "/v1/mcp/prompts") == 1) {
+        if (method == 0) { api_mcp_prompts_list(fd); return 0; }
+        if (method == 1) { api_mcp_prompt_register(fd, http_parse_body(buf, buf_len)); return 0; }
+    }
+
     # POST /v1/mcp/call
     if (streq(path, "/v1/mcp/call") == 1) {
         api_mcp_call(fd, http_parse_body(buf, buf_len));
