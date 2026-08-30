@@ -2,7 +2,7 @@ commit	515a57f439c31951eaf5ca81444fd64881ffe9c0	sakshi	https://github.com/MacCra
 commit	b4cb1d80d6d39ed2217346d561775854dea0642b	bayan	https://github.com/MacCracken/bayan.git	1.5.2
 commit	592dbfd8611d7c87187f4d559837b15235824239	sigil	https://github.com/MacCracken/sigil.git	3.12.14
 commit	f101d29348ecb0ab7d912c1c578f2e835f68cfbb	libro	https://github.com/MacCracken/libro.git	2.8.12
-commit	bc92fecb4c3f8f43712d5a808384d03582654667	majra	https://github.com/MacCracken/majra.git	2.7.0
+commit	d4f7bee9cf3aae0ec15605b4081056ceabea10b1	majra	https://github.com/MacCracken/majra.git	2.7.1
 commit	90290da9a07d31540574f516dd0ae35d2a2030fb	bote	https://github.com/MacCracken/bote.git	3.3.7
 commit	490f8ff5e2914ca6366db5e7a444662e07b9c438	patra	https://github.com/MacCracken/patra.git	1.13.10
 7240760b1260fa06c53c5a139d1a2086fb439e21ac90e53eacd4bf486ac0e9ca  lib/tagged.cyr
@@ -25,7 +25,7 @@ c1111039c78e19c9404d8d296b3e88b588e735c21ae8a67a3852251d63199170  lib/grp.cyr
 293c2e14bf89307bab9d50ef08f99293b26b71da3cefe2c040ed75c6b5a88a83  lib/async.cyr
 1f96ccd5e7d46a49441aac6b00010b44b4470ef0319d5919f971bfe76effe0d1  lib/regression.cyr
 f421d9a99161a3f9afb945c384d4a0261f0e89d11390a354c5e15f94891dd925  lib/ws_server.cyr
-3ba7b333a2719ed1473a1feb920292f43fa3062aadef4f06b90b2e7448039f54  lib/majra.cyr
+52d40ef9c1b3da4de90bbc8c1b46c7118b2f3fd08153c7d13f2de5392069dca1  lib/majra.cyr
 81e04cb9d9dcf62655ecb8eaa318c0ad15215cf53d734431c0c12b97cfaf1c34  lib/pam.cyr
 3685581ab3dca17cb01b8e65a654ce4ca683ac67b1871b17b8bd9fb3c2cf8a02  lib/pwd.cyr
 f9d4d9f58fb1b177f90cfdd72172000567600b3e74dcf76024316681811d12e5  lib/thread_agnos.cyr

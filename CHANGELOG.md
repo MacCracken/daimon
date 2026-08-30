@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.1.2] - 2026-08-30
+
+Picks up the majra fix for the `_sub_new` collision 2.1.1 reported. **235 tests**
+pass, lock verifies 114/114, and the 19-benchmark suite shows no regressions.
+
+### Fixed
+
+- **`majra` 2.7.0 → 2.7.1**, which closes the `_sub_new` collision recorded as a
+  known issue in 2.1.1. majra renamed its private pubsub helper to
+  `_majra_sub_new`, so `libro`'s `_sub_new(pattern)` is no longer silently
+  answered by majra's `_sub_new(chan, filter_fn)` — a two-argument call reaching
+  a two-parameter function that allocated 40 bytes via `fl_alloc` where 24 via
+  `alloc` were meant. **daimon now builds with zero duplicate-fn warnings.**
+
+  majra 2.7.1 also prefixed `sha1`/`_sha1_rotl32`, which collided with the
+  stdlib's `lib/sha1.cyr` at a *different arity* (`sha1(data, len, digest_out)`
+  against majra's two-argument form). daimon links both, so that one was live
+  here too.
+
+### Known issues
+
+- majra's `ws_recv_frame` and `ws_send_text` still collide with the stdlib
+  `lib/ws.cyr`, and the implementations differ. They are majra's documented
+  public API, so renaming them is a breaking change awaiting a majra minor.
+  daimon does not call either, so nothing here reaches the ambiguity.
+
 ## [2.1.1] - 2026-08-30
 
 Dependency and toolchain refresh. No source change; **235 tests** pass and the

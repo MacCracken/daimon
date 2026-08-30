@@ -123,7 +123,7 @@ modules = ["dist/libro.cyr"]
 
 [deps.majra]
 git = "https://github.com/MacCracken/majra.git"
-tag = "2.7.0"
+tag = "2.7.1"
 modules = ["dist/majra.cyr"]
 
 [deps.bote]
