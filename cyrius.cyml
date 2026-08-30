@@ -5,7 +5,7 @@ description = "daimon — AGNOS agent orchestrator"
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/daimon"
 language = "cyrius"
-cyrius = "6.5.35"
+cyrius = "6.5.36"
 
 [build]
 entry = "src/main.cyr"
@@ -63,7 +63,7 @@ modules = ["dist/sakshi.cyr"]
 [deps.ai-hwaccel]
 git = "https://github.com/MacCracken/ai-hwaccel.git"
 path = "../ai-hwaccel"
-tag = "2.3.19"
+tag = "2.3.20"
 modules = ["dist/ai-hwaccel.cyr"]
 
 # samay — task scheduler. daimon 2.0.0 REPLACES its own duplicated
@@ -113,7 +113,7 @@ modules = ["dist/bayan.cyr"]
 
 [deps.sigil]
 git = "https://github.com/MacCracken/sigil.git"
-tag = "3.12.9"
+tag = "3.12.14"
 modules = ["dist/sigil.cyr"]
 
 [deps.libro]

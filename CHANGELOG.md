@@ -4,6 +4,48 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.1.1] - 2026-08-30
+
+Dependency and toolchain refresh. No source change; **235 tests** pass and the
+19-benchmark suite shows no regressions. The build now emits no shadow warning
+and its static-data footprint drops by 43%.
+
+### Changed
+
+- **`ai-hwaccel` 2.3.19 → 2.3.20.** 2.3.20 makes ai-hwaccel's bayan dependency
+  optional and feature-gated, so it no longer resolves transitively into
+  consumers. daimon declares its own `[deps.bayan] 1.5.2`, so this removes a
+  duplicate rather than a capability.
+
+- **`sigil` 3.12.9 → 3.12.14**, aligning the declared dep with the version the
+  pinned stdlib snapshot ships. This was the larger of the two `./lib/ shadows
+  version-pinned lib/` warnings: two copies of sigil were being linked. Static
+  data falls **806,976 → 454,720 bytes (−43.6%)**. 3.12.14 also carries the
+  fix for 3.12.13's subprocess regression, which broke agnos and Windows builds
+  across the ecosystem.
+
+- **`lib/sankoch.cyr` refreshed** 2.7.8 → the pinned 2.7.10. Not a declared dep
+  — a stale vendored file, the same drift class as the sigil one. 2.7.10 is the
+  release that survives a caller's `alloc_reset()`.
+
+- **Cyrius pin `6.5.35` → `6.5.36`**, matching the installed compiler; `lib/`
+  resynced (67 declared modules). Clears the toolchain-drift warning.
+
+### Known issues
+
+- **`_sub_new` is defined by both `majra` and `libro` with different signatures**
+  and different semantics — `majra` takes `(chan, filter_fn)` and `fl_alloc`s 40
+  bytes, `libro` takes `(pattern)` and `alloc`s 24. Cyrius has one flat function
+  namespace, so majra's wins by include order and `libro.cyr:6634`'s one-argument
+  call reaches it with an uninitialised second argument and the wrong allocation
+  size.
+
+  **Latent in daimon**: nothing in `src/` calls either subscription API, so no
+  daimon code path reaches it today. It is not fixable from here — both are
+  upstream libraries, and libro 2.10.0 still defines the name — so it needs one
+  of the two to adopt a module prefix. Bumping libro two minor versions inside a
+  patch release would not have fixed it and was not attempted.
+
 ## [2.1.0] - 2026-08-24
 
 ### Added
