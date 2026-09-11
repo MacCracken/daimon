@@ -4,6 +4,72 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.1.3] - 2026-09-11
+
+**Toolchain `6.5.36` → `6.6.2` — the `Result` / `Option` / `Either` value form — plus
+all eight dependency pins.** **235 tests** pass, five fuzz harnesses clean, benches
+flat.
+
+### Fixed — `memory_store_set` rejected a key and reported success
+
+⛔ **A genuine fail-open, and the reason this is a Fixed.** `src/memory.cyr:61` read:
+
+```
+var vr = validate_key(key);
+if (is_err_result(vr) == 1) { return vr; }
+```
+
+Under the value form `vr` binds the **tag alone**, so `return vr;` handed the caller
+the payload by itself — a rejected key arrived as `tag = <payload>`,
+`is_err_result == 0`. **An error that reads as SUCCESS.** `validate_key` is the guard
+on the agent-memory key namespace, so a key it refused was reported to the caller as
+stored. Now rebuilt from both halves with `return Err(vr_v);`.
+
+### Changed — dependency pins
+
+| dep | was | now | | dep | was | now |
+|---|---|---|---|---|---|---|
+| cyrius | 6.5.36 | **6.6.2** | | sigil | 3.12.14 | **3.12.16** |
+| sakshi | 2.4.11 | **2.5.1** | | libro | 2.8.12 | **2.10.0** |
+| ai-hwaccel | 2.3.20 | **2.3.22** | | majra | 2.7.1 | **2.7.2** |
+| samay | 1.0.1 | **1.1.2** | | bote | 3.3.7 | **3.3.8** |
+
+The **bote** bump closes the loop on the collision daimon itself reported at 2.1.1.
+majra 2.7.1 renamed `_sub_new` → `_majra_sub_new`, but bote ≤ 3.3.7 still pinned majra
+**2.7.0**, so any consumer reaching majra *through* bote — daimon does — kept inheriting
+it. bote 3.3.8 re-pins majra 2.7.2. Separately, daimon consumes the **full**
+`dist/bote.cyr`, which at 3.3.7 called bare `payload(` from `src/transport_unix.cyr`;
+that symbol does not exist in the 6.6.2 stdlib, so the build could not have linked.
+
+### Changed — value-form migration
+
+Nine sites. Five were reachable by scanning for the deleted `payload()` accessor
+(`src/agent.cyr`, `src/api_edge.cyr`, `src/api_sched.cyr`, and two in
+`tests/daimon.tcyr`); **the other four were not**, because they bind a `Result` and
+test it without ever unwrapping — `edge_fleet_heartbeat`, `edge_fleet_decommission`,
+`task_scheduler_cancel_task` and four test sites. They surfaced only from the
+compiler. An accessor grep is not a migration survey.
+
+### Added — a guard in `api_sched_submit`
+
+`POST /v1/scheduler/tasks` took the result of `task_scheduler_submit_task` and used
+its payload as the task id with **no error check**, while `api_edge_register` — the
+structurally identical endpoint eight lines away in `api_edge.cyr` — has always
+guarded. Added for symmetry.
+
+⚠ **Honest scope:** this is defensive, not a fix. samay's
+`task_scheduler_submit_task` returns `Ok(id)` on every path today, so the `Err` arm is
+currently unreachable. It matters only if samay grows a failure path — at which point
+the `Err` payload would have been serialised as the `task_id` in a 201 response.
+
+### Note — `fuzz/` is not run by CI
+
+`fuzz/` holds five harnesses (circuit_breaker, mcp_registry, memory_keys,
+scheduler_fsm, vector_store) and neither workflow invokes `cyrius fuzz`. All five pass
+today — run by hand for this release — but nothing gates them. bote 3.3.8 found four
+harnesses that had silently stopped compiling four minors earlier for exactly this
+reason.
+
 ## [2.1.2] - 2026-08-30
 
 Picks up the majra fix for the `_sub_new` collision 2.1.1 reported. **235 tests**

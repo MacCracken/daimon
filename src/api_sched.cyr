@@ -16,8 +16,19 @@ fn api_sched_submit(fd, body) {
     var priority = jget_int(pairs, "priority");
     if (priority == 0) { priority = 5; }
     var task = scheduled_task_new(name, desc, agent_id, priority, resource_req_default());
-    var result = task_scheduler_submit_task(_scheduler, task);
-    var tid = payload(result);
+    # Guarded to match api_edge_register, the structurally identical endpoint
+    # eight lines away in api_edge.cyr, which has always checked its Result
+    # while this one did not. samay's task_scheduler_submit_task returns
+    # Ok(id) on every path today, so the Err arm is currently unreachable —
+    # this is defensive, not a live fix. It matters if samay ever grows a
+    # failure path: without it the Err PAYLOAD would be serialised as the
+    # task_id in a 201 response.
+    var result_t, result_v = task_scheduler_submit_task(_scheduler, task);
+    if (is_err_result(result_t) == 1) {
+        http_bad_request(fd, str_from("task submission failed"));
+        return 0;
+    }
+    var tid = result_v;
     var sb = str_builder_new();
     str_builder_add_cstr(sb, "{\"task_id\":\"");
     str_builder_add(sb, tid);
@@ -73,8 +84,8 @@ fn api_sched_get_task(fd, id_cstr) {
 
 # POST /v1/scheduler/tasks/{id}/cancel
 fn api_sched_cancel(fd, id_cstr) {
-    var result = task_scheduler_cancel_task(_scheduler, str_from(id_cstr));
-    if (is_err_result(result) == 1) {
+    var cx_t, cx_v = task_scheduler_cancel_task(_scheduler, str_from(id_cstr));
+    if (is_err_result(cx_t) == 1) {
         http_error(fd, 404, str_from("task not found or invalid state"));
         return 0;
     }

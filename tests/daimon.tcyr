@@ -1624,7 +1624,8 @@ fn main() {
     assert_eq(load64(rec + 16), 0, "0 frames initially");
 
     assert(is_ok(recording_add_frame(rec)) == 1, "add frame 1");
-    assert_eq(payload(recording_add_frame(rec)), 2, "add frame 2");
+    var af_t, af_v = recording_add_frame(rec);
+    assert_eq(af_v, 2, "add frame 2");
 
     assert(is_ok(recording_pause(rec)) == 1, "pause ok");
     assert(is_err_result(recording_add_frame(rec)) == 1, "add frame while paused fails");
@@ -1700,8 +1701,8 @@ fn main() {
     var sam_s = task_scheduler_new();
     task_scheduler_register_node(sam_s, node_capacity_new(str_from("w1"), f64_from(8), 16384, 102400, 0));
     var sam_t = scheduled_task_new(str_from("job"), str_from("d"), str_from("a1"), 7, resource_req_default());
-    var sam_r = task_scheduler_submit_task(sam_s, sam_t);
-    assert(is_ok(sam_r) == 1, "samay submit ok");
+    var sam_r_t, sam_r_v = task_scheduler_submit_task(sam_s, sam_t);
+    assert(is_ok(sam_r_t) == 1, "samay submit ok");
     var sam_dec = task_scheduler_schedule_pending(sam_s);
     assert_eq(vec_len(sam_dec), 1, "samay scheduled 1 task");
     assert_eq(str_eq_cstr(SchedulingDecision_assigned_node(vec_get(sam_dec, 0)), "w1"), 1, "assigned to w1");
@@ -1726,8 +1727,8 @@ fn main() {
     assert(fscore <= 100, "score <= 100");
 
     var fid_cstr = str_cstr(fed_node_id(fnode));
-    var fterm = fed_mgr_start_election(fm, fid_cstr);
-    assert(is_ok(fterm) == 1, "election started");
+    var fterm_t, fterm_v = fed_mgr_start_election(fm, fid_cstr);
+    assert(is_ok(fterm_t) == 1, "election started");
     assert_eq(fed_node_role(fnode), ROLE_CANDIDATE, "became candidate");
 
     fed_mgr_become_coordinator(fm, fid_cstr);
@@ -1740,8 +1741,8 @@ fn main() {
 
     var efleet = edge_fleet_new(edge_fleet_config_default());
     var enode = edge_node_new(str_from("edge-a"), str_from("x86_64"), 4, 4096);
-    var ereg = edge_fleet_register(efleet, enode);
-    assert(is_ok(ereg) == 1, "register ok");
+    var ereg_t, ereg_v = edge_fleet_register(efleet, enode);
+    assert(is_ok(ereg_t) == 1, "register ok");
     assert_eq(edge_fleet_node_count(efleet), 1, "1 edge node");
 
     var en_bad = edge_node_new(str_from(""), str_from("x86_64"), 4, 4096);
@@ -1750,12 +1751,12 @@ fn main() {
     var en_dup = edge_node_new(str_from("edge-a"), str_from("x86_64"), 4, 4096);
     assert(is_err_result(edge_fleet_register(efleet, en_dup)) == 1, "duplicate rejected");
 
-    var eid_cstr = str_cstr(payload(ereg));
-    var ehb = edge_fleet_heartbeat(efleet, eid_cstr, 5, 20);
-    assert(is_ok(ehb) == 1, "heartbeat ok");
+    var eid_cstr = str_cstr(ereg_v);
+    var ehb_t, ehb_v = edge_fleet_heartbeat(efleet, eid_cstr, 5, 20);
+    assert(is_ok(ehb_t) == 1, "heartbeat ok");
 
-    var edc = edge_fleet_decommission(efleet, eid_cstr);
-    assert(is_ok(edc) == 1, "decommission ok");
+    var edc_t, edc_v = edge_fleet_decommission(efleet, eid_cstr);
+    assert(is_ok(edc_t) == 1, "decommission ok");
     var enode_after = edge_fleet_get(efleet, eid_cstr);
     assert_eq(edge_node_status(enode_after), EDGE_DECOMMISSIONED, "decommissioned status");
 

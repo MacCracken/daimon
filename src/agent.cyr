@@ -283,12 +283,12 @@ fn agent_start(h, executable) {
 
     sakshi_info("starting agent", 14);
 
-    var pid_result = spawn(str_data(executable), str_data(id_str), str_data(name));
-    if (is_err_result(pid_result) == 1) {
+    var pid_t, pid_v = spawn(str_data(executable), str_data(id_str), str_data(name));
+    if (is_err_result(pid_t) == 1) {
         agent_set_status(h, AGENT_FAILED);
         return Err(DAIMON_ERR_SUPERVISOR);
     }
-    var pid = payload(pid_result);
+    var pid = pid_v;
     agent_set_pid(h, pid);
     agent_set_started_at(h, clock_epoch_secs());
     agent_set_status(h, AGENT_RUNNING);

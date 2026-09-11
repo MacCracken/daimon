@@ -29,12 +29,12 @@ fn api_edge_register(fd, body) {
     if (name == 0) { http_error(fd, 422, str_from("name required")); return 0; }
     if (str_len(name) == 0) { http_error(fd, 422, str_from("name cannot be empty")); return 0; }
     var node = edge_node_new(name, str_from("x86_64"), 4, 4096);
-    var result = edge_fleet_register(_edge_fleet, node);
-    if (is_err_result(result) == 1) {
+    var result_t, result_v = edge_fleet_register(_edge_fleet, node);
+    if (is_err_result(result_t) == 1) {
         http_bad_request(fd, str_from("registration failed (duplicate or full)"));
         return 0;
     }
-    var id = payload(result);
+    var id = result_v;
     var sb = str_builder_new();
     str_builder_add_cstr(sb, "{\"id\":\"");
     str_builder_add(sb, id);
@@ -108,8 +108,8 @@ fn api_edge_heartbeat(fd, id_cstr, body) {
         active = jget_int(pairs, "active_tasks");
         completed = jget_int(pairs, "tasks_completed");
     }
-    var result = edge_fleet_heartbeat(_edge_fleet, id_cstr, active, completed);
-    if (is_err_result(result) == 1) {
+    var hb_t, hb_v = edge_fleet_heartbeat(_edge_fleet, id_cstr, active, completed);
+    if (is_err_result(hb_t) == 1) {
         http_error(fd, 404, str_from("node not found"));
         return 0;
     }
@@ -119,8 +119,8 @@ fn api_edge_heartbeat(fd, id_cstr, body) {
 
 # POST /v1/edge/nodes/{id}/decommission
 fn api_edge_decommission(fd, id_cstr) {
-    var result = edge_fleet_decommission(_edge_fleet, id_cstr);
-    if (is_err_result(result) == 1) {
+    var dc_t, dc_v = edge_fleet_decommission(_edge_fleet, id_cstr);
+    if (is_err_result(dc_t) == 1) {
         http_error(fd, 404, str_from("node not found"));
         return 0;
     }

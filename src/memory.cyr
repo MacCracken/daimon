@@ -58,8 +58,11 @@ fn memory_store_agent_dir(ms, agent_id_str) {
 }
 
 fn memory_store_set(ms, agent_id_str, key, value_json) {
-    var vr = validate_key(key);
-    if (is_err_result(vr) == 1) { return vr; }
+    # `return vr;` here returned the PAYLOAD alone — the tag was dropped, so a
+    # rejected key arrived at the caller as tag=<payload>, is_err_result==0:
+    # an error that reads as SUCCESS. Rebuild the Err from both halves.
+    var vr_t, vr_v = validate_key(key);
+    if (is_err_result(vr_t) == 1) { return Err(vr_v); }
 
     var dir = memory_store_agent_dir(ms, agent_id_str);
     # Ensure directory exists (VULN-005: 0700 not 0755)
