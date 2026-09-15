@@ -110,7 +110,7 @@ fn memory_store_delete(ms, agent_id_str, key) {
     var fname = str_cat(safe_key, str_from(".json"));
     var fpath = path_join(str_data(dir), str_data(fname));
 
-    var r = sys_unlink(str_data(fpath));
+    var r = daimon_unlink(str_data(fpath), str_len(fpath));
     if (r == 0) { return Ok(1); }
     return Ok(0);
 }
@@ -146,7 +146,7 @@ fn memory_store_clear(ms, agent_id_str) {
         var name_s = str_from(name);
         if (str_ends_with(name_s, str_from(".json")) == 1) {
             var fpath = path_join(str_data(dir), name);
-            sys_unlink(str_data(fpath));
+            daimon_unlink(str_data(fpath), str_len(fpath));
             count = count + 1;
         }
         i = i + 1;
