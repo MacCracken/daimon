@@ -6,6 +6,41 @@
 **Affects:** daimon **2.1.3** (and every version before it — no agnos build has ever been attempted).
 **Severity:** **Blocking for crab M7/M8.** Latent for daimon itself, which targets the host today.
 
+## ⚠ 2.1.4 update (2026-09-14): re-measured under cyrius 6.6.4 — hypothesis §"LIKELY ROOT" REFUTED
+
+daimon 2.1.4 moved the pin to **6.6.4** and re-vendored every dep (`cyrius deps` from a lock
+restored to HEAD). `cyrius build --agnos src/main.cyr` then reports the **same 53 errors, the same
+36 symbols, the same 50/3 split** between `lib/syscalls_linux_common.cyr` and `src/agent.cyr`. The
+vendored-snapshot drift was real (the `lib/ai-hwaccel.cyr` lock hash, below) but it was not the
+cause of this.
+
+**The measured root is upstream, in two halves:**
+
+1. **bote's `dist/bote.deps` sidecar names `syscalls_linux_common` as a stdlib leaf** (3.3.8 and
+   3.3.9 alike). bote's own `[deps] stdlib` does not declare it and its sources mention it only in a
+   comment — the sidecar entry comes from `cyrius distlib`'s leaf resolution, which maps each symbol
+   the bundle calls (`sys_accept4`, `sys_getpeername`, …) to the stdlib file that *defines* it.
+   On the producer's host that file is `lib/syscalls_linux_common.cyr`, the Linux-internal peer
+   that `lib/syscalls.cyr` reaches only through `#ifdef CYRIUS_TARGET_LINUX` → the per-arch
+   Linux peer's `include`. distlib recorded the peer, not the `syscalls` dispatch umbrella.
+2. **`cyrius deps` prepends every sidecar leaf as a target-blind top-level `include`** (cbt
+   `deps.cyr` `_dep_pull_leaves` → cbt `build.cyr` `_dep_includes` prepend). So on `--agnos`,
+   `lib/syscalls_linux_common.cyr` is compiled next to the STANDALONE `lib/syscalls_x86_64_agnos.cyr`
+   that the dispatch selected — which is exactly the "should not be compiling for agnos at all" shape
+   observed above. Every one of the 50 is that file's Linux-only `SYS_*` / `EPOLL_CLOEXEC` /
+   `LINUX_REBOOT_MAGIC*` names, plus 6 arity collisions against the agnos peer's same-named wrappers.
+
+Nothing in daimon's `[deps] stdlib` or `src/` names `syscalls_linux_common`; no daimon-side edit
+removes it from the include set. **Where it closes:** distlib should not name a per-target internal
+peer as a sidecar leaf (record the umbrella a consumer would include), or the consumer resolver
+should not prepend a sidecar leaf the dispatch umbrella already owns. Either is a cyrius (`cbt`)
+change; regenerating `dist/bote.deps` afterwards clears bote. The 3 in `src/agent.cyr` remain
+daimon's, as §"What would close it" item 2 says.
+
+**Also re-measured:** the `cyrius.lock` rewrite this filing observed is the class cyrius 6.6.4 now
+refuses (its lock carries a `cyrius	<pin>` trailer and a moved snapshot hash under an unchanged pin
+aborts the build). At 2.1.4 the lock is re-locked under 6.6.4 and verifies.
+
 ## Why crab is filing it
 
 crab **declared daimon** on 2026-09-14 (`[deps.daimon]`, pinned 2.1.3) — the operator's ruling, and

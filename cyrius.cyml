@@ -5,7 +5,7 @@ description = "daimon — AGNOS agent orchestrator"
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/daimon"
 language = "cyrius"
-cyrius = "6.6.2"
+cyrius = "6.6.4"
 
 [build]
 entry = "src/main.cyr"
@@ -57,13 +57,13 @@ stdlib = [
 
 [deps.sakshi]
 git = "https://github.com/MacCracken/sakshi.git"
-tag = "2.5.1"
+tag = "2.5.2"
 modules = ["dist/sakshi.cyr"]
 
 [deps.ai-hwaccel]
 git = "https://github.com/MacCracken/ai-hwaccel.git"
 path = "../ai-hwaccel"
-tag = "2.3.22"
+tag = "2.3.23"
 modules = ["dist/ai-hwaccel.cyr"]
 
 # samay — task scheduler. daimon 2.0.0 REPLACES its own duplicated
@@ -108,17 +108,17 @@ modules = ["dist/samay.cyr"]
 # version, is vendored.
 [deps.bayan]
 git = "https://github.com/MacCracken/bayan.git"
-tag = "1.5.5"
+tag = "1.5.6"
 modules = ["dist/bayan.cyr"]
 
 [deps.sigil]
 git = "https://github.com/MacCracken/sigil.git"
-tag = "3.12.16"
+tag = "3.12.18"
 modules = ["dist/sigil.cyr"]
 
 [deps.libro]
 git = "https://github.com/MacCracken/libro.git"
-tag = "2.10.0"
+tag = "2.10.1"
 modules = ["dist/libro.cyr"]
 
 [deps.majra]
@@ -128,7 +128,7 @@ modules = ["dist/majra.cyr"]
 
 [deps.bote]
 git = "https://github.com/MacCracken/bote.git"
-tag = "3.3.8"
+tag = "3.3.9"
 modules = ["dist/bote.cyr"]
 
 # Distribution manifest. Single binary today (`daimon`), with a best-effort

@@ -180,7 +180,7 @@ fn agent_ipc_bind(ipc) {
     sys_mkdir(str_data(dir), 493);  # 0755
 
     # Remove stale socket if it exists
-    daimon_unlink(path_cstr, cstr_len(path_cstr));
+    daimon_unlink(path_cstr, str_len(spath));
 
     # Create Unix domain socket (AF_UNIX=1, SOCK_STREAM=1)
     var fd = syscall(SYS_SOCKET, 1, 1, 0);

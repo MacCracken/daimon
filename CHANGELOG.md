@@ -4,6 +4,121 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.1.4] - 2026-09-14
+
+**Toolchain `6.6.2` → `6.6.4` plus six of the eight dependency pins.** No daimon source
+migration was needed — 6.6.3/6.6.4 are repair releases (lexer, visibility, `continue`
+binding, DCE data-vaddr, lock determinism), and daimon uses none of the `private`/`public`
+file-visibility surface those releases tightened. **235 tests** pass, five fuzz harnesses
+clean, all 19 benchmarks flat within noise against a clean 2.1.3 build under 6.6.2.
+
+### Fixed — `agent_ipc_bind` called a function that does not exist
+
+The 2.1.3 tree's uncommitted-then-committed `daimon_unlink` shim (the agnos arity fix
+filed at `docs/development/issues/2026-09-14-daimon-does-not-build-for-agnos.md`) had one
+call site spelled `daimon_unlink(path_cstr, cstr_len(path_cstr))` at `src/ipc.cyr:183`.
+There is no `cstr_len` in the stdlib — the build printed `warning: undefined function
+'cstr_len'` and linked anyway. Now `str_len(spath)`: the `Str` is already in scope two
+lines up, it matches the other three call sites, and it avoids the scan the shim's own
+comment says the host arm should not pay.
+
+### Changed — dependency pins
+
+| dep | was | now | | dep | was | now |
+|---|---|---|---|---|---|---|
+| cyrius | 6.6.2 | **6.6.4** | | sigil | 3.12.16 | **3.12.18** |
+| sakshi | 2.5.1 | **2.5.2** | | libro | 2.10.0 | **2.10.1** |
+| ai-hwaccel | 2.3.22 | **2.3.23** | | majra | 2.7.2 | 2.7.2 |
+| samay | 1.1.2 | 1.1.2 | | bote | 3.3.8 | **3.3.9** |
+
+samay and majra are already at their latest tags. The transitive `patra` pin (via libro)
+moves 1.13.10 → 1.14.1 in the lock; the vendored `lib/patra.cyr` reads 1.14.3 because the
+6.6.4 stdlib snapshot ships it and the resolver keeps the snapshot leaf over the dep
+artifact (the pre-existing "refusing to overwrite stdlib leaf" note).
+
+What each pin carries for daimon:
+
+- **cyrius 6.6.4** — `cyrius.lock` now ends with a `cyrius	6.6.4` trailer and is written
+  in sorted order (6.6.3), so the committed lock verifies on any machine and a stdlib leaf
+  whose snapshot bytes move under an unchanged pin is refused rather than silently
+  re-locked. This is the class the 2.1.3 tree hit: `cyrius build` rewrote the
+  `lib/ai-hwaccel.cyr` hash on every run while `git status lib/` stayed clean. Requires the
+  6.6.4 wrapper — pre-6.6.4 `deps --verify` skips the trailer (it is last by design).
+- **sigil 3.12.18** — `agnosys_uname` moves from a raw `syscall(63, …)` (x86_64 `uname`;
+  `read(2)` on aarch64) to `sys_uname` from `lib/sys.cyr`, which the sidecar now pulls.
+  ⚠ Two definitions of `uname_release(uts)` now land in one translation unit —
+  `lib/sys.cyr:203` and sigil's bundled copy at `lib/sigil.cyr:746` — and the compiler
+  reports `duplicate fn 'uname_release' (last definition wins)`. Both bodies are the same
+  one-liner (`return uts + UTS_RELEASE;`), so last-wins is a no-op; it is an upstream
+  packaging duplicate for sigil to drop, not a daimon defect. Noted so the next bump
+  knows it is expected.
+- **libro 2.10.1** — fixes the `--features tpm` arm that could not compile under the value
+  form. daimon does not build that arm.
+- **bote 3.3.9** — retires bote's `ulimit -v` distlib workaround now that cyrius 6.6.3
+  fixed the ~20 GB leaf-lookup allocation. No bundle change that reaches daimon.
+- **sakshi 2.5.2 / bayan 1.5.6 / ai-hwaccel 2.3.23** — toolchain re-verification
+  releases, no source change.
+
+### Benchmarks — 6.6.2 (clean 2.1.3 checkout) vs 6.6.4 (this tree), same machine
+
+| bench | 6.6.2 | 6.6.4 | | bench | 6.6.2 | 6.6.4 |
+|---|---:|---:|---|---|---:|---:|
+| config_default | 123ns | 98ns | | mcp_extract_input_schema | 5.064µs | 5.290µs |
+| cosine_128d | 727ns | 676ns | | edge_register_100 | 190.235µs | 189.184µs |
+| vector_insert_100x128d | 25.183µs | 26.822µs | | edge_heartbeat_100 | 721.735µs | 724.549µs |
+| vector_search_1k_64d | 322.525µs | 323.981µs | | edge_stats_500 | 49.008µs | 53.827µs |
+| rag_ingest_5k_chars | 4.297µs | 4.218µs | | circuit_breaker_cycle | 4.046µs | 4.048µs |
+| scheduler_100_tasks | 186.180µs | 187.436µs | | hashmap_1000_insert_lookup | 493.282µs | 474.718µs |
+| supervisor_register_1000 | 375.284µs | 352.994µs | | json_parse | 421ns | 419ns |
+| mcp_register_100_tools | 62.516µs | 60.358µs | | secure_zero_4k | 5.410µs | 5.446µs |
+| mcp_manifest_100_tools | 68.739µs | 67.067µs | | trace_id_hex | 45ns | 45ns |
+| mcp_find_tool_in_100 | 95ns | 105ns | | | | |
+
+Binary 2,959,376 → 2,963,584 bytes (+4,208; 4,906 → 4,927 fns NOPed by DCE).
+
+⚠ The `bench-history.csv` record before this run dated from 2.1.2 under cyrius **6.5.36**
+(2.1.3 said "benches flat" but never appended a run), so a naive diff against it showed
+`hashmap_1000_insert_lookup` +13% and `edge_stats_500` +10%. Rebuilding 2.1.3 from a clean
+checkout under 6.6.2 reproduced both numbers, so that delta belongs to the 6.5.36 → 6.6.2
+flip, not to this release. Three repeat runs per side agree.
+
+### Note — the `--agnos` build re-measured under 6.6.4: same 53 errors
+
+The issue filed at 2.1.3 named a stale vendored snapshot as the likely root and re-vendoring
+under 6.6.4 as the first thing to try. Tried: **identical 53 errors, 36 distinct symbols**, so
+that hypothesis is refuted. The measured root is upstream: bote's `dist/bote.deps` sidecar
+names `syscalls_linux_common` as a stdlib leaf (distlib resolved the symbols bote calls —
+`sys_accept4` et al. — to the file that *defines* them, which is the Linux-internal peer, not
+the `syscalls` dispatch umbrella), and `cyrius deps` prepends every sidecar leaf as a
+target-blind top-level include. So on `--agnos` the Linux peer is compiled next to the
+standalone agnos peer. Nothing in daimon's own `[deps] stdlib` or sources names it. Recorded
+in the issue file; the fix sits in cyrius distlib and/or bote's sidecar.
+
+### Note — the aarch64 artifact carries x86_64 syscall numbers (pre-existing, filed)
+
+`cyrius build --aarch64` exits 0 at both 6.6.2 and 6.6.4 — the CI lane's three "known
+upstream blocker" symbols are long resolved — but it prints six `duplicate symbol 'SYS_…'
+redefined with conflicting value (last definition wins)` warnings. Five are daimon's
+`src/main.cyr:34-42` / `src/server.cyr:11` globals (`SYS_SOCKET` 41, `SYS_CONNECT` 42,
+`SYS_BIND` 49, `SYS_LISTEN` 50, `SYS_GETPEERNAME` 52) overriding the aarch64 peer's
+198/203/200/201/205; `SYS_ACCEPT` 43, `SYS_GETSOCKOPT` 55, `SYS_RENAME` 82 and
+`SYS_SETRLIMIT` 160 (`uname` on aarch64) have no aarch64 meaning at all. The sixth is
+majra 2.7.2's `SYS_GETRANDOM = 318` (278 on aarch64). The shipped `daimon-aarch64` release
+asset therefore cannot bind a socket; CI checks only that it is an aarch64 ELF. This is the
+class cyrius 6.6.4 swept from the stdlib and named for the consumer pin sweep. Not fixed
+here — it is a port, not a bump — filed as
+`docs/development/issues/2026-09-14-aarch64-binary-issues-x86-syscall-numbers.md` and
+roadmapped P1.
+
+### Note — a diagnostic false positive on dead code
+
+6.6.2+ prints `warning:src/memory.cyr:102:19: memory_store_get returns a : stack pair on
+another path but a SINGLE value here` for `return None();`. Per `lib/tagged.cyr`'s own note
+a nullary variant returns its tag alone and is *correctly* not pair-returning, so
+`None()` on one path + `Some(v)` on another is the documented shape; the diagnostic keys on
+the callee's pair flag, which `None` does not carry. `memory_store_get` has no callers and
+is DCE'd. Left as-is rather than restructured around a compiler warning.
+
 ## [2.1.3] - 2026-09-11
 
 **Toolchain `6.5.36` → `6.6.2` — the `Result` / `Option` / `Either` value form — plus
