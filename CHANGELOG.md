@@ -94,21 +94,28 @@ target-blind top-level include. So on `--agnos` the Linux peer is compiled next 
 standalone agnos peer. Nothing in daimon's own `[deps] stdlib` or sources names it. Recorded
 in the issue file; the fix sits in cyrius distlib and/or bote's sidecar.
 
-### Note — the aarch64 artifact carries x86_64 syscall numbers (pre-existing, filed)
+### Note — the aarch64 artifact silently loses two hardening layers (pre-existing, filed)
 
 `cyrius build --aarch64` exits 0 at both 6.6.2 and 6.6.4 — the CI lane's three "known
 upstream blocker" symbols are long resolved — but it prints six `duplicate symbol 'SYS_…'
-redefined with conflicting value (last definition wins)` warnings. Five are daimon's
-`src/main.cyr:34-42` / `src/server.cyr:11` globals (`SYS_SOCKET` 41, `SYS_CONNECT` 42,
-`SYS_BIND` 49, `SYS_LISTEN` 50, `SYS_GETPEERNAME` 52) overriding the aarch64 peer's
-198/203/200/201/205; `SYS_ACCEPT` 43, `SYS_GETSOCKOPT` 55, `SYS_RENAME` 82 and
-`SYS_SETRLIMIT` 160 (`uname` on aarch64) have no aarch64 meaning at all. The sixth is
-majra 2.7.2's `SYS_GETRANDOM = 318` (278 on aarch64). The shipped `daimon-aarch64` release
-asset therefore cannot bind a socket; CI checks only that it is an aarch64 ELF. This is the
-class cyrius 6.6.4 swept from the stdlib and named for the consumer pin sweep. Not fixed
-here — it is a port, not a bump — filed as
-`docs/development/issues/2026-09-14-aarch64-binary-issues-x86-syscall-numbers.md` and
-roadmapped P1.
+redefined with conflicting value (last definition wins)` warnings: five daimon globals
+(`src/main.cyr:34-42`, `src/server.cyr:11`) and majra 2.7.2's `SYS_GETRANDOM = 318`. Seven of
+daimon's nine hand-spelled x86_64 numbers are harmless on aarch64 because the backend's
+runtime `ESYSXLAT` chain renumbers them (41/42/43/49/50/55/82 → socket/connect/accept/
+bind/listen/getsockopt/renameat) — the binary binds and serves. **Two are not routed and run
+as different syscalls:** `SYS_GETPEERNAME` 52 is `fchmod` there — it *succeeds* with an
+untouched buffer, so `get_peer_ip` returns 0 and `rate_check` takes its "can't determine IP,
+allow" path: the VULN-009 per-IP rate limiter is off for every client. `SYS_SETRLIMIT` 160 is
+`uname` — `-EFAULT`, unchecked in the forked child, so agents exec with no RLIMIT_AS/RLIMIT_CPU:
+the VULN-010 limits are never applied, and this one emits **no** warning. CI checks only that the
+output is an aarch64 ELF. This is the class cyrius 6.6.4 swept from its stdlib and named for the
+consumer pin sweep. Not fixed here — filed as
+`docs/development/issues/2026-09-14-aarch64-binary-issues-x86-syscall-numbers.md` (P2) and,
+for majra's bundle — where the same sweep found `_SYS_FCHMOD` 91 on its IPC bind path and a raw
+`syscall(35)` in its DAG backoff, both unrouted — as majra
+`docs/development/issues/2026-09-14-raw-x86-syscall-numbers-aarch64.md`. ⚠ The first cut of
+this note said the aarch64 asset "cannot bind a socket"; that was wrong and was corrected after
+verifying against the emitter's routing table.
 
 ### Note — a diagnostic false positive on dead code
 
