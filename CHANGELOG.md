@@ -135,15 +135,7 @@ Unchanged from 2.1.5 and re-checked here: `duplicate fn 'uname_release'` and the
 warning (both upstream in sigil), and the `memory_store_get` *"SINGLE value"* diagnostic, still a
 documented false positive on dead code.
 
-The **`--agnos` build still fails, now at 3 errors with a different cause.** The 2.1.5 errors were
-undefined `SYS_EXECVE` / `SYS_WAIT4`; those resolve now, and what surfaces is that agnos's peer
-declares *different arities* for the same wrapper names — `sys_waitpid(pid)` (1 arg, not 3) and
-`sys_rename(old, oldlen, new, newlen)` (4 args, not 2) — and defines no `sys_socket` / `sys_bind` /
-`sys_listen` / `sys_accept4` / `sys_execve` / `sys_pidfd_open` at all. **This is a better failure
-than 2.1.5's**: `src/memory.cyr` previously compiled on agnos against daimon's `SYS_RENAME = 82`
-while agnos's own `rename` is **31** (`lib/syscalls_x86_64_agnos.cyr:86`) — a silent wrong-syscall
-that is now a loud compile error. Still P2, still awaiting the agnos scoping decision the filing
-calls for.
+The **`--agnos` build still fails, at 3 errors** — and the 2.1.5 characterisation of this as a "scoping decision" was wrong enough to correct here. **AGNOS is daimon's primary target**, and the agnos kernel supplies a primitive for everything daimon does; the gap is that daimon has never been mapped onto them, behind the `#ifdef CYRIUS_TARGET_AGNOS` pattern seven sibling repos already use. The sweep changed the error *class* for the better: 2.1.5's undefined `SYS_EXECVE` / `SYS_WAIT4` resolve now, and what surfaces is that the agnos peer spells these differently — `sys_waitpid(pid)` takes 1 arg, `sys_rename(old, oldlen, new, newlen)` takes 4 (agnos carries an explicit-length invariant: every path argument carries its length). More importantly `src/memory.cyr` previously compiled on agnos against daimon's `SYS_RENAME = 82` while agnos's `rename` is **31** — a silent wrong-syscall, now a loud compile error, which is the same win as the aarch64 half of this release. The mapping and its two real constraints (chan's 64-byte payload cap vs daimon's 64 KB messages; agnos having no rlimit syscall) are written up in the roadmap and the filing. Raised to **P1**.
 
 ## [2.1.5] - 2026-09-22
 

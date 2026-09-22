@@ -1,11 +1,92 @@
 # daimon does not build for `--agnos`, and that blocks crab's M7 index
 
-**Status:** 🟠 **OPEN, DOWNGRADED — the upstream half is CLOSED.** `cyrius build --agnos
-src/main.cyr` fails at daimon **2.1.5** with **3 errors across 2 symbols**, all daimon-owned (was
-53 errors / 36 symbols at 2.1.3 and 2.1.4). No longer upstream-blocked — see the 2.1.5 update.
+**Status:** 🔴 **OPEN — RAISED to P1 at 2.1.6.** `cyrius build --agnos src/main.cyr` fails at daimon
+**2.1.6** with **3 errors across 2 symbols**, all daimon-owned and all wrapper-arity (was 53 errors /
+36 symbols at 2.1.3–2.1.4; the upstream half closed at 2.1.5). **There is no capability gap** — the
+agnos kernel supplies a primitive for everything daimon does; daimon has simply never been mapped
+onto them. See the 2.1.6 update for the subsystem-by-subsystem mapping, the two real constraints,
+and the retraction of the "scoping decision" framing this filing previously carried.
 **Filed:** 2026-09-14, by **crab**.
 **Affects:** daimon **2.1.3** (and every version before it — no agnos build has ever been attempted).
-**Severity:** **Blocking for crab M7/M8.** Latent for daimon itself, which targets the host today.
+**Severity:** **P1 — blocking for crab M7/M8, and first-order for daimon.** ⛔ This line used to read
+*"latent for daimon itself, which targets the host today"*. That was the wrong assumption and is
+retracted: **daimon is the AGNOS agent orchestrator**, every consumer is an AGNOS agent, and a build
+that runs only on the host is the exception, not the baseline. The host build is where daimon is
+developed; agnos is where it is meant to run.
+
+## ⚠ 2.1.6 update (2026-09-22): 3 errors — and a RETRACTION of how this has been framed
+
+**The "scoping decision" framing is wrong and is retracted here.** This filing (§"What would close
+it" step 3) and daimon's roadmap have both carried the idea that agnos support turns on *"a scoping
+decision about what daimon IS on agnos"*. That reads as: agnos support is optional and under review.
+It is not. **daimon is the AGNOS agent orchestrator** — AGNOS is the primary target and every
+consumer is an AGNOS agent. Raised to **P1** in daimon's roadmap.
+
+### crab's step 3 has a concrete answer: it is NOT the real question
+
+Step 3 asks whether `dynlib`, `fdlopen`, `tls`, `mmap` and `net` — all in daimon's `[deps] stdlib`
+— are available on agnos, and suggests *"that, not the syscall arity, may be the real question"*.
+Measured:
+
+- **`dynlib`, `fdlopen`, `tls` — daimon calls ZERO symbols from all three.** Checked by taking every
+  `fn` each module exports and grepping `src/`: 0, 0, 0. They are in `[deps] stdlib` only because
+  sandhi's bundle references them at compile time (daimon's `CLAUDE.md` says so explicitly), and
+  `CYRIUS_DCE=1` NOPs them. They cannot block an agnos build because nothing reaches them.
+- **`mmap` — available.** The agnos peer defines `sys_mmap` and `sys_munmap`.
+- **`net` — available.** `lib/net.cyr` already carries **44** `CYRIUS_TARGET_AGNOS` arms.
+
+So step 3 resolves to "no blocker", and the syscall arity *is* the live question after all.
+
+### There is no capability gap
+
+Read from `agnos/kernel/core/syscall.cyr` — the canonical source, 1.57.5, 104 dispatch arms — the
+kernel supplies a primitive for every OS-facing thing daimon does:
+
+| daimon subsystem | Linux today | agnos primitive |
+|---|---|---|
+| HTTP API (8090) | `sys_socket`/`bind`/`listen`/`accept4` | `sys_sock_listen(port)` — bind+listen in one — then `sys_sock_accept`, `sys_sock_recv/send`. |
+| agent IPC (`src/ipc.cyr`) | AF_UNIX socket at a filesystem path | **`chan_op` #97 capability channels.** `CH_MINT` returns an unnamed **pair**; `CH_ENDOW` arms one end for placement into the next `spawn_path` child, so the child inherits the endpoint at spawn. |
+| agent spawn (`src/agent.cyr`) | `fork` + `execve` + `prlimit64` | `sys_spawn_path` #43 — one call, and it **does** tokenize argv from the command line. |
+| supervisor `/proc` reads | `/proc/{pid}/status`, `/stat`, `/fd`, `/task` | agnos has **no `/proc`**. `sys_proclist` #99 returns 64-byte records: pid · state · ppid · name[32] · `+56` split as **cpu ticks (low u32) / rss pages (high u32)** — the same two numbers `read_vm_rss` / `read_cpu_time_ms` parse today. |
+
+⭐ **The IPC mapping is an UPGRADE, not a workaround.** An AF_UNIX server binds a *name* on the
+filesystem, which is why `agent_ipc_bind` must `unlink` the path first — and that unlink-then-bind
+window is a race. An agnos channel has **no name**: it is minted as a pair and one end is handed to
+the child by the spawn itself. The kernel says so directly (`kernel/core/syscall.cyr:9140`) — the
+pair design *"deletes the entire unlink-before-bind race class AF_UNIX carries."*
+
+### Two real constraints, stated rather than hand-waved
+
+1. **`CH_SEND` caps a payload at 64 bytes** (`CH_SEND = 0x02; (fd, buf, len<=64)`) while daimon's
+   `MAX_MESSAGE_SIZE` is **65536** (`src/ipc.cyr:17`). Bulk bodies need `sys_shm_create` /
+   `sys_shm_write` / `sys_shm_read` / `sys_shm_free`, with the channel carrying the control word and
+   the shm id. A design decision to take, not a blocker.
+2. **agnos has no rlimit syscall at all** — `grep -ci 'rlimit'` over `kernel/core/syscall.cyr`
+   returns **0**. VULN-010's per-agent `RLIMIT_AS` / `RLIMIT_CPU` has no direct equivalent. Whether
+   that becomes a kernel ask, a scheduler-side quota, or a documented non-guarantee on agnos is a
+   question **for the agnos side**, and should be asked rather than assumed in either direction.
+
+### What the 3 errors are now
+
+The 2.1.6 raw-syscall sweep resolved 2.1.5's undefined `SYS_EXECVE` / `SYS_WAIT4`. What surfaces is
+that the agnos peer spells the same wrappers differently, because agnos carries an **explicit-length
+invariant** — every path argument carries its length, with no NUL-termination assumption:
+
+```
+error:src/agent.cyr:344: 'sys_waitpid' expects 1 argument, got 3     # agnos: sys_waitpid(pid)
+error:src/agent.cyr:347: 'sys_waitpid' expects 1 argument, got 3
+error:src/memory.cyr:89: 'sys_rename' expects 4 arguments, got 2     # agnos: sys_rename(old, oldlen, new, newlen)
+```
+
+**Strictly better than 2.1.5.** `src/memory.cyr` previously *compiled* on agnos against daimon's
+`SYS_RENAME = 82`, while agnos's `rename` is **31** — the atomic-write path issued a silently wrong
+syscall. It is a loud compile error now. Same win as the aarch64 half of 2.1.6.
+
+⚠ **Do not treat `lib/syscalls_x86_64_agnos.cyr` as authority.** Its own header records that a
+doc→peer→doc citation loop once let a wrong number verify itself, and states the kernel is canonical.
+It mirrors 1.56.x against a 1.57.5 kernel. Every claim above was read from the kernel. The first
+draft of this note was written from the peer and asserted agnos was "TCP/IP only" with no local IPC
+— wrong, and exactly the failure mode the peer's own header warns about.
 
 ## ✅ 2.1.5 update (2026-09-22): 53 errors → 3 — the bote/cyrius half is CLOSED
 
@@ -25,9 +106,11 @@ cyrius 6.6.6 also made `lib/io.cyr` self-sufficient (it includes `lib/args_agnos
 closed the `_agnos_getenv` gap that sibling consumers hit on the same target.
 
 **What remains is a daimon change, not a wait.** An agnos spawn arm for `execve` / `wait4` in
-`src/agent.cyr`, plus the scoping decision this filing already raises on whether `dynlib` /
-`fdlopen` / `tls` / `mmap` / `net` mean anything on agnos. Deliberately not done in 2.1.5: that
-release is pin-only, and an agnos spawn path needs its own tests.
+`src/agent.cyr`. Deliberately not done in 2.1.5: that release is pin-only, and an agnos spawn path
+needs its own tests. ⛔ This paragraph originally continued *"plus the scoping decision this filing
+already raises on whether `dynlib` / `fdlopen` / `tls` / `mmap` / `net` mean anything on agnos"* —
+**retracted at 2.1.6**, which measured it: daimon calls **zero** symbols from `dynlib`, `fdlopen`
+and `tls`, and `mmap` and `net` both have agnos support. See the 2.1.6 update.
 
 ## ⚠ 2.1.4 update (2026-09-14): re-measured under cyrius 6.6.4 — hypothesis §"LIKELY ROOT" REFUTED
 
@@ -141,6 +224,13 @@ express permission"*, and commits are the operator's. The change is prepared, no
    and none is obviously available on agnos. **That, not the syscall arity, may be the real question**
    — and it is a scoping decision about what daimon IS on agnos, which is daimon's to make, not
    crab's to assume.
+
+   > ✅ **ANSWERED at daimon 2.1.6 — this is NOT the real question.** daimon calls **zero** symbols
+   > from `dynlib`, `fdlopen` and `tls` (measured: every `fn` each module exports, grepped against
+   > `src/` — 0/0/0); they are in `[deps] stdlib` only so sandhi's bundle resolves at compile time,
+   > and `CYRIUS_DCE=1` NOPs them. `mmap` has `sys_mmap`/`sys_munmap` on agnos, and `lib/net.cyr`
+   > carries 44 agnos arms. The syscall/wrapper arity **is** the live question. crab was right to
+   > flag the uncertainty and right not to assume the answer; the answer is "no blocker".
 
 ⚠ **crab will not work around this.** Faking an index crab cannot back, or shipping surfaces that
 look like the roadmap's mock and under-deliver, is the failure crab's own VOLUMES entry exists to
