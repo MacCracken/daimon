@@ -42,10 +42,6 @@ stdlib = [
     "assert",
     "bench",
     "freelist",
-    # Pulled in by the bote MCP bundle (1.3.0): libro's audit-chain crypto
-    # (ct/keccak), majra/libro concurrency + collections (thread_local/slice/
-    # random), and bote's ws transport (ws_server). Full-bundle for now; a
-    # later cycle trims to only the modules the reachable tool surface needs.
     "ct",
     "keccak",
     "random",
