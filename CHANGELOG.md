@@ -4,6 +4,106 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.2.1] - 2026-09-22
+
+**Three live cross-request data leaks fixed — found by finishing a sweep that 2.1.6 asked for and
+nobody did.** Plus the test-integrity arc's second batch: `error`, `supervisor` and `ipc` are off
+their mirrors, which surfaced three more latent defects of the same class and two of other kinds.
+
+**356 tests** (was 306) across eight files, 5 fuzz harnesses, `fmt` / `lint` / `vet` clean, all three
+targets build. cyrius 6.6.6 and all nine pins unchanged.
+
+### Security — three LIVE cross-request data leaks on unauthenticated endpoints
+
+The 2.1.6 RAG filing ended with *"Sweep, don't spot-fix. Audit every `jget` result that outlives its
+handler across `src/api_*`."* That sweep never happened. Doing it found the same bug on three more
+**live, reachable** endpoints. Each stored a `jget` **view** into the per-connection request buffer —
+which sandhi **reuses** — so the next request from *any* client overwrote the stored field, and a
+later read served that client's bytes back. Each was probed on the real binary before and after:
+
+| endpoint | registered | after one unrelated request, served back |
+|---|---|---|
+| `POST`/`GET /v1/agents` | `"name":"ORIGINAL_AGENT_NAME"` | `"name":"y\":\"ZZZZZZZZZZZZZZZ"` |
+| `POST`/`GET /v1/edge/nodes` | `"name":"ORIGINAL_EDGE_NODE"` | `"name":"ZZZZZZZZZZZZZZZZZZ"` |
+| `POST /v1/scheduler/tasks` → `GET …/{id}` | `"name":"ORIGINAL_TASK_NAME"` | `"name":"ZZZZZZZZZZZZZZZZZZ"` |
+
+All three now read back byte-for-byte. Fixed at the **retention** boundary, per the RAG precedent:
+`agent_handle_new` and `edge_node_new` own the Strs they store, so every future caller is covered.
+The scheduler is different: tasks are stored by **samay**, whose `scheduled_task_new` and
+`node_capacity_new` store their Strs raw. daimon closes it at *its* boundary (`api_sched_submit`,
+`api_sched_register_node`) because `lib/samay.cyr` is vendored and regenerated; the root cause is
+upstream and recorded below. Regression tests use the 1.2.5 clobber shape and are
+**mutation-proven** — each fails against the unfixed code.
+
+**Verified clean, not assumed:** MCP tool, resource and prompt registration (the 1.2.5 fix covers
+all three), RAG ingest (2.1.6), and every `str_cstr(...)` map key in `mcp.cyr`, `edge.cyr` and
+`fed_vector_store.cyr` — `str_cstr` allocates and copies.
+
+### Fixed — the same class, latent (no live caller yet), found by the test migration
+
+- **`supervisor_register`** keyed three maps by `str_data(agent_id_str)`. `map_new()` keys are
+  **borrowed** — `map_set_a` does `store64(ep, key)`, it never copies — so the key pointed into the
+  caller's buffer. 2.3.x will call this with an id from `/v1/agents/{id}`.
+- **`msg_bus_subscribe`, `msg_bus_register_name`, `rpc_register_method`** stored caller cstrs as
+  keys *and* values. Against the unfixed code the clobbered lookup returned 0 and the next `streq`
+  on it **SIGSEGV'd**. All five sites now go through one `_ipc_own` helper.
+
+### Fixed — `rpc_unregister_agent` compared ids by pointer
+
+`if (handler == agent_id_cstr)` is pointer equality. It removed a method only if the caller passed
+the *identical pointer* used at registration, so an unregister request carrying the same id in a
+different buffer removed nothing and the departed agent's methods stayed routable. Now `streq`. The
+two fixes had to land together: once registration owns its values, no caller pointer can ever equal
+a stored one.
+
+### Fixed — `error_json` inserted `msg` unescaped
+
+A `"` or `\` in the message broke the JSON, and a message shaped `x","admin":true,"y":"` injected
+fields. **Latent** — all ~20 callers pass constants — but the natural next line anyone writes,
+`http_bad_request(fd, str_cat("unknown key: ", key))`, would have made it live. `json_escape_str`
+moved from `src/http.cyr` into `src/error.cyr` (included earlier, so every caller still resolves it)
+and `error_json` now uses it. Mutation-proven: the raw insert fails all three injection assertions.
+
+### Changed — test integrity, batch two (roadmap 2.2.x)
+
+| module | mirror covered | real-module tests | what the migration found |
+|---|---|---|---|
+| `error` | enum + 3 of 4 fns | in `daimon.tcyr` | the mirrored enum had **drifted**: it defined `DAIMON_ERR_IO = 10`, a code `src/` never has, while the real code 10 (`DAIMON_ERR_IPC_FAULT`) had never been tested; `error_json` had never run |
+| `supervisor` | 11 of 26 | `tests/supervisor.tcyr` (43) | the registry aliasing above |
+| `ipc` | 10 of 28 | `tests/ipc.tcyr` (24) | aliasing ×3, pointer-compare unregister |
+| `fuzz/circuit_breaker` | 4 fns, magic numbers | real `supervisor.cyr` | asserted `load64(cb) != 1` for OPEN — correct only while `CircuitState` stays 0/1/2; now names the enum |
+
+Every assertion the mirrors carried was moved forward, not dropped. `tests/edge.tcyr` is new (the
+edge regression). `tests/daimon.tcyr` shrinks by ~300 lines of mirror.
+
+### Note — on "bare errors"
+
+Asked to clean up daimon's remaining bare `ERR_*`: **there are none.** The enum has been
+`DAIMON_ERR_*` since 1.4.2, `cyrius lint` reports zero `lint_error_enum_namespace` notes across
+`src/`, `tests/` and `fuzz/`, and the build has zero `ERR_*` duplicate-symbol collisions. The only
+two `ERR_*` tokens in the tree are in a historical comment. The error-module work above — the
+drifted mirror, the untested code, the unescaped `error_json` — is what that request turned up
+instead.
+
+### Recorded — found, not fixed here
+
+- **samay stores its Strs raw.** `scheduled_task_new` (name, description, agent_id) and
+  `node_capacity_new` (node_id) retain caller Strs without copying. daimon defends at its boundary;
+  the library should own what it retains. Upstream item for samay.
+- **`/v1/scheduler/nodes` has no method check.** Every method routes to the register handler, so
+  nodes cannot be listed and a `GET` answers `400 missing body`. Also why the node-id fix could be
+  verified only by code, not by a live read-back.
+- **Latent aliasing with no live route**: `federation.cyr:62`, `fed_vector_store.cyr` (collection
+  and dedup keys), `screen.cyr:69,99`. Nothing reaches them from an entry point today; they come in
+  scope with the arcs that wire them.
+
+### Performance
+
+The 19-benchmark suite is **byte-identical** before and after this release: `tests/daimon.bcyr` built
+from the 2.2.0 tag and from this tree `cmp` equal. So its results are *provably* unchanged — and
+that is also the clearest statement of the test-integrity problem: the benchmark suite cannot observe
+a single one of this release's seven fixes, because it mirrors `src/` rather than including it.
+
 ## [2.2.0] - 2026-09-22
 
 **The test-integrity arc opens, and its first bite found a bug that had been live since the port.**

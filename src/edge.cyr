@@ -20,9 +20,18 @@ fn edge_node_new(name, arch, cpu_cores, memory_mb) {
     var nid = str_from_int(_next_agent_id);
     _next_agent_id = _next_agent_id + 1;
     store64(n, nid);
-    store64(n + 8, name);
+    # ⛔ str_clone the retained Strs — 2.2.1. `api_edge_register` passes
+    # `jget(pairs, "name")`, a VIEW into the request buffer sandhi reuses.
+    # Measured live: POST /v1/edge/nodes {"name":"ORIGINAL_EDGE_NODE"}, then one
+    # unrelated request from another client, and GET /v1/edge/nodes served
+    # `"name":"ZZZZZZZZZZZZZZZZZZ"` — that client's bytes. The same live leak as
+    # agent names (src/agent.cyr agent_handle_new), found by the same sweep.
+    # `arch` is a literal at the one call site today, but it is the same
+    # retained-Str parameter at the same boundary, so it is owned too rather
+    # than left for the next caller to rediscover.
+    store64(n + 8, str_clone(name));
     store64(n + 16, EDGE_ONLINE);
-    store64(n + 24, arch);
+    store64(n + 24, str_clone(arch));
     store64(n + 32, cpu_cores);
     store64(n + 40, memory_mb);
     store64(n + 48, 32768);       # disk_mb default

@@ -21,6 +21,13 @@ include "lib/math.cyr"
 include "lib/net.cyr"
 include "lib/process.cyr"
 
+# ⭐ 2.2.1 — the REAL error module, replacing this file's local copy. The mirror
+# had DRIFTED: its enum ended `DAIMON_ERR_IO = 10`, a code src/ never defines,
+# while the real code 10 is `DAIMON_ERR_IPC_FAULT` (renamed at 1.3.0 to dodge
+# majra's bare `ERR_IPC`, prefixed at 1.4.2) — which no test had ever touched.
+# The suite had been asserting against an error vocabulary that did not exist.
+include "src/error.cyr"
+
 var SYS_RENAME = 82;
 
 # ================================================================
@@ -29,27 +36,6 @@ var SYS_RENAME = 82;
 # ================================================================
 
 # --- error ---
-
-enum DaimonError {
-    DAIMON_ERR_NONE = 0;
-    DAIMON_ERR_INVALID_PARAM = 1;
-    DAIMON_ERR_AGENT_NOT_FOUND = 2;
-    DAIMON_ERR_AGENT_EXISTS = 3;
-    DAIMON_ERR_SUPERVISOR = 4;
-    DAIMON_ERR_IPC = 5;
-    DAIMON_ERR_SCHEDULER = 6;
-    DAIMON_ERR_FEDERATION = 7;
-    DAIMON_ERR_API = 8;
-    DAIMON_ERR_STORAGE = 9;
-    DAIMON_ERR_IO = 10;
-}
-
-fn error_to_status(err) {
-    if (err == DAIMON_ERR_INVALID_PARAM) { return 400; }
-    if (err == DAIMON_ERR_AGENT_NOT_FOUND) { return 404; }
-    if (err == DAIMON_ERR_AGENT_EXISTS) { return 409; }
-    return 500;
-}
 
 # --- config ---
 
@@ -89,101 +75,7 @@ fn agent_next_id() {
 
 # --- circuit breaker ---
 
-enum CircuitState { CB_CLOSED = 0; CB_OPEN = 1; CB_HALF_OPEN = 2; }
-
-fn cb_new(threshold, timeout_ms, half_open_max) {
-    var cb = alloc(56);
-    store64(cb, CB_CLOSED);
-    store64(cb + 8, 0);
-    store64(cb + 16, 0);
-    store64(cb + 24, threshold);
-    store64(cb + 32, timeout_ms);
-    store64(cb + 40, half_open_max);
-    store64(cb + 48, 0);
-    return cb;
-}
-
-fn cb_state(cb) { return load64(cb); }
-fn cb_failure_count(cb) { return load64(cb + 8); }
-
-fn cb_record_success(cb) {
-    var state = load64(cb);
-    if (state == CB_HALF_OPEN) {
-        var sc = load64(cb + 16) + 1;
-        store64(cb + 16, sc);
-        if (sc >= load64(cb + 40)) {
-            store64(cb, CB_CLOSED);
-            store64(cb + 8, 0);
-            store64(cb + 16, 0);
-        }
-    }
-    elif (state == CB_CLOSED) { store64(cb + 8, 0); }
-}
-
-fn cb_record_failure(cb) {
-    var fc = load64(cb + 8) + 1;
-    store64(cb + 8, fc);
-    store64(cb + 48, clock_epoch_secs());
-    var state = load64(cb);
-    if (state == CB_CLOSED) {
-        if (fc >= load64(cb + 24)) { store64(cb, CB_OPEN); }
-    }
-    elif (state == CB_HALF_OPEN) {
-        store64(cb, CB_OPEN);
-        store64(cb + 16, 0);
-    }
-}
-
-fn cb_can_execute(cb) {
-    var state = load64(cb);
-    if (state == CB_CLOSED) { return 1; }
-    if (state == CB_HALF_OPEN) { return 1; }
-    var last = load64(cb + 48);
-    if (last > 0) {
-        var elapsed_ms = (clock_epoch_secs() - last) * 1000;
-        if (elapsed_ms >= load64(cb + 32)) {
-            store64(cb, CB_HALF_OPEN);
-            store64(cb + 16, 0);
-            return 1;
-        }
-    }
-    return 0;
-}
-
-fn cb_reset(cb) {
-    store64(cb, CB_CLOSED);
-    store64(cb + 8, 0);
-    store64(cb + 16, 0);
-    store64(cb + 48, 0);
-}
-
 # --- output capture ---
-
-enum OutputStream { OUT_STDOUT = 0; OUT_STDERR = 1; }
-
-fn output_line_new(stream, content) {
-    var ol = alloc(24);
-    store64(ol, str_from_int(clock_epoch_secs()));
-    store64(ol + 8, stream);
-    store64(ol + 16, content);
-    return ol;
-}
-
-fn output_capture_new(max_lines) {
-    var oc = alloc(16);
-    store64(oc, vec_new());
-    store64(oc + 8, max_lines);
-    return oc;
-}
-
-fn output_capture_push(oc, stream, content) {
-    var lines = load64(oc);
-    var max = load64(oc + 8);
-    if (vec_len(lines) >= max) { vec_remove(lines, 0); }
-    vec_push(lines, output_line_new(stream, content));
-}
-
-fn output_capture_len(oc) { return vec_len(load64(oc)); }
 
 # --- memory ---
 
@@ -609,25 +501,6 @@ fn recording_stop(s) {
 
 # --- jget (cstr-based JSON lookup) ---
 
-fn jget(pairs, key_cstr) {
-    if (pairs == 0) { return 0; }
-    var len = vec_len(pairs);
-    var gi = 0;
-    while (gi < len) {
-        var p = vec_get(pairs, gi);
-        var k = load64(p);
-        if (str_eq_cstr(k, key_cstr) == 1) { return load64(p + 8); }
-        gi = gi + 1;
-    }
-    return 0;
-}
-
-fn jget_int(pairs, key_cstr) {
-    var v = jget(pairs, key_cstr);
-    if (v == 0) { return 0; }
-    return str_to_int(v);
-}
-
 # --- federation enums + types ---
 
 enum NodeRole { ROLE_COORDINATOR = 0; ROLE_FOLLOWER = 1; ROLE_CANDIDATE = 2; }
@@ -787,72 +660,6 @@ fn edge_node_active_tasks(n) { return load64(n + 72); }
 # --- IPC / message bus ---
 
 enum MessageType { MSG_REQUEST = 0; MSG_RESPONSE = 1; MSG_EVENT = 2; MSG_HEARTBEAT = 3; MSG_COMMAND = 4; }
-
-fn ipc_msg_new(source, target, msg_type, payload) {
-    var m = alloc(48);
-    store64(m, str_from_int(agent_next_id()));
-    store64(m + 8, source);
-    store64(m + 16, target);
-    store64(m + 24, msg_type);
-    store64(m + 32, payload);
-    store64(m + 40, clock_epoch_secs());
-    return m;
-}
-
-fn msg_bus_new() {
-    var mb = alloc(16);
-    store64(mb, map_new());
-    store64(mb + 8, map_new());
-    return mb;
-}
-
-fn msg_bus_subscribe(mb, agent_id_cstr) { map_set(load64(mb), agent_id_cstr, vec_new()); }
-fn msg_bus_register_name(mb, name_cstr, agent_id_cstr) { map_set(load64(mb + 8), name_cstr, agent_id_cstr); }
-
-fn msg_bus_publish(mb, msg) {
-    var target = load64(msg + 16);
-    var target_cstr = str_cstr(target);
-    var subs = load64(mb);
-    if (streq(target_cstr, "*") == 1) {
-        var keys = map_keys(subs);
-        var i = 0;
-        while (i < vec_len(keys)) {
-            var queue = map_get(subs, vec_get(keys, i));
-            if (queue != 0) { vec_push(queue, msg); }
-            i = i + 1;
-        }
-        return Ok(0);
-    }
-    var names = load64(mb + 8);
-    var resolved = map_get(names, target_cstr);
-    if (resolved != 0) {
-        var queue = map_get(subs, resolved);
-        if (queue != 0) { vec_push(queue, msg); }
-        return Ok(0);
-    }
-    var queue = map_get(subs, target_cstr);
-    if (queue != 0) { vec_push(queue, msg); }
-    return Ok(0);
-}
-
-fn msg_bus_send_to_name(mb, name_cstr, msg) {
-    var id = map_get(load64(mb + 8), name_cstr);
-    if (id == 0) { return Err(DAIMON_ERR_AGENT_NOT_FOUND); }
-    var queue = map_get(load64(mb), id);
-    if (queue == 0) { return Err(DAIMON_ERR_AGENT_NOT_FOUND); }
-    vec_push(queue, msg);
-    return Ok(0);
-}
-
-fn rpc_registry_new() {
-    var rr = alloc(8);
-    store64(rr, map_new());
-    return rr;
-}
-
-fn rpc_register_method(rr, method_cstr, agent_id_cstr) { map_set(load64(rr), method_cstr, agent_id_cstr); }
-fn rpc_find_handler(rr, method_cstr) { return map_get(load64(rr), method_cstr); }
-fn rpc_list_methods(rr) { return map_keys(load64(rr)); }
 
 # --- Federated vector store ---
 
@@ -1094,6 +901,29 @@ fn main() {
     assert_eq(error_to_status(DAIMON_ERR_FEDERATION), 500, "federation -> 500");
     assert_eq(error_to_status(DAIMON_ERR_API), 500, "api -> 500");
     assert_eq(error_to_status(DAIMON_ERR_STORAGE), 500, "storage -> 500");
+    # 2.2.1 — the real code 10, never tested while the mirror carried a phantom
+    # `DAIMON_ERR_IO = 10` in its place.
+    assert_eq(DAIMON_ERR_IPC_FAULT, 10, "IPC_FAULT is code 10");
+    assert_eq(error_to_status(DAIMON_ERR_IPC_FAULT), 500, "ipc_fault -> 500");
+    assert_eq(error_to_status(99999), 500, "unknown code falls through to 500");
+
+    # error_json — the one fn in src/error.cyr the old mirror never copied, so
+    # it had never run. Plain message first, then the injection shapes.
+    assert(str_eq(error_json(404, str_from("agent not found")),
+        str_from("{\"error\":\"agent not found\",\"code\":404}")) == 1,
+      "error_json renders a plain message exactly");
+
+    # ⛔ A quote in msg must not close the string. Before 2.2.1 this produced
+    # {"error":"x","admin":true,"y":"","code":400} — two injected fields.
+    var inj = error_json(400, str_from("x\",\"admin\":true,\"y\":\""));
+    assert(str_contains(inj, str_from("\"admin\":true")) == 0,
+      "error_json: a quote in msg cannot inject a field");
+    assert(str_contains(inj, str_from("\\\"admin\\\"")) == 1,
+      "error_json: the quotes arrive escaped as \\\"");
+    # A backslash must be escaped too, or `\"` in msg re-opens the string.
+    var bs = error_json(400, str_from("a\\b"));
+    assert(str_contains(bs, str_from("a\\\\b")) == 1,
+      "error_json: a backslash in msg arrives escaped");
 
     # =============================================================
     # config — defaults and modification
@@ -1123,81 +953,13 @@ fn main() {
     # call it, and untangling those is their own bite of the 2.2.x arc.
 
     # =============================================================
-    # circuit breaker
+    # circuit breaker + output capture — MIGRATED to tests/supervisor.tcyr (2.2.1)
     # =============================================================
-    test_group("circuit_breaker");
-
-    # Starts closed
-    var cb = cb_new(3, 10000, 2);
-    assert_eq(cb_state(cb), CB_CLOSED, "starts closed");
-    assert_eq(cb_failure_count(cb), 0, "no failures");
-    assert_eq(cb_can_execute(cb), 1, "can execute when closed");
-
-    # Opens after threshold
-    cb_record_failure(cb);
-    cb_record_failure(cb);
-    assert_eq(cb_state(cb), CB_CLOSED, "still closed at 2");
-    cb_record_failure(cb);
-    assert_eq(cb_state(cb), CB_OPEN, "opens at 3");
-    assert_eq(cb_can_execute(cb), 0, "blocked when open");
-
-    # Success resets failure count
-    var cb2 = cb_new(5, 10000, 1);
-    cb_record_failure(cb2);
-    cb_record_failure(cb2);
-    assert_eq(cb_failure_count(cb2), 2, "failure count 2");
-    cb_record_success(cb2);
-    assert_eq(cb_failure_count(cb2), 0, "reset on success");
-
-    # Half-open transition (0ms timeout = immediate)
-    var cb3 = cb_new(1, 0, 1);
-    cb_record_failure(cb3);
-    assert_eq(cb_state(cb3), CB_OPEN, "open after 1 failure");
-    assert_eq(cb_can_execute(cb3), 1, "transitions to half-open");
-    assert_eq(cb_state(cb3), CB_HALF_OPEN, "now half-open");
-
-    # Closes after half-open successes
-    var cb4 = cb_new(1, 0, 2);
-    cb_record_failure(cb4);
-    cb_can_execute(cb4);  # -> half-open
-    cb_record_success(cb4);
-    assert_eq(cb_state(cb4), CB_HALF_OPEN, "still half-open at 1 success");
-    cb_record_success(cb4);
-    assert_eq(cb_state(cb4), CB_CLOSED, "closed after 2 successes");
-
-    # Re-opens on half-open failure
-    var cb5 = cb_new(1, 0, 3);
-    cb_record_failure(cb5);
-    cb_can_execute(cb5);  # -> half-open
-    cb_record_failure(cb5);
-    assert_eq(cb_state(cb5), CB_OPEN, "re-opened from half-open");
-
-    # Reset
-    cb_reset(cb);
-    assert_eq(cb_state(cb), CB_CLOSED, "reset to closed");
-    assert_eq(cb_failure_count(cb), 0, "reset failure count");
-
-    # =============================================================
-    # output capture — ring buffer
-    # =============================================================
-    test_group("output_capture");
-
-    var oc = output_capture_new(3);
-    assert_eq(output_capture_len(oc), 0, "empty initially");
-
-    output_capture_push(oc, OUT_STDOUT, str_from("line1"));
-    output_capture_push(oc, OUT_STDERR, str_from("line2"));
-    output_capture_push(oc, OUT_STDOUT, str_from("line3"));
-    assert_eq(output_capture_len(oc), 3, "3 lines");
-
-    # Ring buffer eviction
-    output_capture_push(oc, OUT_STDOUT, str_from("line4"));
-    output_capture_push(oc, OUT_STDOUT, str_from("line5"));
-    assert_eq(output_capture_len(oc), 3, "ring at capacity");
-    # First line should be line3 now
-    var lines = load64(oc);
-    var first = vec_get(lines, 0);
-    assert(str_eq(load64(first + 16), str_from("line3")) == 1, "oldest is line3");
+    # Both groups ran against local mirrors of 11 of src/supervisor.cyr's 26
+    # functions. tests/supervisor.tcyr carries every assertion forward against
+    # the real module and covers the other 15 for the first time — which
+    # found supervisor_register keying its maps by a BORROWED pointer into the
+    # caller's buffer (the MCP 1.2.5 / RAG 2.1.6 aliasing class, a third time).
 
     # =============================================================
     # memory — key validation and sanitization
@@ -1682,37 +1444,11 @@ fn main() {
     # =============================================================
     # IPC — message bus + RPC registry
     # =============================================================
-    test_group("ipc");
+    # ipc — MIGRATED to tests/ipc.tcyr (2.2.1). Every assertion carried forward
+    # against the real module; the migration found the bus + RPC registry
+    # storing BORROWED keys and values (aliasing, instances 4-6) and
+    # rpc_unregister_agent comparing handler ids by POINTER, not content.
 
-    var bus = msg_bus_new();
-    msg_bus_subscribe(bus, "agent-1");
-    msg_bus_subscribe(bus, "agent-2");
-    msg_bus_register_name(bus, "worker", "agent-1");
-
-    var imsg = ipc_msg_new(str_from("sys"), str_from("*"), MSG_EVENT, str_from("hello"));
-    msg_bus_publish(bus, imsg);
-    var iq1 = map_get(load64(bus), "agent-1");
-    var iq2 = map_get(load64(bus), "agent-2");
-    assert_eq(vec_len(iq1), 1, "agent-1 got broadcast");
-    assert_eq(vec_len(iq2), 1, "agent-2 got broadcast");
-
-    var imsg2 = ipc_msg_new(str_from("sys"), str_from("x"), MSG_COMMAND, str_from("cmd"));
-    msg_bus_send_to_name(bus, "worker", imsg2);
-    assert_eq(vec_len(iq1), 2, "agent-1 got named msg");
-    assert_eq(vec_len(iq2), 1, "agent-2 unchanged");
-
-    var rpc = rpc_registry_new();
-    rpc_register_method(rpc, "calculate", "agent-1");
-    rpc_register_method(rpc, "fetch", "agent-2");
-    assert(rpc_find_handler(rpc, "calculate") != 0, "find calculate");
-    assert(rpc_find_handler(rpc, "fetch") != 0, "find fetch");
-    assert_eq(rpc_find_handler(rpc, "missing"), 0, "missing method");
-
-    var rpc_methods = rpc_list_methods(rpc);
-    assert_eq(vec_len(rpc_methods), 2, "2 methods");
-
-    # =============================================================
-    # RAG pipeline — ingest + query
     # =============================================================
     test_group("rag_pipeline");
 

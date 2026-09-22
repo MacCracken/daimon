@@ -149,4 +149,15 @@ var nz = normalize_vec(zero, 2);
 assert(f64_eq(load64(nz), f64_from(0)) == 1,
   "normalize_vec of a zero vector is zero, not NaN");
 
+# --- 2.2.1: the handle must OWN its name ---------------------------------
+# LIVE leak on POST /v1/agents: api_register_agent passes a jget VIEW into the
+# reused request buffer, and agent_handle_new stored it raw, so GET /v1/agents
+# served the next client's bytes as this agent's name. The 1.2.5 clobber shape:
+var nbuf = alloc(32);
+memcpy(nbuf, "live-agent-name", 15);
+var hname = agent_handle_new(agent_next_id(), str_new(nbuf, 15));
+memset(nbuf, 88, 32);                  # the next request reuses the buffer
+assert(str_eq(agent_name(hname), str_from("live-agent-name")) == 1,
+  "agent name survives the request buffer being reused");
+
 syscall(SYS_EXIT, assert_summary());

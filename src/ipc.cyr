@@ -35,6 +35,24 @@ fn ipc_msg_payload(m) { return load64(m + 32); }
 
 # MessageBus: {subscribers: map<agent_id_cstr, queue_vec>,
 #               agent_names: map<name_cstr, agent_id_cstr>}
+# Own a caller-supplied cstr: copy its bytes into a fresh, NUL-terminated,
+# never-freed buffer and return that. Used for every key AND value the bus and
+# RPC registry store.
+#
+# ⚠ The MCP-registry (1.2.5) / RAG (2.1.6) / supervisor (2.2.1) aliasing class,
+# instances 4-6. map_new() keys and values are BORROWED — map_set_a stores the
+# pointer as-is, it does not copy — and every one of these callers receives a
+# cstr that, once 2.3.x wires IPC to the API, points into the per-connection
+# request buffer sandhi REUSES. Stored raw, a later request rewrites the keys
+# under the map (lookups miss) and the values under the entries (routes point
+# at garbage). Measured at 2.2.1 on the unfixed code: the clobbered lookup
+# returned 0 and the very next streq on it SIGSEGV'd.
+#
+# Five call sites, so it earns a helper (CLAUDE.md: extract on the third).
+fn _ipc_own(cstr) {
+    return str_data(str_clone(str_from(cstr)));
+}
+
 fn msg_bus_new() {
     var mb = alloc(16);
     store64(mb, map_new());      # subscribers
@@ -43,7 +61,7 @@ fn msg_bus_new() {
 }
 
 fn msg_bus_subscribe(mb, agent_id_cstr) {
-    map_set(load64(mb), agent_id_cstr, vec_new());
+    map_set(load64(mb), _ipc_own(agent_id_cstr), vec_new());
 }
 
 fn msg_bus_unsubscribe(mb, agent_id_cstr) {
@@ -51,7 +69,7 @@ fn msg_bus_unsubscribe(mb, agent_id_cstr) {
 }
 
 fn msg_bus_register_name(mb, name_cstr, agent_id_cstr) {
-    map_set(load64(mb + 8), name_cstr, agent_id_cstr);
+    map_set(load64(mb + 8), _ipc_own(name_cstr), _ipc_own(agent_id_cstr));
 }
 
 fn msg_bus_publish(mb, msg) {
@@ -111,7 +129,7 @@ fn rpc_registry_new() {
 }
 
 fn rpc_register_method(rr, method_cstr, agent_id_cstr) {
-    map_set(load64(rr), method_cstr, agent_id_cstr);
+    map_set(load64(rr), _ipc_own(method_cstr), _ipc_own(agent_id_cstr));
 }
 
 fn rpc_find_handler(rr, method_cstr) {
@@ -124,7 +142,13 @@ fn rpc_unregister_agent(rr, agent_id_cstr) {
     var i = 0;
     while (i < vec_len(keys)) {
         var handler = map_get(methods, vec_get(keys, i));
-        if (handler == agent_id_cstr) { map_delete(methods, vec_get(keys, i)); }
+        # ⛔ Was `handler == agent_id_cstr` — POINTER equality. It matched only
+        # when the caller passed the identical pointer used at registration, so
+        # an unregister request (a different buffer holding the same id) removed
+        # nothing and the departed agent's methods stayed routable. And once
+        # registration owns its values (_ipc_own, above) no caller pointer can
+        # EVER equal a stored one — the two fixes have to land together.
+        if (streq(handler, agent_id_cstr) == 1) { map_delete(methods, vec_get(keys, i)); }
         i = i + 1;
     }
 }

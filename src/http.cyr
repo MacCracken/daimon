@@ -9,30 +9,8 @@ var MAX_HEADER_SIZE = 8192;
 
 # --- JSON escaping (VULN-002) ---
 
-fn json_escape_str(s) {
-    var data = str_data(s);
-    var slen = str_len(s);
-    var sb = str_builder_new();
-    var ei = 0;
-    while (ei < slen) {
-        var c = load8(data + ei);
-        if (c == 34) { str_builder_add_cstr(sb, "\\\""); }
-        elif (c == 92) { str_builder_add_cstr(sb, "\\\\"); }
-        elif (c == 10) { str_builder_add_cstr(sb, "\\n"); }
-        elif (c == 13) { str_builder_add_cstr(sb, "\\r"); }
-        elif (c == 9) { str_builder_add_cstr(sb, "\\t"); }
-        elif (c < 32) {
-            # Control character — skip
-        }
-        else {
-            var cbuf[1];
-            store8(&cbuf, c);
-            str_builder_add(sb, str_new(&cbuf, 1));
-        }
-        ei = ei + 1;
-    }
-    return str_builder_build(sb);
-}
+# (json_escape_str moved to src/error.cyr at 2.2.1 — error_json needs it, and error.cyr
+#  is included before this file, so every caller here still resolves it.)
 
 # --- HTTP helpers ---
 

@@ -81,10 +81,46 @@ fn jget_int(pairs, key_cstr) {
     return str_to_int(v);
 }
 
+fn json_escape_str(s) {
+    var data = str_data(s);
+    var slen = str_len(s);
+    var sb = str_builder_new();
+    var ei = 0;
+    while (ei < slen) {
+        var c = load8(data + ei);
+        if (c == 34) { str_builder_add_cstr(sb, "\\\""); }
+        elif (c == 92) { str_builder_add_cstr(sb, "\\\\"); }
+        elif (c == 10) { str_builder_add_cstr(sb, "\\n"); }
+        elif (c == 13) { str_builder_add_cstr(sb, "\\r"); }
+        elif (c == 9) { str_builder_add_cstr(sb, "\\t"); }
+        elif (c < 32) {
+            # Control character — skip
+        }
+        else {
+            var cbuf[1];
+            store8(&cbuf, c);
+            str_builder_add(sb, str_new(&cbuf, 1));
+        }
+        ei = ei + 1;
+    }
+    return str_builder_build(sb);
+}
+
+# ⛔ 2.2.1 — `msg` is now JSON-ESCAPED. It used to be inserted raw between the
+# quotes, so a message containing `"` or `\` produced malformed JSON, and one
+# shaped like `x","admin":true,"y":"` injected fields into the error body.
+#
+# LATENT, not live, at the time of the fix: every one of the ~20 callers
+# (http_bad_request / http_error / api_mcp) passes a constant `str_from("...")`.
+# But the natural next line anyone writes — `http_bad_request(fd,
+# str_cat(str_from("unknown key: "), key))` — would have made it a live
+# injection on an unauthenticated endpoint. Found because 2.2.1 tests the REAL
+# error module: `error_json` was the one function in it the old test mirror
+# never copied, so it had never been exercised.
 fn error_json(code, msg) {
     var sb = str_builder_new();
     str_builder_add_cstr(sb, "{\"error\":\"");
-    str_builder_add(sb, msg);
+    str_builder_add(sb, json_escape_str(msg));
     str_builder_add_cstr(sb, "\",\"code\":");
     str_builder_add_int(sb, code);
     str_builder_add_cstr(sb, "}");

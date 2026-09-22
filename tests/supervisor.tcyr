@@ -1,0 +1,145 @@
+# =========================================================================
+# supervisor — tests against THE REAL src/supervisor.cyr
+#
+# 2.2.1, second bite of the test-integrity arc (roadmap 2.2.x).
+#
+# tests/daimon.tcyr mirrored 11 of this module's 26 functions (the circuit
+# breaker + output capture) and nothing else. Its circuit-breaker and output-
+# capture groups are carried forward here verbatim against the real code, and
+# the other 15 functions — quota, health, hc_config, the supervisor registry
+# itself — are covered for the first time. The mirror is DELETED from
+# daimon.tcyr in the same change, so there is exactly one supervisor under test.
+#
+# supervisor.cyr has no dependency on agent.cyr (it keys by id string and never
+# calls agent_id()), so this file needs only the stdlib — no audit/libro chain.
+# =========================================================================
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/io.cyr"
+include "lib/hashmap.cyr"
+include "lib/chrono.cyr"
+include "lib/syscalls.cyr"
+include "lib/assert.cyr"
+
+include "src/supervisor.cyr"
+
+test_group("supervisor");
+
+# --- circuit breaker: carried forward from daimon.tcyr, now against real code
+var cb = cb_new(3, 10000, 2);
+assert_eq(cb_state(cb), CB_CLOSED, "cb starts closed");
+assert_eq(cb_failure_count(cb), 0, "cb no failures");
+assert_eq(cb_can_execute(cb), 1, "cb can execute when closed");
+cb_record_failure(cb);
+cb_record_failure(cb);
+assert_eq(cb_state(cb), CB_CLOSED, "cb still closed at 2");
+cb_record_failure(cb);
+assert_eq(cb_state(cb), CB_OPEN, "cb opens at threshold 3");
+assert_eq(cb_can_execute(cb), 0, "cb blocked when open");
+
+var cb2 = cb_new(5, 10000, 1);
+cb_record_failure(cb2);
+cb_record_failure(cb2);
+assert_eq(cb_failure_count(cb2), 2, "cb failure count 2");
+cb_record_success(cb2);
+assert_eq(cb_failure_count(cb2), 0, "cb success resets failures");
+
+var cb3 = cb_new(1, 0, 1);
+cb_record_failure(cb3);
+assert_eq(cb_state(cb3), CB_OPEN, "cb open after 1 failure");
+assert_eq(cb_can_execute(cb3), 1, "cb 0ms timeout -> half-open on probe");
+assert_eq(cb_state(cb3), CB_HALF_OPEN, "cb now half-open");
+
+var cb4 = cb_new(1, 0, 2);
+cb_record_failure(cb4);
+cb_can_execute(cb4);
+cb_record_success(cb4);
+assert_eq(cb_state(cb4), CB_HALF_OPEN, "cb still half-open at 1 success");
+cb_record_success(cb4);
+assert_eq(cb_state(cb4), CB_CLOSED, "cb closes after 2 half-open successes");
+
+var cb5 = cb_new(1, 0, 3);
+cb_record_failure(cb5);
+cb_can_execute(cb5);
+cb_record_failure(cb5);
+assert_eq(cb_state(cb5), CB_OPEN, "cb re-opens on half-open failure");
+
+cb_reset(cb);
+assert_eq(cb_state(cb), CB_CLOSED, "cb reset -> closed");
+assert_eq(cb_failure_count(cb), 0, "cb reset clears failures");
+
+# cb_default — never tested before
+var cbd = cb_default();
+assert_eq(cb_state(cbd), CB_CLOSED, "cb_default starts closed");
+
+# --- output capture: carried forward, plus tail/clear (never tested) -----
+var oc = output_capture_new(3);
+assert_eq(output_capture_len(oc), 0, "oc empty initially");
+output_capture_push(oc, OUT_STDOUT, str_from("line1"));
+output_capture_push(oc, OUT_STDERR, str_from("line2"));
+output_capture_push(oc, OUT_STDOUT, str_from("line3"));
+assert_eq(output_capture_len(oc), 3, "oc holds 3");
+output_capture_push(oc, OUT_STDOUT, str_from("line4"));
+output_capture_push(oc, OUT_STDOUT, str_from("line5"));
+assert_eq(output_capture_len(oc), 3, "oc ring stays at capacity");
+var first = vec_get(load64(oc), 0);
+assert(str_eq(load64(first + 16), str_from("line3")) == 1, "oc evicts oldest; line3 now first");
+assert_eq(load64(first + 8), OUT_STDOUT, "oc line keeps its stream tag");
+
+var tail = output_capture_tail(oc, 2);
+assert_eq(vec_len(tail), 2, "tail(2) returns 2");
+assert(str_eq(load64(vec_get(tail, 1) + 16), str_from("line5")) == 1, "tail ends at newest");
+var tall = output_capture_tail(oc, 99);
+assert_eq(vec_len(tall), 3, "tail(n > len) clamps to len");
+output_capture_clear(oc);
+assert_eq(output_capture_len(oc), 0, "clear empties the ring");
+
+# --- quota / health / hc_config — never tested ---------------------------
+var q = quota_default();
+assert_eq(quota_mem_limit(q), 1073741824, "quota_default mem = 1 GiB");
+assert_eq(quota_cpu_time_limit(q), 3600000, "quota_default cpu = 1h ms");
+var q2 = quota_new(512, 9);
+assert_eq(quota_mem_limit(q2), 512, "quota_new mem round-trips");
+assert_eq(quota_cpu_time_limit(q2), 9, "quota_new cpu round-trips");
+
+var ah = agent_health_new(7);
+assert_eq(health_agent_id(ah), 7, "health keeps its agent id");
+assert_eq(health_is_healthy(ah), 1, "health starts healthy");
+assert_eq(health_failures(ah), 0, "health starts with no failures");
+assert_eq(health_successes(ah), 0, "health starts with no successes");
+
+var hc = hc_config_default();
+assert_eq(load64(hc), 30, "hc interval 30s");
+assert_eq(load64(hc + 16), 3, "hc unhealthy threshold 3");
+
+# --- the registry itself — never tested ----------------------------------
+var sup = supervisor_new();
+supervisor_register(sup, str_from("agent-a"));
+assert(map_get(load64(sup), "agent-a") != 0, "register creates a health record");
+assert(map_get(load64(sup + 8), "agent-a") != 0, "register creates a quota");
+assert(map_get(load64(sup + 16), "agent-a") != 0, "register creates a breaker");
+supervisor_unregister(sup, str_from("agent-a"));
+assert_eq(map_get(load64(sup), "agent-a"), 0, "unregister removes the health record");
+assert_eq(map_get(load64(sup + 16), "agent-a"), 0, "unregister removes the breaker");
+
+# ⛔ ALIASING — the MCP (1.2.5) / RAG (2.1.6) class, a third time. map_new()
+# keys are BORROWED (map_set_a does store64(ep, key)), and supervisor_register
+# used to key all three maps by str_data(agent_id_str): a pointer into the
+# CALLER's buffer. 2.3.x will call this with an id from /v1/agents/{id} — the
+# reused request buffer — so a later request would rewrite the keys under the
+# map and every lookup for that agent would miss. The 1.2.5 clobber shape:
+var idbuf = alloc(32);
+memcpy(idbuf, "agent-zz", 8);
+store8(idbuf + 8, 0);
+supervisor_register(sup, str_new(idbuf, 8));
+memset(idbuf, 88, 32);                 # a later request reuses the buffer
+assert(map_get(load64(sup), "agent-zz") != 0,
+  "registry key survives the caller's buffer being reused (health)");
+assert(map_get(load64(sup + 16), "agent-zz") != 0,
+  "registry key survives the caller's buffer being reused (breaker)");
+
+syscall(SYS_EXIT, assert_summary());

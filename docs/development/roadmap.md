@@ -4,11 +4,10 @@
 >
 > **Severity legend**: **P0** blocking (security / correctness — must-fix before ship) · **P1** high (must-have for the current arc) · **P2** medium (schedule when capacity opens) · **P3 / Low** nice-to-have, no urgency. Upstream-blocker items quote the upstream tracker's own severity.
 
-**Where daimon stands** — `2.2.0`, on cyrius 6.6.6, nine dep pins current. Builds and runs on
-**three targets**: x86_64, aarch64 and AGNOS. **306 tests**, 5 fuzz harnesses, 21 benchmarks, all
-gates clean. Zero open issue filings. MCP surface: 13 tools — libro audit x5, bote web x2, nein
-firewall x6 (mutating half gated shut until 2.5.x). **The 2.2.x arc is underway** — `agent` is
-migrated off its mirror; `supervisor` and `ipc` are next.
+**Where daimon stands** — `2.2.1`, on cyrius 6.6.6, nine dep pins current. Builds and runs on
+**three targets**: x86_64, aarch64 and AGNOS. **356 tests**, 5 fuzz harnesses, 21 benchmarks, all
+gates clean. Zero open issue filings. MCP surface: 13 tools. **The 2.2.x arc is mostly done** —
+`agent`, `error`, `supervisor` and `ipc` are off their mirrors; the rest of `daimon.tcyr` remains.
 
 ## The arc to 3.0.0
 
@@ -36,15 +35,17 @@ the functions they name, so a passing suite has never been a statement about dai
 source. Two shipped security defects were green under it, each because the mirror never called the
 code that was wrong.
 
-**In progress.** `agent` landed at **2.2.0**: `tests/agent.tcyr` covers the real module and its
-real dependency chain (33 assertions), and the mirror plus its 20 assertions are gone from
-`daimon.tcyr`. It found two defects immediately — `read_vm_rss` could never parse a number (fixed,
-live since the port) and `dir_list` enumerates nothing under `/proc/<pid>/fd` (upstream, pinned as
-a KNOWN GAP assertion that fails when the stdlib fixes it). Five files now include `src/` directly.
+**In progress — four modules done.** `agent` (2.2.0), then `error`, `supervisor` and `ipc`
+(2.2.1) each moved onto real-module tests with every mirror assertion carried forward. Seven files
+now include `src/` directly. The migration keeps paying for itself: it found `read_vm_rss` returning
+0 for every process, a mirrored error enum that had **drifted** from the real one, the registry
+aliasing in `supervisor` and `ipc`, a pointer-compare `rpc_unregister_agent`, and an unescaped
+`error_json`.
 
-⚠ `agent_next_id` is still mirrored: the screen / scheduler / mcp mirrors call it, so it comes out
-with whichever of those migrates first. **Next: `supervisor`, then `ipc`** — the modules 2.3.x
-needs.
+**Remaining**: the other mirrors in `tests/daimon.tcyr` (config, memory, vector_store, rag, mcp,
+screen, scheduler, federation, edge, http/router), `tests/daimon.bcyr` — which `cmp` shows is
+**byte-identical** before and after 2.2.1, i.e. it cannot observe any `src/` change — and four of the
+five fuzz harnesses. `agent_next_id` is still mirrored until the screen/scheduler/mcp mirrors go.
 
 **One module per bite, suite green at each step** — not one cut-over. Start with the modules the
 next arc touches: `agent`, `supervisor`, `ipc`. Expect the migration to surface defects; that is the
@@ -75,6 +76,11 @@ reaping children is exactly the class where the mirrored-test problem has alread
 wiring it while the suite tests a parallel reimplementation would repeat that with `fork`/`execve`
 instead of a string copy. Migrating `src/agent.cyr`'s tests first also answers for free whether this
 code works at all — **it has never been executed.**
+
+⚠ **Aliasing sweep status (2.2.1).** Every `jget` retained by a *live* endpoint is now owned —
+agents, edge nodes, scheduler tasks and nodes, MCP tools/resources/prompts, RAG. Still borrowed and
+**latent only because nothing calls them yet**: `federation.cyr:62`, `fed_vector_store.cyr` keys,
+`screen.cyr:69,99`. When this arc wires a route to any of them, own the key in the same change.
 
 **Sequence**: migrate `agent` + `supervisor` tests → wire start/stop → signals and reaping → IPC.
 One bite each, suite green at every step.

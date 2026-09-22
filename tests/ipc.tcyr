@@ -1,0 +1,133 @@
+# =========================================================================
+# ipc — tests against THE REAL src/ipc.cyr
+#
+# 2.2.1, third bite of the test-integrity arc (roadmap 2.2.x). tests/daimon.tcyr
+# mirrored 10 of this module's 28 functions — the in-memory message bus and
+# RPC registry — and its mirror is DELETED in the same change.
+#
+# The socket half (agent_ipc_bind / accept_one / send / cleanup) is exercised
+# by tests/syscall_portability.tcyr, which round-trips a real AF_UNIX socket
+# through exactly the wrappers those functions call, plus SO_PEERCRED — on
+# x86_64 AND aarch64. This file covers the registry half.
+#
+# ipc.cyr depends on agent.cyr: ipc_msg_new draws message ids from agent.cyr's
+# `_next_agent_id` counter, so the include chain is agent.tcyr's.
+# =========================================================================
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/io.cyr"
+include "lib/fs.cyr"
+include "lib/hashmap.cyr"
+include "lib/tagged.cyr"
+include "lib/bayan.cyr"
+include "lib/chrono.cyr"
+include "lib/syscalls.cyr"
+include "lib/math.cyr"
+include "lib/process.cyr"
+include "lib/sakshi.cyr"
+include "lib/libro.cyr"
+include "lib/assert.cyr"
+
+include "src/syscalls.cyr"
+include "src/error.cyr"
+include "src/audit.cyr"
+include "src/agent.cyr"
+include "src/ipc.cyr"
+
+test_group("ipc");
+daimon_audit_init();
+
+# --- messages ------------------------------------------------------------
+var m = ipc_msg_new(str_from("a"), str_from("b"), 3, str_from("hi"));
+assert(str_eq(ipc_msg_source(m), str_from("a")) == 1, "msg source round-trips");
+assert(str_eq(ipc_msg_target(m), str_from("b")) == 1, "msg target round-trips");
+assert_eq(ipc_msg_type(m), 3, "msg type round-trips");
+assert(str_eq(ipc_msg_payload(m), str_from("hi")) == 1, "msg payload round-trips");
+var m2 = ipc_msg_new(str_from("a"), str_from("b"), 3, str_from("x"));
+assert(str_eq(load64(m), load64(m2)) == 0, "message ids are unique");
+
+# --- message bus ---------------------------------------------------------
+var mb = msg_bus_new();
+msg_bus_register_name(mb, "scanner", "agent-1");
+assert(streq(msg_bus_get_agent_id(mb, "scanner"), "agent-1") == 1, "name resolves to agent id");
+assert_eq(msg_bus_get_agent_id(mb, "nobody"), 0, "unknown name resolves to 0");
+
+# --- broadcast + named delivery: carried forward from daimon.tcyr --------
+var bus = msg_bus_new();
+msg_bus_subscribe(bus, "agent-1");
+msg_bus_subscribe(bus, "agent-2");
+msg_bus_register_name(bus, "worker", "agent-1");
+msg_bus_publish(bus, ipc_msg_new(str_from("sys"), str_from("*"), MSG_EVENT, str_from("hello")));
+var iq1 = map_get(load64(bus), "agent-1");
+var iq2 = map_get(load64(bus), "agent-2");
+assert_eq(vec_len(iq1), 1, "broadcast reaches agent-1");
+assert_eq(vec_len(iq2), 1, "broadcast reaches agent-2");
+var sn_t, sn_v = msg_bus_send_to_name(bus, "worker",
+  ipc_msg_new(str_from("sys"), str_from("x"), MSG_COMMAND, str_from("cmd")));
+assert_eq(is_ok(sn_t), 1, "send_to_name to a known name is Ok");
+assert_eq(vec_len(iq1), 2, "named message lands on the resolved agent");
+assert_eq(vec_len(iq2), 1, "named message does not reach anyone else");
+var mt, mv = msg_bus_send_to_name(bus, "nobody",
+  ipc_msg_new(str_from("sys"), str_from("x"), MSG_COMMAND, str_from("c")));
+assert_eq(is_err_result(mt), 1, "send_to_name to an unknown name is Err");
+assert_eq(mv, DAIMON_ERR_AGENT_NOT_FOUND, "and the error is AGENT_NOT_FOUND");
+
+# --- RPC registry --------------------------------------------------------
+var rr = rpc_registry_new();
+rpc_register_method(rr, "scan", "agent-1");
+rpc_register_method(rr, "patch", "agent-1");
+rpc_register_method(rr, "report", "agent-2");
+assert(streq(rpc_find_handler(rr, "scan"), "agent-1") == 1, "method resolves to its agent");
+assert_eq(vec_len(rpc_list_methods(rr)), 3, "three methods listed");
+assert_eq(rpc_find_handler(rr, "missing"), 0, "unknown method resolves to 0");
+
+# ⛔ rpc_unregister_agent compared `handler == agent_id_cstr` — POINTER equality.
+# It only removed a method if the caller passed the IDENTICAL pointer used at
+# registration. A different buffer holding the same id — which is what a real
+# unregister request carries — matched nothing, and the agent's methods stayed
+# routable after it was gone.
+var gone = alloc(16);
+memcpy(gone, "agent-1", 7);
+store8(gone + 7, 0);
+rpc_unregister_agent(rr, gone);        # same CONTENT, different POINTER
+assert_eq(rpc_find_handler(rr, "scan"), 0,
+  "unregister removes the agent's methods by id CONTENT, not by pointer");
+assert_eq(rpc_find_handler(rr, "patch"), 0, "every method of that agent is removed");
+assert(streq(rpc_find_handler(rr, "report"), "agent-2") == 1,
+  "unregister leaves other agents' methods alone");
+
+# ⛔ ALIASING — instances 4-6 of the MCP (1.2.5) / RAG (2.1.6) / supervisor
+# (2.2.1) class. map_new() keys AND values are borrowed pointers; these three
+# functions stored the caller's cstr as both. The 1.2.5 clobber shape:
+var kb = alloc(16);
+var vb = alloc(16);
+memcpy(kb, "deploy", 6);  store8(kb + 6, 0);
+memcpy(vb, "agent-9", 7); store8(vb + 7, 0);
+rpc_register_method(rr, kb, vb);
+memset(kb, 88, 16);
+memset(vb, 88, 16);                    # a later request reuses both buffers
+assert(rpc_find_handler(rr, "deploy") != 0, "rpc: method KEY survives buffer reuse");
+assert(streq(rpc_find_handler(rr, "deploy"), "agent-9") == 1,
+  "rpc: handler VALUE survives buffer reuse");
+
+var nb = alloc(16);
+var ab = alloc(16);
+memcpy(nb, "builder", 7); store8(nb + 7, 0);
+memcpy(ab, "agent-7", 7); store8(ab + 7, 0);
+msg_bus_register_name(mb, nb, ab);
+memset(nb, 88, 16);
+memset(ab, 88, 16);
+assert(streq(msg_bus_get_agent_id(mb, "builder"), "agent-7") == 1,
+  "bus: registered name + id both survive buffer reuse");
+
+var sb = alloc(16);
+memcpy(sb, "agent-5", 7); store8(sb + 7, 0);
+msg_bus_subscribe(mb, sb);
+memset(sb, 88, 16);
+assert(map_get(load64(mb), "agent-5") != 0, "bus: subscriber key survives buffer reuse");
+
+syscall(SYS_EXIT, assert_summary());

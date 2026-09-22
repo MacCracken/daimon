@@ -1,0 +1,58 @@
+# =========================================================================
+# edge — tests against THE REAL src/edge.cyr (2.2.1)
+#
+# Regression test for a LIVE cross-request leak found by the 2.2.1 aliasing
+# sweep: POST /v1/edge/nodes {"name":"ORIGINAL_EDGE_NODE"}, then one unrelated
+# request from another client, and GET /v1/edge/nodes served that client's
+# bytes as the node's name. api_edge_register passes a jget VIEW into the
+# request buffer sandhi reuses; edge_node_new stored it raw. Fixed by owning
+# both retained Strs (name, arch) at the retention boundary.
+#
+# edge.cyr draws node ids from agent.cyr's `_next_agent_id`, so the include
+# chain is agent.tcyr's.
+# =========================================================================
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/io.cyr"
+include "lib/fs.cyr"
+include "lib/hashmap.cyr"
+include "lib/tagged.cyr"
+include "lib/bayan.cyr"
+include "lib/chrono.cyr"
+include "lib/syscalls.cyr"
+include "lib/math.cyr"
+include "lib/process.cyr"
+include "lib/sakshi.cyr"
+include "lib/libro.cyr"
+include "lib/assert.cyr"
+
+include "src/syscalls.cyr"
+include "src/error.cyr"
+include "src/audit.cyr"
+include "src/agent.cyr"
+include "src/edge.cyr"
+
+test_group("edge");
+daimon_audit_init();
+
+var n = edge_node_new(str_from("node-a"), str_from("aarch64"), 8, 16384);
+assert(str_eq(edge_node_name(n), str_from("node-a")) == 1, "edge node name round-trips");
+
+# The 1.2.5 clobber shape, on both retained Strs.
+var nb = alloc(32);
+var ab = alloc(32);
+memcpy(nb, "ORIGINAL_EDGE_NODE", 18);
+memcpy(ab, "x86_64", 6);
+var live = edge_node_new(str_new(nb, 18), str_new(ab, 6), 4, 4096);
+memset(nb, 88, 32);                    # the next request reuses the buffer
+memset(ab, 88, 32);
+assert(str_eq(edge_node_name(live), str_from("ORIGINAL_EDGE_NODE")) == 1,
+  "edge node NAME survives the request buffer being reused");
+assert(str_eq(load64(live + 24), str_from("x86_64")) == 1,
+  "edge node ARCH survives the request buffer being reused");
+
+syscall(SYS_EXIT, assert_summary());

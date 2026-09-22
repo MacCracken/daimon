@@ -27,7 +27,25 @@ enum StopReason {
 fn agent_handle_new(id, name) {
     var h = alloc(80);
     store64(h, id);                # id (integer counter)
-    store64(h + 8, name);          # name: Str
+    # ⛔ str_clone THE NAME — copy at the RETENTION boundary. 2.2.1.
+    #
+    # `api_register_agent` passes `jget(pairs, "name")`: a VIEW into the
+    # per-connection request buffer, which sandhi REUSES. Stored raw, the next
+    # request from ANY client overwrote it, and `GET /v1/agents` served that
+    # client's bytes back as this agent's name. Measured on the live binary:
+    #
+    #   POST /v1/agents {"name":"ORIGINAL_AGENT_NAME"} -> {"name":"ORIGINAL_AGENT_NAME"}
+    #   (one unrelated POST /v1/rag/query from another client)
+    #   GET  /v1/agents -> {"name":"y\":\"ZZZZZZZZZZZZZZZ"}
+    #
+    # A LIVE cross-request data disclosure on an unauthenticated endpoint — the
+    # same class as the 2.1.6 RAG leak (docs/development/issues/archive/
+    # 2026-09-22-rag-chunks-alias-the-request-buffer.md), whose "sweep, don't
+    # spot-fix" instruction was never carried out until 2.2.1. Fixed here rather
+    # than at the caller so every future caller of agent_handle_new is covered;
+    # cloning a caller that already owns its Str (a literal, str_from_int) costs
+    # one small copy and is harmless.
+    store64(h + 8, str_clone(name));   # name: Str (owned)
     store64(h + 16, AGENT_PENDING); # status
     store64(h + 24, clock_epoch_secs());   # created_at (epoch secs)
     store64(h + 32, 0);            # started_at

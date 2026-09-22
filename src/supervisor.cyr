@@ -220,7 +220,19 @@ fn supervisor_register(sup, agent_id_str) {
     var qmap = load64(sup + 8);
     var bmap = load64(sup + 16);
 
-    var id_cstr = str_data(agent_id_str);
+    # ⚠ str_clone THE KEY — the MCP-registry (1.2.5) / RAG (2.1.6) aliasing
+    # class, a third time. map_new() keys are BORROWED: map_set_a stores the
+    # key pointer as-is (`store64(ep, key)`), it does not copy. So keying the
+    # three maps by str_data(agent_id_str) stored a pointer into the CALLER's
+    # buffer. When 2.3.x wires the lifecycle, the id arrives from
+    # /v1/agents/{id} — the per-connection request buffer sandhi reuses — so a
+    # later request would rewrite the keys underneath the maps and every lookup
+    # for that agent would miss. str_clone allocates slen + 1 and NUL-
+    # terminates (lib/str.cyr), so str_data of the clone is a stable cstr, and
+    # the bump allocator never frees it. Found at 2.2.1 by the first test ever
+    # run against this function (tests/supervisor.tcyr). Unregister needs no
+    # clone: map_delete only compares the key, it never stores it.
+    var id_cstr = str_data(str_clone(agent_id_str));
     map_set(hmap, id_cstr, agent_health_new(0));
     map_set(qmap, id_cstr, quota_default());
     map_set(bmap, id_cstr, cb_default());
