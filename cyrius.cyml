@@ -5,7 +5,7 @@ description = "daimon — AGNOS agent orchestrator"
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/daimon"
 language = "cyrius"
-cyrius = "6.6.4"
+cyrius = "6.6.6"
 
 [build]
 entry = "src/main.cyr"
@@ -114,17 +114,17 @@ modules = ["dist/sigil.cyr"]
 
 [deps.libro]
 git = "https://github.com/MacCracken/libro.git"
-tag = "2.10.1"
+tag = "2.10.3"
 modules = ["dist/libro.cyr"]
 
 [deps.majra]
 git = "https://github.com/MacCracken/majra.git"
-tag = "2.7.2"
+tag = "2.9.1"
 modules = ["dist/majra.cyr"]
 
 [deps.bote]
 git = "https://github.com/MacCracken/bote.git"
-tag = "3.3.9"
+tag = "3.3.13"
 modules = ["dist/bote.cyr"]
 
 # Distribution manifest. Single binary today (`daimon`), with a best-effort

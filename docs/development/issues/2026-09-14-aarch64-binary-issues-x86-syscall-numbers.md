@@ -13,6 +13,26 @@ port). Not a 6.6.4 regression — the same warnings print under 6.6.2, and the r
 same for every number involved.
 **Severity:** **P2 — two silent hardening regressions, not an outage.** The x86_64 binary is unaffected.
 
+## ⚠ 2.1.5 update (2026-09-22): re-verified under cyrius 6.6.6 — daimon's half UNCHANGED, majra's half CLOSED
+
+The `ESYSXLAT` routed set **grew 44 → 60 rows** at 6.6.6. Re-derived here by disassembling the shipped
+artifact rather than reading it off a changelog (`aarch64-linux-gnu-objdump -d build/daimon-aarch64`,
+walking the `cmp x8,#SRC` / `mov x8,#DST` chain): 60 rows, source numbers
+
+```
+0 1 2 3 4 5 6 7 9 10 11 12 16 22 33 35 39 41 42 43 44 45 46 47 48 49 50 51 54 55 60 72 73 74 75 76
+77 79 82 83 84 87 88 89 137 138 217 228 232 262 263 269 280 319 1022 1039 1049 1054 1073 1074
+```
+
+**Neither 52 nor 160 is among the sixteen added**, so both defects in the table below stand exactly as
+filed; the seven correct ones are still correct (41→198, 42→203, 43→202, 49→200, 50→201, 55→209,
+82→38, and 434/424 pass through under unified numbering). Status stays 🔴 OPEN.
+
+**The sixth warning — majra's — is RESOLVED.** majra 2.9.1 (daimon 2.1.5 moved the pin from 2.7.2)
+replaced the raw `syscall(318, …)` in `uuid_generate` with the per-target `sys_getrandom` wrapper. The
+`duplicate symbol 'SYS_GETRANDOM'` line is gone from daimon's aarch64 build, which now emits exactly
+the five daimon-owned warnings quoted below and no sixth. See §"The sixth warning is upstream: majra".
+
 ## What was measured
 
 `src/main.cyr:34-42` ("Syscall numbers not in stdlib"), `src/server.cyr:11` and `src/agent.cyr:231`
@@ -117,12 +137,14 @@ neither of daimon's two real defects is.
 warning:lib/majra.cyr:205:19: duplicate symbol 'SYS_GETRANDOM' redefined with conflicting value (last definition wins)
 ```
 
-majra 2.7.2 (the latest tag) declares `var SYS_GETRANDOM = 318;` — x86_64 — in its bundle; the aarch64
+✅ **RESOLVED at daimon 2.1.5 (majra 2.9.1).** Historical description follows.
+
+majra 2.7.2 declared `var SYS_GETRANDOM = 318;` — x86_64 — in its bundle; the aarch64
 peer defines 278 (agnos 45), 318 is not an ESYSXLAT row, and the bundle is prepended after the stdlib
 leaves, so 318 wins on aarch64 for every `getrandom` in the translation unit. Filed with majra as
 `docs/development/issues/2026-09-14-raw-x86-syscall-numbers-aarch64.md` together with two more
 unrouted sites the sweep found there (`_SYS_FCHMOD` 91 on its IPC access-control path, raw
-`syscall(35)` in its DAG backoff). Not a daimon edit; recorded so the next majra bump checks for it.
+`syscall(35)` in its DAG backoff). Not a daimon edit; recorded so the next majra bump checks for it. **The next bump was daimon 2.1.5 → majra 2.9.1, and it did: the warning is gone.**
 
 ## Related
 

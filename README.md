@@ -6,7 +6,7 @@ The core runtime for the AGNOS ecosystem: agent lifecycle, HTTP API (port 8090),
 
 ## Building
 
-Requires [Cyrius](https://github.com/MacCracken/cyrius) 6.6.4+ (pinned in `cyrius.cyml`; the committed `cyrius.lock` carries the 6.6.4 `cyrius` trailer).
+Requires [Cyrius](https://github.com/MacCracken/cyrius) 6.6.6+ (pinned in `cyrius.cyml`; the committed `cyrius.lock` carries the 6.6.6 `cyrius` trailer).
 
 ```bash
 cyrius lib sync                        # vendor stdlib subset from the pin (lib/ is gitignored)

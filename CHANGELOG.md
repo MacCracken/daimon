@@ -4,6 +4,154 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.1.5] - 2026-09-22
+
+**Toolchain `6.6.4` → `6.6.6` plus three dependency pins; the other five were already at their
+latest tags.** No daimon source change — this is a pin-only release. **235 tests** pass, five fuzz
+harnesses clean, `fmt` / `lint` / `vet` clean (29 deps, 0 untrusted), `cyrius.lock` verifies 117/0
+with the `cyrius	6.6.6` trailer. Benchmarks measured head-to-head against a 6.6.4 build of the
+same tree, **10 interleaved trial pairs**: 15 of 19 flat, three faster, one slower — detail below.
+
+Two portability items moved without a line of daimon code changing, and one **pre-existing P1 data
+leak was found** by running the binary. Both are recorded rather than acted on here.
+
+### Changed — dependency pins
+
+| dep | was | now | | dep | was | now |
+|---|---|---|---|---|---|---|
+| cyrius | 6.6.4 | **6.6.6** | | sakshi | 2.5.2 | 2.5.2 |
+| libro | 2.10.1 | **2.10.3** | | bayan | 1.5.6 | 1.5.6 |
+| majra | 2.7.2 | **2.9.1** | | sigil | 3.12.18 | 3.12.18 |
+| bote | 3.3.9 | **3.3.13** | | samay | 1.1.2 | 1.1.2 |
+| | | | | ai-hwaccel | 2.3.23 | 2.3.23 |
+
+The transitive `patra` pin moves 1.14.1 → **1.14.3** in the lock, which is the version the stdlib
+snapshot already vendored — the 2.1.4 mismatch noted under "refusing to overwrite stdlib leaf" is
+gone. Lock grows 116 → 117 entries. `lib sync --full` copies 111 files (was 110); the new one is
+`alloc_cx.cyr`, the allocator peer for the cx bytecode target, which nothing in daimon reaches.
+
+What each moved pin carries for daimon:
+
+- **cyrius 6.6.6** — the 6.6.5+6.6.6 repair line. The three hard-error classes it adds were audited
+  against `src/` before the bump and none has a site: no `ret2`/`rethi` pair-return with a
+  single-value branch, no top-level `{ }` block `var`, and no duplicate top-level global (`grep '^var '`
+  across `src/*.cyr` → 50 globals, zero duplicated names). The roadmap's pre-flight prediction that
+  `lib/assert.cyr`'s new transitive `lib/vec.cyr` include would not collide with
+  `src/vector_store.cyr`'s `vec_entry_*` family held — the prefix is shared, the fourteen exported
+  `vec_*` names are not.
+- **majra 2.9.1** (two minors, from 2.7.2) — **closes the upstream half of the aarch64 filing.**
+  majra 2.7.2's bundle declared `var SYS_GETRANDOM = 318;` (x86_64), which is not an `ESYSXLAT` row
+  and, being prepended after the stdlib leaves, overrode the aarch64 peer's 278 **for daimon's whole
+  translation unit**. 2.9.1 routes `uuid_generate` through the per-target `sys_getrandom` wrapper, and
+  the sixth duplicate-symbol warning is gone from daimon's aarch64 build. majra remains
+  compile-time-only for daimon; nothing calls it at runtime.
+- **bote 3.3.13** — answers `ping` with `{"result":{}}` instead of `-32601` (SDK clients read the
+  error as an unhealthy server), accepts MCP revision `2025-06-18`, and adds `src/sandbox.cyr` to
+  `dist/bote.cyr` (30 → 31 modules). daimon calls the `libro_*` handlers directly, so the dispatcher
+  fixes do not reach its MCP surface; the bundle change is the reachable part.
+- **libro 2.10.3** — repair releases behind the audit chain daimon seeds at `daimon_audit_init`.
+
+### Changed — `--agnos` build: 53 errors → 3, and the upstream blocker is closed
+
+The roadmap item read *"P2 (upstream cyrius/bote + 3 daimon sites) — `--agnos` build fails, 53
+errors"*, rooted at 2.1.4 in bote's `dist/bote.deps` sidecar naming the Linux-internal
+`syscalls_linux_common` as a leaf, which `cyrius deps` prepended target-blind so the Linux peer
+compiled beside the standalone agnos peer. **Measured at 6.6.6: three errors, and
+`syscalls_linux_common` does not appear in the agnos unit at all.** What remains is exactly daimon's
+own share, already named in the filing:
+
+```
+error:src/agent.cyr:262:27: undefined variable 'SYS_EXECVE'
+error:src/agent.cyr:321:35: undefined variable 'SYS_WAIT4'
+error:src/agent.cyr:324:30: undefined variable 'SYS_WAIT4'
+```
+
+The item is no longer upstream-blocked; it is a scoped daimon change (an agnos spawn arm) awaiting
+the `dynlib`/`fdlopen`/`tls`/`mmap`/`net` scoping decision the filing calls for. Not done here — a
+pin release is the wrong place for it.
+
+### Fixed (upstream) — the aarch64 asset's sixth warning; its two real defects are unchanged
+
+The aarch64 cross-build succeeds and produces a valid ELF. The `ESYSXLAT` routed set was re-derived
+**by disassembling the shipped `build/daimon-aarch64`** rather than read off a changelog: **60 rows**
+at 6.6.6, up from 44 — confirming the growth, and confirming what it does *not* include.
+
+| symbol | daimon | routed at 6.6.6 | effect on aarch64 |
+|---|---:|---|---|
+| `SYS_SOCKET` / `CONNECT` / `ACCEPT` / `BIND` / `LISTEN` / `GETSOCKOPT` | 41/42/43/49/50/55 | → 198/203/202/200/201/209 | correct ✓ |
+| `SYS_RENAME` | 82 | → 38 (`renameat`) | correct ✓ |
+| `SYS_PIDFD_OPEN` / `SYS_PIDFD_SEND_SIGNAL` | 434/424 | pass-through (unified numbering) | correct ✓ |
+| **`SYS_GETPEERNAME`** | **52** | **still not a row** | runs as `fchmod` — VULN-009 per-IP rate limiter off |
+| **`SYS_SETRLIMIT`** | **160** | **still not a row** | runs as `uname` — VULN-010 agent rlimits never applied |
+
+Neither of daimon's two broken numbers was among the sixteen added, so
+[the P2 filing](docs/development/issues/2026-09-14-aarch64-binary-issues-x86-syscall-numbers.md)
+stays open and unchanged on the daimon side. Its majra half is now resolved (above).
+
+### Note — a P1 cross-request data leak, found by running the binary
+
+The roadmap's own post-bump check ("one agent lifecycle through the HTTP API and a vector-store
+round trip") turned up a **pre-existing** defect the 235-assertion suite cannot see:
+`POST /v1/rag/ingest` stores chunk text and metadata as `str_sub` **views** into the per-connection
+request buffer, which `src/server.cyr:210` documents as a *reused* per-batch arena. A later request
+overwrites those bytes, so `POST /v1/rag/query` returns **another client's request body**:
+
+```
+ingest {"text":"Daimon is the AGNOS agent orchestrator. …"} → {"chunk_ids":[1]}
+query  {"query":"what orchestrates AGNOS agents?"}
+    → "[1] hat orchestrates AGNOS agents?\"} rator. It supervises agents …"
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the query body, in the stored record
+```
+
+This is a recurrence of the HIGH bug thoth filed in June and daimon fixed at 1.2.5 for the MCP
+registry — `src/mcp.cyr` carries two ⚠ blocks calling it *"a documented CVE-class bug in this very
+file"* and instructing *"`str_clone` EVERY FIELD"*. That fix was never swept to the other retaining
+stores (`grep -c str_clone`: `mcp.cyr` 16, `rag.cyr` 0). **Reproduced identically on 6.6.4 and 6.6.6
+builds of the same tree, so it is not a bump regression** — recorded, not fixed here, because it
+needs its own test and bench cycle. Filed as
+[`2026-09-22-rag-chunks-alias-the-request-buffer.md`](docs/development/issues/2026-09-22-rag-chunks-alias-the-request-buffer.md)
+(P1) and roadmapped. The fix is one call site (`src/rag.cyr:140`); the regression-test pattern
+already exists in-repo from 1.2.5.
+
+### Performance
+
+19 benchmarks, `build/daimon_bench` from this tree built twice — once at the 2.1.4 pins, once at
+2.1.5's — then run **interleaved, 10 trial pairs**, so machine drift hits both equally. Median of
+per-trial means; `Δmin` is the best single sample, which is the floor with scheduler noise removed.
+
+| benchmark | 6.6.4 | 6.6.6 | Δmed | Δmin |
+|---|---:|---:|---:|---:|
+| config_default | 96ns | **88ns** | −8.4% | −3.4% |
+| mcp_find_tool_in_100 | 96ns | **90ns** | −6.7% | −5.3% |
+| cosine_128d | 641ns | **608ns** | −5.2% | +0.0% |
+| vector_insert_100x128d | 24.306us | 26.080us | **+7.3%** | +2.7% |
+| rag_ingest_5k_chars | 4.114us | 4.298us | +4.5% | +1.9% |
+| *(14 others)* | | | within ±3% | within ±3%, except `mcp_manifest_100_tools` +4.8% |
+
+`vector_insert_100x128d` is the one regression and the noisiest target in the set — 100 iterations
+against a ~20.6 µs floor with tail samples from 33 µs to 92 µs. Its **floor moved +2.7% while its
+median moved +7.3%**, i.e. most of the gap is tail distribution, not per-op cost. No daimon source
+changed, so this is code layout and the compiler's own growth (the x86_64 binary is 2,963,584 →
+2,993,192 bytes, +1.0%, which cyrius 6.6.6 attributes to its new refusals, the checked write path
+and the PE flag decoder). Recorded as measured rather than written off as noise.
+
+### Known issues (carried, re-checked at 6.6.6)
+
+- `duplicate fn 'uname_release'` — `lib/sigil.cyr:746` vs `lib/sys.cyr:203`. Upstream (sigil),
+  harmless (identical one-line bodies, last-wins is a no-op), unchanged since 2.1.4.
+- `array local over the per-fn frame budget gets STATIC storage` — `lib/sigil.cyr:25118`, sigil's
+  `var buf[262144]` crypto-bank init. Always had static storage; 6.6.5 promoted the note to a
+  warning. Upstream.
+- The `memory_store_get` *"returns a `: stack` pair … but a SINGLE value here"* diagnostic is still a
+  **false positive**, and the 2.1.4 note's reasoning was re-verified independently this release: a
+  16-line repro of the canonical `None()`-on-one-path / `Some(v)`-on-another shape reproduces the
+  warning **and all four runtime assertions hold** (`is_some`=1, payload=50, `is_none`=1,
+  `is_some`=0). `lib/tagged.cyr` documents the shape as correct; cyrius's own 6.6.0 entry introducing
+  the diagnostic documents its false-positive class and says *"the shape is only a defect when every
+  path is meant to be a Result — read the callers before acting on it."* A/B'd across 6.6.4 / 6.6.5 /
+  6.6.6: identical at all three, so it is not new. `memory_store_get` has no callers and is DCE'd.
+  Left as-is.
+
 ## [2.1.4] - 2026-09-14
 
 **Toolchain `6.6.2` → `6.6.4` plus six of the eight dependency pins.** No daimon source

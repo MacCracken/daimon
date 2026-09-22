@@ -1,10 +1,33 @@
 # daimon does not build for `--agnos`, and that blocks crab's M7 index
 
-**Status:** 🔴 **OPEN — MEASURED, not read.** `cyrius build --agnos src/main.cyr` fails at daimon
-2.1.3 with **53 errors across 36 distinct undefined symbols**.
+**Status:** 🟠 **OPEN, DOWNGRADED — the upstream half is CLOSED.** `cyrius build --agnos
+src/main.cyr` fails at daimon **2.1.5** with **3 errors across 2 symbols**, all daimon-owned (was
+53 errors / 36 symbols at 2.1.3 and 2.1.4). No longer upstream-blocked — see the 2.1.5 update.
 **Filed:** 2026-09-14, by **crab**.
 **Affects:** daimon **2.1.3** (and every version before it — no agnos build has ever been attempted).
 **Severity:** **Blocking for crab M7/M8.** Latent for daimon itself, which targets the host today.
+
+## ✅ 2.1.5 update (2026-09-22): 53 errors → 3 — the bote/cyrius half is CLOSED
+
+daimon 2.1.5 moved the pin to **cyrius 6.6.6** and bote to **3.3.13**. `cyrius build --agnos
+src/main.cyr` now reports **three errors, and `syscalls_linux_common` does not appear in the agnos
+translation unit at all** (`grep -c syscalls_linux_common` over the build log: 0). The 50 errors
+attributed to the Linux peer compiling beside the standalone agnos peer are gone; what is left is
+precisely the "3 daimon sites" this filing always named:
+
+```
+error:src/agent.cyr:262:27: undefined variable 'SYS_EXECVE' (missing include or enum?)
+error:src/agent.cyr:321:35: undefined variable 'SYS_WAIT4'  (missing include or enum?)
+error:src/agent.cyr:324:30: undefined variable 'SYS_WAIT4'  (missing include or enum?)
+```
+
+cyrius 6.6.6 also made `lib/io.cyr` self-sufficient (it includes `lib/args_agnos.cyr` itself), which
+closed the `_agnos_getenv` gap that sibling consumers hit on the same target.
+
+**What remains is a daimon change, not a wait.** An agnos spawn arm for `execve` / `wait4` in
+`src/agent.cyr`, plus the scoping decision this filing already raises on whether `dynlib` /
+`fdlopen` / `tls` / `mmap` / `net` mean anything on agnos. Deliberately not done in 2.1.5: that
+release is pin-only, and an agnos spawn path needs its own tests.
 
 ## ⚠ 2.1.4 update (2026-09-14): re-measured under cyrius 6.6.4 — hypothesis §"LIKELY ROOT" REFUTED
 
