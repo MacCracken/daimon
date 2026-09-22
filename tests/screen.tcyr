@@ -1,0 +1,130 @@
+# =========================================================================
+# screen — tests against THE REAL src/screen.cyr (2.2.3)
+#
+# Test-integrity arc (roadmap 2.2.x). tests/daimon.tcyr carried a local copy of
+# the recording-session state machine; its assertions are carried forward here
+# against the real module and the copy is DELETED from daimon.tcyr in the same
+# change. The recording manager and the capture-permission manager — seven
+# functions, none of which had a test or a caller — are covered for the first
+# time.
+#
+# screen.cyr draws session ids from agent.cyr's `_next_agent_id`, so the
+# include chain is agent.tcyr's.
+# =========================================================================
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/io.cyr"
+include "lib/fs.cyr"
+include "lib/hashmap.cyr"
+include "lib/tagged.cyr"
+include "lib/bayan.cyr"
+include "lib/chrono.cyr"
+include "lib/syscalls.cyr"
+include "lib/math.cyr"
+include "lib/process.cyr"
+include "lib/sakshi.cyr"
+include "lib/libro.cyr"
+include "lib/assert.cyr"
+
+include "src/syscalls.cyr"
+include "src/error.cyr"
+include "src/audit.cyr"
+include "src/agent.cyr"
+include "src/screen.cyr"
+
+daimon_audit_init();
+
+# --- recording state machine: carried forward from daimon.tcyr -------------
+test_group("recording");
+var rec = recording_session_new(str_from("agent-1"));
+assert_eq(recording_status(rec), REC_ACTIVE, "starts active");
+assert_eq(recording_frame_count(rec), 0, "0 frames initially");
+
+assert(is_ok(recording_add_frame(rec)) == 1, "add frame 1");
+var af_t, af_v = recording_add_frame(rec);
+assert_eq(af_v, 2, "add frame 2");
+
+assert(is_ok(recording_pause(rec)) == 1, "pause ok");
+assert(is_err_result(recording_add_frame(rec)) == 1, "add frame while paused fails");
+
+assert(is_ok(recording_resume(rec)) == 1, "resume ok");
+assert(is_ok(recording_add_frame(rec)) == 1, "add frame after resume");
+assert_eq(recording_frame_count(rec), 3, "3 frames total");
+
+assert(is_ok(recording_stop(rec)) == 1, "stop ok");
+assert_eq(recording_status(rec), REC_STOPPED, "stopped status");
+assert(is_err_result(recording_add_frame(rec)) == 1, "add frame after stop fails");
+
+var rec2 = recording_session_new(str_from("agent-2"));
+assert(is_err_result(recording_resume(rec2)) == 1, "resume active fails");
+recording_pause(rec2);
+assert(is_err_result(recording_pause(rec2)) == 1, "double pause fails");
+
+# First coverage: ids are unique, and a stopped session stays stopped.
+assert(str_eq(recording_id(rec), recording_id(rec2)) == 0, "session ids are unique");
+assert(is_err_result(recording_resume(rec)) == 1, "a stopped session cannot resume");
+
+# ⛔ 2.2.3 — the session OWNS its agent id (the 1.2.5 clobber shape).
+var ab = alloc(32);
+memcpy(ab, "agent-ORIGINAL", 14);
+var rec3 = recording_session_new(str_new(ab, 14));
+memset(ab, 88, 32);
+assert(str_eq(load64(rec3 + 32), str_from("agent-ORIGINAL")) == 1,
+  "recording agent id survives the request buffer being reused");
+
+# --- recording manager: first coverage --------------------------------------
+test_group("rec_mgr");
+var rm = rec_mgr_new();
+var sid = rec_mgr_start(rm, str_from("agent-7"));
+assert(sid != 0, "rec_mgr_start returns the session id");
+var got = rec_mgr_get(rm, str_data(sid));
+assert(got != 0, "the session is found by its id");
+assert_eq(recording_status(got), REC_ACTIVE, "and is active");
+assert_eq(rec_mgr_get(rm, "no-such-session"), 0, "an unknown id finds nothing");
+var sid2 = rec_mgr_start(rm, str_from("agent-7"));
+assert(str_eq(sid, sid2) == 0, "a second start is a second session");
+
+# --- capture permissions: first coverage ------------------------------------
+test_group("cap_mgr");
+var cm = cap_mgr_new();
+assert(is_err_result(cap_mgr_check(cm, "agent-1")) == 1, "no permission, no capture");
+cap_mgr_grant(cm, cap_perm_new(str_from("agent-1"), 2));
+assert(is_ok(cap_mgr_check(cm, "agent-1")) == 1, "first capture allowed");
+assert(is_ok(cap_mgr_check(cm, "agent-1")) == 1, "second capture allowed (max 2/min)");
+assert(is_err_result(cap_mgr_check(cm, "agent-1")) == 1, "third capture in the minute refused");
+assert(is_err_result(cap_mgr_check(cm, "agent-2")) == 1, "another agent's grant is not shared");
+
+cap_mgr_revoke(cm, "agent-1");
+assert(is_err_result(cap_mgr_check(cm, "agent-1")) == 1, "revoked means refused");
+
+var expired = cap_perm_new(str_from("agent-3"), 10);
+store64(expired + 16, clock_epoch_secs() - 1);          # expires_at, already past
+cap_mgr_grant(cm, expired);
+assert(is_err_result(cap_mgr_check(cm, "agent-3")) == 1, "an expired grant is refused");
+
+var future = cap_perm_new(str_from("agent-4"), 10);
+store64(future + 16, clock_epoch_secs() + 3600);
+cap_mgr_grant(cm, future);
+assert(is_ok(cap_mgr_check(cm, "agent-4")) == 1, "an unexpired grant is honoured");
+
+# ⛔ 2.2.3 — the grant's key and agent id are OWNED. cap_mgr_grant keyed the map
+# by str_data(<caller's Str>): a view that the next request rewrote.
+var gb = alloc(32);
+memcpy(gb, "agent-GRANTED", 13);
+cap_mgr_grant(cm, cap_perm_new(str_new(gb, 13), 5));
+memset(gb, 88, 32);
+assert(is_ok(cap_mgr_check(cm, "agent-GRANTED")) == 1,
+  "a grant survives the request buffer being reused (its map key is owned)");
+
+# A view of a LARGER buffer must key by the id alone — only a terminated copy
+# ends where the id ends.
+var vb = alloc(32);
+memcpy(vb, "agent-V,trailing-bytes", 22);
+cap_mgr_grant(cm, cap_perm_new(str_new(vb, 7), 5));
+assert(is_ok(cap_mgr_check(cm, "agent-V")) == 1, "a grant whose id is a view is found by that id");
+
+syscall(SYS_EXIT, assert_summary());

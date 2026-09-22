@@ -5,31 +5,64 @@
 
 > The Rust-vs-Cyrius tables below are the **frozen v1.0.1 port-era snapshot** (cyrius 4.2.0). The current toolchain baseline is captured separately just below.
 
-## Current baseline — daimon 1.3.0 / cyrius 6.3.43 (2026-07-03)
+## Current baseline — daimon 2.2.3 / cyrius 6.6.6 (2026-09-22) — THE REAL CODE
 
-Re-baselined under the 6.3.43 toolchain (`./scripts/bench-history.sh` → `tests/daimon.bcyr`). Averages over the iteration counts shown; no microbenchmark touches HTTP, so these are pure in-memory op costs.
+`./scripts/bench-history.sh` → `tests/daimon.bcyr`. Averages over the iteration counts shown; no
+microbenchmark touches HTTP.
 
-| Benchmark | avg | min | iters |
-|---|---:|---:|---:|
-| config_default | 1.510µs | 907ns | 10000 |
-| cosine_128d | 2.068µs | 908ns | 10000 |
-| vector_insert_100x128d | 58.548µs | 53.917µs | 100 |
-| vector_search_1k_64d | 325.916µs | 316.032µs | 100 |
-| rag_ingest_5k_chars | 7.629µs | 5.657µs | 1000 |
-| scheduler_100_tasks | 194.797µs | 189.339µs | 100 |
-| supervisor_register_1000 | 399.205µs | 382.590µs | 10 |
-| mcp_register_100_tools | 70.228µs | 67.257µs | 100 |
-| mcp_manifest_100_tools | 69.505µs | 66.349µs | 1000 |
-| mcp_find_tool_in_100 | 1.456µs | 907ns | 100000 |
-| mcp_extract_input_schema | 2.216µs | 908ns | 10000 |
-| edge_register_100 | 197.444µs | 190.877µs | 100 |
-| edge_heartbeat_100 | 721.560µs | 668.032µs | 1000 |
-| edge_stats_500 | 49.119µs | 45.816µs | 1000 |
-| circuit_breaker_cycle | 5.372µs | 4.260µs | 100000 |
-| hashmap_1000_insert_lookup | 489.127µs | 471.499µs | 100 |
-| json_parse | 1.976µs | 908ns | 10000 |
+⛔ **Until 2.2.3 `tests/daimon.bcyr` benchmarked simplified local COPIES of daimon's functions, not
+daimon.** At 2.2.1 `cmp` showed its binary was byte-identical before and after that release: it
+could not observe any change to `src/`. Every benchmark now calls the shipping function, so the
+seven marked † below measure different — larger — work than their pre-2.2.3 numbers did, and
+those numbers are not comparable.
 
-The stdlib hot-path shapes are unchanged from the port-era analysis below (hashmap value-iteration and compute-loop vectorization remain the standing optimization opportunities).
+| Benchmark | avg | min | iters | pre-2.2.3 (copy) |
+|---|---:|---:|---:|---:|
+| config_default | 91ns | 88ns | 10000 | 91ns |
+| cosine_128d | 616ns | 611ns | 10000 | 650ns |
+| vector_insert_100x128d † | 173.0µs | 166.4µs | 100 | 26.0µs — filled arrays, never called `vindex_insert` |
+| vector_search_1k_64d † | 377.3µs | 368.6µs | 100 | 316.1µs — scored, never ranked |
+| rag_chunk_5k_chars (was rag_ingest_5k_chars) | 4.20µs | 4.10µs | 1000 | 4.14µs — same work; renamed because it never ingested |
+| scheduler_100_tasks † | 318.4µs | 308.2µs | 100 | 88.4µs — counted fake structs, not samay |
+| supervisor_register_1000 † | 2.437ms | 2.437ms | 10 | 356.2µs — one map_set, the real call fills three |
+| mcp_register_100_tools | 70.3µs | 68.2µs | 100 | 56.2µs |
+| mcp_manifest_100_tools † | 139.1µs | 133.0µs | 1000 | 65.5µs — sorted keys, built no JSON |
+| mcp_find_tool_in_100 | 93ns | 92ns | 100000 | 142ns |
+| mcp_extract_input_schema | 4.49µs | 4.28µs | 10000 | 5.02µs |
+| edge_register_100 † | 898.5µs | 840.1µs | 100 | 85.2µs — no duplicate-name scan |
+| edge_heartbeat_100 | 142.2µs | 140.1µs | 1000 | 221.5µs |
+| edge_stats_500 | 56.6µs | 54.7µs | 1000 | 51.2µs |
+| circuit_breaker_cycle † | 4.06µs | 3.99µs | 100000 | 1.09µs — no clock read, no log call |
+| hashmap_1000_insert_lookup | 477.1µs | 460.1µs | 100 | 480.2µs |
+| json_parse | 421ns | 409ns | 10000 | 418ns |
+| secure_zero_4k | 5.46µs | 5.24µs | 100000 | 5.45µs |
+| trace_id_hex | 47ns | 46ns | 100000 | 43ns |
+
+`tests/rag_ingest.bcyr` (real since 2.1.6): `rag_ingest_real_5k` 133.1µs, `rag_chunk_only_5k` 508ns.
+
+### The search fix these numbers exposed (2.2.3)
+
+Run against the real function for the first time, `vector_search_1k_64d` read **7.51 ms**, not the
+copy's 316 µs: `vindex_search` insertion-sorted every entry to return the top five, which is
+quadratic in the index size on `POST /v1/rag/query`. It now keeps only the best `top_k` while
+scoring — same results, order included (a differential test over 3,000 random indexes with
+36,454 tied pairs found no difference). Per query, 64-d, top_k 5:
+
+| entries | before | after |
+|---:|---:|---:|
+| 1,000 | 7.48 ms | 0.38 ms |
+| 4,000 | 115 ms | 1.51 ms |
+| 10,000 | 716 ms | 3.86 ms |
+
+## Port-era comparison (frozen, v1.0.1)
+
+⛔ **Correction (2.2.3).** Every Cyrius number in the frozen tables below was measured against the
+benchmark file's local COPIES, not daimon's source (see the note above), so where the copy did less
+work than the Rust benchmark the comparison flatters Cyrius. The two recorded "wins" were artifacts
+of exactly that: `rag_ingest_5k_chars` timed `chunk_text` alone (a real 5 KB ingest is 133 µs against
+Rust's 210 µs — still ahead, by 1.6x, not 42x), and `vector_insert_100x128d` timed array fills (a
+real 100-entry insert is 173 µs against Rust's 343 µs — 2.0x, not 3.5x). The tables are kept as the
+historical record; read their Cyrius column as a lower bound.
 
 ## Core Operations
 
@@ -87,7 +120,8 @@ The stdlib hot-path shapes are unchanged from the port-era analysis below (hashm
 
 ### Where Cyrius wins
 
-**Allocation-heavy workloads** — `vector_insert` (3.5x faster) and `rag_ingest` (42x faster). The bump allocator eliminates malloc/free overhead entirely. Insert 100 vectors with 128-dimension embeddings: Rust spends time in HashMap resizing and Vec allocation; Cyrius just increments a pointer.
+**Allocation-heavy workloads** — `vector_insert` and `rag_ingest` (recorded as 3.5x and 42x; **2.0x
+and 1.6x** against the real code — see the 2.2.3 correction above). The bump allocator eliminates malloc/free overhead entirely. Insert 100 vectors with 128-dimension embeddings: Rust spends time in HashMap resizing and Vec allocation; Cyrius just increments a pointer.
 
 ### Where Rust wins
 
@@ -103,7 +137,8 @@ Scheduler scheduling (1.5x), supervisor registration (2.5x), MCP registration (1
 
 1. **Hashmap value iteration** — add `map_values()` or `map_for_each()` to cyrius stdlib to avoid the keys→get indirection chain. Would close the 30-60x gap on edge heartbeat/stats.
 2. **SIMD cosine** — hand-written SSE2 `asm {}` block for the dot product inner loop. Would close the 10x gap.
-3. **Inline sort** — the insertion sort in vector search and scheduler scheduling could be replaced with a more cache-friendly merge sort for larger datasets.
+3. **Inline sort** — ✅ vector search, 2.2.3: top-k selection replaced the full insertion sort (see
+   the table above). Scheduling's sort is samay's now.
 
 ## Project Comparison
 
@@ -130,7 +165,7 @@ Scheduler scheduling (1.5x), supervisor registration (2.5x), MCP registration (1
 | config | Complete | Complete | Defaults, accessors |
 | agent | Complete | Complete | Lifecycle, /proc, pidfd signals, rlimits |
 | supervisor | Complete | Complete | Circuit breaker, output capture, health, quotas |
-| memory | Complete | Complete | CRUD, list_keys, list_by_tag, clear, usage_bytes |
+| memory | Complete | Complete (2.2.3) | ⛔ Listed "Complete" since the port and never run: the first call of any kind killed the process until 2.2.3. No route reaches it yet; no `tags` field, so `list_by_tag` is a substring search |
 | vector_store | Complete | Complete | Cosine similarity, search, normalize |
 | rag | Complete | Complete | Chunk, embed, ingest, query, context format |
 | mcp | Complete | Complete | Registry + types; external forwarding via sandhi_rpc_mcp_call (1.2.1); bote libro-tool re-exports being wired (1.3.0) |
@@ -138,10 +173,10 @@ Scheduler scheduling (1.5x), supervisor registration (2.5x), MCP registration (1
 | scheduler | Complete | Complete | NodeCapacity, scheduling, cron, preemption, stats |
 | federation | Complete | Complete | Cluster, election, scoring, placement, vector store |
 | edge | Complete | Complete | Register, heartbeat, health, decommission, stats |
-| ipc | Complete | Complete | Unix sockets, message bus, RPC registry |
+| ipc | Complete | Partial | Message bus + RPC registry tested; the Unix-socket half first ran at 2.2.3 (`agent_ipc_new` crashed, `agent_ipc_bind` made a directory at the socket path). No route wires it yet (roadmap 2.3.x) |
 | api | Complete | Complete | 24/24 endpoints |
 | logging | Complete | Complete | sakshi integration |
-| firewall | Complete | **Blocked** | Requires nein Cyrius port |
+| firewall | Complete | Integrated (2.1.8) | nein's MCP tools; the mutating half is gated shut until caller authentication (roadmap 2.5.x) |
 | http-forward | Complete | Complete | External MCP forwarding via sandhi_rpc_mcp_call (1.2.1) |
 
 ### Test Coverage
@@ -149,7 +184,8 @@ Scheduler scheduling (1.5x), supervisor registration (2.5x), MCP registration (1
 | | Rust | Cyrius |
 |---|---|---|
 | Unit tests | 305 | — (inline in test groups) |
-| Integration tests | 28 | 225 assertions / 26 groups |
-| Benchmarks | 19 | 17 |
-| Fuzz harnesses | 0 | 5 |
+| Integration tests | 28 | 645 assertions / 16 suites, each against its real `src/` module (2.2.3) |
+| Benchmarks | 19 | 21, against the real code (2.2.3) |
+| Fuzz harnesses | 0 | 6, property-based, run in CI (2.2.3) |
+| HTTP smoke | — | tests/smoke.sh, run in CI (2.2.3) |
 | Security audit | — | 10 findings, 9 fixed, 1 gated |

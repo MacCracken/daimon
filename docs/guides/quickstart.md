@@ -44,23 +44,25 @@ curl -X POST http://localhost:8090/v1/agents -d '{"name":"my-first-agent"}'
 ## Run Tests
 
 ```bash
-cyrius build tests/daimon.tcyr build/daimon_test && build/daimon_test
-# → 225 passed, 0 failed (225 total)
+cyrius tests          # every tests/*.tcyr suite — each prints "N passed, 0 failed"
+cyrius fuzz           # the fuzz/ harnesses
+sh tests/smoke.sh     # the built binary over HTTP
 ```
 
 ## Run Benchmarks
 
 ```bash
-cyrius build tests/daimon.bcyr build/daimon_bench && build/daimon_bench
+cyrius bench tests/daimon.bcyr
 ```
 
 ## Project Structure
 
 ```
 src/                  Source (30 modules, entry src/main.cyr)
-tests/daimon.tcyr     Test suite (225 assertions)
-tests/daimon.bcyr     Benchmarks (17)
-fuzz/                 Fuzz harnesses (5)
+tests/*.tcyr          Test suites, one per module (645 assertions, 16 files)
+tests/daimon.bcyr     Benchmarks (19; tests/rag_ingest.bcyr has 2 more)
+tests/smoke.sh        HTTP smoke checks against the built binary
+fuzz/                 Property-based fuzz harnesses (6), sharing fuzz/rng.cyr
 build/daimon          Binary (181 KB)
 docs/                 Architecture, guides, ADRs, audit reports
 ```

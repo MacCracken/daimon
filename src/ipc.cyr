@@ -16,14 +16,27 @@ enum MessageType {
 
 var MAX_MESSAGE_SIZE = 65536;
 
+# Own a retained Str (0 stays 0 — an absent field is not an error here).
+fn _ipc_own_str(s) {
+    if (s == 0) { return 0; }
+    return str_clone(s);
+}
+
+# ⛔ 2.2.3 — the message OWNS its three Strs. A message outlives the call that
+# made it: msg_bus_publish pushes it onto subscriber queues, where it waits to be
+# read. Borrowed, a source/target/payload that came from a request (a jget VIEW
+# into the buffer sandhi reuses) would be rewritten by the next request while
+# still queued — the same class as the 2.2.1 registry fix, one struct over, and
+# missed by that sweep. It also makes `target` NUL-terminated, which
+# msg_bus_publish relies on when it uses str_data(target) as a map key.
 fn ipc_msg_new(source, target, msg_type, payload) {
     var m = alloc(48);
     store64(m, str_from_int(_next_agent_id));
     _next_agent_id = _next_agent_id + 1;
-    store64(m + 8, source);
-    store64(m + 16, target);
+    store64(m + 8, _ipc_own_str(source));
+    store64(m + 16, _ipc_own_str(target));
     store64(m + 24, msg_type);
-    store64(m + 32, payload);
+    store64(m + 32, _ipc_own_str(payload));
     store64(m + 40, clock_epoch_secs());
     return m;
 }
@@ -173,15 +186,25 @@ fn active_connection_count() { return _global_active_connections; }
 # AgentIpc: {agent_id: Str, socket_path: Str, queue: vec<IpcMessage>}
 # 3 fields x 8 = 24 bytes
 
+# ⛔ 2.2.3 — this crashed on its first call, which it had never had. It handed
+# `path_join` two `str_data(...)` char pointers where it takes Strs, so
+# path_join read the directory's bytes as a Str header and the process died in
+# str_builder ("alloc failed", exit 1) — the defect that also took down every
+# memory_store_* call. The agent id is owned for the same reason ipc_msg_new's
+# fields are: the struct outlives the request that named it.
 fn agent_ipc_new(agent_id_str, socket_dir) {
     var ipc = alloc(24);
-    store64(ipc, agent_id_str);
-    var sock_name = str_cat(agent_id_str, str_from(".sock"));
-    var spath = path_join(str_data(socket_dir), str_data(sock_name));
+    var aid = str_clone(agent_id_str);
+    store64(ipc, aid);
+    var sock_name = str_cat(aid, str_from(".sock"));
+    var spath = path_join(socket_dir, sock_name);
     store64(ipc + 8, spath);
     store64(ipc + 16, vec_new());    # message queue
     return ipc;
 }
+
+# sockaddr_un.sun_path is 108 bytes including its NUL: 107 usable.
+var IPC_SUN_PATH_MAX = 107;
 
 fn agent_ipc_id(ipc) { return load64(ipc); }
 fn agent_ipc_socket_path(ipc) { return load64(ipc + 8); }
@@ -192,16 +215,25 @@ fn agent_ipc_bind(ipc) {
     var spath = load64(ipc + 8);
     var path_cstr = str_data(spath);
 
-    # Ensure parent directory exists
-    var dir = path_dirname(spath);
-    # ⚠ sys_* WRAPPER, never a raw syscall(SYS_MKDIR, ...). A bare `syscall(SYS_FOO, ...)` is a
-    # portability CLAIM that arm64 Linux does not honour: it has no legacy mkdir/unlink/chmod at all,
-    # only the *at forms, so the constants simply do not exist there and the cross-build fails to
-    # compile. This file and memory.cyr were the reason daimon's aarch64 CI lane was red. The wrapper
-    # resolves per target. (Note for anyone porting further: the AGNOS variant of these wrappers takes
-    # a pathlen rather than a mode and sys_unlink takes two args — daimon does not target AGNOS, but
-    # that arity difference is real and would need handling if it ever does.)
-    sys_mkdir(str_data(dir), 493);  # 0755
+    # A path sun_path cannot hold is an ERROR, not something to truncate: the
+    # old code clipped it to 107 bytes and bound a DIFFERENT socket than the one
+    # agent_ipc_socket_path reports, which no sender would ever find.
+    if (str_len(spath) > IPC_SUN_PATH_MAX) { return Err(DAIMON_ERR_IPC_FAULT); }
+
+    # Ensure parent directory exists.
+    #
+    # ⛔ 2.2.3 — two defects on this one line, both invisible until it ran:
+    #  1. `path_dirname` returns a str_sub VIEW of the socket path, not a copy,
+    #     so `str_data(dir)` is not terminated at the directory: mkdir received
+    #     the WHOLE socket path and created a DIRECTORY where the socket goes.
+    #     The unlink below then fails on it (EISDIR) and bind fails (EADDRINUSE)
+    #     — every time. str_cstr copies exactly the dirname and terminates it.
+    #  2. `sys_mkdir(path, 493)` is (path, PATHLEN) on agnos, not (path, mode) —
+    #     same arity, so it compiled — and handed that kernel 493 as the length.
+    #     xmkdir_p is the stdlib's portable form, and it also creates parents.
+    # (This comment used to say "daimon does not target AGNOS". It is daimon's
+    # primary target — see src/syscalls.cyr.)
+    xmkdir_p(str_cstr(path_dirname(spath)), 493);  # 0755
 
     # Remove stale socket if it exists
     daimon_unlink(path_cstr, str_len(spath));
@@ -213,8 +245,7 @@ fn agent_ipc_bind(ipc) {
     # Build sockaddr_un: {sa_family=1, sun_path=...}
     var addr_buf = alloc(112);  # sizeof(sockaddr_un) = 110
     store16(addr_buf, 1);        # AF_UNIX
-    var plen = str_len(spath);
-    if (plen > 107) { plen = 107; }
+    var plen = str_len(spath);        # <= IPC_SUN_PATH_MAX, checked above
     memcpy(addr_buf + 2, path_cstr, plen);
     store8(addr_buf + 2 + plen, 0);
 
@@ -325,6 +356,8 @@ fn agent_ipc_accept_one(fd, ipc) {
 # Send a message to another agent's socket
 fn agent_ipc_send(target_socket_path, message_str) {
     var path_cstr = str_data(target_socket_path);
+    # Same rule as agent_ipc_bind: never connect to a truncated, different path.
+    if (str_len(target_socket_path) > IPC_SUN_PATH_MAX) { return Err(DAIMON_ERR_IPC_FAULT); }
 
     # Connect to Unix socket
     var fd = sys_socket(1, 1, 0);
@@ -333,7 +366,6 @@ fn agent_ipc_send(target_socket_path, message_str) {
     var addr_buf = alloc(112);
     store16(addr_buf, 1);  # AF_UNIX
     var plen = str_len(target_socket_path);
-    if (plen > 107) { plen = 107; }
     memcpy(addr_buf + 2, path_cstr, plen);
     store8(addr_buf + 2 + plen, 0);
 
@@ -353,8 +385,9 @@ fn agent_ipc_send(target_socket_path, message_str) {
     sys_write(fd, &hdr, 4);
     sys_write(fd, str_data(message_str), msg_len);
 
-    # Read ACK
-    var ack_buf[1];
+    # Read ACK. A failed read leaves ack at 0, which is neither ACK nor a NACK.
+    var ack_buf: u8[1];
+    store8(&ack_buf, 0);
     sys_read(fd, &ack_buf, 1);
     var ack = load8(&ack_buf);
 

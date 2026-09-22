@@ -10,13 +10,24 @@ enum VectorReplication {
     REPL_SHARDED = 2;
 }
 
+# ⛔ 2.2.3 — every Str or key this store RETAINS is owned: the replica's node id
+# and address, the store's own local id, and the collection name it keys by.
+# All four were the caller's pointers — the 2.2.1 aliasing class, recorded as
+# latent on the roadmap ("fed_vector_store.cyr keys") because nothing calls the
+# store yet. The collection key mattered twice over: map_new() keys are
+# borrowed, AND a key must be a terminated cstr, which a view is not.
+fn _fvs_own(s) {
+    if (s == 0) { return 0; }
+    return str_clone(s);
+}
+
 # CollectionReplica: {node_id: Str, address: Str, vector_count, last_synced}
 # 4 fields x 8 = 32 bytes
 
 fn collection_replica_new(node_id, address, vector_count) {
     var cr = alloc(32);
-    store64(cr, node_id);
-    store64(cr + 8, address);
+    store64(cr, _fvs_own(node_id));
+    store64(cr + 8, _fvs_own(address));
     store64(cr + 16, vector_count);
     store64(cr + 24, clock_epoch_secs());
     return cr;
@@ -31,7 +42,7 @@ fn replica_vector_count(cr) { return load64(cr + 16); }
 
 fn fed_vstore_new(local_node_id, strategy) {
     var fvs = alloc(32);
-    store64(fvs, local_node_id);
+    store64(fvs, _fvs_own(local_node_id));
     store64(fvs + 8, map_new());     # collections map
     store64(fvs + 16, strategy);
     store64(fvs + 24, 100);           # max_remote_results
@@ -46,7 +57,7 @@ fn fed_vstore_register_replica(fvs, collection_cstr, node_id, address, vector_co
     var replicas = map_get(colls, collection_cstr);
     if (replicas == 0) {
         replicas = vec_new();
-        map_set(colls, collection_cstr, replicas);
+        map_set(colls, str_data(str_clone(str_from(collection_cstr))), replicas);
     }
     vec_push(replicas, collection_replica_new(node_id, address, vector_count));
 }

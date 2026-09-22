@@ -83,6 +83,25 @@ fn mcp_register_builtin(reg, tool) {
     map_set(load64(reg), str_cstr(name), tool);
 }
 
+# 1 if `name_cstr` names a builtin tool.
+fn mcp_is_builtin(reg, name_cstr) {
+    if (map_get(load64(reg), name_cstr) != 0) { return 1; }
+    return 0;
+}
+
+# ⛔ 2.2.3 — AN EXTERNAL REGISTRATION MAY NOT TAKE A BUILTIN'S NAME. Returns Ok(0),
+# or Err(DAIMON_ERR_AGENT_EXISTS) — the enum's one "already exists" code, which
+# error_to_status maps to 409 — when a builtin already has the name.
+#
+# Before, it could. api_mcp_call routes on "does this name have an external
+# URL?", so one registration of `{"name":"libro_verify","callback_url":<any>}`
+# redirected every later call to daimon's own audit-chain verifier to that URL,
+# with the caller's arguments, and relayed whatever came back as the verdict.
+# Measured on 2.2.2: libro_verify answered {"ok":true} before, and was forwarded
+# (502, nothing listening) after — from a `Content-Type: text/plain` POST, which
+# is a CORS-simple request any web page can send. api_mcp_call now also prefers
+# the builtin outright, so the two layers each close it.
+#
 # Deep-copy the tool's Strs and callback_url into registry-owned storage
 # before storing. The Strs handed in by api_mcp_register point into the
 # transient per-connection request buffer, which sync mode reuses for later
@@ -93,6 +112,9 @@ fn mcp_register_builtin(reg, tool) {
 # lifetime. See docs/development/issues/archive/2026-06-11-mcp-registry-aliases-
 # request-buffer.md.
 fn mcp_register_external(reg, tool, callback_url) {
+    if (mcp_is_builtin(reg, str_cstr(mcp_tool_name(tool))) == 1) {
+        return Err(DAIMON_ERR_AGENT_EXISTS);
+    }
     var name = str_clone(mcp_tool_name(tool));
     var desc = str_clone(mcp_tool_desc(tool));
     var schema = str_clone(mcp_tool_schema(tool));
@@ -101,10 +123,54 @@ fn mcp_register_external(reg, tool, callback_url) {
     store64(ext, owned);
     store64(ext + 8, str_clone(callback_url));
     map_set(load64(reg + 8), str_cstr(name), ext);
+    return Ok(0);
 }
 
 fn mcp_tool_count(reg) {
     return map_count(load64(reg)) + map_count(load64(reg + 8));
+}
+
+# One manifest entry: {"name":…,"description":…,"inputSchema":…}.
+fn _mcp_manifest_entry(sb, t) {
+    str_builder_add_cstr(sb, "{\"name\":\"");
+    str_builder_add(sb, json_escape_str(mcp_tool_name(t)));
+    str_builder_add_cstr(sb, "\",\"description\":\"");
+    str_builder_add(sb, json_escape_str(mcp_tool_desc(t)));
+    str_builder_add_cstr(sb, "\",\"inputSchema\":");
+    str_builder_add(sb, mcp_manifest_schema(t));
+    str_builder_add_cstr(sb, "}");
+}
+
+# The GET /v1/mcp/tools body: {"tools":[…builtins, …externals],"count":N}.
+#
+# Moved here from api_mcp_manifest at 2.2.3. It was built inline in the HTTP
+# handler, so no test could reach the one response every MCP client reads
+# first, and daimon.bcyr's "mcp_manifest_100_tools" timed a local key SORT the
+# real manifest has never done. As a pure function of the registry it is
+# tested (tests/mcp.tcyr parses it back) and benchmarked as it actually runs.
+fn mcp_manifest_json(reg) {
+    var builtin = load64(reg);
+    var external = load64(reg + 8);
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"tools\":[");
+    var keys = map_keys(builtin);
+    var i = 0;
+    while (i < vec_len(keys)) {
+        if (i > 0) { str_builder_add_cstr(sb, ","); }
+        _mcp_manifest_entry(sb, map_get(builtin, vec_get(keys, i)));
+        i = i + 1;
+    }
+    var ekeys = map_keys(external);
+    var j = 0;
+    while (j < vec_len(ekeys)) {
+        if (i + j > 0) { str_builder_add_cstr(sb, ","); }
+        _mcp_manifest_entry(sb, load64(map_get(external, vec_get(ekeys, j))));
+        j = j + 1;
+    }
+    str_builder_add_cstr(sb, "],\"count\":");
+    str_builder_add_int(sb, mcp_tool_count(reg));
+    str_builder_add_cstr(sb, "}");
+    return str_builder_build(sb);
 }
 
 fn mcp_find_tool(reg, name_cstr) {
@@ -242,7 +308,13 @@ fn mcp_register_resource_builtin(reg, res) {
     map_set(load64(reg), str_cstr(mcp_resource_uri(res)), res);
 }
 
+# Same rule as tools (mcp_register_external): a builtin's URI or name is not
+# available to an external registrant. No builtin resources or prompts exist
+# yet, so this is the invariant, stated before the first one is added.
 fn mcp_register_resource_external(reg, res, callback_url) {
+    if (map_get(load64(reg), str_cstr(mcp_resource_uri(res))) != 0) {
+        return Err(DAIMON_ERR_AGENT_EXISTS);
+    }
     var uri  = str_clone(mcp_resource_uri(res));
     var name = str_clone(mcp_resource_name(res));
     var desc = str_clone(mcp_resource_desc(res));
@@ -252,6 +324,7 @@ fn mcp_register_resource_external(reg, res, callback_url) {
     store64(ext, owned);
     store64(ext + 8, str_clone(callback_url));
     map_set(load64(reg + 8), str_cstr(uri), ext);
+    return Ok(0);
 }
 
 fn mcp_register_prompt_builtin(reg, p) {
@@ -259,6 +332,9 @@ fn mcp_register_prompt_builtin(reg, p) {
 }
 
 fn mcp_register_prompt_external(reg, p, callback_url) {
+    if (map_get(load64(reg), str_cstr(mcp_prompt_name(p))) != 0) {
+        return Err(DAIMON_ERR_AGENT_EXISTS);
+    }
     var name = str_clone(mcp_prompt_name(p));
     var desc = str_clone(mcp_prompt_desc(p));
     var args = str_clone(mcp_prompt_args(p));
@@ -267,6 +343,7 @@ fn mcp_register_prompt_external(reg, p, callback_url) {
     store64(ext, owned);
     store64(ext + 8, str_clone(callback_url));
     map_set(load64(reg + 8), str_cstr(name), ext);
+    return Ok(0);
 }
 
 fn mcp_resource_count(reg) { return map_count(load64(reg)) + map_count(load64(reg + 8)); }

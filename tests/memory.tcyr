@@ -1,0 +1,232 @@
+# =========================================================================
+# memory — tests against THE REAL src/memory.cyr and src/secmem.cyr (2.2.3)
+#
+# Test-integrity arc (roadmap 2.2.x). tests/daimon.tcyr carried local copies of
+# validate_key, sanitize_key and secure_zero; their assertions are carried
+# forward here against the real modules, and the copies are DELETED from
+# daimon.tcyr in the same change.
+#
+# ⛔ The store itself had NEVER RUN. memory_store_* has no caller in src/ and the
+# copies never reached it. The first call of any kind killed the process
+# ("str_builder: alloc failed", exit 1) — path_join and dir_list take Strs and
+# were handed raw pointers. Everything from "the store" down is its first test,
+# and each group names the defect it pins. The store lives in a scratch
+# directory under build/ and is removed at the end.
+# =========================================================================
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/io.cyr"
+include "lib/fs.cyr"
+include "lib/tagged.cyr"
+include "lib/chrono.cyr"
+include "lib/syscalls.cyr"
+include "lib/assert.cyr"
+
+include "src/syscalls.cyr"
+include "src/error.cyr"
+include "src/secmem.cyr"
+include "src/memory.cyr"
+
+test_group("memory");
+
+# --- key validation: carried forward from daimon.tcyr ---------------------
+assert(is_ok(validate_key(str_from("my-key"))) == 1, "valid key");
+assert(is_ok(validate_key(str_from("key_123"))) == 1, "valid key_123");
+assert(is_ok(validate_key(str_from("a"))) == 1, "valid single char");
+assert(is_err_result(validate_key(str_from(""))) == 1, "empty key rejected");
+assert(is_err_result(validate_key(str_from("../etc/passwd"))) == 1, "traversal rejected");
+assert(is_err_result(validate_key(str_from("foo/bar"))) == 1, "slash rejected");
+assert(is_err_result(validate_key(str_from("foo\\bar"))) == 1, "backslash rejected");
+assert(is_err_result(validate_key(str_from(".."))) == 1, "dotdot rejected");
+
+fn _mem_repeat(ch, n) {
+    var sb = str_builder_new();
+    var i = 0;
+    while (i < n) { str_builder_add_cstr(sb, ch); i = i + 1; }
+    return str_builder_build(sb);
+}
+assert(is_err_result(validate_key(_mem_repeat("x", 257))) == 1, "too-long rejected");
+
+assert(str_eq(sanitize_key(str_from("hello-world")), str_from("hello-world")) == 1, "hyphen preserved");
+assert(str_eq(sanitize_key(str_from("key_123")), str_from("key_123")) == 1, "underscore preserved");
+assert(str_eq(sanitize_key(str_from("has spaces")), str_from("has_spaces")) == 1, "spaces replaced");
+assert(str_eq(sanitize_key(str_from("path/traversal")), str_from("path_traversal")) == 1, "slash replaced");
+
+# --- key validation: 2.2.3 rules -------------------------------------------
+# Charset. sanitize_key folds everything outside a-z A-Z 0-9 - _ . to '_', so
+# before 2.2.3 "user:1", "user;1" and "user 1" were three valid keys naming ONE
+# file. Now only the bytes sanitize_key keeps are valid, and it is the identity.
+assert(is_err_result(validate_key(str_from("user:1"))) == 1, "':' rejected (collided with user_1)");
+assert(is_err_result(validate_key(str_from("user 1"))) == 1, "' ' rejected (collided with user_1)");
+assert(is_err_result(validate_key(str_from("k\"v"))) == 1, "'\"' rejected");
+assert(is_ok(validate_key(str_from("A.b-c_9"))) == 1, "every allowed class together");
+assert(str_eq(sanitize_key(str_from("A.b-c_9")), str_from("A.b-c_9")) == 1,
+  "sanitize_key is the identity on a valid key");
+assert(is_err_result(validate_key(0)) == 1, "a null key is rejected, not dereferenced");
+# Length: the longest valid key must also be STORABLE (checked by the store below).
+assert(is_ok(validate_key(_mem_repeat("k", MAX_KEY_LENGTH))) == 1, "a MAX_KEY_LENGTH key is valid");
+assert(is_err_result(validate_key(_mem_repeat("k", MAX_KEY_LENGTH + 1))) == 1, "one byte more is not");
+
+# --- secure_zero: carried forward from daimon.tcyr ------------------------
+var sz_buf = alloc(64);
+memset(sz_buf, 170, 64);
+secure_zero(sz_buf, 64);
+var sz_ok = 1;
+var szi = 0;
+while (szi < 64) {
+    if (load8(sz_buf + szi) != 0) { sz_ok = 0; }
+    szi = szi + 1;
+}
+assert_eq(sz_ok, 1, "secure_zero clears all bytes");
+var sz_buf2 = alloc(16);
+memset(sz_buf2, 187, 16);
+secure_zero(sz_buf2, 8);
+assert_eq(load8(sz_buf2 + 0), 0, "scrubbed byte 0");
+assert_eq(load8(sz_buf2 + 7), 0, "scrubbed byte 7 (last in range)");
+assert_eq(load8(sz_buf2 + 8), 187, "byte past len untouched");
+assert_eq(secure_zero(0, 64), 0, "null ptr no-ops");
+assert_eq(secure_zero(sz_buf2, 0), 0, "zero len no-ops");
+assert_eq(load8(sz_buf2 + 8), 187, "zero-len leaves buffer intact");
+
+# First coverage: secure_zero_str scrubs a Str's backing bytes.
+var szs_buf = alloc(8);
+memcpy(szs_buf, "secret!!", 8);
+secure_zero_str(str_new(szs_buf, 8));
+assert_eq(load64(szs_buf), 0, "secure_zero_str scrubs the Str's bytes");
+assert_eq(secure_zero_str(0), 0, "secure_zero_str(0) no-ops");
+
+# =========================================================================
+# The store — first execution
+# =========================================================================
+var base_sb = str_builder_new();
+str_builder_add_cstr(base_sb, "build/test-mem-");
+str_builder_add_int(base_sb, sys_getpid());
+var base = str_builder_build(base_sb);
+var store_dir = str_cat(base, str_from("/store"));   # neither level exists yet
+var ms = memory_store_new(store_dir);
+var A = str_from("agent-1");
+
+# set / get round trip. Creating the store's directories is set's job: the old
+# code made only the agent directory, never the base, and ignored failure.
+var s1_t, s1_v = memory_store_set(ms, A, str_from("k1"), str_from("{\"v\":1}"));
+assert_eq(is_ok(s1_t), 1, "set succeeds on a store whose directories do not exist yet");
+var g1_t, g1_v = memory_store_get(ms, A, str_from("k1"));
+assert_eq(is_some(g1_t), 1, "get finds what set stored");
+if (is_some(g1_t) == 1) {
+    assert(str_contains(g1_v, str_from("\"key\":\"k1\"")) == 1, "record carries the key");
+    assert(str_contains(g1_v, str_from("\"value\":{\"v\":1}")) == 1, "record carries the value");
+}
+var gm_t, gm_v = memory_store_get(ms, A, str_from("absent"));
+assert_eq(is_none(gm_t), 1, "get of a key never set is None");
+
+# The longest valid key round-trips. At the Rust original's 256 this failed at
+# open() with ENAMETOOLONG: `<key>.json` plus the atomic-write temp suffix
+# overran NAME_MAX (255). A key that validates must be storable.
+var longk = _mem_repeat("k", MAX_KEY_LENGTH);
+var sl_t, sl_v = memory_store_set(ms, A, longk, str_from("2"));
+assert_eq(is_ok(sl_t), 1, "a MAX_KEY_LENGTH key can be stored");
+var gl_t, gl_v = memory_store_get(ms, A, longk);
+assert_eq(is_some(gl_t), 1, "and read back");
+
+# ⛔ Agent id traversal. The id is joined into the path; before 2.2.3 it was not
+# validated, so "../escaped" wrote OUTSIDE the store.
+var st_t, st_v = memory_store_set(ms, str_from("../escaped"), str_from("k"), str_from("1"));
+assert_eq(is_err_result(st_t), 1, "set refuses a traversing agent id");
+assert_eq(st_v, DAIMON_ERR_INVALID_PARAM, "with INVALID_PARAM");
+var esc = str_cat(base, str_from("/escaped/k.json"));
+assert_eq(file_exists(str_data(esc)), 0, "and nothing was written outside the store");
+var gt_t, gt_v = memory_store_get(ms, str_from("../escaped"), str_from("k"));
+assert_eq(is_none(gt_t), 1, "get refuses a traversing agent id");
+var dt_t, dt_v = memory_store_delete(ms, str_from(".."), str_from("k1"));
+assert_eq(is_err_result(dt_t), 1, "delete refuses a traversing agent id");
+
+var sk_t, sk_v = memory_store_set(ms, A, str_from("user:1"), str_from("1"));
+assert_eq(is_err_result(sk_t), 1, "set refuses a key outside the charset");
+
+# ⛔ Size. MAX_VALUE_SIZE was declared and never enforced, and get read at most
+# MAX_VALUE_SIZE - 1 bytes — so a large value was written whole and handed back
+# CUT, as truncated JSON with no error. Now: at the cap it round-trips whole,
+# one byte over it is refused.
+var big = _mem_repeat("a", MAX_VALUE_SIZE - 2);
+var bigv = str_cat(str_cat(str_from("\""), big), str_from("\""));  # a JSON string, exactly the cap
+assert_eq(str_len(bigv), MAX_VALUE_SIZE, "the big value is exactly MAX_VALUE_SIZE");
+var sb_t, sb_v = memory_store_set(ms, A, str_from("big"), bigv);
+assert_eq(is_ok(sb_t), 1, "a value at MAX_VALUE_SIZE is stored");
+var gb_t, gb_v = memory_store_get(ms, A, str_from("big"));
+assert_eq(is_some(gb_t), 1, "and read back");
+if (is_some(gb_t) == 1) {
+    assert(str_len(gb_v) > MAX_VALUE_SIZE, "WHOLE — the record is longer than the value, not cut");
+    assert(str_ends_with(gb_v, str_from("}")) == 1, "and ends with its closing brace");
+}
+var over = str_cat(bigv, str_from(" "));
+var so_t, so_v = memory_store_set(ms, A, str_from("over"), over);
+assert_eq(is_err_result(so_t), 1, "one byte past MAX_VALUE_SIZE is refused");
+
+# ⛔ Allocation per read. Each get took a fresh 1 MiB buffer that the bump
+# allocator never frees; 50 gets was 50 MiB. Now reads share one buffer and
+# copy out only the record.
+var before = alloc_used();
+var ri = 0;
+while (ri < 50) {
+    var rg_t, rg_v = memory_store_get(ms, A, str_from("k1"));
+    ri = ri + 1;
+}
+var grew = alloc_used() - before;
+assert(grew < 262144, "50 gets of a small record allocate < 256 KiB (was ~50 MiB)");
+
+# Listing — which could not see a single file before 2.2.3: dir_list returns
+# Strs and every lister wrapped each in str_from, reading a POINTER as text.
+var keys = memory_store_list_keys(ms, A);
+assert_eq(vec_len(keys), 3, "list_keys sees k1, the long key and big");
+var saw_k1 = 0;
+var ki = 0;
+while (ki < vec_len(keys)) {
+    if (str_eq(vec_get(keys, ki), str_from("k1")) == 1) { saw_k1 = 1; }
+    ki = ki + 1;
+}
+assert_eq(saw_k1, 1, "list_keys names k1 (the .json suffix stripped)");
+assert_eq(vec_len(memory_store_list_keys(ms, str_from("nobody"))), 0,
+  "list_keys of an agent with no directory is empty");
+assert_eq(vec_len(memory_store_list_keys(ms, str_from("../x"))), 0,
+  "list_keys refuses a traversing agent id");
+
+# list_by_tag is a SUBSTRING search over the record (KNOWN GAP, see memory.cyr).
+assert_eq(vec_len(memory_store_list_by_tag(ms, A, str_from("\"v\":1"))), 1,
+  "list_by_tag finds the one record containing the text");
+assert_eq(vec_len(memory_store_list_by_tag(ms, A, str_from(""))), 0,
+  "an empty tag matches nothing (it used to match every record)");
+assert_eq(vec_len(memory_store_list_by_tag(ms, A, 0)), 0, "a null tag matches nothing");
+
+var usage = memory_store_usage_bytes(ms, A);
+assert(usage > MAX_VALUE_SIZE, "usage_bytes counts the whole big record (the old 64 KiB cap undercounted)");
+
+# delete / clear
+var d1_t, d1_v = memory_store_delete(ms, A, str_from("k1"));
+assert_eq(is_ok(d1_t), 1, "delete of a stored key is Ok");
+assert_eq(d1_v, 1, "and reports that it removed one");
+var gd_t, gd_v = memory_store_get(ms, A, str_from("k1"));
+assert_eq(is_none(gd_t), 1, "a deleted key is gone");
+var d2_t, d2_v = memory_store_delete(ms, A, str_from("k1"));
+assert_eq(d2_v, 0, "deleting it again removes nothing");
+assert_eq(memory_store_clear(ms, A), 2, "clear removes the two remaining records");
+assert_eq(vec_len(memory_store_list_keys(ms, A)), 0, "and the agent's store is empty");
+
+# ⛔ Write failure is an error. The old set ignored the write and the rename and
+# answered Ok(0) to a record that never reached disk.
+var bad = memory_store_new(str_from("/proc/daimon-memory-test-cannot-exist"));
+var sf_t, sf_v = memory_store_set(bad, A, str_from("k"), str_from("1"));
+assert_eq(is_err_result(sf_t), 1, "set reports a store it cannot create");
+assert_eq(sf_v, DAIMON_ERR_STORAGE, "as STORAGE");
+
+# Scratch cleanup.
+var adir = str_cat(store_dir, str_from("/agent-1"));
+xrmdir(str_data(adir));
+xrmdir(str_data(store_dir));
+xrmdir(str_data(base));
+assert_eq(is_dir(base), 0, "scratch store removed");
+
+syscall(SYS_EXIT, assert_summary());

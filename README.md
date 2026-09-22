@@ -18,10 +18,15 @@ cyrius build src/main.cyr build/daimon # build
 ## Testing
 
 ```bash
-cyrius test tests/daimon.tcyr       # 225 assertions / 26 groups
-cyrius bench tests/daimon.bcyr      # 17 benchmarks
-sh tests/test.sh                    # tests + fuzz harnesses + libro integration smoke
+cyrius tests                        # every suite in tests/ — 645 assertions, 16 files
+cyrius fuzz                         # 6 property-based harnesses, ~160,000 generated cases
+cyrius bench tests/daimon.bcyr      # 19 benchmarks (+2 in tests/rag_ingest.bcyr)
+sh tests/smoke.sh                   # the linked binary over HTTP: libro, tracing, regressions
+sh tests/test.sh                    # all of the above except the benchmarks
 ```
+
+Every suite, benchmark and fuzz harness includes the real `src/` module it tests — none carries a
+copy of daimon's code (that was the 2.2.x test-integrity arc; see the CHANGELOG for what it found).
 
 ## MCP audit tools
 

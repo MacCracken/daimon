@@ -214,6 +214,18 @@ fn normalize_vec(v, dim) {
     return result;
 }
 
+# ⛔ 2.2.3 — `dir_list` takes a Str. Both counters below passed
+# `str_data(path)`, a raw char pointer, so dir_list read the path's first
+# sixteen BYTES as a Str header, opened a garbage path, and returned an empty
+# vec: count_fds was always 0 and count_threads always 1.
+#
+# 2.2.0 recorded this as a stdlib procfs defect ("KNOWN GAP") on the strength
+# of a control — `dir_list("/tmp")` enumerating fine — that was not a control.
+# A string LITERAL passed to a `: Str` parameter is converted to a Str by the
+# compiler; a `str_data(...)` expression is not. The control changed the
+# argument's form along with the directory, and only the form mattered:
+# measured, dir_list on /proc/<pid>/fd returns 4 entries given a Str and 0
+# given str_data — and 0 for /tmp given str_data too.
 fn count_fds(pid) {
     if (pid == 0) { return 0; }
     var path_sb = str_builder_new();
@@ -221,7 +233,7 @@ fn count_fds(pid) {
     str_builder_add_int(path_sb, pid);
     str_builder_add_cstr(path_sb, "/fd");
     var path = str_builder_build(path_sb);
-    var entries = dir_list(str_data(path));
+    var entries = dir_list(path);
     if (entries == 0) { return 0; }
     return vec_len(entries);
 }
@@ -233,7 +245,7 @@ fn count_threads(pid) {
     str_builder_add_int(path_sb, pid);
     str_builder_add_cstr(path_sb, "/task");
     var path = str_builder_build(path_sb);
-    var entries = dir_list(str_data(path));
+    var entries = dir_list(path);   # a Str — see count_fds
     if (entries == 0) { return 1; }
     var n = vec_len(entries);
     if (n == 0) { return 1; }
@@ -339,7 +351,12 @@ fn agent_start(h, executable) {
 
     sakshi_info("starting agent", 14);
 
-    var pid_t, pid_v = spawn(str_data(executable), str_data(id_str), str_data(name));
+    # str_cstr, not str_data, for `executable`: execve reads a NUL-terminated
+    # path, and a Str's data is only terminated when something made it so. Once
+    # 2.3.x wires this to a route, `executable` is a jget VIEW into the request
+    # buffer, and execve would read on past the value into the rest of the JSON.
+    # (id_str is builder-built and `name` is owned since 2.2.1 — both terminated.)
+    var pid_t, pid_v = spawn(str_cstr(executable), str_data(id_str), str_data(name));
     if (is_err_result(pid_t) == 1) {
         agent_set_status(h, AGENT_FAILED);
         return Err(DAIMON_ERR_SUPERVISOR);

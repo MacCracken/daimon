@@ -1,5 +1,5 @@
 # =========================================================================
-# trace — distributed tracing over sakshi (span stack + i64 trace-id)
+# trace — distributed tracing over sakshi (span stack + 128-bit trace-id)
 # =========================================================================
 #
 # daimon participates in a distributed trace: it adopts an inbound trace id
@@ -7,18 +7,16 @@
 # under it, spans key operations, and echoes the id back (`X-Trace-Id`) so a
 # caller can stitch daimon's spans into its own trace.
 #
-# sakshi's tracing model is a span stack + a single i64 trace id
-# (sakshi_span_enter/exit + sakshi_trace_set/id), so daimon's trace id is
-# 64-bit.
+# sakshi's tracing model is a span stack + a trace id, which is 128-bit since
+# sakshi 2.4.4 (sakshi_trace_set_128 / _id_hi / _id_lo). daimon carries the
+# FULL W3C trace-id through adoption, the X-Trace-Id echo and the outbound
+# `traceparent` it injects on MCP forwards (trace_mcp_forward_method, via
+# sandhi_rpc_mcp_call_with_headers).
 #
-# LIMITATIONS (honest):
-#  - i64 trace id — a W3C 128-bit trace-id is folded to its low 64 bits (that
-#    is all sakshi holds). Correlation inside a daimon-rooted trace is exact; a
-#    full 128-bit round-trip is not preserved.
-#  - No outbound HTTP propagation — `sandhi_rpc_mcp_call` takes no custom
-#    request headers, so daimon cannot inject `traceparent` on external MCP
-#    forwards. The id reaches downstream only if sandhi's rpc gains header
-#    support (see the note in api_mcp.cyr).
+# (Until 2.2.3 this header still listed two LIMITATIONS — "an i64 trace id,
+# folded to its low 64 bits" and "no outbound HTTP propagation" — that 1.3.4
+# and the header-capable sandhi forward had already removed. Found when the
+# module got its first test of its own.)
 #
 # Opt-in: `daimon serve --trace`. Off by default — per-request span emission
 # is noisy for production — and when off every helper is a cheap no-op.
@@ -56,18 +54,55 @@ fn _trace_gen_id(): i64 {
     return id;
 }
 
+# 1 if the `n` bytes at data+off are all hex digits (either case).
+fn _trace_all_hex(data, off, n): i64 {
+    var i = 0;
+    while (i < n) {
+        if (_trace_parse_hex(data, off + i, 1) == 0) {
+            if (load8(data + off + i) != 48) { return 0; }   # '0' parses to 0 too
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# 1 if `tp` is a structurally valid W3C traceparent:
+#     vv-<32 hex trace-id>-<16 hex parent-id>-<2 hex flags>     (55 bytes)
+# with version ff reserved. Hex case is accepted either way.
+fn _trace_valid_traceparent(tp): i64 {
+    if (strlen(tp) < 55) { return 0; }
+    if (load8(tp + 2) != 45) { return 0; }    # '-'
+    if (load8(tp + 35) != 45) { return 0; }
+    if (load8(tp + 52) != 45) { return 0; }
+    if (_trace_all_hex(tp, 0, 2) == 0) { return 0; }
+    if (_trace_all_hex(tp, 3, 32) == 0) { return 0; }
+    if (_trace_all_hex(tp, 36, 16) == 0) { return 0; }
+    if (_trace_all_hex(tp, 53, 2) == 0) { return 0; }
+    if (_trace_parse_hex(tp, 0, 2) == 255) { return 0; }   # version ff is invalid
+    return 1;
+}
+
 # Adopt a trace id from the request headers, or generate a fresh one, and set
 # it on sakshi as a full 128-bit id (sakshi 2.4.4+). Priority: W3C `traceparent`
-# trace-id (full 128 bits) > `X-Trace-Id` (32 hex = 128-bit, else 16 hex =
-# 64-bit) > a generated 128-bit random. sandhi_server_find_header returns a
-# NUL-terminated cstr (the header value) or 0 — not a Str; use strlen / the raw
-# pointer.
+# trace-id (full 128 bits) > `X-Trace-Id` (exactly 32 hex = 128-bit, exactly 16
+# hex = 64-bit) > a generated 128-bit random. sandhi_server_find_header returns
+# a NUL-terminated cstr (the header value) or 0 — not a Str; use strlen / the
+# raw pointer.
+#
+# ⛔ 2.2.3 — a MALFORMED header is ignored, not partially adopted. The parser
+# stops at the first non-hex byte and returns what it has, and the old checks
+# were only "at least 35 bytes" (traceparent) and "at least 32" (X-Trace-Id), so
+# `00-abc-…` was adopted as trace-id 0xabc plus whatever the low half's offset
+# held (tests/trace.tcyr pins it), so two unrelated clients sending the same
+# malformed prefix would share one trace id. W3C Trace Context §3.2: a vendor MUST ignore an invalid
+# traceparent. An all-zero id is invalid in both headers (the old X-Trace-Id arm
+# adopted it, which switched the X-Trace-Id echo off for that request).
 fn trace_adopt_or_new(buf, blen): i64 {
     # W3C traceparent: "00-<32hex trace-id>-<16hex span-id>-<2hex flags>".
     # trace-id is chars 3..34: hi 64 bits = chars 3..18, lo = chars 19..34.
     var tp = sandhi_server_find_header(buf, blen, "traceparent");
     if (tp != 0) {
-        if (strlen(tp) >= 35) {
+        if (_trace_valid_traceparent(tp) == 1) {
             var hi = _trace_parse_hex(tp, 3, 16);
             var lo = _trace_parse_hex(tp, 19, 16);
             if (hi != 0 || lo != 0) {
@@ -78,12 +113,23 @@ fn trace_adopt_or_new(buf, blen): i64 {
     }
     var xt = sandhi_server_find_header(buf, blen, "X-Trace-Id");
     if (xt != 0) {
-        if (strlen(xt) >= 32) {
-            sakshi_trace_set_128(_trace_parse_hex(xt, 0, 16), _trace_parse_hex(xt, 16, 16));
-            return 0;
+        var xl = strlen(xt);
+        if (xl == 32) {
+            if (_trace_all_hex(xt, 0, 32) == 1) {
+                var xhi = _trace_parse_hex(xt, 0, 16);
+                var xlo = _trace_parse_hex(xt, 16, 16);
+                if (xhi != 0 || xlo != 0) {
+                    sakshi_trace_set_128(xhi, xlo);
+                    return 0;
+                }
+            }
         }
-        var id2 = _trace_parse_hex(xt, 0, 16);
-        if (id2 != 0) { sakshi_trace_set_128(0, id2); return 0; }
+        if (xl == 16) {
+            if (_trace_all_hex(xt, 0, 16) == 1) {
+                var id2 = _trace_parse_hex(xt, 0, 16);
+                if (id2 != 0) { sakshi_trace_set_128(0, id2); return 0; }
+            }
+        }
     }
     # Generate a full 128-bit random id (daimon-initiated trace).
     sakshi_trace_set_128(_trace_gen_id(), _trace_gen_id());

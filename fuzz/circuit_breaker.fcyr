@@ -1,5 +1,9 @@
 # Fuzz: circuit breaker state machine
-# Exercises all state transitions with random success/failure sequences
+# The fixed cases below, then (2.2.3) 2,000 breakers with random parameters each
+# driven through 50 random success / failure / can-execute steps. Until 2.2.3
+# this header promised "random sequences" and the only sequence was a fixed
+# every-third-call pattern; the random run is new, and so is the portable exit
+# (it used the x86-only `syscall(60, n)`).
 include "lib/alloc.cyr"
 include "lib/string.cyr"
 include "lib/fmt.cyr"
@@ -15,41 +19,41 @@ include "lib/hashmap.cyr"
 # silently wrong the day it does not. Assertions now name CB_CLOSED / CB_OPEN /
 # CB_HALF_OPEN, so a renumbering fails to compile instead of fuzzing a fiction.
 include "src/supervisor.cyr"
+include "fuzz/rng.cyr"
 
 alloc_init();
-
-alloc_init();
+sakshi_set_level(SK_ERROR);   # cb_record_failure warns on every open; thousands here
 
 # Test threshold = 1
 var cb1 = cb_new(1, 0, 3);
 cb_record_failure(cb1);
-if (load64(cb1) != CB_OPEN) { syscall(60, 1); }
-if (cb_can_execute(cb1) != 1) { syscall(60, 2); }
-if (load64(cb1) != CB_HALF_OPEN) { syscall(60, 3); }
+if (load64(cb1) != CB_OPEN) { sys_exit(1); }
+if (cb_can_execute(cb1) != 1) { sys_exit(2); }
+if (load64(cb1) != CB_HALF_OPEN) { sys_exit(3); }
 cb_record_success(cb1);
 cb_record_success(cb1);
 cb_record_success(cb1);
-if (load64(cb1) != CB_CLOSED) { syscall(60, 4); }
+if (load64(cb1) != CB_CLOSED) { sys_exit(4); }
 
 # Test threshold = 5
 var cb5 = cb_new(5, 0, 2);
 var fi = 0;
 while (fi < 5) { cb_record_failure(cb5); fi = fi + 1; }
-if (load64(cb5) != CB_OPEN) { syscall(60, 11); }
+if (load64(cb5) != CB_OPEN) { sys_exit(11); }
 cb_can_execute(cb5);
-if (load64(cb5) != CB_HALF_OPEN) { syscall(60, 12); }
+if (load64(cb5) != CB_HALF_OPEN) { sys_exit(12); }
 cb_record_success(cb5);
 cb_record_success(cb5);
-if (load64(cb5) != CB_CLOSED) { syscall(60, 13); }
+if (load64(cb5) != CB_CLOSED) { sys_exit(13); }
 
 # Test threshold = 10
 var cb10 = cb_new(10, 0, 1);
 fi = 0;
 while (fi < 10) { cb_record_failure(cb10); fi = fi + 1; }
-if (load64(cb10) != CB_OPEN) { syscall(60, 21); }
+if (load64(cb10) != CB_OPEN) { sys_exit(21); }
 cb_can_execute(cb10);
 cb_record_success(cb10);
-if (load64(cb10) != CB_CLOSED) { syscall(60, 22); }
+if (load64(cb10) != CB_CLOSED) { sys_exit(22); }
 
 # Rapid alternation
 var cb_alt = cb_new(3, 0, 1);
@@ -58,8 +62,70 @@ while (ai < 200) {
     if (ai % 3 == 0) { cb_record_failure(cb_alt); }
     else { cb_record_success(cb_alt); }
     var s = load64(cb_alt);
-    if (s > 2) { syscall(60, 30); }
+    if (s > 2) { sys_exit(30); }
     ai = ai + 1;
 }
 
-syscall(60, 0);
+# --- random breakers ----------------------------------------------------------
+# Properties from the documented contract, checked after every step:
+#   * the state is one of CLOSED / OPEN / HALF_OPEN;
+#   * a CLOSED breaker's failure count stays below its threshold (reaching it opens);
+#   * a success while CLOSED resets the failure count to 0;
+#   * a failure while HALF_OPEN re-opens;
+#   * can_execute is 1 when CLOSED or HALF_OPEN; when OPEN it recovers to HALF_OPEN
+#     only once the timeout has passed (0 here), and stays OPEN otherwise.
+var NB = 2000;
+var steps_total = 0;
+var bi = 0;
+while (bi < NB) {
+    var thr = 1 + fz_below(10);
+    var hmax = 1 + fz_below(5);
+    var tmo = 0;
+    if (fz_below(2) == 0) { tmo = 3600000; }        # an hour: OPEN must hold
+    var cb = cb_new(thr, tmo, hmax);
+    var st = 0;
+    while (st < 50) {
+        var before = cb_state(cb);
+        var op = fz_below(3);
+        if (op == 0) {
+            cb_record_success(cb);
+            if (before == CB_CLOSED) {
+                if (cb_failure_count(cb) != 0) { sys_exit(60); }
+            }
+        }
+        if (op == 1) {
+            cb_record_failure(cb);
+            if (before == CB_HALF_OPEN) {
+                if (cb_state(cb) != CB_OPEN) { sys_exit(61); }
+            }
+        }
+        if (op == 2) {
+            var ok = cb_can_execute(cb);
+            if (before == CB_CLOSED) { if (ok != 1) { sys_exit(62); } }
+            if (before == CB_HALF_OPEN) { if (ok != 1) { sys_exit(63); } }
+            if (before == CB_OPEN) {
+                if (tmo == 0) {
+                    if (ok != 1) { sys_exit(64); }
+                    if (cb_state(cb) != CB_HALF_OPEN) { sys_exit(65); }
+                } else {
+                    if (ok != 0) { sys_exit(66); }
+                    if (cb_state(cb) != CB_OPEN) { sys_exit(67); }
+                }
+            }
+        }
+        var now_s = cb_state(cb);
+        if (now_s != CB_CLOSED) {
+            if (now_s != CB_OPEN) {
+                if (now_s != CB_HALF_OPEN) { sys_exit(68); }
+            }
+        }
+        if (now_s == CB_CLOSED) {
+            if (cb_failure_count(cb) >= thr) { sys_exit(69); }
+        }
+        steps_total = steps_total + 1;
+        st = st + 1;
+    }
+    bi = bi + 1;
+}
+
+fz_done("circuit_breaker", steps_total);

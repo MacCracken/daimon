@@ -35,12 +35,22 @@ include "lib/math.cyr"
 include "lib/process.cyr"
 include "lib/sakshi.cyr"
 include "lib/libro.cyr"
+include "lib/thread.cyr"
 include "lib/assert.cyr"
 
 include "src/syscalls.cyr"
 include "src/error.cyr"
 include "src/audit.cyr"
 include "src/agent.cyr"
+
+# Keeps a second thread alive long enough for count_threads to observe it.
+fn _agent_test_sleeper(arg) {
+    var ts: i64[2];
+    store64(&ts, 0);
+    store64(&ts + 8, 300000000);   # 300 ms
+    sys_nanosleep(&ts, 0);
+    return 0;
+}
 
 test_group("agent");
 
@@ -82,42 +92,48 @@ assert_eq(count_threads(0), 1, "count_threads(0) answers 1, not 0");
 
 var me = sys_getpid();
 assert(read_vm_rss(me) > 0, "read_vm_rss reads a real RSS for this process");
-# Narrowing count_fds: is it dir_list that returns nothing, or the count?
+# ⛔ CORRECTED at 2.2.3. This block used to assert — labelled KNOWN GAP — that
+# dir_list enumerates nothing under /proc/<pid>/fd, blaming the stdlib. It was
+# daimon: `dir_list` takes a Str, and count_fds/count_threads (and this test's
+# own probe) passed `str_data(path)`, a raw pointer. The "control" that made it
+# look procfs-specific, `dir_list("/tmp")`, passed a string LITERAL, which the
+# compiler converts to a Str for a `: Str` parameter — so the control changed
+# the argument's form as well as the directory. Measured: dir_list on
+# /proc/<pid>/fd gives 4 entries for a Str and 0 for str_data, and /tmp gives 0
+# for str_data as well. The assertions below are the real values.
 var fdpath = str_builder_new();
 str_builder_add_cstr(fdpath, "/proc/");
 str_builder_add_int(fdpath, me);
 str_builder_add_cstr(fdpath, "/fd");
-var fdents = dir_list(str_data(str_builder_build(fdpath)));
-assert(fdents != 0, "dir_list(/proc/<pid>/fd) returns a vec, not 0");
+var fdents = dir_list(str_builder_build(fdpath));
+assert(vec_len(fdents) > 0, "dir_list(Str) enumerates /proc/<pid>/fd");
 
-# Control: dir_list works fine on an ordinary directory, so the emptiness
-# above is procfs-specific, not a broken dir_list.
-var ctl = dir_list("/tmp");
-assert(ctl != 0, "control: dir_list(/tmp) returns a vec");
-assert(vec_len(ctl) > 0, "control: dir_list(/tmp) enumerates entries");
+# The pair that pins the diagnosis: the same directory, the same call, only the
+# argument's FORM differs. If this ever stops holding, the 2.2.3 note is wrong.
+var tmp_sb = str_builder_new();
+str_builder_add_cstr(tmp_sb, "/tmp");
+var tmp_s = str_builder_build(tmp_sb);
+assert(vec_len(dir_list(tmp_s)) > 0, "dir_list(Str \"/tmp\") enumerates entries");
+assert_eq(vec_len(dir_list(str_data(tmp_s))), 0,
+  "dir_list(raw pointer) enumerates nothing — even for /tmp — which is the 2.2.0 bug");
 
-# ⛔ FINDING (2.2.0): `dir_list` returns an EMPTY vec for /proc/<pid>/fd while
-# enumerating an ordinary directory fine, so `count_fds` — which is written
-# correctly against dir_list's contract — reports 0 for every live agent, and
-# `agent_update_resources` stores that 0 into the handle. `/v1/agents` would
-# therefore serve fds_used = 0 forever once the supervisor is wired (2.3.x).
-# The defect is below daimon: procfs returns entries whose d_reclen/d_type the
-# stdlib's getdents walk does not surface. daimon's own code needs no change.
-# Asserted as it ACTUALLY behaves, so this file stays green and the day the
-# stdlib fixes it, THIS assertion fails and tells us to flip it back.
-assert_eq(vec_len(fdents), 0,
-  "KNOWN GAP: dir_list enumerates nothing under /proc/<pid>/fd (flip when stdlib fixes it)");
-assert_eq(count_fds(me), 0,
-  "KNOWN GAP: count_fds is 0 as a consequence — correct code, upstream gap");
-assert_eq(count_threads(me), 1,
-  "KNOWN GAP: count_threads falls back to 1 for the same reason");
+assert(count_fds(me) > 0, "count_fds reads a real open-fd count (was always 0)");
+assert_eq(count_threads(me), 1, "count_threads: this test process has one thread");
+
+# count_threads must COUNT, not fall back: with a second thread alive it reads 2.
+# (Single-threaded, the bug's fallback of 1 and the right answer coincide — so
+# only a live second thread can tell them apart.)
+var t2 = thread_create(&_agent_test_sleeper, 0);
+assert(t2 != 0, "second thread started");
+assert_eq(count_threads(me), 2, "count_threads sees a second live thread (was stuck at 1)");
+thread_join(t2);
 
 # agent_update_resources writes the three fields it owns.
 agent_set_pid(h, me);
 agent_update_resources(h);
 assert(agent_mem_used(h) > 0, "agent_update_resources populated mem_used");
-assert_eq(agent_fds_used(h), 0, "agent_update_resources stores the (gapped) fds count");
-assert_eq(agent_threads(h), 1, "agent_update_resources stores the (gapped) thread count");
+assert(agent_fds_used(h) > 0, "agent_update_resources stores a real fds count");
+assert_eq(agent_threads(h), 1, "agent_update_resources stores the thread count");
 
 # --- liveness ------------------------------------------------------------
 assert_eq(agent_is_alive(agent_handle_new(99, str_from("x"))), 0,

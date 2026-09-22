@@ -1,0 +1,50 @@
+# =========================================================================
+# config — tests against THE REAL src/config.cyr (2.2.3)
+#
+# Test-integrity arc (roadmap 2.2.x). tests/daimon.tcyr carried a local copy of
+# config_new and five accessors; this file carries its assertions forward
+# against the real module, and covers the two setters the copy never had. The
+# copy is DELETED from daimon.tcyr in the same change.
+#
+# The version half of this module has its own file, tests/version_sync.tcyr.
+# =========================================================================
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/syscalls.cyr"
+include "lib/assert.cyr"
+
+include "src/config.cyr"
+
+test_group("config");
+
+# --- carried forward from daimon.tcyr -------------------------------------
+var cfg = config_new();
+assert_eq(config_port(cfg), 8090, "default port");
+assert_eq(config_max_agents(cfg), 1000, "default max_agents");
+assert(str_eq(config_listen_addr(cfg), str_from("127.0.0.1")) == 1, "default listen_addr");
+assert(str_eq(config_data_dir(cfg), str_from("/var/lib/agnos")) == 1, "default data_dir");
+
+config_set_port(cfg, 9090);
+assert_eq(config_port(cfg), 9090, "modified port");
+
+# --- first coverage: the setters the copy never had -----------------------
+config_set_max_agents(cfg, 7);
+assert_eq(config_max_agents(cfg), 7, "config_set_max_agents writes max_agents");
+assert_eq(config_port(cfg), 9090, "setting max_agents leaves port alone");
+
+config_set_data_dir(cfg, str_from("/srv/daimon"));
+assert(str_eq(config_data_dir(cfg), str_from("/srv/daimon")) == 1,
+  "config_set_data_dir writes data_dir");
+assert(str_eq(config_listen_addr(cfg), str_from("127.0.0.1")) == 1,
+  "setting data_dir leaves listen_addr alone");
+
+# Two configs share nothing: the defaults are per-instance, not a shared literal
+# that one caller's setter would change for everyone.
+var cfg2 = config_new();
+assert_eq(config_port(cfg2), 8090, "a fresh config is unaffected by another's setters");
+
+syscall(SYS_EXIT, assert_summary());

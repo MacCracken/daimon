@@ -1,0 +1,57 @@
+# =========================================================================
+# fuzz/rng.cyr — the one input generator every harness in fuzz/ shares
+# =========================================================================
+#
+# xorshift64 with a FIXED seed. A harness that fails exits with the number of
+# the property that broke, and re-running it replays exactly the same inputs —
+# a fuzz failure that cannot be reproduced cannot be fixed. Change FZ_SEED to
+# explore a different input stream; the harnesses do not depend on its value.
+#
+# Not cryptographic and not meant to be: it only has to be cheap, deterministic
+# and well mixed. The right shift is masked so the sequence is the same whether
+# the compiler's `>>` on a negative i64 is arithmetic or logical.
+
+var FZ_SEED = 88172645463325252;
+var _fz_state = 88172645463325252;
+
+fn fz_next() {
+    var x = _fz_state;
+    x = x ^ (x << 13);
+    x = x ^ ((x >> 7) & 0x01FFFFFFFFFFFFFF);
+    x = x ^ (x << 17);
+    _fz_state = x;
+    return x;
+}
+
+# In [0, n), for n > 0.
+fn fz_below(n) {
+    var r = fz_next() % n;
+    if (r < 0) { r = 0 - r; }
+    return r;
+}
+
+# A heap buffer of `len` random bytes drawn from [lo, hi], as a Str.
+fn fz_bytes(len, lo, hi) {
+    var buf = alloc(len + 1);
+    var i = 0;
+    while (i < len) {
+        store8(buf + i, lo + fz_below(hi - lo + 1));
+        i = i + 1;
+    }
+    store8(buf + len, 0);
+    return str_new(buf, len);
+}
+
+# Report a clean run on stdout and exit 0.
+fn fz_done(name, iterations) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "fuzz ");
+    str_builder_add_cstr(sb, name);
+    str_builder_add_cstr(sb, ": ");
+    str_builder_add_int(sb, iterations);
+    str_builder_add_cstr(sb, " generated cases, all properties held\n");
+    var out = str_builder_build(sb);
+    sys_write(1, str_data(out), str_len(out));
+    sys_exit(0);
+    return 0;
+}

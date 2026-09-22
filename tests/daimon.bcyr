@@ -1,8 +1,24 @@
-# daimon.bcyr — daimon benchmarks
-# Parity with rust-old/benches/benchmarks.rs (19 benchmarks)
+# daimon.bcyr — daimon benchmarks, against THE REAL src/ modules (2.2.3)
 #
-# Run: cyrius bench tests/daimon.bcyr
-#   or: cat tests/daimon.bcyr | cc3 > /tmp/daimon_bench && chmod +x /tmp/daimon_bench && /tmp/daimon_bench
+# Run: cyrius bench tests/daimon.bcyr        (scripts/bench-history.sh appends a run)
+#
+# ⭐ 2.2.3 — NO MIRRORS. Until 2.2.3 this file benchmarked simplified local copies
+# of the functions it named. 2.2.1 showed the consequence with `cmp`: the bench
+# binary was BYTE-IDENTICAL before and after that release, i.e. it could not
+# observe any change to daimon's source. Some copies did different work from the
+# code they were named after:
+#   vector_insert_100x128d   filled arrays and pushed them to a vec — never
+#                            vindex_insert
+#   vector_search_1k_64d     scored and kept the max — the real search also RANKS
+#   scheduler_100_tasks      counted fake structs in a map — not samay at all
+#   supervisor_register_1000 one map_set per agent — the real call fills three
+#   mcp_manifest_100_tools   insertion-SORTED the keys, which the manifest never
+#                            does, and built no JSON, which it always does
+#   edge_register_100        a bare map_set — no duplicate-name scan
+#   rag_ingest_5k_chars      chunk_text only — now named rag_chunk_5k_chars;
+#                            the full ingest is tests/rag_ingest.bcyr
+# Every benchmark now calls the shipping function, so numbers from before 2.2.3
+# are not comparable for those seven; the CHANGELOG records old vs new.
 
 include "lib/string.cyr"
 include "lib/fmt.cyr"
@@ -10,6 +26,7 @@ include "lib/alloc.cyr"
 include "lib/vec.cyr"
 include "lib/str.cyr"
 include "lib/io.cyr"
+include "lib/fs.cyr"
 include "lib/hashmap.cyr"
 include "lib/tagged.cyr"
 include "lib/bayan.cyr"
@@ -18,151 +35,33 @@ include "lib/fnptr.cyr"
 include "lib/bench.cyr"
 include "lib/syscalls.cyr"
 include "lib/math.cyr"
+include "lib/process.cyr"
+include "lib/sakshi.cyr"
+include "lib/libro.cyr"
 
-# ================================================================
-# Inline types needed for benchmarking
-# ================================================================
-
-var _bid = 1;
-fn bid() { var id = _bid; _bid = _bid + 1; return id; }
-
-# --- config ---
-
-fn config_new() {
-    var c = alloc(32);
-    store64(c, str_from("127.0.0.1"));
-    store64(c + 8, 8090);
-    store64(c + 16, str_from("/var/lib/agnos"));
-    store64(c + 24, 1000);
-    return c;
-}
-
-# --- circuit breaker ---
-
-fn cb_new(threshold, timeout_ms, half_open_max) {
-    var cb = alloc(56);
-    store64(cb, 0);  # CLOSED
-    store64(cb + 8, 0);
-    store64(cb + 16, 0);
-    store64(cb + 24, threshold);
-    store64(cb + 32, timeout_ms);
-    store64(cb + 40, half_open_max);
-    store64(cb + 48, 0);
-    return cb;
-}
-
-fn cb_record_success(cb) {
-    var state = load64(cb);
-    if (state == 2) {
-        var sc = load64(cb + 16) + 1;
-        store64(cb + 16, sc);
-        if (sc >= load64(cb + 40)) { store64(cb, 0); store64(cb + 8, 0); store64(cb + 16, 0); }
-    }
-    elif (state == 0) { store64(cb + 8, 0); }
-}
-
-fn cb_record_failure(cb) {
-    var fc = load64(cb + 8) + 1;
-    store64(cb + 8, fc);
-    store64(cb + 48, clock_epoch_secs());
-    if (load64(cb) == 0) { if (fc >= load64(cb + 24)) { store64(cb, 1); } }
-    elif (load64(cb) == 2) { store64(cb, 1); store64(cb + 16, 0); }
-}
-
-# --- cosine similarity ---
-
-fn cosine_similarity(a, b, dim) {
-    if (dim == 0) { return 0; }
-    var dot = f64_from(0);
-    var norm_a = f64_from(0);
-    var norm_b = f64_from(0);
-    var i = 0;
-    while (i < dim) {
-        var x = load64(a + i * 8);
-        var y = load64(b + i * 8);
-        dot = f64_add(dot, f64_mul(x, y));
-        norm_a = f64_add(norm_a, f64_mul(x, x));
-        norm_b = f64_add(norm_b, f64_mul(y, y));
-        i = i + 1;
-    }
-    var denom = f64_mul(f64_sqrt(norm_a), f64_sqrt(norm_b));
-    if (f64_eq(denom, f64_from(0)) == 1) { return f64_from(0); }
-    return f64_div(dot, denom);
-}
-
-# --- MCP registry ---
-
-fn mcp_tool_new(name, desc) {
-    var t = alloc(24);
-    store64(t, name);
-    store64(t + 8, desc);
-    store64(t + 16, str_from("{}"));
-    return t;
-}
-
-fn mcp_registry_new() {
-    var reg = alloc(16);
-    store64(reg, map_new());
-    store64(reg + 8, map_new());
-    return reg;
-}
-
-fn mcp_register_builtin(reg, tool) {
-    map_set(load64(reg), str_data(load64(tool)), tool);
-}
-
-fn mcp_find_tool(reg, name_cstr) {
-    return map_get(load64(reg), name_cstr);
-}
-
-fn mcp_tool_count(reg) { return map_count(load64(reg)) + map_count(load64(reg + 8)); }
-
-# --- chunk text ---
-
-fn chunk_text(text, chunk_size, overlap) {
-    var chunks = vec_new();
-    var tlen = str_len(text);
-    if (tlen == 0) { return chunks; }
-    if (chunk_size == 0) { return chunks; }
-    if (overlap >= chunk_size) { overlap = chunk_size - 1; }
-    var step = chunk_size - overlap;
-    if (step == 0) { step = 1; }
-    var pos = 0;
-    while (pos < tlen) {
-        var end = pos + chunk_size;
-        if (end > tlen) { end = tlen; }
-        vec_push(chunks, str_sub(text, pos, end - pos));
-        pos = pos + step;
-    }
-    return chunks;
-}
-
-# --- edge fleet stats ---
-
-fn edge_fleet_stats(nodes_map) {
-    var keys = map_keys(nodes_map);
-    var total = vec_len(keys);
-    var online = 0;
-    var i = 0;
-    while (i < total) {
-        var n = map_get(nodes_map, vec_get(keys, i));
-        if (load64(n + 16) == 0) { online = online + 1; }
-        i = i + 1;
-    }
-    return online;
-}
-
-# ================================================================
-# Benchmark globals
-# ================================================================
+include "src/syscalls.cyr"
+include "src/error.cyr"
+include "src/config.cyr"
+include "src/audit.cyr"
+include "src/secmem.cyr"
+include "src/trace.cyr"
+include "src/agent.cyr"
+include "src/supervisor.cyr"
+include "src/vector_store.cyr"
+include "src/rag.cyr"
+include "src/mcp.cyr"
+include "src/edge.cyr"
 
 var _cos_a = 0;
 var _cos_b = 0;
-var _vec_entries = 0;
+var _vindex_1k = 0;
 var _cos_query = 0;
 var _mcp_reg = 0;
-var _edge_map = 0;
+var _edge_fleet_100 = 0;
+var _edge_ids_100 = 0;
+var _edge_fleet_500 = 0;
 var _rag_text = 0;
+var _schema_body = 0;
 
 # ================================================================
 # Benchmark functions (each called by bench_run)
@@ -175,8 +74,9 @@ fn bench_cosine_128d() {
     return 0;
 }
 
+# 100 inserts of 128-d entries into a fresh index — what an ingest does per chunk.
 fn bench_vector_insert_100() {
-    var entries = vec_new();
+    var vi = vindex_new();
     var i = 0;
     while (i < 100) {
         var emb = alloc(128 * 8);
@@ -185,65 +85,42 @@ fn bench_vector_insert_100() {
             store64(emb + j * 8, f64_from(i * 128 + j));
             j = j + 1;
         }
-        vec_push(entries, emb);
+        vindex_insert(vi, vec_entry_new(i, emb, 128, _rag_text, _rag_text));
         i = i + 1;
     }
     return 0;
 }
 
+# Top-5 search over 1,000 64-d entries — /v1/rag/query's default top_k.
 fn bench_vector_search_1k() {
-    var n = vec_len(_vec_entries);
-    var best_score = f64_from(0);
-    var i = 0;
-    while (i < n) {
-        var emb = vec_get(_vec_entries, i);
-        var score = cosine_similarity(_cos_query, emb, 64);
-        if (f64_gt(score, best_score) == 1) { best_score = score; }
-        i = i + 1;
-    }
+    vindex_search(_vindex_1k, _cos_query, 64, 5);
     return 0;
 }
 
-fn bench_rag_ingest_5k() {
+fn bench_rag_chunk_5k() {
     chunk_text(_rag_text, 50, 10);
     return 0;
 }
 
+# samay: submit 100 tasks of mixed priority, then list the pending queue
+# (priority-sorted) — daimon's scheduler since 2.0.0.
 fn bench_scheduler_100() {
-    var tasks = map_new();
+    var s = task_scheduler_new();
     var i = 0;
     while (i < 100) {
-        var t = alloc(72);
-        var tid = str_from_int(i);
-        store64(t, tid);
-        store64(t + 8, str_from("task"));
-        store64(t + 32, (i % 10) + 1);
-        store64(t + 40, 0);  # QUEUED
-        store64(t + 48, clock_epoch_secs());
-        map_set(tasks, str_data(tid), t);
+        var t = scheduled_task_new(str_from("task"), str_from("d"), str_from("agent"),
+          (i % 10) + 1, resource_req_default());
+        task_scheduler_submit_task(s, t);
         i = i + 1;
     }
-    # Sort pending by priority (count queued)
-    var keys = map_keys(tasks);
-    var queued = 0;
-    i = 0;
-    while (i < vec_len(keys)) {
-        var t = map_get(tasks, vec_get(keys, i));
-        if (load64(t + 40) == 0) { queued = queued + 1; }
-        i = i + 1;
-    }
-    return queued;
+    return vec_len(task_scheduler_pending_tasks(s));
 }
 
 fn bench_supervisor_register_1000() {
-    var health = map_new();
+    var sup = supervisor_new();
     var i = 0;
     while (i < 1000) {
-        var id_str = str_from_int(i);
-        var ah = alloc(80);
-        store64(ah, i);
-        store64(ah + 8, 1);
-        map_set(health, str_data(id_str), ah);
+        supervisor_register(sup, str_from_int(i));
         i = i + 1;
     }
     return 0;
@@ -254,30 +131,16 @@ fn bench_mcp_register_100() {
     var i = 0;
     while (i < 100) {
         var name = str_cat(str_from("tool-"), str_from_int(i));
-        mcp_register_builtin(reg, mcp_tool_new(name, str_from("desc")));
+        mcp_register_builtin(reg, mcp_tool_new(name, str_from("desc"), 0));
         i = i + 1;
     }
     return 0;
 }
 
+# The GET /v1/mcp/tools body for 100 tools, exactly as the route builds it.
 fn bench_mcp_manifest_100() {
-    # Collect all tool keys (manifest = sorted list)
-    var keys = map_keys(load64(_mcp_reg));
-    var n = vec_len(keys);
-    # Sort keys (insertion sort)
-    var i = 1;
-    while (i < n) {
-        var key = vec_get(keys, i);
-        var j = i - 1;
-        while (j >= 0) {
-            if (strcmp(vec_get(keys, j), key) <= 0) { break; }
-            vec_set(keys, j + 1, vec_get(keys, j));
-            j = j - 1;
-        }
-        vec_set(keys, j + 1, key);
-        i = i + 1;
-    }
-    return n;
+    mcp_manifest_json(_mcp_reg);
+    return 0;
 }
 
 fn bench_mcp_find_tool() {
@@ -285,52 +148,35 @@ fn bench_mcp_find_tool() {
     return 0;
 }
 
-# Schema extraction on registration (typed parse + compact re-emit). Mirrors
-# api_mcp_register's mcp_extract_input_schema on a representative MCP body.
 fn bench_mcp_extract_schema() {
-    var head = str_from("{\"name\":\"echo\",\"callback_url\":\"http://127.0.0.1:9000\",\"inputSchema\":");
-    var sj_a = str_from("{\"type\":\"object\",\"properties\":{\"text\":");
-    var sj_b = str_from("{\"type\":\"string\"}},\"required\":[\"text\"]}}");
-    var body = str_cat(head, str_cat(sj_a, sj_b));
-    var root = bayan_json_v_parse(body);
-    if (root == 0) { return 0; }
-    var sv = bayan_json_v_obj_get(root, "inputSchema");
-    if (sv == 0) { return 0; }
-    bayan_json_v_build(sv);
+    mcp_extract_input_schema(_schema_body);
     return 0;
 }
 
+# 100 registrations into a fresh fleet — each one scans the fleet for a
+# duplicate name, as POST /v1/edge/nodes does.
 fn bench_edge_register_100() {
-    var nodes = map_new();
+    var ef = edge_fleet_new(edge_fleet_config_default());
     var i = 0;
     while (i < 100) {
-        var n = alloc(96);
-        var nid = str_from_int(i);
-        store64(n, nid);
-        store64(n + 8, str_cat(str_from("node-"), nid));
-        store64(n + 16, 0);  # ONLINE
-        store64(n + 64, clock_epoch_secs());
-        map_set(nodes, str_data(nid), n);
+        var name = str_cat(str_from("node-"), str_from_int(i));
+        edge_fleet_register(ef, edge_node_new(name, str_from("x86_64"), 4, 4096));
         i = i + 1;
     }
     return 0;
 }
 
 fn bench_edge_heartbeat_100() {
-    var keys = map_keys(_edge_map);
     var i = 0;
-    while (i < vec_len(keys)) {
-        var n = map_get(_edge_map, vec_get(keys, i));
-        store64(n + 64, clock_epoch_secs());
-        store64(n + 72, 2);
-        store64(n + 80, 50);
+    while (i < 100) {
+        edge_fleet_heartbeat(_edge_fleet_100, vec_get(_edge_ids_100, i), 2, 50);
         i = i + 1;
     }
     return 0;
 }
 
 fn bench_edge_stats_500() {
-    edge_fleet_stats(_edge_map);
+    edge_fleet_stats(_edge_fleet_500);
     return 0;
 }
 
@@ -344,6 +190,7 @@ fn bench_cb_cycle() {
     return 0;
 }
 
+# stdlib contract (not a daimon module) — unchanged.
 fn bench_hashmap_1000() {
     var m = map_new();
     var i = 0;
@@ -352,7 +199,6 @@ fn bench_hashmap_1000() {
         map_set(m, str_data(key), i);
         i = i + 1;
     }
-    # Lookup all
     i = 0;
     while (i < 1000) {
         var key = str_from_int(i);
@@ -367,54 +213,15 @@ fn bench_json_parse() {
     return 0;
 }
 
-# secure_zero (src/secmem.cyr) — VULN-007 sensitive-memory scrub, 4 KiB buffer
-var _secmem_sink = 0;
-fn secure_zero(ptr, len): i64 {
-    if (ptr == 0) { return 0; }
-    if (len <= 0) { return 0; }
-    var i = 0;
-    while (i < len) { store8(ptr + i, 0); i = i + 1; }
-    _secmem_sink = _secmem_sink + load8(ptr + len - 1);
-    return 0;
-}
 var _bench_sz_buf = 0;
 fn bench_secure_zero() {
-    if (_bench_sz_buf == 0) { _bench_sz_buf = alloc(4096); }
     secure_zero(_bench_sz_buf, 4096);
     return 0;
 }
 
-# trace_id_hex (src/trace.cyr) — format an i64 trace id as 16 hex chars
-fn trace_id_hex(id, buf): i64 {
-    var i = 0;
-    while (i < 16) {
-        var shift = (15 - i) * 4;
-        var nib = (id >> shift) & 15;
-        var c = 48 + nib;
-        if (nib >= 10) { c = 87 + nib; }
-        store8(buf + i, c);
-        i = i + 1;
-    }
-    store8(buf + 16, 0);
-    return buf;
-}
 var _bench_tid_buf = 0;
 fn bench_trace_id_hex() {
-    if (_bench_tid_buf == 0) { _bench_tid_buf = alloc(17); }
     trace_id_hex(305419896, _bench_tid_buf);
-    return 0;
-}
-
-# Helper for strcmp
-fn strcmp(a, b) {
-    var i = 0;
-    while (1 == 1) {
-        var ca = load8(a + i);
-        var cb = load8(b + i);
-        if (ca != cb) { return ca - cb; }
-        if (ca == 0) { return 0; }
-        i = i + 1;
-    }
     return 0;
 }
 
@@ -424,8 +231,11 @@ fn strcmp(a, b) {
 
 fn main() {
     alloc_init();
+    # The real circuit breaker logs a WARN each time it opens, and samay logs
+    # every task it cannot place; 100,000 log lines would time the logger.
+    sakshi_set_level(SK_ERROR);
+    daimon_audit_init();
 
-    # Setup: build cosine vectors (128d)
     _cos_a = alloc(128 * 8);
     _cos_b = alloc(128 * 8);
     var i = 0;
@@ -435,8 +245,8 @@ fn main() {
         i = i + 1;
     }
 
-    # Setup: build 1000 vectors (64d) for search bench
-    _vec_entries = vec_new();
+    # 1,000 64-d entries, the same values the old copy used.
+    _vindex_1k = vindex_new();
     i = 0;
     while (i < 1000) {
         var emb = alloc(64 * 8);
@@ -445,7 +255,7 @@ fn main() {
             store64(emb + j * 8, f64_from(i * 64 + j));
             j = j + 1;
         }
-        vec_push(_vec_entries, emb);
+        vindex_insert(_vindex_1k, vec_entry_new(i, emb, 64, str_from("c"), str_from("m")));
         i = i + 1;
     }
     _cos_query = alloc(64 * 8);
@@ -455,32 +265,31 @@ fn main() {
         i = i + 1;
     }
 
-    # Setup: MCP registry with 100 tools
     _mcp_reg = mcp_registry_new();
     i = 0;
     while (i < 100) {
         var name = str_cat(str_from("tool-"), str_from_int(i));
-        mcp_register_builtin(_mcp_reg, mcp_tool_new(name, str_from("desc")));
+        mcp_register_builtin(_mcp_reg, mcp_tool_new(name, str_from("desc"), 0));
         i = i + 1;
     }
 
-    # Setup: edge fleet with 500 nodes
-    _edge_map = map_new();
+    _edge_fleet_100 = edge_fleet_new(edge_fleet_config_default());
+    _edge_ids_100 = vec_new();
+    i = 0;
+    while (i < 100) {
+        var en = edge_node_new(str_cat(str_from("hb-"), str_from_int(i)), str_from("x86_64"), 4, 4096);
+        edge_fleet_register(_edge_fleet_100, en);
+        vec_push(_edge_ids_100, str_cstr(edge_node_id(en)));
+        i = i + 1;
+    }
+    _edge_fleet_500 = edge_fleet_new(edge_fleet_config_default());
     i = 0;
     while (i < 500) {
-        var n = alloc(96);
-        var nid = str_from_int(i);
-        store64(n, nid);
-        store64(n + 8, str_cat(str_from("node-"), nid));
-        store64(n + 16, 0);
-        store64(n + 64, clock_epoch_secs());
-        store64(n + 72, 0);
-        store64(n + 80, 0);
-        map_set(_edge_map, str_data(nid), n);
+        edge_fleet_register(_edge_fleet_500,
+          edge_node_new(str_cat(str_from("st-"), str_from_int(i)), str_from("x86_64"), 4, 4096));
         i = i + 1;
     }
 
-    # Setup: RAG text (~5k chars)
     var rag_sb = str_builder_new();
     i = 0;
     while (i < 100) {
@@ -489,10 +298,16 @@ fn main() {
     }
     _rag_text = str_builder_build(rag_sb);
 
-    # Run benchmarks
+    var head = str_from("{\"name\":\"echo\",\"callback_url\":\"http://127.0.0.1:9000\",\"inputSchema\":");
+    var sj_a = str_from("{\"type\":\"object\",\"properties\":{\"text\":");
+    var sj_b = str_from("{\"type\":\"string\"}},\"required\":[\"text\"]}}");
+    _schema_body = str_cat(head, str_cat(sj_a, sj_b));
+
+    _bench_sz_buf = alloc(4096);
+    _bench_tid_buf = alloc(17);
+
     var benches = vec_new();
 
-    # Core (parity with Rust suite)
     var b1 = bench_new("config_default");
     bench_run(b1, &bench_config_default, 10000);
     vec_push(benches, b1);
@@ -509,20 +324,18 @@ fn main() {
     bench_run(b4, &bench_vector_search_1k, 100);
     vec_push(benches, b4);
 
-    var b5 = bench_new("rag_ingest_5k_chars");
-    bench_run(b5, &bench_rag_ingest_5k, 1000);
+    var b5 = bench_new("rag_chunk_5k_chars");
+    bench_run(b5, &bench_rag_chunk_5k, 1000);
     vec_push(benches, b5);
 
     var b6 = bench_new("scheduler_100_tasks");
     bench_run(b6, &bench_scheduler_100, 100);
     vec_push(benches, b6);
 
-    # Agent registration
     var b7 = bench_new("supervisor_register_1000");
     bench_run(b7, &bench_supervisor_register_1000, 10);
     vec_push(benches, b7);
 
-    # MCP dispatch
     var b8 = bench_new("mcp_register_100_tools");
     bench_run(b8, &bench_mcp_register_100, 100);
     vec_push(benches, b8);
@@ -539,7 +352,6 @@ fn main() {
     bench_run(b10b, &bench_mcp_extract_schema, 10000);
     vec_push(benches, b10b);
 
-    # Edge fleet
     var b11 = bench_new("edge_register_100");
     bench_run(b11, &bench_edge_register_100, 100);
     vec_push(benches, b11);
@@ -552,7 +364,6 @@ fn main() {
     bench_run(b13, &bench_edge_stats_500, 1000);
     vec_push(benches, b13);
 
-    # Additional
     var b14 = bench_new("circuit_breaker_cycle");
     bench_run(b14, &bench_cb_cycle, 100000);
     vec_push(benches, b14);

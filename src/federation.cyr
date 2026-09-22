@@ -25,12 +25,20 @@ enum SchedulingStrategy {
 #                   cpu_cores, memory_mb, gpu_count}
 # 10 fields x 8 = 80 bytes
 
+# ⛔ 2.2.3 — the node OWNS its name. It stored the caller's Str, so a name taken
+# from a request (a jget VIEW into the buffer sandhi reuses) would be rewritten
+# by the next request — the 2.2.1 class. The roadmap recorded the latent case
+# as "federation.cyr:62", which pointed at fed_mgr_add_node's map key; that key
+# is in fact safe — the node's own freshly formatted id, which fmt_int_buf
+# NUL-terminates — and this field was the borrowed one.
 fn fed_node_new(name, cpu_cores, memory_mb, gpu_count) {
     var n = alloc(80);
     var nid = str_from_int(_next_agent_id);
     _next_agent_id = _next_agent_id + 1;
     store64(n, nid);
-    store64(n + 8, name);
+    var owned_name = 0;
+    if (name != 0) { owned_name = str_clone(name); }
+    store64(n + 8, owned_name);
     store64(n + 16, ROLE_FOLLOWER);
     store64(n + 24, FED_ONLINE);
     store64(n + 32, clock_epoch_secs());

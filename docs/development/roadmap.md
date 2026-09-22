@@ -4,10 +4,12 @@
 >
 > **Severity legend**: **P0** blocking (security / correctness — must-fix before ship) · **P1** high (must-have for the current arc) · **P2** medium (schedule when capacity opens) · **P3 / Low** nice-to-have, no urgency. Upstream-blocker items quote the upstream tracker's own severity.
 
-**Where daimon stands** — `2.2.2`, on cyrius 6.6.6, nine dep pins current (samay 1.1.3). Builds
-and runs on **three targets**: x86_64, aarch64 and AGNOS. **368 tests**, 5 fuzz harnesses, 21
-benchmarks, all gates clean. Zero open issue filings. MCP surface: 13 tools. Every route now states
-its HTTP method, and no state change can be reached by a GET.
+**Where daimon stands** — `2.2.3`, cyrius 6.6.6, nine dep pins current (samay
+1.1.3). Builds and runs on **three targets**: x86_64, aarch64 and AGNOS (the agnos build boots on AGNOS
+1.57.5 and listens). **645 tests** in 16 suites, **every one against its real `src/` module** — the
+2.2.x test-integrity arc is complete, and so are the benchmarks (21) and fuzz harnesses (6,
+property-based, run by CI). Zero open issue filings. MCP surface: 13 tools, and an external
+registration can no longer take a builtin's name.
 
 ## The arc to 3.0.0
 
@@ -16,8 +18,7 @@ prerequisites, sequenced. Each line is a release train, not a single release.
 
 | arc | theme | why it must come after the one above |
 |---|---|---|
-| **2.2.x** | **Test integrity** — migrate the mirrored suites onto `src/` | It is the net everything else lands in. The lifecycle code has **never been executed**; migrating its tests answers whether it works *before* anything depends on it. |
-| **2.3.x** | **Agent lifecycle** — start / stop / signal / reap through the API | The product gap. Needs 2.2.x first: wiring `fork`/`execve`/signals while the suite tests a parallel reimplementation is how two releases already shipped defects green. |
+| **2.3.x** | **Agent lifecycle** — start / stop / signal / reap through the API | The product gap, and next. Its prerequisite — every suite testing the real code, not a copy — is in place, so the `fork`/`execve`/signal paths get wired under tests that can see them. |
 | **2.4.x** | **AGNOS spawn + IPC** — `sys_spawn_path`, `chan_op` capability channels, `sys_proclist` | Nothing to map until a route actually spawns. Unblocks the moment 2.3.x lands. |
 | **2.5.x** | **Agent identity + MCP authentication** | Prerequisite for un-gating nein's mutating firewall tools, and for any `claims`-based authorisation. Needs 2.3.x, because identity is per-agent. |
 | **3.0.0** | **Per-agent arena isolation** — VULN-007's open half; unlocks multi-tenant hosting, kavach sandboxing, untrusted federation, external MCP callbacks | Major because it changes the allocation model under every agent and flips the gates the P0 below guards. Needs identity (2.5.x) to know what a tenant *is*. |
@@ -27,29 +28,6 @@ cut re-evaluates the P0 below.
 
 
 ---
-
-## 2.2.x · P1 — Tests, benches and fuzz harnesses include no `src/` file
-
-`tests/daimon.tcyr`, `tests/daimon.bcyr` and all five `fuzz/*.fcyr` reimplement simplified copies of
-the functions they name, so a passing suite has never been a statement about daimon's shipping
-source. Two shipped security defects were green under it, each because the mirror never called the
-code that was wrong.
-
-**In progress — four modules done.** `agent` (2.2.0), then `error`, `supervisor` and `ipc`
-(2.2.1) each moved onto real-module tests with every mirror assertion carried forward. Seven files
-now include `src/` directly. The migration keeps paying for itself: it found `read_vm_rss` returning
-0 for every process, a mirrored error enum that had **drifted** from the real one, the registry
-aliasing in `supervisor` and `ipc`, a pointer-compare `rpc_unregister_agent`, and an unescaped
-`error_json`.
-
-**Remaining**: the other mirrors in `tests/daimon.tcyr` (config, memory, vector_store, rag, mcp,
-screen, scheduler, federation, edge, http/router), `tests/daimon.bcyr` — which `cmp` shows is
-**byte-identical** before and after 2.2.1, i.e. it cannot observe any `src/` change — and four of the
-five fuzz harnesses. `agent_next_id` is still mirrored until the screen/scheduler/mcp mirrors go.
-
-**One module per bite, suite green at each step** — not one cut-over. Start with the modules the
-next arc touches: `agent`, `supervisor`, `ipc`. Expect the migration to surface defects; that is the
-point of it.
 
 ## 2.3.x · P1 — Wire the agent lifecycle to the API
 
@@ -71,19 +49,24 @@ This is the product gap, not a cleanup, and it is why several items below are do
 spawn/IPC mapping, the VULN-010 rlimit question, and most of the supervisor's value all sit behind
 it.
 
-⚠ **Do it after the test-integrity item, not before.** Spawning processes, delivering signals and
-reaping children is exactly the class where the mirrored-test problem has already cost two releases;
-wiring it while the suite tests a parallel reimplementation would repeat that with `fork`/`execve`
-instead of a string copy. Migrating `src/agent.cyr`'s tests first also answers for free whether this
-code works at all — **it has never been executed.**
+The test-integrity prerequisite is done: `src/agent.cyr`, `supervisor` and `ipc` are tested against
+their real source, and the process paths have run under test (spawn, `/proc` readers, a real IPC
+socket round trip). Every Str a retaining struct keeps is now owned where it is retained (2.2.3
+closed the last latent cases), so a route can hand these functions request-buffer views safely.
 
-⚠ **Aliasing sweep status (2.2.1).** Every `jget` retained by a *live* endpoint is now owned —
-agents, edge nodes, scheduler tasks and nodes, MCP tools/resources/prompts, RAG. Still borrowed and
-**latent only because nothing calls them yet**: `federation.cyr:62`, `fed_vector_store.cyr` keys,
-`screen.cyr:69,99`. When this arc wires a route to any of them, own the key in the same change.
+**The same gap, one level down: a scheduled task never starts.** samay places tasks on nodes, but
+nothing moves a task from SCHEDULED to RUNNING — there is no start or complete route — so through
+the API every task stops at SCHEDULED, and `complete_task` is unreachable. Whatever executes an agent
+on a node is what should report a task running and done; wire both in this arc.
 
-**Sequence**: migrate `agent` + `supervisor` tests → wire start/stop → signals and reaping → IPC.
-One bite each, suite green at every step.
+**The IPC step, when it comes** — found when the socket code first ran (2.2.3), deliberately left for
+the step that wires it:
+- the SO_PEERCRED check (VULN-006) **fails open**: if `getsockopt` fails, the peer is not checked;
+- a message cut short by its sender is queued and ACKed as if whole;
+- `agent_ipc_accept_one` reads with no timeout, so one silent peer holds the accept loop.
+
+**Sequence**: wire start/stop → signals and reaping → task start/complete → IPC. One bite each,
+suite green at every step.
 
 ## 2.4.x · P2 — AGNOS spawn + IPC mapping
 
@@ -123,6 +106,14 @@ nein's firewall admin tools (`nein_allow` / `nein_deny`) are registered and **ga
 (`_nein_admin_enabled` stops being an operator-trust flag), per-agent authorisation on every other
 MCP tool, and a meaningful definition of "tenant" for the 3.0.0 isolation work.
 
+Also waiting on identity:
+- **The agent memory API.** The per-agent memory store works since 2.2.3 (it crashed on its first
+  call before), but no route reaches it, and one must not until a caller can be tied to an agent —
+  otherwise any client reads any agent's memory. Its records also need the `tags` field the Rust
+  original had: `list_by_tag` is a substring search over the record today.
+- **Who may replace an external MCP registration.** Re-registering a name replaces it, whoever
+  registered it first. (Taking a *builtin's* name is refused since 2.2.3.)
+
 Needs 2.3.x first — identity is per-agent, and there are no agents until the lifecycle exists.
 
 ## 3.0.0 · P0 (gated, dormant) — VULN-007: per-agent arena isolation
@@ -134,6 +125,13 @@ those; **P0 the moment one does.** Re-evaluate at every `2.x.0` cut.
 Zero-on-reset and secret hygiene close the *reuse* and *leak* channels but do not **isolate trust
 domains** — one bump allocator still backs every agent. Isolation is the open half and the hard
 prerequisite. (Both shipped halves are in the CHANGELOG.)
+
+## P3 — Edge registration takes no capabilities
+
+`POST /v1/edge/nodes` records every node as `x86_64`, 4 cores, 4096 MB whatever it is, so placement
+and stats describe a fleet that does not exist. Read `arch` / `cpu_cores` / `memory_mb` from the
+body (validated). Its duplicate-name check is also a linear scan per registration — bounded by
+`max_nodes` (1,000), so not urgent.
 
 ## Beyond the arc (unsequenced)
 

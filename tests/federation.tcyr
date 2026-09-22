@@ -1,0 +1,271 @@
+# =========================================================================
+# federation — tests against THE REAL src/federation.cyr and
+# src/fed_vector_store.cyr (2.2.3)
+#
+# Test-integrity arc (roadmap 2.2.x). tests/daimon.tcyr carried local copies of
+# 9 of federation.cyr's 24 functions and 14 of fed_vector_store.cyr's 18; every
+# assertion is carried forward here against the real modules, and the copies
+# are DELETED from daimon.tcyr in the same change. The copy of fed_score_node
+# had dropped the 30% locality term entirely, so no test had ever exercised
+# placement preference.
+#
+# Neither module has a caller in src/ yet (federation is gated behind 3.0.0's
+# isolation work), which is exactly when its tests are cheapest to put in place.
+# The ownership groups close the last latent entries on the roadmap's aliasing
+# list.
+#
+# federation.cyr draws node ids from agent.cyr's `_next_agent_id`, so the
+# include chain is agent.tcyr's.
+# =========================================================================
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/io.cyr"
+include "lib/fs.cyr"
+include "lib/hashmap.cyr"
+include "lib/tagged.cyr"
+include "lib/bayan.cyr"
+include "lib/chrono.cyr"
+include "lib/syscalls.cyr"
+include "lib/math.cyr"
+include "lib/process.cyr"
+include "lib/sakshi.cyr"
+include "lib/libro.cyr"
+include "lib/assert.cyr"
+
+include "src/syscalls.cyr"
+include "src/error.cyr"
+include "src/audit.cyr"
+include "src/agent.cyr"
+include "src/federation.cyr"
+include "src/fed_vector_store.cyr"
+
+daimon_audit_init();
+
+# --- federation: carried forward from daimon.tcyr -------------------------
+test_group("federation");
+var fm = fed_mgr_new(SCHED_BALANCED);
+var fnode = fed_node_new(str_from("node-a"), 8, 16384, 1);
+fed_mgr_add_node(fm, fnode);
+assert_eq(fed_mgr_node_count(fm), 1, "1 fed node");
+var flive = fed_mgr_live_nodes(fm);
+assert_eq(vec_len(flive), 1, "1 live node");
+var fscore = fed_score_node(fnode, 2, 4096, 0, 1, 0);
+assert(fscore > 0, "positive score");
+assert(fscore <= 100, "score <= 100");
+var fid_cstr = str_cstr(fed_node_id(fnode));
+var fterm_t, fterm_v = fed_mgr_start_election(fm, fid_cstr);
+assert(is_ok(fterm_t) == 1, "election started");
+assert_eq(fed_node_role(fnode), ROLE_CANDIDATE, "became candidate");
+fed_mgr_become_coordinator(fm, fid_cstr);
+assert_eq(fed_node_role(fnode), ROLE_COORDINATOR, "became coordinator");
+
+# --- federation: first coverage ---------------------------------------------
+test_group("federation_coverage");
+assert(str_eq(fed_node_name(fnode), str_from("node-a")) == 1, "fed_node_name accessor");
+assert(fed_mgr_get_node(fm, fid_cstr) == fnode, "get_node finds the node by id");
+assert_eq(fed_mgr_get_node(fm, "nope"), 0, "get_node of an unknown id is 0");
+
+# Placement score, exactly. 8 cores / 16 GiB asked for 2 cores / 4 GiB: 75%
+# headroom on both. 0.4 * 75 + 0.2 * 100 (idle) = 50, and +30 for locality.
+# The copy computed the first number only — it had no locality term at all.
+assert_eq(fed_score_node(fnode, 2, 4096, 0, 1, 0), 50, "score without a preferred node");
+assert_eq(fed_score_node(fnode, 2, 4096, fed_node_id(fnode), 1, 0), 80,
+  "the preferred node gets the 30% locality term");
+assert_eq(fed_score_node(fnode, 16, 4096, 0, 1, 0), 34,
+  "asking for more cores than exist: cpu headroom 0, so resource = (0 + 75) / 2");
+
+# Terms and votes.
+var t2_t, t2_v = fed_mgr_start_election(fm, fid_cstr);
+assert_eq(t2_v, fterm_v + 1, "each election increments the term");
+assert(str_eq(load64(fnode + 48), fed_node_id(fnode)) == 1, "a candidate votes for itself");
+assert_eq(fed_mgr_receive_vote_request(fm, fid_cstr, "other", t2_v), 0, "an equal term is denied");
+assert_eq(fed_mgr_receive_vote_request(fm, fid_cstr, "other", t2_v + 5), 1, "a higher term is granted");
+assert_eq(fed_node_role(fnode), ROLE_FOLLOWER, "and the voter steps down");
+assert_eq(load64(fnode + 40), t2_v + 5, "and adopts the candidate's term");
+assert_eq(fed_mgr_receive_vote_request(fm, "nope", "other", 99), 0, "an unknown voter denies");
+assert_eq(fed_mgr_receive_vote(fm, 1, 3, 1), 1, "2 of 3 is a majority");
+assert_eq(fed_mgr_receive_vote(fm, 1, 4, 1), 0, "2 of 4 is not");
+assert_eq(fed_mgr_receive_vote(fm, 0, 3, 5), 0, "a denied vote never completes a majority");
+var sd_t, sd_v = fed_mgr_step_down(fm, fid_cstr, 42);
+assert_eq(is_ok(sd_t), 1, "step_down of a known node is Ok");
+assert_eq(load64(fnode + 40), 42, "step_down sets the term");
+assert_eq(load64(fnode + 48), 0, "and clears the vote");
+assert_eq(is_err_result(fed_mgr_step_down(fm, "nope", 1)), 1, "step_down of an unknown node fails");
+assert_eq(is_err_result(fed_mgr_start_election(fm, "nope")), 1, "an unknown node cannot stand");
+
+# Health, heartbeats and placement.
+var gpu = fed_node_new(str_from("gpu-box"), 4, 8192, 2);
+var quiet = fed_node_new(str_from("quiet"), 64, 65536, 0);
+var dead = fed_node_new(str_from("dead"), 64, 65536, 4);
+fed_mgr_add_node(fm, gpu);
+fed_mgr_add_node(fm, quiet);
+fed_mgr_add_node(fm, dead);
+var now = clock_epoch_secs();
+store64(quiet + 32, now - 45);          # last_heartbeat
+store64(dead + 32, now - 600);
+fed_mgr_check_health(fm, 30, 90);
+assert_eq(fed_node_status(quiet), FED_SUSPECT, "45 s of silence: suspect");
+assert_eq(fed_node_status(dead), FED_DEAD, "10 min of silence: dead");
+assert_eq(fed_node_status(gpu), FED_ONLINE, "a fresh node stays online");
+assert_eq(vec_len(fed_mgr_live_nodes(fm)), 2, "live nodes exclude suspect and dead");
+var fst = fed_mgr_stats(fm);
+assert_eq(load64(fst), 4, "stats: total");
+assert_eq(load64(fst + 8), 2, "stats: live");
+assert_eq(load64(fst + 16), 1, "stats: suspect");
+assert_eq(load64(fst + 24), 1, "stats: dead");
+
+# Placement only ever lands on a live node, and honours a GPU requirement. Its
+# own manager, so every node's eligibility is unambiguous.
+var fm2 = fed_mgr_new(SCHED_BALANCED);
+var big = fed_node_new(str_from("big-cpu"), 64, 65536, 0);
+var small_gpu = fed_node_new(str_from("small-gpu"), 4, 8192, 2);
+var dead_gpu = fed_node_new(str_from("dead-gpu"), 64, 65536, 8);
+fed_mgr_add_node(fm2, big);
+fed_mgr_add_node(fm2, small_gpu);
+fed_mgr_add_node(fm2, dead_gpu);
+fed_node_set_status(dead_gpu, FED_DEAD);
+var pg_t, pg_v = fed_place_agent(fm2, 1, 1024, 1, 0);
+assert_eq(is_ok(pg_t), 1, "a GPU request finds a live GPU node");
+assert(pg_v == small_gpu, "the small live GPU node — not the bigger, dead one");
+var pc_t, pc_v = fed_place_agent(fm2, 1, 1024, 0, 0);
+assert(pc_v == big, "without a GPU requirement, the node with the most headroom");
+var pp_t, pp_v = fed_place_agent(fm2, 1, 1024, 0, fed_node_id(small_gpu));
+assert(pp_v == small_gpu, "a live preferred node outscores more headroom (locality 30%)");
+fed_node_set_status(small_gpu, FED_SUSPECT);
+var pn_t, pn_v = fed_place_agent(fm2, 1, 1024, 1, 0);
+assert_eq(is_err_result(pn_t), 1, "no live GPU node: placement fails");
+
+var rh_t, rh_v = fed_mgr_record_heartbeat(fm, str_cstr(fed_node_id(dead)));
+assert_eq(is_ok(rh_t), 1, "a heartbeat from a dead node is recorded");
+assert_eq(fed_node_status(dead), FED_ONLINE, "and brings it back online");
+assert_eq(is_err_result(fed_mgr_record_heartbeat(fm, "nope")), 1, "an unknown node's heartbeat fails");
+fed_node_update_heartbeat(quiet);
+fed_node_set_role(quiet, ROLE_CANDIDATE);
+assert_eq(fed_node_role(quiet), ROLE_CANDIDATE, "fed_node_set_role");
+
+assert_eq(fed_mgr_remove_node(fm, str_cstr(fed_node_id(quiet))), 1, "remove_node removes");
+assert_eq(fed_mgr_node_count(fm), 3, "and the count drops");
+
+# ⛔ 2.2.3 — the node OWNS its name (the 1.2.5 clobber shape).
+var nb = alloc(32);
+memcpy(nb, "node-ORIGINAL", 13);
+var owned = fed_node_new(str_new(nb, 13), 1, 1, 0);
+memset(nb, 88, 32);
+assert(str_eq(fed_node_name(owned), str_from("node-ORIGINAL")) == 1,
+  "federation node name survives the request buffer being reused");
+
+# --- fed_vector_store: carried forward from daimon.tcyr -------------------
+test_group("fed_vector_store");
+var fvs = fed_vstore_new(str_from("local-1"), REPL_FULL);
+assert_eq(fed_vstore_collection_count(fvs), 0, "empty store");
+assert(str_eq(fed_vstore_local_id(fvs), str_from("local-1")) == 1, "local id");
+assert_eq(fed_vstore_strategy(fvs), REPL_FULL, "strategy full");
+
+fed_vstore_register_replica(fvs, "docs", str_from("local-1"), str_from("127.0.0.1:8090"), 100);
+fed_vstore_register_replica(fvs, "docs", str_from("node-2"), str_from("10.0.0.2:8090"), 95);
+fed_vstore_register_replica(fvs, "logs", str_from("node-3"), str_from("10.0.0.3:8090"), 50);
+assert_eq(fed_vstore_collection_count(fvs), 2, "2 collections");
+var docs_all = fed_vstore_all_replicas(fvs, "docs");
+assert_eq(vec_len(docs_all), 2, "docs has 2 replicas");
+var docs_remote = fed_vstore_remote_replicas(fvs, "docs");
+assert_eq(vec_len(docs_remote), 1, "docs has 1 remote");
+assert(str_eq(replica_node_id(vec_get(docs_remote, 0)), str_from("node-2")) == 1, "remote is node-2");
+var fv_colls = fed_vstore_collections(fvs);
+assert_eq(vec_len(fv_colls), 2, "2 collection names");
+
+fed_vstore_remove_node(fvs, str_from("node-2"));
+var docs_after = fed_vstore_all_replicas(fvs, "docs");
+assert_eq(vec_len(docs_after), 1, "docs down to 1 replica");
+var docs_remote2 = fed_vstore_remote_replicas(fvs, "docs");
+assert_eq(vec_len(docs_remote2), 0, "no remote replicas for docs");
+
+var fv_st = fed_vstore_stats(fvs);
+assert_eq(load64(fv_st), 2, "2 collections in stats");
+assert_eq(load64(fv_st + 8), 2, "2 total replicas");
+
+var local_res = vec_new();
+vec_push(local_res, remote_result_new(str_from("v1"), f64_from(90), str_from("doc1"), str_from("local")));
+vec_push(local_res, remote_result_new(str_from("v2"), f64_from(70), str_from("doc2"), str_from("local")));
+var remote_batch = vec_new();
+var rbatch1 = vec_new();
+vec_push(rbatch1, remote_result_new(str_from("v3"), f64_from(85), str_from("doc3"), str_from("node-2")));
+vec_push(rbatch1, remote_result_new(str_from("v1"), f64_from(80), str_from("doc1-dup"), str_from("node-2")));
+vec_push(remote_batch, rbatch1);
+var merged = fed_vstore_merge_results(fvs, local_res, remote_batch, 3);
+assert_eq(vec_len(merged), 3, "3 merged results");
+assert(str_eq(remote_result_id(vec_get(merged, 0)), str_from("v1")) == 1, "top result is v1");
+
+# --- fed_vector_store: first coverage ---------------------------------------
+test_group("fed_vector_store_coverage");
+# The copy's comment said "v1 should have score 90 (kept higher), not 80" and
+# stopped there; this checks it.
+assert_eq(remote_result_score(vec_get(merged, 0)), f64_from(90), "the duplicate kept its higher score");
+assert(str_eq(remote_result_content(vec_get(merged, 0)), str_from("doc1")) == 1,
+  "and the content of the higher-scoring copy");
+assert(str_eq(remote_result_id(vec_get(merged, 1)), str_from("v3")) == 1, "second is v3 (85)");
+assert(str_eq(remote_result_id(vec_get(merged, 2)), str_from("v2")) == 1, "third is v2 (70)");
+assert_eq(vec_len(fed_vstore_merge_results(fvs, local_res, remote_batch, 1)), 1, "top_k truncates");
+
+# max_remote_results caps how many results one remote batch may contribute.
+store64(fvs + 24, 1);
+var capped = fed_vstore_merge_results(fvs, vec_new(), remote_batch, 10);
+assert_eq(vec_len(capped), 1, "a batch contributes at most max_remote_results");
+
+assert_eq(load64(fv_st + 16), 150, "stats: total vectors (100 + 50)");
+assert_eq(load64(fv_st + 24), 2, "stats: distinct nodes holding vectors");
+assert_eq(load64(fv_st + 32), REPL_FULL, "stats: strategy");
+assert_eq(vec_len(fed_vstore_all_replicas(fvs, "absent")), 0, "an unknown collection has no replicas");
+assert_eq(vec_len(fed_vstore_remote_replicas(fvs, "absent")), 0, "and no remote replicas");
+assert_eq(replica_vector_count(vec_get(docs_after, 0)), 100, "replica_vector_count");
+
+# ⛔ 2.2.3 — ownership: the local id, the collection KEY, and each replica's
+# node id and address were all the caller's pointers.
+var lb = alloc(32);
+memcpy(lb, "local-ORIGINAL", 14);
+var ofvs = fed_vstore_new(str_new(lb, 14), REPL_SHARDED);
+memset(lb, 88, 32);
+assert(str_eq(fed_vstore_local_id(ofvs), str_from("local-ORIGINAL")) == 1,
+  "the store's local id survives the request buffer being reused");
+
+var cb = alloc(32);
+memcpy(cb, "collection-A", 12);
+store8(cb + 12, 0);
+var idb = alloc(32);
+memcpy(idb, "node-ORIG", 9);
+var adb = alloc(32);
+memcpy(adb, "10.9.9.9:1", 10);
+fed_vstore_register_replica(ofvs, cb, str_new(idb, 9), str_new(adb, 10), 7);
+memset(cb, 88, 32);
+memset(idb, 88, 32);
+memset(adb, 88, 32);
+var oreps = fed_vstore_all_replicas(ofvs, "collection-A");
+assert_eq(vec_len(oreps), 1, "the collection is still found by its name after the key buffer is reused");
+if (vec_len(oreps) == 1) {
+    var orep = vec_get(oreps, 0);
+    assert(str_eq(replica_node_id(orep), str_from("node-ORIG")) == 1, "the replica's node id is owned");
+    assert(str_eq(load64(orep + 8), str_from("10.9.9.9:1")) == 1, "the replica's address is owned");
+}
+
+# The replica's own Strs, independently of the key: a literal collection name,
+# clobbered node id and address.
+var idb2 = alloc(32);
+memcpy(idb2, "node-SECOND", 11);
+var adb2 = alloc(32);
+memcpy(adb2, "10.8.8.8:2", 10);
+fed_vstore_register_replica(ofvs, "collection-B", str_new(idb2, 11), str_new(adb2, 10), 3);
+memset(idb2, 88, 32);
+memset(adb2, 88, 32);
+var oreps2 = fed_vstore_all_replicas(ofvs, "collection-B");
+assert_eq(vec_len(oreps2), 1, "collection-B has its replica");
+if (vec_len(oreps2) == 1) {
+    assert(str_eq(replica_node_id(vec_get(oreps2, 0)), str_from("node-SECOND")) == 1,
+      "a replica's node id survives its buffer being reused");
+    assert(str_eq(load64(vec_get(oreps2, 0) + 8), str_from("10.8.8.8:2")) == 1,
+      "a replica's address survives its buffer being reused");
+}
+
+syscall(SYS_EXIT, assert_summary());

@@ -2,45 +2,10 @@
 # api_mcp — MCP tool registry + dispatch endpoints
 # =========================================================================
 
+# The body is built by mcp_manifest_json (src/mcp.cyr) since 2.2.3, where a test
+# and a benchmark can reach it; this handler only sends it.
 fn api_mcp_manifest(fd) {
-    var builtin = load64(_mcp_registry);
-    var external = load64(_mcp_registry + 8);
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "{\"tools\":[");
-    var keys = map_keys(builtin);
-    var i = 0;
-    while (i < vec_len(keys)) {
-        if (i > 0) { str_builder_add_cstr(sb, ","); }
-        var t = map_get(builtin, vec_get(keys, i));
-        str_builder_add_cstr(sb, "{\"name\":\"");
-        str_builder_add(sb, json_escape_str(mcp_tool_name(t)));
-        str_builder_add_cstr(sb, "\",\"description\":\"");
-        str_builder_add(sb, json_escape_str(mcp_tool_desc(t)));
-        str_builder_add_cstr(sb, "\",\"inputSchema\":");
-        str_builder_add(sb, mcp_manifest_schema(t));
-        str_builder_add_cstr(sb, "}");
-        i = i + 1;
-    }
-    # Also add external tools
-    var ekeys = map_keys(external);
-    var j = 0;
-    while (j < vec_len(ekeys)) {
-        if (i + j > 0) { str_builder_add_cstr(sb, ","); }
-        var ext = map_get(external, vec_get(ekeys, j));
-        var t = load64(ext);
-        str_builder_add_cstr(sb, "{\"name\":\"");
-        str_builder_add(sb, json_escape_str(mcp_tool_name(t)));
-        str_builder_add_cstr(sb, "\",\"description\":\"");
-        str_builder_add(sb, json_escape_str(mcp_tool_desc(t)));
-        str_builder_add_cstr(sb, "\",\"inputSchema\":");
-        str_builder_add(sb, mcp_manifest_schema(t));
-        str_builder_add_cstr(sb, "}");
-        j = j + 1;
-    }
-    str_builder_add_cstr(sb, "],\"count\":");
-    str_builder_add_int(sb, mcp_tool_count(_mcp_registry));
-    str_builder_add_cstr(sb, "}");
-    http_ok(fd, str_builder_build(sb));
+    http_ok(fd, mcp_manifest_json(_mcp_registry));
 }
 
 # POST /v1/mcp/tools — register external tool
@@ -63,7 +28,13 @@ fn api_mcp_register(fd, body) {
     # Read the optional MCP inputSchema (verbatim object text, {} if absent).
     var schema = mcp_extract_input_schema(body);
     var tool = mcp_tool_new(name, desc, schema);
-    mcp_register_external(_mcp_registry, tool, url);
+    var rr_t, rr_v = mcp_register_external(_mcp_registry, tool, url);
+    if (is_err_result(rr_t) == 1) {
+        # A builtin has this name — see mcp_register_external (2.2.3).
+        daimon_audit(SEV_SECURITY, "mcp", "mcp.register.shadow", "external registration named a builtin tool");
+        http_error(fd, 409, str_from("a builtin tool already has that name"));
+        return 0;
+    }
     http_send_response(fd, 201, "{\"ok\":true}", 11);
     return 0;
 }
@@ -113,7 +84,10 @@ fn api_mcp_call(fd, body) {
     var name_c = str_cstr(name);
     var tool = mcp_find_tool(_mcp_registry, name_c);
     if (tool == 0) { http_bad_request(fd, str_from("tool not found")); return 0; }
-    var url = mcp_find_external_url(_mcp_registry, name_c);
+    # A builtin ALWAYS dispatches in-process, whatever the external map holds
+    # (2.2.3 — see mcp_register_external for the hijack this closes).
+    var url = 0;
+    if (mcp_is_builtin(_mcp_registry, name_c) == 0) { url = mcp_find_external_url(_mcp_registry, name_c); }
     if (url == 0) {
         # Builtin tools dispatch in-process. Extract the raw MCP `arguments`
         # object (verbatim, so nested structure survives) and hand it to the
@@ -380,7 +354,13 @@ fn api_mcp_resource_register(fd, body) {
         http_bad_request(fd, str_from("invalid callback_url (must be http:// or https://)"));
         return 0;
     }
-    mcp_register_resource_external(_mcp_resources, mcp_resource_new(uri, name, desc, mime), url);
+    var rr_t, rr_v = mcp_register_resource_external(_mcp_resources, mcp_resource_new(uri, name, desc, mime), url);
+    if (is_err_result(rr_t) == 1) {
+        daimon_audit(SEV_SECURITY, "mcp", "mcp.resource.register.shadow",
+          "external registration named a builtin resource");
+        http_error(fd, 409, str_from("a builtin resource already has that uri"));
+        return 0;
+    }
     daimon_audit(SEV_INFO, "mcp", "mcp.resource.register", str_cstr(uri));
     var sb = str_builder_new();
     str_builder_add_cstr(sb, "{\"registered\":\"");
@@ -410,7 +390,12 @@ fn api_mcp_prompt_register(fd, body) {
     }
     # arguments is a nested ARRAY — the typed engine, never the flat jget scanner.
     var args = mcp_extract_prompt_arguments(body);
-    mcp_register_prompt_external(_mcp_prompts, mcp_prompt_new(name, desc, args), url);
+    var pr_t, pr_v = mcp_register_prompt_external(_mcp_prompts, mcp_prompt_new(name, desc, args), url);
+    if (is_err_result(pr_t) == 1) {
+        daimon_audit(SEV_SECURITY, "mcp", "mcp.prompt.register.shadow", "external registration named a builtin prompt");
+        http_error(fd, 409, str_from("a builtin prompt already has that name"));
+        return 0;
+    }
     daimon_audit(SEV_INFO, "mcp", "mcp.prompt.register", str_cstr(name));
     var sb = str_builder_new();
     str_builder_add_cstr(sb, "{\"registered\":\"");

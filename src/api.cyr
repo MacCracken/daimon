@@ -35,7 +35,12 @@ fn api_metrics(fd) {
     str_builder_add_cstr(sb, ",\"mcp_prompts\":");
     str_builder_add_int(sb, mcp_prompt_count(_mcp_prompts));
     str_builder_add_cstr(sb, ",\"vector_entries\":");
-    str_builder_add_int(sb, vindex_len(_vindex));
+    # ⛔ 2.2.3 — the RAG pipeline's OWN index. This read a global `_vindex` that
+    # app_init created and nothing ever inserted into (rag_pipeline_new makes
+    # its own), so the metric was 0 forever. Measured on 2.2.2: after a
+    # successful ingest that a query then retrieved, /v1/metrics reported
+    # "vector_entries":0. The orphan global is gone.
+    str_builder_add_int(sb, vindex_len(rag_pipeline_index(_rag_pipeline)));
     str_builder_add_cstr(sb, ",\"edge_nodes\":");
     str_builder_add_int(sb, edge_fleet_node_count(_edge_fleet));
     str_builder_add_cstr(sb, ",\"federation_nodes\":");

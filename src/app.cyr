@@ -7,7 +7,6 @@ var _config = 0;
 var _agents = 0;        # map<id_str_cstr, AgentHandle>
 var _supervisor = 0;
 var _mem_store = 0;
-var _vindex = 0;
 var _mcp_registry = 0;
 var _mcp_resources = 0;   # 2.1.0: MCP resources registry (sibling of _mcp_registry)
 var _mcp_prompts = 0;     # 2.1.0: MCP prompts registry
@@ -25,7 +24,6 @@ fn app_init() {
     _agents = map_new();
     _supervisor = supervisor_new();
     _mem_store = memory_store_new(str_from("/var/lib/agnos/agent-memory"));
-    _vindex = vindex_new();
     _mcp_registry = mcp_registry_new();
     _mcp_resources = mcp_resource_registry_new();   # 2.1.0
     _mcp_prompts = mcp_prompt_registry_new();       # 2.1.0

@@ -4,6 +4,171 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.2.3] - 2026-09-22
+
+**The 2.2.x test-integrity arc is finished: no test, benchmark or fuzz harness uses a copy of
+daimon's code any more.** Moving the last ten modules onto their real source did what the arc said
+it would — it found defects the copies had hidden. **Seven are live on the HTTP API** (one only
+under `serve --trace`), among them a security hole — an external tool could take over a builtin;
+the rest sit in code no route reaches yet, including a memory store that killed the process on its
+first call. It also overturns one of
+this project's own earlier conclusions (2.2.0's "stdlib procfs gap" was daimon's bug).
+
+**645 tests** (was 368) across 16 suites, every one including the real `src/` module; **6 fuzz
+harnesses**, property-based and now run by CI (~160,000 generated cases); **21 benchmarks** against
+the real code; an HTTP smoke script (`tests/smoke.sh`) now run by CI. fmt / lint / vet clean, lock
+verified, x86_64 + aarch64 + agnos build, and the agnos build boots on AGNOS 1.57.5 and listens.
+
+### Security — an external MCP tool could take over a builtin
+
+`POST /v1/mcp/call` sent a call to the external callback URL whenever the tool name had one — and
+nothing stopped an external registration from using a **builtin's** name. One registration of
+`{"name":"libro_verify","callback_url":<any>}` redirected every later call to daimon's own
+audit-chain verifier to that URL, with the caller's arguments, and relayed whatever came back as
+the verdict. Measured on 2.2.2:
+
+```
+POST /v1/mcp/call libro_verify           -> {"ok":true}        (the builtin)
+POST /v1/mcp/tools  name=libro_verify    -> 201                (Content-Type: text/plain)
+POST /v1/mcp/call libro_verify           -> 502, forwarded     (nothing listening at the URL)
+GET  /v1/mcp/tools                       -> "count":14, the name listed twice
+```
+
+The registration is a CORS-simple request (a `text/plain` POST needs no preflight), and daimon has
+no authentication, so a web page can send it. **Fixed in two layers:** `mcp_register_external`
+refuses a builtin's name (409, audit event `mcp.register.shadow`), and `api_mcp_call` dispatches a
+builtin in-process whatever the external map holds. Resources and prompts get the same registration
+rule, stated before either has a builtin. Found by `tests/mcp.tcyr`'s first run; pinned by a
+shadowing group there, the `mcp_registry` fuzz harness (a mutant that drops the guard fails it) and
+`tests/smoke.sh`.
+
+### Fixed — live on the HTTP API (each measured on 2.2.2, then on the fix)
+
+- **`/v1/rag/query` could answer with invalid JSON.** Its hand-rolled escape passed every control
+  byte but `\n` / `\r` through raw; the answer echoes ingested text, so a TAB or 0x01 in a document
+  came back inside a JSON string, which RFC 8259 forbids — Python's `json.loads` rejects it. Now
+  `json_escape_str`, the escaper everything else uses.
+- **`/v1/metrics` `vector_entries` was always 0.** It counted a global index `app_init` created and
+  nothing ever inserted into; the RAG pipeline has its own. After an ingest the query then
+  retrieved: `"vector_entries":0`. Now it counts the pipeline's index; the orphan global is gone.
+- **Edge-node health was never evaluated.** `edge_fleet_check_health` (ONLINE → SUSPECT after 30 s
+  silent → OFFLINE after 90 s) had no caller, so a node silent for a week was served as online.
+  Measured: 35 s after its last heartbeat 2.2.2 reported `"status":"Online"`; now `"Suspect"`, and
+  every edge read (`/v1/edge/nodes`, `/{id}`, `/stats`) re-evaluates first. `/stats` also gained the
+  `updating` and `decommissioned` counts it computed and dropped.
+- **Edge heartbeats accepted negative task counts** and summed them into the fleet totals (2.2.2:
+  `"active_tasks":-5` fleet-wide) — now 400. A heartbeat to a **decommissioned** node said "404 not
+  found"; it is a 409 conflict now, and an unknown id stays 404.
+- **RAG search cost grew with the square of the index.** See Performance.
+- **Tracing half-adopted malformed headers** (with `serve --trace`). The hex parser stops at the
+  first non-hex byte, and the checks were only "at least 35 / 32 bytes", so
+  `traceparent: 00-abc-…` became trace-id 0xabc… (W3C Trace Context requires ignoring an invalid
+  traceparent). Both headers are now validated structurally, and an all-zero id is refused. The
+  module's header comment still listed two limitations 1.3.4 had removed; corrected.
+
+### Fixed — before any route could reach them (first execution of this code)
+
+- **The per-agent memory store killed the process on its first call.** `path_join` and `dir_list`
+  take `Str`s; every `memory_store_*` function handed them raw pointers, so `path_join` read the
+  path's bytes as a Str header and died in `str_builder` (`alloc failed`, exit 1) — and the listers
+  read `dir_list`'s Strs as C strings, so no file ever matched. Its first test then found what a
+  route would have met next, all fixed: an **agent id joined into the path unvalidated**
+  (`../escaped` wrote outside the store); **write and rename failures answered Ok** (now
+  `file_write_atomic`, fsync'd, `DAIMON_ERR_STORAGE` on failure); **values past the read buffer came
+  back silently truncated** (MAX_VALUE_SIZE is now enforced, and a record at the cap round-trips
+  whole); `sys_mkdir(path, 448)`, which on agnos is `(path, PATHLEN)` (now `xmkdir_p`); keys like
+  `user:1` / `user;1` / `user 1` that all named one file (the key charset is now the filename
+  charset, so no two keys share a file); a key inserted into the record's JSON unescaped; and a
+  fresh 1 MiB buffer per read under an allocator that never frees (50 gets was 50 MiB; now under
+  256 KiB). `MAX_KEY_LENGTH` is 200, not 256, so the longest valid key is also storable (NAME_MAX).
+- **The IPC socket functions had never worked.** `agent_ipc_new` crashed the same way (raw pointers
+  to `path_join`). `agent_ipc_bind` passed `path_dirname`'s VIEW — not terminated at the directory —
+  to mkdir, which created a **directory where the socket belongs**, so bind always failed. A path
+  longer than `sun_path` was silently truncated into a different socket; now refused. A real
+  bind → send → accept round trip (across a fork) is tested for the first time.
+- **`count_fds` and `count_threads` were always 0 and 1** — see *Correction* below.
+- **`vindex_search` with a query of another dimension read past every embedding** and scored
+  whatever the heap held next. Refused now.
+- **Borrowed Strs in structs that outlive the request**: IPC messages (source / target / payload),
+  screen recordings and capture grants (and the grant map's key), federation node names, and the
+  federated vector store's local id, collection keys, replica ids and addresses. Each is now owned
+  where it is retained, with the 1.2.5 clobber test. This closes the roadmap's latent-aliasing list
+  — which, it turns out, named two sites that were fine (`federation.cyr:62`, `screen.cyr:69` key
+  on freshly built ids) and missed the fields that were not.
+- `agent_start` handed `execve` a Str's data pointer, which a request-buffer view does not
+  terminate; now `str_cstr`.
+
+### Correction — 2.2.0's "dir_list procfs gap" was daimon's bug
+
+2.2.0 recorded `count_fds` reading 0 as a **stdlib** defect ("KNOWN GAP"), because
+`dir_list("/tmp")` listed fine while `/proc/<pid>/fd` listed nothing. That control changed two
+things at once: a string **literal** passed to a `: Str` parameter is converted to a Str by the
+compiler, while `str_data(path)` is not. Measured: `dir_list` returns 4 entries for
+`/proc/<pid>/fd` given a Str, 0 given `str_data` — and 0 for `/tmp` given `str_data` too.
+`count_fds` and `count_threads` now pass the Str; `tests/agent.tcyr` pins the corrected diagnosis
+and proves the thread count with a second live thread (single-threaded, the bug's fallback of 1 and
+the right answer coincide). A sweep of every `src/` call that hands a raw pointer to a
+`: Str`-typed stdlib parameter found three: these two and `agent_ipc_new`'s `path_join` — besides the
+memory store's, fixed above.
+
+### Performance — RAG search is linear, not quadratic
+
+Benchmarked against the real function for the first time, `vector_search_1k_64d` read **7.51 ms**,
+not the old copy's 316 µs: `vindex_search` insertion-sorted **every** entry to return the top five.
+On `POST /v1/rag/query`, whose index anyone can grow through the unauthenticated ingest route, that
+cost lands on the single request thread. It now keeps the best `top_k` while scoring. Per query,
+64-d, top_k 5 (old vs new, same process):
+
+| entries | before | after |
+|---:|---:|---:|
+| 1,000 | 7.48 ms | 0.38 ms |
+| 4,000 | 115 ms | 1.51 ms |
+| 10,000 | 716 ms | 3.86 ms |
+
+Results are identical, tie order included: a differential test against the old function over 3,000
+random indexes (36,454 tied neighbours) found no difference. It also stops allocating a pair per
+entry per query.
+
+### Changed — the test-integrity arc (roadmap 2.2.x), complete
+
+`tests/daimon.tcyr` no longer defines a single daimon function; it keeps the error module, `jget`,
+samay and the two stdlib contracts, plus a ledger of where every group went. New suites: `config`,
+`memory` (+ `secmem`), `rag` (+ `vector_store`), `mcp`, `screen`, `trace`, `federation`
+(+ `fed_vector_store`); `edge`, `agent` and `ipc` extended. Every migration carried the old
+assertions forward and was **mutation-checked**: with the fix reverted, the new assertions fail.
+
+- **Benchmarks** now call the shipping functions. Seven measured different work than their names
+  said (e.g. `mcp_manifest_100_tools` sorted keys the manifest never sorts and built no JSON); the
+  full old-vs-new table is in BENCHMARKS.md. `rag_ingest_5k_chars` → `rag_chunk_5k_chars`, since it
+  only ever chunked. BENCHMARKS.md also corrects the frozen port-era comparison, whose two "Cyrius
+  wins" (42x, 3.5x) were measured on the copies (real: 1.6x and 2.0x).
+- **Fuzz harnesses** drive the real modules with a shared fixed-seed generator (`fuzz/rng.cyr`) and
+  check properties from each module's documented contract; `fuzz/rag.fcyr` is new (chunking and
+  tokenizing of untrusted ingest text); the scheduler harness now fuzzes samay, which has been
+  daimon's scheduler since 2.0.0. They exited through `syscall(60, n)` — exit only on x86_64 — and
+  CI never ran them; both fixed. A harness exits with the number of the property that broke.
+- **`tests/test.sh`** built and ran `daimon.tcyr` only, so every suite the arc created was invisible
+  to it; it now runs them all. Its HTTP checks moved to `tests/smoke.sh`, which CI runs — two of them
+  had been failing unnoticed (`"count":5` against a 13-tool manifest; a verdict now JSON-escaped in
+  an MCP envelope) — and it gained one check per HTTP-layer fix in 2.2.2 and this release, each of
+  which fails against the 2.2.2 binary.
+- The manifest body moved from `api_mcp_manifest` into `mcp_manifest_json(reg)` (src/mcp.cyr), so it
+  is tested (parsed back, quotes and newlines in names escaped) and benchmarked as it runs.
+- README, quickstart, CONTRIBUTING (new modules get a real-module suite, never a copy) and
+  BENCHMARKS.md (its "Complete" rows for the memory store and IPC were never true) updated.
+
+### Recorded, not fixed (roadmap)
+
+- The memory store has no route and no `tags` field (`list_by_tag` is a substring search).
+- IPC, for its 2.3.x wiring step: the SO_PEERCRED check fails OPEN when getsockopt fails; a message
+  cut short by its sender is queued and acknowledged; the reads have no timeout.
+- Nothing moves a scheduled task to RUNNING — no route starts or completes a task — so through the
+  API every task stops at SCHEDULED. Part of the 2.3.x lifecycle gap.
+- Edge registration ignores the node's arch, cores and memory (always `x86_64` / 4 / 4096), and its
+  duplicate-name scan is linear per registration (bounded by `max_nodes`).
+- Re-registering an external MCP name replaces it, whoever registered it first — an identity
+  question (2.5.x).
+
 ## [2.2.2] - 2026-09-22
 
 **Two state-changing endpoints could be triggered by a plain GET — and so by any web page a local

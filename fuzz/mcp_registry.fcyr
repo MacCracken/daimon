@@ -1,100 +1,129 @@
-# Fuzz: MCP registry operations
-# Exercises register, find, deregister with edge cases
+# Fuzz: MCP registry — THE REAL src/mcp.cyr (2.2.3)
+#
+# Until 2.2.3 this harness fuzzed a local COPY of the registry (a two-argument
+# mcp_tool_new the module does not have, an external registration that stored
+# the caller's pointers) and exited through the x86-only `syscall(60, n)`. It now
+# drives the real registry: the original fixed cases, then 20,000 random
+# register / deregister / lookup operations over a small name pool, checked
+# against a plain set of which names are registered. The properties:
+#   * the count is always builtins + registered externals — re-registration is
+#     an update, never a second entry;
+#   * a name is findable exactly when it is a builtin or currently registered;
+#   * a builtin can never be registered over, deregistered, or given an external
+#     URL — the 2.2.3 hijack, from every angle the random walk reaches.
 include "lib/alloc.cyr"
 include "lib/string.cyr"
 include "lib/fmt.cyr"
 include "lib/str.cyr"
 include "lib/vec.cyr"
+include "lib/io.cyr"
 include "lib/hashmap.cyr"
+include "lib/tagged.cyr"
+include "lib/bayan.cyr"
 include "lib/syscalls.cyr"
+
+include "src/error.cyr"
+include "src/mcp.cyr"
+include "fuzz/rng.cyr"
 
 alloc_init();
 
-fn mcp_tool_new(name, desc) {
-    var t = alloc(24);
-    store64(t, name);
-    store64(t + 8, desc);
-    store64(t + 16, str_from("{}"));
-    return t;
-}
+fn _tool(name) { return mcp_tool_new(str_from(name), str_from("d"), str_from("{}")); }
 
-fn mcp_registry_new() {
-    var reg = alloc(16);
-    store64(reg, map_new());
-    store64(reg + 8, map_new());
-    return reg;
-}
-
-fn mcp_register_builtin(reg, tool) {
-    map_set(load64(reg), str_data(load64(tool)), tool);
-}
-
-fn mcp_register_external(reg, tool, url) {
-    var ext = alloc(16);
-    store64(ext, tool);
-    store64(ext + 8, url);
-    map_set(load64(reg + 8), str_data(load64(tool)), ext);
-}
-
-fn mcp_find_tool(reg, name_cstr) {
-    var t = map_get(load64(reg), name_cstr);
-    if (t != 0) { return t; }
-    var ext = map_get(load64(reg + 8), name_cstr);
-    if (ext != 0) { return load64(ext); }
-    return 0;
-}
-
-fn mcp_deregister_ext(reg, name_cstr) {
-    return map_delete(load64(reg + 8), name_cstr);
-}
-
-fn mcp_count(reg) { return map_count(load64(reg)) + map_count(load64(reg + 8)); }
-
-# Test 1: register + find
+# --- fixed cases (carried forward) -------------------------------------------
 var reg = mcp_registry_new();
-var t1 = mcp_tool_new(str_from("scan"), str_from("scanner"));
-mcp_register_builtin(reg, t1);
-if (mcp_find_tool(reg, "scan") == 0) { syscall(60, 1); }
-if (mcp_count(reg) != 1) { syscall(60, 2); }
-
-# Test 2: find missing
-if (mcp_find_tool(reg, "nonexistent") != 0) { syscall(60, 3); }
-
-# Test 3: register 100 tools, find all
+mcp_register_builtin(reg, _tool("scan"));
+if (mcp_find_tool(reg, "scan") == 0) { sys_exit(1); }
+if (mcp_tool_count(reg) != 1) { sys_exit(2); }
+if (mcp_find_tool(reg, "nonexistent") != 0) { sys_exit(3); }
 var i = 0;
 while (i < 100) {
     var name = str_cat(str_from("tool-"), str_from_int(i));
-    mcp_register_builtin(reg, mcp_tool_new(name, str_from("desc")));
+    mcp_register_builtin(reg, mcp_tool_new(name, str_from("desc"), str_from("{}")));
     i = i + 1;
 }
-if (mcp_count(reg) != 101) { syscall(60, 4); }  # 100 + scan
-
-# Verify lookup for all 100
+if (mcp_tool_count(reg) != 101) { sys_exit(4); }
 i = 0;
 while (i < 100) {
-    var name = str_cat(str_from("tool-"), str_from_int(i));
-    if (mcp_find_tool(reg, str_data(name)) == 0) { syscall(60, 5); }
+    var name2 = str_cat(str_from("tool-"), str_from_int(i));
+    if (mcp_find_tool(reg, str_data(name2)) == 0) { sys_exit(5); }
     i = i + 1;
 }
-
-# Test 4: external tools
 var reg2 = mcp_registry_new();
-var ext1 = mcp_tool_new(str_from("ext-scan"), str_from("external scanner"));
-mcp_register_external(reg2, ext1, str_from("http://localhost:9000/callback"));
-if (mcp_find_tool(reg2, "ext-scan") == 0) { syscall(60, 6); }
-if (mcp_count(reg2) != 1) { syscall(60, 7); }
-
-# Test 5: deregister external
-mcp_deregister_ext(reg2, "ext-scan");
-if (mcp_find_tool(reg2, "ext-scan") != 0) { syscall(60, 8); }
-if (mcp_count(reg2) != 0) { syscall(60, 9); }
-
-# Test 6: overwrite builtin
+mcp_register_external(reg2, _tool("ext-scan"), str_from("http://localhost:9000/callback"));
+if (mcp_find_tool(reg2, "ext-scan") == 0) { sys_exit(6); }
+if (mcp_tool_count(reg2) != 1) { sys_exit(7); }
+mcp_deregister(reg2, "ext-scan");
+if (mcp_find_tool(reg2, "ext-scan") != 0) { sys_exit(8); }
+if (mcp_tool_count(reg2) != 0) { sys_exit(9); }
 var reg3 = mcp_registry_new();
-mcp_register_builtin(reg3, mcp_tool_new(str_from("dup"), str_from("v1")));
-mcp_register_builtin(reg3, mcp_tool_new(str_from("dup"), str_from("v2")));
-if (mcp_count(reg3) != 1) { syscall(60, 10); }  # Should overwrite, not duplicate
-var found = mcp_find_tool(reg3, "dup");
-if (found == 0) { syscall(60, 11); }
+mcp_register_builtin(reg3, _tool("dup"));
+mcp_register_builtin(reg3, _tool("dup"));
+if (mcp_tool_count(reg3) != 1) { sys_exit(10); }
 
-syscall(60, 0);
+# --- generated operations ------------------------------------------------------
+# Pool: 4 builtins b0..b3 and 12 external candidates e0..e11. Every operation
+# names a pool member, so collisions — including builtin names — are frequent.
+var fz = mcp_registry_new();
+var NB = 4;
+var NE = 12;
+var bi = 0;
+while (bi < NB) {
+    mcp_register_builtin(fz, mcp_tool_new(str_cat(str_from("b"), str_from_int(bi)), str_from("d"), 0));
+    bi = bi + 1;
+}
+var present = alloc(NE * 8);    # model: is external e<k> registered?
+memset(present, 0, NE * 8);
+
+var N = 20000;
+var n = 0;
+while (n < N) {
+    var op = fz_below(3);
+    var builtin_pick = fz_below(4) == 0;           # a quarter of ops aim at a builtin
+    var k = 0;
+    var nm = 0;
+    if (builtin_pick) {
+        k = fz_below(NB);
+        nm = str_cat(str_from("b"), str_from_int(k));
+    } else {
+        k = fz_below(NE);
+        nm = str_cat(str_from("e"), str_from_int(k));
+    }
+    var nc = str_cstr(nm);
+
+    if (op == 0) {
+        var rt, rv = mcp_register_external(fz, mcp_tool_new(nm, str_from("x"), str_from("{}")),
+          str_from("http://h.test/"));
+        if (builtin_pick) {
+            if (is_err_result(rt) == 0) { sys_exit(20); }  # a builtin name was taken
+        } else {
+            if (is_ok(rt) == 0) { sys_exit(21); }
+            store64(present + k * 8, 1);
+        }
+    }
+    if (op == 1) {
+        mcp_deregister(fz, nc);
+        if (builtin_pick == 0) { store64(present + k * 8, 0); }
+    }
+    # op 2: lookup only
+
+    # Properties, after every operation.
+    if (builtin_pick) {
+        if (mcp_find_tool(fz, nc) == 0) { sys_exit(22); }        # builtins never vanish
+        if (mcp_find_external_url(fz, nc) != 0) { sys_exit(23); } # and never gain a URL
+        if (mcp_is_builtin(fz, nc) != 1) { sys_exit(24); }
+    } else {
+        var want = load64(present + k * 8);
+        var found = 0;
+        if (mcp_find_tool(fz, nc) != 0) { found = 1; }
+        if (found != want) { sys_exit(25); }
+        if (mcp_is_builtin(fz, nc) != 0) { sys_exit(26); }
+    }
+    var registered = 0;
+    var pk = 0;
+    while (pk < NE) { registered = registered + load64(present + pk * 8); pk = pk + 1; }
+    if (mcp_tool_count(fz) != NB + registered) { sys_exit(27); }
+    n = n + 1;
+}
+
+fz_done("mcp_registry", N);

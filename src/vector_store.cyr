@@ -92,55 +92,70 @@ fn vindex_search(vi, query, query_dim, top_k) {
     var entries = load64(vi);
     var n = vec_len(entries);
     if (n == 0) { return vec_new(); }
-    if (top_k == 0) { return vec_new(); }
+    if (top_k <= 0) { return vec_new(); }
     if (query_dim == 0) { return vec_new(); }
+    # ⛔ 2.2.3 — the query must have the index's dimension. cosine_similarity
+    # reads `query_dim` f64s from EACH entry's embedding, and vindex_insert
+    # guarantees every entry has exactly vindex_dimension() of them — so a longer
+    # query read past the end of every embedding into whatever the heap held
+    # next, and scored on it. rag_query_text always passes 32 today, so no live
+    # route could send a mismatch; found by the module's first real test.
+    if (query_dim != load64(vi + 8)) { return vec_new(); }
 
-    # Score all entries
-    var scored = vec_new();
+    # ⛔ 2.2.3 — TOP-K SELECTION, not a full sort. This scored every entry, then
+    # insertion-sorted ALL n of them to return the first top_k: O(n^2) per query
+    # on POST /v1/rag/query, whose index anyone can grow through the
+    # unauthenticated ingest route. daimon.bcyr's copy of this search never
+    # ranked, so the benchmark said 316 us; run against the real function it
+    # said 7.51 ms. Old vs new, 64-d entries, top_k 5, per query:
+    #       1,000 entries     7.48 ms  ->  0.38 ms
+    #       4,000 entries   115    ms  ->  1.51 ms
+    #      10,000 entries   716    ms  ->  3.86 ms
+    # — all of it on the single request thread. (That data is near the sort's
+    # worst case; random data lowers its constant, never its n^2.)
+    #
+    # `best` now holds at most top_k (score, entry) pairs, best first. A new
+    # entry goes after every kept pair that STRICTLY outscores it — so, as with
+    # the full sort it replaces, a later entry precedes an earlier one it ties,
+    # and the results are identical, order included. O(n * top_k), and a pair is
+    # allocated only for an entry that makes the cut (the old loop allocated one
+    # per entry, per query, under an allocator that never frees).
+    var best = vec_new();
     var i = 0;
     while (i < n) {
         var e = vec_get(entries, i);
         var score = cosine_similarity(query, vec_entry_embedding(e), query_dim);
-        # Store (score, entry) pair — pack into a 16-byte struct
-        var pair = alloc(16);
-        store64(pair, score);
-        store64(pair + 8, e);
-        vec_push(scored, pair);
+        var bl = vec_len(best);
+        var p = 0;
+        while (p < bl) {
+            if (f64_gt(load64(vec_get(best, p)), score) == 0) { break; }
+            p = p + 1;
+        }
+        if (p < top_k) {
+            var pair = alloc(16);
+            store64(pair, score);
+            store64(pair + 8, e);
+            if (bl < top_k) {
+                vec_push(best, pair);      # grow by one; the shift below fills it
+                bl = bl + 1;
+            }
+            var q = bl - 1;                # when full, the last pair falls off
+            while (q > p) {
+                vec_set(best, q, vec_get(best, q - 1));
+                q = q - 1;
+            }
+            vec_set(best, p, pair);
+        }
         i = i + 1;
     }
 
-    # Sort by score descending (simple insertion sort for moderate sizes)
-    var sn = vec_len(scored);
-    var si = 1;
-    while (si < sn) {
-        var key = vec_get(scored, si);
-        var key_score = load64(key);
-        var sj = si - 1;
-        while (sj >= 0) {
-            var cmp_score = load64(vec_get(scored, sj));
-            if (f64_gt(cmp_score, key_score) == 1) { break; }
-            vec_set(scored, sj + 1, vec_get(scored, sj));
-            sj = sj - 1;
-        }
-        vec_set(scored, sj + 1, key);
-        si = si + 1;
-    }
-
-    # Take top_k
     var results = vec_new();
     var ri = 0;
-    while (ri < top_k) {
-        if (ri >= sn) { break; }
-        var pair = vec_get(scored, ri);
-        var e = load64(pair + 8);
-        var sr = search_result_new(
-          vec_entry_id(e),
-          vec_entry_content(e),
-          vec_entry_metadata(e),
-          load64(pair),
-          ri
-          );
-        vec_push(results, sr);
+    while (ri < vec_len(best)) {
+        var bp = vec_get(best, ri);
+        var be = load64(bp + 8);
+        vec_push(results, search_result_new(vec_entry_id(be), vec_entry_content(be),
+            vec_entry_metadata(be), load64(bp), ri));
         ri = ri + 1;
     }
     return results;

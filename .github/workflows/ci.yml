@@ -80,7 +80,7 @@ jobs:
         # stdout by design. Same shape kavach uses.
         run: |
           drift=0
-          for f in src/*.cyr tests/*.tcyr tests/*.bcyr fuzz/*.fcyr; do
+          for f in src/*.cyr tests/*.tcyr tests/*.bcyr fuzz/*.fcyr fuzz/*.cyr; do
             [ -f "$f" ] || continue
             if ! cyrius fmt "$f" --check > /dev/null 2>&1; then
               echo "needs fmt: $f"
@@ -94,10 +94,10 @@ jobs:
 
       - name: Lint
         # Fail-on-warn — daimon is clean under 6.1.24. Lint covers
-        # src/ + tests/ + bench/ + fuzz/.
+        # src/ + tests/ + bench/ + fuzz/ (harnesses and the shared fuzz/rng.cyr).
         run: |
           fail=0
-          for f in src/*.cyr tests/*.tcyr tests/*.bcyr fuzz/*.fcyr; do
+          for f in src/*.cyr tests/*.tcyr tests/*.bcyr fuzz/*.fcyr fuzz/*.cyr; do
             [ -f "$f" ] || continue
             out=$(cyrius lint "$f" 2>&1)
             echo "$out"
@@ -234,12 +234,32 @@ jobs:
           done
           [ $fail -eq 0 ] || { echo "test failures"; exit 1; }
 
+      - name: HTTP smoke (linked binary)
+        # 2.2.3. tests/smoke.sh drives the shipped binary over real sockets: the
+        # libro tools, the tracing echo, and one check per HTTP-layer defect a
+        # release fixed (CSRF-by-GET, builtin hijack, metrics, RAG JSON, heartbeat
+        # bounds). Until 2.2.3 these lived in tests/test.sh, which CI never ran,
+        # and two of them had been failing unnoticed.
+        run: sh tests/smoke.sh
+
       - name: Bench
         run: |
           for b in tests/*.bcyr; do
             [ -f "$b" ] || continue
             cyrius bench "$b"
           done
+
+      - name: Fuzz
+        # 2.2.3. The harnesses in fuzz/ were formatted and linted here and never
+        # RUN — only tests/test.sh ran them, locally. Each one now drives the
+        # real src/ module with a fixed-seed generator (fuzz/rng.cyr), so a
+        # failure is reproducible, and exits with the number of the property
+        # that broke. ~160,000 generated cases, well under a minute.
+        run: |
+          rc=0
+          out=$(cyrius fuzz 2>&1) || rc=$?
+          echo "$out" | grep -E '^fuzz |PASS|FAIL|passed|failed' || true
+          [ $rc -eq 0 ] || { echo "::error::a fuzz harness failed — its exit code names the property"; exit 1; }
 
   security:
     name: Security Scan

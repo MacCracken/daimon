@@ -16,9 +16,10 @@ cyrius lib sync                      # Vendor the stdlib subset from the pin
 cyrius deps                          # Resolve git dependencies (e.g. sakshi)
 cyrius build src/main.cyr build/daimon  # Build
 cyrius check                         # Format + lint + test + build
-cyrius tests                         # Run test suite
+cyrius tests                         # Run every test suite
+cyrius fuzz                          # Run the fuzz harnesses
 cyrius bench tests/daimon.bcyr       # Run benchmarks
-sh tests/test.sh                     # Tests + fuzz harnesses
+sh tests/test.sh                     # Tests + fuzz + HTTP smoke (tests/smoke.sh)
 ./scripts/bench-history.sh           # Append benchmark baseline
 ```
 
@@ -43,9 +44,14 @@ the pin) and `cyrius deps` (git deps like sakshi). Run both after cloning.
 ## Adding a New Module
 
 1. Add the module code under `src/` (a new `src/*.cyr` module)
-2. Add tests in `tests/daimon.tcyr`
-3. Add benchmarks in `tests/daimon.bcyr` if performance-relevant
-4. Add fuzz harnesses in `fuzz/` for security-critical code
+2. Add its suite as `tests/<module>.tcyr`, which **`include`s `src/<module>.cyr`** and its real
+   dependencies — never a copy of the functions under test. Until 2.2.3 `tests/daimon.tcyr`
+   tested simplified local copies, and two security defects shipped green because the copies did
+   not contain them; moving the last modules onto their real source found more (2.2.3 CHANGELOG).
+3. Add benchmarks in `tests/daimon.bcyr` if performance-relevant — against the real functions too
+4. Add a fuzz harness in `fuzz/` for code that takes untrusted input: drive the real module with
+   `fuzz/rng.cyr`, check properties from the documented contract, and exit with the number of the
+   property that broke (`sys_exit(n)` — never a raw `syscall(60, …)`, which is x86-only)
 
 ## Reporting Issues
 

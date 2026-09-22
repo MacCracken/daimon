@@ -8,6 +8,13 @@
 # request buffer sandhi reuses; edge_node_new stored it raw. Fixed by owning
 # both retained Strs (name, arch) at the retention boundary.
 #
+# 2.2.3 — the module suite. tests/daimon.tcyr's two edge groups ran against
+# local copies of 12 of this module's 17 functions; they are carried forward
+# below against the real code, and the copies are DELETED from daimon.tcyr. The
+# health checker, the stats and the per-node heartbeat — none of which the
+# copies had — are covered for the first time. (The health checker also had no
+# CALLER: see src/api_edge.cyr, which now runs it on every read.)
+#
 # edge.cyr draws node ids from agent.cyr's `_next_agent_id`, so the include
 # chain is agent.tcyr's.
 # =========================================================================
@@ -54,5 +61,122 @@ assert(str_eq(edge_node_name(live), str_from("ORIGINAL_EDGE_NODE")) == 1,
   "edge node NAME survives the request buffer being reused");
 assert(str_eq(load64(live + 24), str_from("x86_64")) == 1,
   "edge node ARCH survives the request buffer being reused");
+
+# --- edge_fleet: carried forward from daimon.tcyr --------------------------
+test_group("edge_fleet");
+var n1 = edge_node_new(str_from("edge-1"), str_from("x86_64"), 4, 4096);
+assert(str_eq(edge_node_name(n1), str_from("edge-1")) == 1, "node name");
+assert_eq(edge_node_status(n1), EDGE_ONLINE, "initial online");
+edge_node_set_status(n1, EDGE_SUSPECT);
+assert_eq(edge_node_status(n1), EDGE_SUSPECT, "set suspect");
+edge_node_set_status(n1, EDGE_DECOMMISSIONED);
+assert_eq(edge_node_status(n1), EDGE_DECOMMISSIONED, "set decommissioned");
+
+# --- edge_lifecycle: carried forward from daimon.tcyr ----------------------
+test_group("edge_lifecycle");
+var efleet = edge_fleet_new(edge_fleet_config_default());
+var enode = edge_node_new(str_from("edge-a"), str_from("x86_64"), 4, 4096);
+var ereg_t, ereg_v = edge_fleet_register(efleet, enode);
+assert(is_ok(ereg_t) == 1, "register ok");
+assert_eq(edge_fleet_node_count(efleet), 1, "1 edge node");
+
+var en_bad = edge_node_new(str_from(""), str_from("x86_64"), 4, 4096);
+assert(is_err_result(edge_fleet_register(efleet, en_bad)) == 1, "empty name rejected");
+var en_dup = edge_node_new(str_from("edge-a"), str_from("x86_64"), 4, 4096);
+assert(is_err_result(edge_fleet_register(efleet, en_dup)) == 1, "duplicate rejected");
+
+var eid_cstr = str_cstr(ereg_v);
+var ehb_t, ehb_v = edge_fleet_heartbeat(efleet, eid_cstr, 5, 20);
+assert(is_ok(ehb_t) == 1, "heartbeat ok");
+
+var edc_t, edc_v = edge_fleet_decommission(efleet, eid_cstr);
+assert(is_ok(edc_t) == 1, "decommission ok");
+var enode_after = edge_fleet_get(efleet, eid_cstr);
+assert_eq(edge_node_status(enode_after), EDGE_DECOMMISSIONED, "decommissioned status");
+assert(is_err_result(edge_fleet_heartbeat(efleet, eid_cstr, 0, 0)) == 1, "heartbeat after decomm fails");
+
+var eall = edge_fleet_list(efleet, 0 - 1);
+assert_eq(vec_len(eall), 1, "list all = 1");
+var eonline = edge_fleet_list(efleet, EDGE_ONLINE);
+assert_eq(vec_len(eonline), 0, "no online nodes");
+var edecomm = edge_fleet_list(efleet, EDGE_DECOMMISSIONED);
+assert_eq(vec_len(edecomm), 1, "1 decommissioned");
+
+# --- first coverage ---------------------------------------------------------
+test_group("edge_coverage");
+# The two heartbeat failures are distinguishable (api_edge_heartbeat maps them
+# to 404 and 409): an unknown id vs a decommissioned node.
+var hbu_t, hbu_v = edge_fleet_heartbeat(efleet, "no-such-node", 0, 0);
+assert_eq(hbu_v, DAIMON_ERR_AGENT_NOT_FOUND, "heartbeat of an unknown id is NOT_FOUND");
+var hbd_t, hbd_v = edge_fleet_heartbeat(efleet, eid_cstr, 0, 0);
+assert_eq(hbd_v, DAIMON_ERR_INVALID_PARAM, "heartbeat of a decommissioned node is INVALID_PARAM");
+var dcu_t, dcu_v = edge_fleet_decommission(efleet, "no-such-node");
+assert_eq(is_err_result(dcu_t), 1, "decommissioning an unknown id fails");
+
+# A decommissioned node still holds its name (the Rust original's rule too).
+var en_again = edge_node_new(str_from("edge-a"), str_from("x86_64"), 4, 4096);
+assert(is_err_result(edge_fleet_register(efleet, en_again)) == 1,
+  "a decommissioned node's name cannot be re-registered");
+
+# The fleet cap.
+var tiny = edge_fleet_config_default();
+store64(tiny + 16, 2);                  # max_nodes
+var tfleet = edge_fleet_new(tiny);
+edge_fleet_register(tfleet, edge_node_new(str_from("t1"), str_from("x86_64"), 1, 1));
+edge_fleet_register(tfleet, edge_node_new(str_from("t2"), str_from("x86_64"), 1, 1));
+var full_t, full_v = edge_fleet_register(tfleet, edge_node_new(str_from("t3"), str_from("x86_64"), 1, 1));
+assert_eq(is_err_result(full_t), 1, "a full fleet refuses another node");
+assert_eq(edge_fleet_node_count(tfleet), 2, "and stays at max_nodes");
+
+# edge_node_heartbeat (per-node) records the counts.
+var hn = edge_node_new(str_from("hb-node"), str_from("aarch64"), 2, 2048);
+edge_node_heartbeat(hn, 3, 9);
+assert_eq(edge_node_active_tasks(hn), 3, "edge_node_heartbeat records active tasks");
+assert_eq(edge_node_tasks_completed(hn), 9, "and completed tasks");
+
+# The health checker — which nothing called before 2.2.3. Age a node's
+# last_heartbeat (offset 64) past each threshold and let it run.
+var hfleet = edge_fleet_new(edge_fleet_config_default());   # suspect 30 s, offline 90 s
+var fresh = edge_node_new(str_from("fresh"), str_from("x86_64"), 1, 1);
+var quiet = edge_node_new(str_from("quiet"), str_from("x86_64"), 1, 1);
+var gone = edge_node_new(str_from("gone"), str_from("x86_64"), 1, 1);
+var busy = edge_node_new(str_from("busy"), str_from("x86_64"), 1, 1);
+var retired = edge_node_new(str_from("retired"), str_from("x86_64"), 1, 1);
+edge_fleet_register(hfleet, fresh);
+edge_fleet_register(hfleet, quiet);
+edge_fleet_register(hfleet, gone);
+edge_fleet_register(hfleet, busy);
+edge_fleet_register(hfleet, retired);
+var now = clock_epoch_secs();
+store64(quiet + 64, now - 45);
+store64(gone + 64, now - 600);
+store64(busy + 64, now - 600);
+edge_node_set_status(busy, EDGE_UPDATING);
+store64(retired + 64, now - 600);
+edge_node_set_status(retired, EDGE_DECOMMISSIONED);
+edge_fleet_check_health(hfleet);
+assert_eq(edge_node_status(fresh), EDGE_ONLINE, "a node heard from just now stays online");
+assert_eq(edge_node_status(quiet), EDGE_SUSPECT, "45 s of silence: suspect");
+assert_eq(edge_node_status(gone), EDGE_OFFLINE, "10 min of silence: offline");
+assert_eq(edge_node_status(busy), EDGE_UPDATING, "an updating node is left alone");
+assert_eq(edge_node_status(retired), EDGE_DECOMMISSIONED, "a decommissioned node is left alone");
+
+# A heartbeat brings a suspect or offline node back.
+edge_fleet_heartbeat(hfleet, str_cstr(edge_node_id(gone)), 0, 0);
+assert_eq(edge_node_status(gone), EDGE_ONLINE, "a heartbeat brings an offline node back online");
+
+# Stats count every status and sum the task counters.
+edge_fleet_heartbeat(hfleet, str_cstr(edge_node_id(fresh)), 4, 10);
+var st = edge_fleet_stats(hfleet);
+assert_eq(load64(st), 5, "stats: total");
+assert_eq(load64(st + 8), 2, "stats: online (fresh, gone)");
+assert_eq(load64(st + 16), 1, "stats: suspect (quiet)");
+assert_eq(load64(st + 24), 0, "stats: offline (gone came back)");
+assert_eq(load64(st + 32), 1, "stats: updating (busy)");
+assert_eq(load64(st + 40), 1, "stats: decommissioned (retired)");
+assert_eq(load64(st + 8) + load64(st + 16) + load64(st + 24) + load64(st + 32) + load64(st + 40), 5,
+  "stats: the five status counts sum to the total");
+assert_eq(load64(st + 48), 4, "stats: active tasks summed");
+assert_eq(load64(st + 56), 10, "stats: completed tasks summed");
 
 syscall(SYS_EXIT, assert_summary());

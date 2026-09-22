@@ -2,7 +2,15 @@
 # api_edge — edge fleet endpoints
 # =========================================================================
 
+# ⛔ 2.2.3 — every read below re-evaluates fleet health first. The health
+# checker (edge_fleet_check_health: ONLINE -> SUSPECT after 30 s without a
+# heartbeat, -> OFFLINE after 90 s) had no caller at all, so no node ever left
+# ONLINE except by decommission: a node silent for a week was served as online
+# by /v1/edge/nodes, /v1/edge/nodes/{id} and /v1/edge/stats alike. Evaluating on
+# read gives every consumer the same answer a background sweep would, without a
+# timer thread; it is O(nodes), and the fleet is capped at max_nodes (1000).
 fn api_edge_stats(fd) {
+    edge_fleet_check_health(_edge_fleet);
     var st = edge_fleet_stats(_edge_fleet);
     var sb = str_builder_new();
     str_builder_add_cstr(sb, "{\"total\":");
@@ -13,6 +21,12 @@ fn api_edge_stats(fd) {
     str_builder_add_int(sb, load64(st + 16));
     str_builder_add_cstr(sb, ",\"offline\":");
     str_builder_add_int(sb, load64(st + 24));
+    # updating + decommissioned were computed by edge_fleet_stats and dropped
+    # here, so the five status counts never summed to `total`.
+    str_builder_add_cstr(sb, ",\"updating\":");
+    str_builder_add_int(sb, load64(st + 32));
+    str_builder_add_cstr(sb, ",\"decommissioned\":");
+    str_builder_add_int(sb, load64(st + 40));
     str_builder_add_cstr(sb, ",\"active_tasks\":");
     str_builder_add_int(sb, load64(st + 48));
     str_builder_add_cstr(sb, ",\"tasks_completed\":");
@@ -39,7 +53,8 @@ fn api_edge_register(fd, body) {
     str_builder_add_cstr(sb, "{\"id\":\"");
     str_builder_add(sb, id);
     str_builder_add_cstr(sb, "\"}");
-    http_send_response(fd, 201, str_data(str_builder_build(sb)), str_len(str_builder_build(sb)));
+    var out = str_builder_build(sb);
+    http_send_response(fd, 201, str_data(out), str_len(out));
     return 0;
 }
 
@@ -54,6 +69,7 @@ fn api_edge_list(fd, buf, buf_len) {
         elif (streq(qp, "updating") == 1) { status_filter = EDGE_UPDATING; }
         elif (streq(qp, "decommissioned") == 1) { status_filter = EDGE_DECOMMISSIONED; }
     }
+    edge_fleet_check_health(_edge_fleet);   # see api_edge_stats
     var nodes = edge_fleet_list(_edge_fleet, status_filter);
     var sb = str_builder_new();
     str_builder_add_cstr(sb, "{\"nodes\":[");
@@ -77,6 +93,7 @@ fn api_edge_list(fd, buf, buf_len) {
 
 # GET /v1/edge/nodes/{id}
 fn api_edge_get(fd, id_cstr) {
+    edge_fleet_check_health(_edge_fleet);   # see api_edge_stats
     var n = edge_fleet_get(_edge_fleet, id_cstr);
     if (n == 0) { http_error(fd, 404, str_from("edge node not found")); return 0; }
     var status_names: i64[5];
@@ -108,9 +125,21 @@ fn api_edge_heartbeat(fd, id_cstr, body) {
         active = jget_int(pairs, "active_tasks");
         completed = jget_int(pairs, "tasks_completed");
     }
+    # Counts are counts. A negative one was stored as-is and summed into
+    # /v1/edge/stats, where one node could cancel out the rest of the fleet.
+    if (active < 0 || completed < 0) {
+        http_bad_request(fd, str_from("task counts cannot be negative"));
+        return 0;
+    }
     var hb_t, hb_v = edge_fleet_heartbeat(_edge_fleet, id_cstr, active, completed);
     if (is_err_result(hb_t) == 1) {
-        http_error(fd, 404, str_from("node not found"));
+        # The two failures are different answers: an unknown id is 404, a
+        # decommissioned node is a conflict — it exists and may not rejoin.
+        if (hb_v == DAIMON_ERR_AGENT_NOT_FOUND) {
+            http_error(fd, 404, str_from("node not found"));
+        } else {
+            http_error(fd, 409, str_from("node is decommissioned"));
+        }
         return 0;
     }
     http_ok(fd, str_from("{\"ok\":true}"));

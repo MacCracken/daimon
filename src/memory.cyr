@@ -1,12 +1,56 @@
 # =========================================================================
-# memory — per-agent key-value store
+# memory — per-agent key-value store (filesystem-backed)
 # =========================================================================
+#
+# ⛔ 2.2.3 — THIS MODULE HAD NEVER RUN. No route reaches it yet (memory_store_*
+# has no caller in src/), and the test suite exercised a local COPY of two of
+# its helpers, never the store. Its first real test found that the first
+# memory_store_* call of any kind killed the whole process:
+#
+#     str_builder: alloc failed          (exit 1)
+#
+# `path_join` and `dir_list` take `Str` structs; this file handed them raw
+# `str_data(...)` char pointers, so `path_join` read the path's own BYTES as a
+# Str header — "/var/lib" as the data pointer, the next eight bytes as the
+# length — and tried to grow a builder by a garbage size. `dir_list` had the
+# same mismatch in the other direction: it returns Strs, and every lister here
+# wrapped each one in `str_from`, reading a heap POINTER as text, so no entry
+# ever ended in ".json" and list/clear/usage could never see a file.
+#
+# The same first test also found, and this revision fixes, everything a route
+# would have met next: an agent id joined into the path unvalidated (traversal
+# out of the store), write and rename failures reported as success, values past
+# the read buffer handed back silently TRUNCATED, a mkdir that meant something
+# else on agnos, keys that collided onto one file, a key inserted into the
+# record's JSON unescaped, and a fresh never-freed 1 MiB buffer per read.
+#
+# KNOWN GAP (roadmap): records carry no tags field, so `memory_store_list_by_tag`
+# is a SUBSTRING search over the whole record — a tag "a" matches any record
+# containing the letter a. The Rust original matched a `tags` list exactly.
 
-var MAX_KEY_LENGTH = 256;
+# ⚠ Why 200 and not the Rust original's 256: a key must be STORABLE, not just
+# valid. The file is `<key>.json`, written through file_write_atomic's temp name
+# `<key>.json.cyrtmp.<pid>.<ctr>` — up to key + 41 bytes — and one path
+# component may not exceed NAME_MAX (255) on ext2/ext4 or agnos. A 256-byte key
+# validated and then failed at open() with ENAMETOOLONG. 200 keeps the longest
+# valid key storable with margin, and tests/memory.tcyr round-trips exactly it.
+var MAX_KEY_LENGTH = 200;
 var MAX_VALUE_SIZE = 1048576;
 
-# Validate a memory key
+# A record is the value plus a bounded envelope: `{"key":"<=200 bytes","value":`
+# + value + `,"updated_at":<=20 digits}`. 1 KiB covers the envelope with room.
+var MEM_RECORD_MAX = MAX_VALUE_SIZE + 1024;
+
+# Validate a memory key — also the rule for an AGENT ID, which is joined into
+# the same path (see memory_store_agent_dir).
+#
+# Accepted bytes are exactly the ones sanitize_key keeps: a-z A-Z 0-9 - _ .
+# Before 2.2.3 any byte but / and \ passed, and sanitize_key then folded the rest
+# to '_' when naming the file — so "user:1" and "user;1" and "user 1" were three
+# valid keys that all read and wrote user_1.json. With the charset enforced,
+# sanitize_key is the identity on every valid key and no two keys share a file.
 fn validate_key(key) {
+    if (key == 0) { return Err(DAIMON_ERR_INVALID_PARAM); }
     var klen = str_len(key);
     if (klen == 0) { return Err(DAIMON_ERR_INVALID_PARAM); }
     if (klen > MAX_KEY_LENGTH) { return Err(DAIMON_ERR_INVALID_PARAM); }
@@ -15,6 +59,28 @@ fn validate_key(key) {
     if (str_contains(key, str_from("..")) == 1) { return Err(DAIMON_ERR_INVALID_PARAM); }
     if (str_contains(key, str_from("/")) == 1) { return Err(DAIMON_ERR_INVALID_PARAM); }
     if (str_contains(key, str_from("\\")) == 1) { return Err(DAIMON_ERR_INVALID_PARAM); }
+
+    # Charset: a-z A-Z 0-9 - _ . and nothing else.
+    var data = str_data(key);
+    var i = 0;
+    while (i < klen) {
+        var c = load8(data + i);
+        var ok = 0;
+        if (c >= 97) {
+            if (c <= 122) { ok = 1; }
+        }
+        if (c >= 65) {
+            if (c <= 90) { ok = 1; }
+        }
+        if (c >= 48) {
+            if (c <= 57) { ok = 1; }
+        }
+        if (c == 45) { ok = 1; }  # -
+        if (c == 95) { ok = 1; }  # _
+        if (c == 46) { ok = 1; }  # .
+        if (ok == 0) { return Err(DAIMON_ERR_INVALID_PARAM); }
+        i = i + 1;
+    }
     return Ok(0);
 }
 
@@ -49,12 +115,54 @@ fn sanitize_key(key) {
 # MemoryStore: {base_dir: Str}
 fn memory_store_new(base_dir) {
     var ms = alloc(8);
-    store64(ms, base_dir);
+    store64(ms, str_clone(base_dir));
     return ms;
 }
 
+# <base>/<agent id>, or 0 when the id is not a valid path segment.
+#
+# ⛔ The agent id is joined into a filesystem path, so it gets the key rule.
+# The Rust original could not be traversed — its id was a UUID type — but this
+# port takes a free-form Str, and "../../tmp" would have put the store's
+# writes, reads and DELETES anywhere the daimon user can reach.
 fn memory_store_agent_dir(ms, agent_id_str) {
-    return path_join(str_data(load64(ms)), str_data(agent_id_str));
+    if (agent_id_str == 0) { return 0; }
+    if (is_err_result(validate_key(agent_id_str)) == 1) { return 0; }
+    return path_join(load64(ms), agent_id_str);
+}
+
+# <agent dir>/<key>.json, or 0 when the agent id or key is invalid.
+fn _mem_key_path(ms, agent_id_str, key) {
+    var dir = memory_store_agent_dir(ms, agent_id_str);
+    if (dir == 0) { return 0; }
+    if (is_err_result(validate_key(key)) == 1) { return 0; }
+    return path_join(dir, str_cat(sanitize_key(key), str_from(".json")));
+}
+
+# ⛔ ONE READ BUFFER FOR THE MODULE, not one per call. The allocator is a bump
+# allocator with no free, and the old readers took a fresh buffer every time —
+# memory_store_get 1 MiB per call, list_by_tag 1 MiB per FILE per call,
+# usage_bytes 64 KiB per file — so a wired GET route would have grown the heap by
+# a megabyte a request, forever. Readers load into this, copy out exactly what
+# they keep, and scrub it (VULN-007 hygiene: it held an agent's value).
+#
+# Not re-entrant, and does not need to be: every request path in daimon runs to
+# completion on one thread (serve) or one cooperative task that cannot yield
+# inside these functions (serve_async); nothing here blocks on the event loop.
+var _mem_rbuf = 0;
+
+# Read a whole record into the shared buffer. Returns the byte count, or -1 when
+# the file cannot be read or is larger than any record this store writes (read
+# one byte past the cap so an oversized file is detected, never truncated).
+fn _mem_read(path_cstr) {
+    if (_mem_rbuf == 0) { _mem_rbuf = alloc(MEM_RECORD_MAX + 1); }
+    var n = file_read_all(path_cstr, _mem_rbuf, MEM_RECORD_MAX + 1);
+    if (n < 0) { return 0 - 1; }
+    if (n > MEM_RECORD_MAX) {
+        secure_zero(_mem_rbuf, n);
+        return 0 - 1;
+    }
+    return n;
 }
 
 fn memory_store_set(ms, agent_id_str, key, value_json) {
@@ -63,56 +171,57 @@ fn memory_store_set(ms, agent_id_str, key, value_json) {
     # an error that reads as SUCCESS. Rebuild the Err from both halves.
     var vr_t, vr_v = validate_key(key);
     if (is_err_result(vr_t) == 1) { return Err(vr_v); }
+    if (value_json == 0) { return Err(DAIMON_ERR_INVALID_PARAM); }
+    # The value cap the Rust original enforced and the port dropped. Without it a
+    # value too large for the read buffer was written whole and read back CUT,
+    # as valid-looking but truncated JSON.
+    if (str_len(value_json) > MAX_VALUE_SIZE) { return Err(DAIMON_ERR_INVALID_PARAM); }
 
     var dir = memory_store_agent_dir(ms, agent_id_str);
-    # Ensure directory exists (VULN-005: 0700 not 0755)
-    sys_mkdir(str_data(dir), 448);  # 0700
+    if (dir == 0) { return Err(DAIMON_ERR_INVALID_PARAM); }
+    # xmkdir_p, not sys_mkdir: agnos's mkdir is (path, PATHLEN), so the old
+    # `sys_mkdir(path, 448)` handed its kernel 448 as the path length. It also
+    # creates the base directory, which nothing else did. VULN-005: 0700.
+    if (xmkdir_p(str_data(dir), 448) != 0) { return Err(DAIMON_ERR_STORAGE); }
 
-    var safe_key = sanitize_key(key);
-    var fname = str_cat(safe_key, str_from(".json"));
-    var fpath = path_join(str_data(dir), str_data(fname));
+    var fpath = path_join(dir, str_cat(sanitize_key(key), str_from(".json")));
 
-    # Build JSON entry
+    # Build JSON entry. The key is escaped even though the charset makes that a
+    # no-op today: the record's validity must not depend on a rule in another fn.
     var sb = str_builder_new();
     str_builder_add_cstr(sb, "{\"key\":\"");
-    str_builder_add(sb, key);
+    str_builder_add(sb, json_escape_str(key));
     str_builder_add_cstr(sb, "\",\"value\":");
     str_builder_add(sb, value_json);
     str_builder_add_cstr(sb, ",\"updated_at\":");
     str_builder_add_int(sb, clock_epoch_secs());
     str_builder_add_cstr(sb, "}");
     var content = str_builder_build(sb);
+    if (str_len(content) > MEM_RECORD_MAX) { return Err(DAIMON_ERR_INVALID_PARAM); }
 
-    # Atomic write: tmp then rename
-    var tmp_path = str_cat(fpath, str_from(".tmp"));
-    file_write_all(str_data(tmp_path), str_data(content), str_len(content));
-    # daimon_rename, not sys_rename: agnos takes (ptr,len) pairs and numbers
-    # rename 31, not Linux's 82. Both Strs are in scope, so the lengths cost
-    # nothing. (src/syscalls.cyr)
-    daimon_rename(str_data(tmp_path), str_len(tmp_path), str_data(fpath), str_len(fpath));
-
+    # Atomic, crash-safe replace — temp + fsync + rename, temp removed on
+    # failure. The hand-rolled `<file>.tmp` + rename it replaces ignored both
+    # results and answered Ok(0) to a write that never happened.
+    if (file_write_atomic(str_data(fpath), str_data(content), str_len(content)) != 0) {
+        return Err(DAIMON_ERR_STORAGE);
+    }
     return Ok(0);
 }
 
 fn memory_store_get(ms, agent_id_str, key) {
-    var dir = memory_store_agent_dir(ms, agent_id_str);
-    var safe_key = sanitize_key(key);
-    var fname = str_cat(safe_key, str_from(".json"));
-    var fpath = path_join(str_data(dir), str_data(fname));
-
-    var buf = alloc(MAX_VALUE_SIZE);
-    var n = file_read_all(str_data(fpath), buf, MAX_VALUE_SIZE - 1);
+    var fpath = _mem_key_path(ms, agent_id_str, key);
+    if (fpath == 0) { return None(); }
+    var n = _mem_read(str_data(fpath));
     if (n <= 0) { return None(); }
-    store8(buf + n, 0);
-    return Some(str_new(buf, n));
+    # Copy out exactly the record, then scrub the shared buffer.
+    var rec = str_from_buf(_mem_rbuf, n);
+    secure_zero(_mem_rbuf, n);
+    return Some(rec);
 }
 
 fn memory_store_delete(ms, agent_id_str, key) {
-    var dir = memory_store_agent_dir(ms, agent_id_str);
-    var safe_key = sanitize_key(key);
-    var fname = str_cat(safe_key, str_from(".json"));
-    var fpath = path_join(str_data(dir), str_data(fname));
-
+    var fpath = _mem_key_path(ms, agent_id_str, key);
+    if (fpath == 0) { return Err(DAIMON_ERR_INVALID_PARAM); }
     var r = daimon_unlink(str_data(fpath), str_len(fpath));
     if (r == 0) { return Ok(1); }
     return Ok(0);
@@ -120,14 +229,14 @@ fn memory_store_delete(ms, agent_id_str, key) {
 
 fn memory_store_list_keys(ms, agent_id_str) {
     var dir = memory_store_agent_dir(ms, agent_id_str);
-    var entries = dir_list(str_data(dir));
+    if (dir == 0) { return vec_new(); }
+    var entries = dir_list(dir);
     if (entries == 0) { return vec_new(); }
     var keys = vec_new();
     var i = 0;
     while (i < vec_len(entries)) {
-        var name = vec_get(entries, i);
-        # Check .json extension
-        var name_s = str_from(name);
+        # dir_list yields Strs (owned copies), not cstrs.
+        var name_s = vec_get(entries, i);
         if (str_ends_with(name_s, str_from(".json")) == 1) {
             # Strip .json suffix (5 chars)
             var stem = str_sub(name_s, 0, str_len(name_s) - 5);
@@ -140,17 +249,16 @@ fn memory_store_list_keys(ms, agent_id_str) {
 
 fn memory_store_clear(ms, agent_id_str) {
     var dir = memory_store_agent_dir(ms, agent_id_str);
-    var entries = dir_list(str_data(dir));
+    if (dir == 0) { return 0; }
+    var entries = dir_list(dir);
     if (entries == 0) { return 0; }
     var count = 0;
     var i = 0;
     while (i < vec_len(entries)) {
-        var name = vec_get(entries, i);
-        var name_s = str_from(name);
+        var name_s = vec_get(entries, i);
         if (str_ends_with(name_s, str_from(".json")) == 1) {
-            var fpath = path_join(str_data(dir), name);
-            daimon_unlink(str_data(fpath), str_len(fpath));
-            count = count + 1;
+            var fpath = path_join(dir, name_s);
+            if (daimon_unlink(str_data(fpath), str_len(fpath)) == 0) { count = count + 1; }
         }
         i = i + 1;
     }
@@ -158,30 +266,30 @@ fn memory_store_clear(ms, agent_id_str) {
 }
 
 fn memory_store_list_by_tag(ms, agent_id_str, tag) {
+    # An absent or empty tag matches nothing (str_contains finds "" everywhere).
+    if (tag == 0) { return vec_new(); }
+    if (str_len(tag) == 0) { return vec_new(); }
     var dir = memory_store_agent_dir(ms, agent_id_str);
-    var entries = dir_list(str_data(dir));
+    if (dir == 0) { return vec_new(); }
+    var entries = dir_list(dir);
     if (entries == 0) { return vec_new(); }
     var matching = vec_new();
     var mi = 0;
     while (mi < vec_len(entries)) {
-        var name = vec_get(entries, mi);
-        var name_s = str_from(name);
+        var name_s = vec_get(entries, mi);
         if (str_ends_with(name_s, str_from(".json")) == 1) {
-            var fpath = path_join(str_data(dir), name);
-            var fbuf = alloc(MAX_VALUE_SIZE);
-            var frd = file_read_all(str_data(fpath), fbuf, MAX_VALUE_SIZE - 1);
+            var fpath = path_join(dir, name_s);
+            var frd = _mem_read(str_data(fpath));
             if (frd > 0) {
-                store8(fbuf + frd, 0);
-                var content = str_new(fbuf, frd);
-                # Check if content contains the tag string
+                var content = str_new(_mem_rbuf, frd);
+                # Substring match over the whole record — see KNOWN GAP above.
                 if (str_contains(content, tag) == 1) {
                     var stem = str_sub(name_s, 0, str_len(name_s) - 5);
                     vec_push(matching, stem);
                 }
-                # VULN-007 hygiene: the read buffer held this agent's full
-                # memory value; only `stem` (a filename slice) is kept. Scrub
-                # the value so it does not linger in the never-freed bump heap.
-                secure_zero(fbuf, frd);
+                # VULN-007 hygiene: the buffer held this agent's full memory
+                # value; only `stem` (a filename slice) is kept.
+                secure_zero(_mem_rbuf, frd);
             }
         }
         mi = mi + 1;
@@ -191,24 +299,22 @@ fn memory_store_list_by_tag(ms, agent_id_str, tag) {
 
 fn memory_store_usage_bytes(ms, agent_id_str) {
     var dir = memory_store_agent_dir(ms, agent_id_str);
-    var entries = dir_list(str_data(dir));
+    if (dir == 0) { return 0; }
+    var entries = dir_list(dir);
     if (entries == 0) { return 0; }
     var total = 0;
     var ui = 0;
     while (ui < vec_len(entries)) {
-        var name = vec_get(entries, ui);
-        var fpath = path_join(str_data(dir), name);
-        # stat the file to get size — use read length as proxy
-        var buf = alloc(1);
-        var sz = file_read_all(str_data(fpath), buf, 0);
-        # Since we can't easily stat(), count actual file content
-        var rbuf = alloc(65536);
-        var rn = file_read_all(str_data(fpath), rbuf, 65535);
-        if (rn > 0) { total = total + rn; }
-        # VULN-007 hygiene: rbuf held the agent value; only its length is used.
-        secure_zero(rbuf, rn);
+        var fpath = path_join(dir, vec_get(entries, ui));
+        # No portable stat here (agnos's takes a length, Windows has none), so
+        # the size is the read length — through the shared buffer, which also
+        # lifts the old 64 KiB read cap that undercounted any larger record.
+        var rn = _mem_read(str_data(fpath));
+        if (rn > 0) {
+            total = total + rn;
+            secure_zero(_mem_rbuf, rn);   # VULN-007: only the length is used
+        }
         ui = ui + 1;
     }
     return total;
 }
-

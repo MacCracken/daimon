@@ -1,0 +1,160 @@
+# =========================================================================
+# trace — tests against THE REAL src/trace.cyr (2.2.3)
+#
+# Test-integrity arc (roadmap 2.2.x). tests/daimon.tcyr carried local copies of
+# the hex parser and formatters; their assertions are carried forward here and
+# the copies are DELETED from daimon.tcyr in the same change.
+#
+# Everything past the formatters is first coverage: header adoption, the span
+# helpers, the X-Trace-Id echo and the outbound traceparent. Until now the only
+# thing exercising them was one smoke check in tests/test.sh, which is not run
+# by CI. The first run found that a MALFORMED traceparent was partially adopted
+# — see "malformed headers" below.
+# =========================================================================
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/io.cyr"
+include "lib/chrono.cyr"
+include "lib/random.cyr"
+include "lib/syscalls.cyr"
+include "lib/sandhi.cyr"
+include "lib/sakshi.cyr"
+include "lib/assert.cyr"
+
+include "src/trace.cyr"
+
+fn _hex16(cstr) { return _trace_parse_hex(cstr, 0, 16); }
+
+# A request buffer carrying the given header lines (each ending \r\n).
+fn _req(hdrs) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "GET /v1/health HTTP/1.1\r\nHost: x\r\n");
+    str_builder_add_cstr(sb, hdrs);
+    str_builder_add_cstr(sb, "\r\n");
+    return str_builder_build(sb);
+}
+
+fn _adopt(hdrs) {
+    var r = _req(hdrs);
+    trace_adopt_or_new(str_data(r), str_len(r));
+    return 0;
+}
+
+# --- hex parse / format: carried forward from daimon.tcyr -----------------
+test_group("trace_id");
+assert_eq(_trace_parse_hex(str_data(str_from("ff")), 0, 2), 255, "parse ff = 255");
+assert_eq(_trace_parse_hex(str_data(str_from("cafe")), 0, 4), 51966, "parse cafe = 0xcafe");
+assert_eq(_trace_parse_hex(str_data(str_from("ab cd")), 0, 5), 171, "parse stops at non-hex");
+var tp_s = str_data(str_from("00-aaaaaaaabbbbbbbbccccccccdddddddd-5566778899aabbcc-01"));
+var exp_lo = str_data(str_from("ccccccccdddddddd"));
+assert_eq(_trace_parse_hex(tp_s, 19, 16), _trace_parse_hex(exp_lo, 0, 16),
+  "traceparent low-64 extracted at offset 19");
+var exp_hi = str_data(str_from("aaaaaaaabbbbbbbb"));
+assert_eq(_trace_parse_hex(tp_s, 3, 16), _trace_parse_hex(exp_hi, 0, 16),
+  "traceparent high-64 extracted at offset 3");
+var rt_buf = alloc(17);
+trace_id_hex(305419896, rt_buf);
+assert_eq(_trace_parse_hex(rt_buf, 0, 16), 305419896, "trace_id_hex round-trips");
+var f128 = alloc(33);
+trace_id_hex_128(0x1111222233334444, 0x5555666677778888, f128);
+assert_eq(_trace_parse_hex(f128, 0, 16), 0x1111222233334444, "hex_128 hi half");
+assert_eq(_trace_parse_hex(f128, 16, 16), 0x5555666677778888, "hex_128 lo half");
+
+# First coverage: the formatter is lowercase and fixed-width.
+var z_buf = alloc(17);
+trace_id_hex(10, z_buf);
+assert_eq(streq(z_buf, "000000000000000a"), 1, "trace_id_hex zero-pads and uses lowercase");
+assert(_trace_gen_id() > 0, "_trace_gen_id is positive");
+
+# --- header adoption: first coverage ---------------------------------------
+test_group("trace_adopt");
+var AB = _hex16("aaaaaaaabbbbbbbb");
+var CD = _hex16("ccccccccdddddddd");
+var TP = "traceparent: 00-aaaaaaaabbbbbbbbccccccccdddddddd-5566778899aabbcc-01\r\n";
+
+_adopt(TP);
+assert_eq(sakshi_trace_id_hi(), AB, "traceparent: high 64 bits adopted");
+assert_eq(sakshi_trace_id_lo(), CD, "traceparent: low 64 bits adopted");
+
+_adopt("X-Trace-Id: 11112222333344445555666677778888\r\n");
+assert_eq(sakshi_trace_id_hi(), 0x1111222233334444, "X-Trace-Id (32 hex): high half");
+assert_eq(sakshi_trace_id_lo(), 0x5555666677778888, "X-Trace-Id (32 hex): low half");
+
+_adopt("X-Trace-Id: 00000000deadbeef\r\n");
+assert_eq(sakshi_trace_id_hi(), 0, "X-Trace-Id (16 hex): high half is 0");
+assert_eq(sakshi_trace_id_lo(), 0xdeadbeef, "X-Trace-Id (16 hex): low half adopted");
+
+var both = str_cat(str_from(TP), str_from("X-Trace-Id: 11112222333344445555666677778888\r\n"));
+_adopt(str_data(both));
+assert_eq(sakshi_trace_id_lo(), CD, "traceparent wins over X-Trace-Id");
+
+_adopt("");
+assert(sakshi_trace_id_hi() != 0, "no header: a fresh id is generated (high half)");
+assert(sakshi_trace_id_lo() != 0, "no header: a fresh id is generated (low half)");
+
+# ⛔ 2.2.3 — malformed headers. The parser stops at the first non-hex byte, and
+# the old checks were only "at least 35 bytes" / "at least 32", so a malformed
+# traceparent was partially ADOPTED: `00-abc-…` became trace-id 0xabc…
+test_group("trace_malformed");
+_adopt("traceparent: 00-abc-5566778899aabbcc-01-padding-past-35\r\n");
+assert(sakshi_trace_id_hi() != 0xabc, "a traceparent with a 3-digit trace-id is not adopted as 0xabc");
+_adopt("traceparent: ff-aaaaaaaabbbbbbbbccccccccdddddddd-5566778899aabbcc-01\r\n");
+assert(sakshi_trace_id_lo() != CD, "version ff is invalid and not adopted");
+_adopt("traceparent: 00-00000000000000000000000000000000-5566778899aabbcc-01\r\n");
+assert(sakshi_trace_id_hi() != 0, "an all-zero trace-id is replaced by a fresh one");
+_adopt("traceparent: 00-aaaaaaaabbbbbbbbccccccccddddddzz-5566778899aabbcc-01\r\n");
+assert(sakshi_trace_id_lo() != CD, "a non-hex byte inside the trace-id invalidates it");
+_adopt("X-Trace-Id: 0000000000000000abc\r\n");
+assert(sakshi_trace_id_lo() != 0xabc, "an X-Trace-Id of neither 16 nor 32 hex is ignored");
+_adopt("X-Trace-Id: 00000000000000000000000000000000\r\n");
+assert(sakshi_trace_id_lo() != 0, "an all-zero X-Trace-Id is replaced by a fresh id");
+
+# A valid traceparent still wins after an invalid one is ignored in the same request.
+var mixed = str_cat(str_from("traceparent: 00-abc-5566778899aabbcc-01-padding-past-35\r\n"),
+  str_from("X-Trace-Id: 00000000deadbeef\r\n"));
+_adopt(str_data(mixed));
+assert_eq(sakshi_trace_id_lo(), 0xdeadbeef, "an invalid traceparent falls through to X-Trace-Id");
+
+# --- spans and the switch: first coverage -----------------------------------
+test_group("trace_spans");
+var req = _req(TP);
+trace_set_enabled(0);
+sakshi_trace_set_128(1, 2);
+assert_eq(trace_begin(str_data(req), str_len(req), "req", 3), 0, "disabled: trace_begin is a no-op");
+assert_eq(sakshi_trace_id_lo(), 2, "disabled: the active id is untouched");
+assert_eq(trace_response_header(), 0, "disabled: no X-Trace-Id header");
+
+trace_set_enabled(1);
+assert_eq(trace_enabled(), 1, "the switch reads back");
+var d0 = sakshi_span_depth();
+assert_eq(trace_begin(str_data(req), str_len(req), "req", 3), CD,
+  "enabled: trace_begin adopts and returns the low 64 bits");
+assert_eq(sakshi_span_depth(), d0 + 1, "and enters the root span");
+trace_span_enter("sub", 3);
+assert_eq(sakshi_span_depth(), d0 + 2, "a nested span nests");
+trace_span_exit();
+trace_end();
+assert_eq(sakshi_span_depth(), d0, "trace_end leaves the root span");
+
+# The echo is the whole 128-bit id (1.3.4 fixed the high half going missing).
+assert_eq(streq(trace_response_header(), "X-Trace-Id: aaaaaaaabbbbbbbbccccccccdddddddd\r\n"), 1,
+  "X-Trace-Id echoes the full 128-bit id");
+sakshi_trace_set_128(0, 0);
+assert_eq(trace_response_header(), 0, "no active id: no header");
+
+# The outbound traceparent is well-formed and carries the active trace-id.
+sakshi_trace_set_128(AB, CD);
+var otp = _trace_build_traceparent();
+assert_eq(strlen(otp), 55, "outbound traceparent is 55 bytes");
+assert_eq(_trace_valid_traceparent(otp), 1, "and passes daimon's own validator");
+assert_eq(_trace_parse_hex(otp, 3, 16), AB, "and carries the active trace-id (high)");
+assert_eq(_trace_parse_hex(otp, 19, 16), CD, "and carries the active trace-id (low)");
+assert_eq(load8(otp + 53), 48, "flags are 01 (sampled)");
+assert_eq(load8(otp + 54), 49, "flags are 01 (sampled)");
+trace_set_enabled(0);
+
+syscall(SYS_EXIT, assert_summary());

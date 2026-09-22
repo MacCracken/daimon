@@ -1,48 +1,61 @@
-# Fuzz: memory key validation and sanitization
-# Exercises edge cases in key validation and sanitization
+# Fuzz: memory key validation and sanitization — THE REAL src/memory.cyr (2.2.3)
+#
+# Until 2.2.3 this harness fuzzed a local COPY of validate_key/sanitize_key and
+# exited through `syscall(60, n)` — 60 is exit only on x86_64. It now drives the
+# real functions, keeps the original fixed cases, and adds 20,000 generated keys
+# checked against the CONTRACT validate_key documents: a key is valid exactly
+# when it is 1..MAX_KEY_LENGTH bytes from a-z A-Z 0-9 - _ . and contains no
+# "..". On a valid key sanitize_key is the identity — which is what stops two
+# keys sharing a file (the 2.2.3 collision fix).
 include "lib/alloc.cyr"
 include "lib/string.cyr"
 include "lib/fmt.cyr"
 include "lib/str.cyr"
 include "lib/vec.cyr"
+include "lib/io.cyr"
+include "lib/fs.cyr"
 include "lib/tagged.cyr"
+include "lib/chrono.cyr"
 include "lib/syscalls.cyr"
+
+include "src/syscalls.cyr"
+include "src/error.cyr"
+include "src/secmem.cyr"
+include "src/memory.cyr"
+include "fuzz/rng.cyr"
 
 alloc_init();
 
-var MAX_KEY_LENGTH = 256;
-
-fn validate_key(key) {
-    var klen = str_len(key);
-    if (klen == 0) { return Err(1); }
-    if (klen > MAX_KEY_LENGTH) { return Err(1); }
-    if (str_contains(key, str_from("..")) == 1) { return Err(1); }
-    if (str_contains(key, str_from("/")) == 1) { return Err(1); }
-    if (str_contains(key, str_from("\\")) == 1) { return Err(1); }
-    return Ok(0);
+fn _in_charset(c) {
+    if (c >= 97) { if (c <= 122) { return 1; } }
+    if (c >= 65) { if (c <= 90) { return 1; } }
+    if (c >= 48) { if (c <= 57) { return 1; } }
+    if (c == 45) { return 1; }
+    if (c == 95) { return 1; }
+    if (c == 46) { return 1; }
+    return 0;
 }
 
-fn sanitize_key(key) {
-    var data = str_data(key);
-    var klen = str_len(key);
-    var buf = alloc(klen + 1);
+# The documented contract, stated independently of the implementation.
+fn _should_be_valid(k) {
+    var n = str_len(k);
+    if (n == 0) { return 0; }
+    if (n > MAX_KEY_LENGTH) { return 0; }
+    var d = str_data(k);
     var i = 0;
-    while (i < klen) {
-        var c = load8(data + i);
-        if (c >= 97) { if (c <= 122) { store8(buf + i, c); i = i + 1; continue; } }
-        if (c >= 65) { if (c <= 90) { store8(buf + i, c); i = i + 1; continue; } }
-        if (c >= 48) { if (c <= 57) { store8(buf + i, c); i = i + 1; continue; } }
-        if (c == 45) { store8(buf + i, c); i = i + 1; continue; }
-        if (c == 95) { store8(buf + i, c); i = i + 1; continue; }
-        if (c == 46) { store8(buf + i, c); i = i + 1; continue; }
-        store8(buf + i, 95);
+    while (i < n) {
+        if (_in_charset(load8(d + i)) == 0) { return 0; }
+        if (i + 1 < n) {
+            if (load8(d + i) == 46) {
+                if (load8(d + i + 1) == 46) { return 0; }
+            }
+        }
         i = i + 1;
     }
-    store8(buf + klen, 0);
-    return str_new(buf, klen);
+    return 1;
 }
 
-# Valid keys
+# --- fixed cases (carried forward) -------------------------------------------
 var valid_keys = vec_new();
 vec_push(valid_keys, str_from("simple"));
 vec_push(valid_keys, str_from("with-dash"));
@@ -51,15 +64,12 @@ vec_push(valid_keys, str_from("with.dot"));
 vec_push(valid_keys, str_from("CamelCase"));
 vec_push(valid_keys, str_from("key123"));
 vec_push(valid_keys, str_from("a"));
-
 var vi = 0;
 while (vi < vec_len(valid_keys)) {
-    var k = vec_get(valid_keys, vi);
-    if (is_err_result(validate_key(k)) == 1) { syscall(60, 1); }
+    if (is_err_result(validate_key(vec_get(valid_keys, vi))) == 1) { sys_exit(1); }
     vi = vi + 1;
 }
 
-# Invalid keys
 var invalid_keys = vec_new();
 vec_push(invalid_keys, str_from(""));
 vec_push(invalid_keys, str_from(".."));
@@ -68,46 +78,45 @@ vec_push(invalid_keys, str_from("foo/bar"));
 vec_push(invalid_keys, str_from("foo\\bar"));
 vec_push(invalid_keys, str_from("a/b"));
 vec_push(invalid_keys, str_from("..hidden"));
-
+vec_push(invalid_keys, str_from("user:1"));     # 2.2.3: collided with user_1
 var ii = 0;
 while (ii < vec_len(invalid_keys)) {
-    var k = vec_get(invalid_keys, ii);
-    if (is_ok(validate_key(k)) == 1) { syscall(60, 2); }
+    if (is_ok(validate_key(vec_get(invalid_keys, ii))) == 1) { sys_exit(2); }
     ii = ii + 1;
 }
 
-# Too-long key
 var long_sb = str_builder_new();
 var li = 0;
 while (li < 260) { str_builder_add_cstr(long_sb, "x"); li = li + 1; }
-if (is_ok(validate_key(str_builder_build(long_sb))) == 1) { syscall(60, 3); }
+if (is_ok(validate_key(str_builder_build(long_sb))) == 1) { sys_exit(3); }
 
-# Sanitization preserves length
-var si = 0;
-while (si < vec_len(valid_keys)) {
-    var k = vec_get(valid_keys, si);
-    var s = sanitize_key(k);
-    if (str_len(s) != str_len(k)) { syscall(60, 4); }
-    si = si + 1;
-}
-
-# Sanitization replaces special chars
 var special = sanitize_key(str_from("a b!c@d#e"));
-if (str_len(special) != 9) { syscall(60, 5); }
-# Only alnum, -, _, . should survive; rest become _
-var sdata = str_data(special);
-var sci = 0;
-while (sci < str_len(special)) {
-    var c = load8(sdata + sci);
-    var ok = 0;
-    if (c >= 97) { if (c <= 122) { ok = 1; } }
-    if (c >= 65) { if (c <= 90) { ok = 1; } }
-    if (c >= 48) { if (c <= 57) { ok = 1; } }
-    if (c == 45) { ok = 1; }
-    if (c == 95) { ok = 1; }
-    if (c == 46) { ok = 1; }
-    if (ok == 0) { syscall(60, 6); }
-    sci = sci + 1;
+if (str_len(special) != 9) { sys_exit(5); }
+
+# --- generated keys -----------------------------------------------------------
+# Half the keys draw from printable ASCII, so plenty land inside the charset and
+# the valid branch is exercised; the other half draw from every byte value.
+var N = 20000;
+var n = 0;
+while (n < N) {
+    var len = fz_below(MAX_KEY_LENGTH + 12);
+    var k = 0;
+    if (fz_below(2) == 0) { k = fz_bytes(len, 45, 122); }
+    else { k = fz_bytes(len, 0, 255); }
+    var got_valid = is_ok(validate_key(k));
+    if (got_valid != _should_be_valid(k)) { sys_exit(10); }
+
+    var s = sanitize_key(k);
+    if (str_len(s) != str_len(k)) { sys_exit(11); }
+    var si = 0;
+    while (si < str_len(s)) {
+        if (_in_charset(load8(str_data(s) + si)) == 0) { sys_exit(12); }
+        si = si + 1;
+    }
+    if (got_valid == 1) {
+        if (str_eq(s, k) == 0) { sys_exit(13); }   # identity on a valid key
+    }
+    n = n + 1;
 }
 
-syscall(60, 0);
+fz_done("memory_keys", N);

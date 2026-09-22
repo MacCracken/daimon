@@ -1,0 +1,102 @@
+# Fuzz: RAG chunking + tokenizing — THE REAL src/rag.cyr (2.2.3, new)
+#
+# POST /v1/rag/ingest runs every request body through chunk_text and tokenize,
+# which makes them the one piece of text processing in daimon that takes
+# arbitrary client bytes — and until 2.2.3 no harness touched either. 10,000
+# generated texts and chunk settings, checked against the documented contract:
+#   * every chunk is 1..chunk_size bytes and a VIEW at the stride position
+#     (pos = i * (chunk_size - overlap), overlap clamped below chunk_size);
+#   * chunks cover the whole text: the last one reaches its end;
+#   * empty text or chunk_size 0 gives no chunks;
+#   * tokenize yields non-empty, lowercase, alphanumeric-only tokens whose
+#     total length equals the text's alphanumeric byte count.
+include "lib/alloc.cyr"
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/str.cyr"
+include "lib/vec.cyr"
+include "lib/io.cyr"
+include "lib/math.cyr"
+include "lib/tagged.cyr"
+include "lib/chrono.cyr"
+include "lib/syscalls.cyr"
+
+include "src/error.cyr"
+include "src/vector_store.cyr"
+include "src/rag.cyr"
+include "fuzz/rng.cyr"
+
+alloc_init();
+
+fn _alnum(c) {
+    if (c >= 97) { if (c <= 122) { return 1; } }
+    if (c >= 65) { if (c <= 90) { return 1; } }
+    if (c >= 48) { if (c <= 57) { return 1; } }
+    return 0;
+}
+
+var N = 10000;
+var n = 0;
+while (n < N) {
+    var tlen = fz_below(300);
+    var text = 0;
+    if (fz_below(2) == 0) { text = fz_bytes(tlen, 32, 126); }   # printable, spaces
+    else { text = fz_bytes(tlen, 0, 255); }                      # anything at all
+    var cs = fz_below(64);
+    var ov = fz_below(80);
+
+    var chunks = chunk_text(text, cs, ov);
+    if (tlen == 0) {
+        if (vec_len(chunks) != 0) { sys_exit(1); }
+    }
+    if (cs == 0) {
+        if (vec_len(chunks) != 0) { sys_exit(2); }
+    }
+    if (tlen > 0) {
+        if (cs > 0) {
+            if (vec_len(chunks) == 0) { sys_exit(3); }
+            var eov = ov;
+            if (eov >= cs) { eov = cs - 1; }
+            var step = cs - eov;
+            var ci = 0;
+            while (ci < vec_len(chunks)) {
+                var c = vec_get(chunks, ci);
+                if (str_len(c) < 1) { sys_exit(4); }
+                if (str_len(c) > cs) { sys_exit(5); }
+                if (str_data(c) != str_data(text) + ci * step) { sys_exit(6); }
+                ci = ci + 1;
+            }
+            var last = vec_get(chunks, vec_len(chunks) - 1);
+            if (str_data(last) + str_len(last) != str_data(text) + tlen) { sys_exit(7); }
+        }
+    }
+
+    var toks = tokenize(text);
+    var tok_bytes = 0;
+    var ti = 0;
+    while (ti < vec_len(toks)) {
+        var t = vec_get(toks, ti);
+        if (str_len(t) == 0) { sys_exit(8); }
+        var bi = 0;
+        while (bi < str_len(t)) {
+            var ch = load8(str_data(t) + bi);
+            if (_alnum(ch) == 0) { sys_exit(9); }
+            if (ch >= 65) {
+                if (ch <= 90) { sys_exit(10); }        # uppercase survived
+            }
+            bi = bi + 1;
+        }
+        tok_bytes = tok_bytes + str_len(t);
+        ti = ti + 1;
+    }
+    var alnum_bytes = 0;
+    var ai = 0;
+    while (ai < tlen) {
+        alnum_bytes = alnum_bytes + _alnum(load8(str_data(text) + ai));
+        ai = ai + 1;
+    }
+    if (tok_bytes != alnum_bytes) { sys_exit(11); }
+    n = n + 1;
+}
+
+fz_done("rag", N);

@@ -1,0 +1,188 @@
+# =========================================================================
+# rag — tests against THE REAL src/vector_store.cyr and src/rag.cyr (2.2.3)
+#
+# Test-integrity arc (roadmap 2.2.x). tests/daimon.tcyr carried local copies of
+# cosine_similarity, chunk_text, tokenize and a three-function RAG pipeline; all
+# of their assertions are carried forward here against the real modules, and
+# the copies are DELETED from daimon.tcyr in the same change.
+#
+# ⚠ The pipeline copy was not a simplification — it was a different program. Its
+# rag_ingest_text allocated ids and stored NOTHING, and its rag_query_text
+# returned "Context for: <query>". Its one content assertion — "the context
+# contains the query" — therefore held for a pipeline that retrieved nothing.
+# The real query echoes the question at the end too, so that assertion still
+# passes here; the new ones below are the ones that check RETRIEVAL.
+#
+# tests/rag_alias.tcyr (2.1.6) stays as the regression test for the aliasing
+# defect it was written for; this file is the module suite.
+# =========================================================================
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/io.cyr"
+include "lib/math.cyr"
+include "lib/tagged.cyr"
+include "lib/chrono.cyr"
+include "lib/syscalls.cyr"
+include "lib/assert.cyr"
+
+include "src/error.cyr"
+include "src/vector_store.cyr"
+include "src/rag.cyr"
+
+fn _near(a, b) {
+    var d = f64_sub(a, b);
+    if (f64_lt(d, f64_from(0)) == 1) { d = f64_sub(f64_from(0), d); }
+    if (f64_lt(d, f64_div(f64_from(1), f64_from(1000000))) == 1) { return 1; }
+    return 0;
+}
+
+fn _vec3(x, y, z) {
+    var v = alloc(24);
+    store64(v, f64_from(x));
+    store64(v + 8, f64_from(y));
+    store64(v + 16, f64_from(z));
+    return v;
+}
+
+# --- cosine_similarity: carried forward from daimon.tcyr -------------------
+test_group("cosine_similarity");
+var v1 = _vec3(1, 2, 3);
+assert(_near(cosine_similarity(v1, v1, 3), f64_from(1)) == 1, "identical vectors ~1.0");
+
+var orth_a = alloc(16);
+var orth_b = alloc(16);
+store64(orth_a, f64_from(1));
+store64(orth_a + 8, f64_from(0));
+store64(orth_b, f64_from(0));
+store64(orth_b + 8, f64_from(1));
+assert(_near(cosine_similarity(orth_a, orth_b, 2), f64_from(0)) == 1, "orthogonal ~0.0");
+assert_eq(cosine_similarity(v1, v1, 0), f64_from(0), "dim 0 -> 0");
+
+var zero = alloc(16);
+store64(zero, f64_from(0));
+store64(zero + 8, f64_from(0));
+assert_eq(cosine_similarity(zero, orth_a, 2), f64_from(0), "zero vec -> 0");
+
+# First coverage: opposite vectors are -1, and scale does not matter.
+var neg = _vec3(0 - 1, 0 - 2, 0 - 3);
+assert(_near(cosine_similarity(v1, neg, 3), f64_from(0 - 1)) == 1, "opposite vectors ~-1.0");
+var v1x10 = _vec3(10, 20, 30);
+assert(_near(cosine_similarity(v1, v1x10, 3), f64_from(1)) == 1, "similarity ignores magnitude");
+
+# --- the index: first coverage ----------------------------------------------
+test_group("vector_index");
+var vi = vindex_new();
+assert_eq(vindex_len(vi), 0, "a new index is empty");
+assert_eq(vindex_dimension(vi), 0, "and has no dimension yet");
+
+var i1_t, i1_v = vindex_insert(vi, vec_entry_new(11, _vec3(1, 0, 0), 3, str_from("x-axis"), str_from("m1")));
+assert_eq(is_ok(i1_t), 1, "insert into an empty index is Ok");
+assert_eq(i1_v, 11, "and returns the entry id");
+assert_eq(vindex_dimension(vi), 3, "the first insert fixes the dimension");
+vindex_insert(vi, vec_entry_new(12, _vec3(0, 1, 0), 3, str_from("y-axis"), str_from("m2")));
+vindex_insert(vi, vec_entry_new(13, _vec3(1, 1, 0), 3, str_from("diagonal"), str_from("m3")));
+assert_eq(vindex_len(vi), 3, "three entries");
+
+var e4 = alloc(32);
+var bad_t, bad_v = vindex_insert(vi, vec_entry_new(14, e4, 4, str_from("4d"), str_from("m")));
+assert_eq(is_err_result(bad_t), 1, "an entry of another dimension is refused");
+assert_eq(vindex_len(vi), 3, "and not stored");
+var z_t, z_v = vindex_insert(vi, vec_entry_new(15, e4, 0, str_from("0d"), str_from("m")));
+assert_eq(is_err_result(z_t), 1, "a zero-dimension entry is refused");
+
+var hits = vindex_search(vi, _vec3(1, 0, 0), 3, 2);
+assert_eq(vec_len(hits), 2, "top_k = 2 returns two results");
+assert(str_eq(search_result_content(vec_get(hits, 0)), str_from("x-axis")) == 1,
+  "the exact match ranks first");
+assert(str_eq(search_result_content(vec_get(hits, 1)), str_from("diagonal")) == 1,
+  "the 45-degree neighbour ranks second");
+assert(_near(search_result_score(vec_get(hits, 0)), f64_from(1)) == 1, "the first score is 1.0");
+assert_eq(search_result_rank(vec_get(hits, 1)), 1, "ranks are 0-based positions");
+assert_eq(vec_len(vindex_search(vi, _vec3(1, 0, 0), 3, 10)), 3, "top_k past the size returns all");
+assert_eq(vec_len(vindex_search(vi, _vec3(1, 0, 0), 3, 0)), 0, "top_k = 0 returns none");
+assert_eq(vec_len(vindex_search(vindex_new(), _vec3(1, 0, 0), 3, 5)), 0, "an empty index returns none");
+
+# ⛔ 2.2.3 — a query of the wrong dimension is refused. cosine_similarity reads
+# query_dim f64s from every entry, so a 4-d query against 3-d entries read one
+# slot past each embedding and scored the heap bytes that followed.
+var q4 = alloc(32);
+store64(q4, f64_from(1));
+store64(q4 + 8, f64_from(0));
+store64(q4 + 16, f64_from(0));
+store64(q4 + 24, f64_from(1));
+assert_eq(vec_len(vindex_search(vi, q4, 4, 5)), 0,
+  "a query of another dimension returns nothing instead of reading past each entry");
+
+assert_eq(vindex_remove(vi, 12), 1, "remove finds the entry");
+assert_eq(vindex_len(vi), 2, "and the index shrinks");
+assert_eq(vindex_remove(vi, 12), 0, "removing it again finds nothing");
+
+# --- chunk_text: carried forward from daimon.tcyr --------------------------
+test_group("chunk_text");
+var chunks = chunk_text(str_from("abcdefgh"), 4, 0);
+assert_eq(vec_len(chunks), 2, "no overlap: 2 chunks");
+assert(str_eq(vec_get(chunks, 0), str_from("abcd")) == 1, "chunk 0 = abcd");
+assert(str_eq(vec_get(chunks, 1), str_from("efgh")) == 1, "chunk 1 = efgh");
+
+var chunks2 = chunk_text(str_from("abcdefgh"), 4, 2);
+assert_eq(vec_len(chunks2), 4, "overlap 2: 4 chunks");
+assert(str_eq(vec_get(chunks2, 0), str_from("abcd")) == 1, "overlap chunk 0");
+assert(str_eq(vec_get(chunks2, 1), str_from("cdef")) == 1, "overlap chunk 1");
+
+assert_eq(vec_len(chunk_text(str_from(""), 10, 0)), 0, "empty text");
+assert_eq(vec_len(chunk_text(str_from("hello"), 0, 0)), 0, "zero chunk size");
+assert_eq(vec_len(chunk_text(str_from("hi"), 100, 0)), 1, "chunk > text");
+
+# First coverage: an overlap >= chunk_size is clamped rather than looping forever.
+assert_eq(vec_len(chunk_text(str_from("abcdef"), 3, 5)), 6, "overlap >= size clamps to step 1");
+
+# --- tokenize: carried forward from daimon.tcyr ----------------------------
+test_group("tokenize");
+var toks = tokenize(str_from("Hello, World! Test-123."));
+assert_eq(vec_len(toks), 4, "4 tokens");
+assert(str_eq(vec_get(toks, 0), str_from("hello")) == 1, "lowercased hello");
+assert(str_eq(vec_get(toks, 1), str_from("world")) == 1, "lowercased world");
+assert(str_eq(vec_get(toks, 2), str_from("test")) == 1, "test");
+assert(str_eq(vec_get(toks, 3), str_from("123")) == 1, "123");
+assert_eq(vec_len(tokenize(str_from(""))), 0, "empty tokens");
+
+# --- the pipeline: carried forward, then retrieval checked -----------------
+test_group("rag_pipeline");
+var cfg = rag_config_default();
+assert_eq(rag_top_k(cfg), 5, "default top_k");
+assert_eq(rag_chunk_size(cfg), 512, "default chunk_size");
+
+var rpipe = rag_pipeline_new(cfg);
+var rdoc = str_from("Rust is a systems programming language focused on safety and performance");
+var rids = rag_ingest_text(rpipe, rdoc, str_from("test"));
+assert(vec_len(rids) > 0, "ingested chunks");
+
+var rctx = rag_query_text(rpipe, str_from("rust safety"));
+assert(str_len(rctx) > 0, "query returned context");
+assert(str_contains(rctx, str_from("rust safety")) == 1, "context contains query");
+
+var empty_ids = rag_ingest_text(rpipe, str_from(""), str_from("x"));
+assert_eq(vec_len(empty_ids), 0, "empty ingest = 0 chunks");
+
+# What the copy could never check: the ingested text is IN the index and COMES
+# BACK. The copy stored nothing and still passed every assertion above.
+assert_eq(vindex_len(rag_pipeline_index(rpipe)), vec_len(rids),
+  "every ingested chunk is in the pipeline's index");
+assert(str_contains(rctx, rdoc) == 1, "the query's context contains the retrieved document");
+assert(str_contains(rctx, str_from("[1] ")) == 1, "numbered as source [1]");
+assert(str_contains(rctx, str_from("Question: rust safety")) == 1, "and ends with the question");
+
+# A document longer than chunk_size becomes several chunks, overlapping.
+var small = rag_config_default();
+store64(small + 8, 16);   # chunk_size
+store64(small + 16, 4);   # overlap
+var rp2 = rag_pipeline_new(small);
+var ids2 = rag_ingest_text(rp2, str_from("alpha beta gamma delta epsilon zeta"), str_from("m"));
+assert_eq(vec_len(ids2), 3, "a 35-byte text at size 16 / overlap 4 is three chunks");
+assert_eq(vec_get(ids2, 1), vec_get(ids2, 0) + 1, "chunk ids are sequential");
+
+syscall(SYS_EXIT, assert_summary());

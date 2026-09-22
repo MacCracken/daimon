@@ -6,7 +6,7 @@ type: state
 
 # Documentation Health — daimon
 
-> **Last refresh**: 2026-07-03 (through 1.3.4 — 1.3.1 doc sweep, 1.3.2 VULN-007 secret-hygiene, 1.3.3 distributed tracing, 1.3.4 cyrius 6.4.1 + sakshi 2.4.4 (VULN-007 structural fix vendored, 128-bit trace-ids + outbound propagation); CLAUDE.md pins + api.md tracing rolled; 1.3.0 arc context preserved below).
+> **Last refresh**: 2026-09-22 (2.2.3 — test-integrity arc complete: README / quickstart / CONTRIBUTING test guidance, BENCHMARKS.md re-baselined against the real code with its port-era claims corrected, roadmap 2.2.x closed. Rows below that predate 2.2.3 are as last recorded.)
 > **Refresh cadence**: when docs are touched, update the affected row. Full re-audit at each minor cut.
 > **Scope**: this repo only (`daimon`) — root-level files plus the entire `docs/` tree.
 
@@ -62,7 +62,30 @@ Daimon is the AGNOS agent orchestrator — every consumer (hoosh, agnoshi, aethe
 - ✅ `SECURITY.md` — supported-versions table rolled `1.0.x` → `1.3.x` (+ `< 1.3` unsupported).
 - ✅ `CHANGELOG.md` / `VERSION` — 1.3.1 cut (`## [1.3.1] - Unreleased` opened; VERSION 1.3.0 → 1.3.1).
 
-**Stale set:** cleared. Next full re-audit at the 1.3 → 1.4 cut (or sooner if a subsystem doc drifts).
+**Doc work shipped in 2.2.3 (2026-09-22):**
+- ✅ `README.md`, `docs/guides/quickstart.md` — test commands and counts were 1.3-era (`225 assertions`,
+  one suite, 17 benchmarks); now `cyrius tests` / `cyrius fuzz` / `tests/smoke.sh`, 645 assertions in
+  16 suites, 21 benchmarks, 6 fuzz harnesses.
+- ✅ `CONTRIBUTING.md` — "add tests in `tests/daimon.tcyr`" steered new work back into the copied-code
+  suite the 2.2.x arc removed; now: a per-module suite that includes the real `src/` file, and fuzz
+  harnesses on `fuzz/rng.cyr` with portable exits.
+- ✅ `BENCHMARKS.md` — current baseline replaced with numbers from the REAL code (the old one timed
+  local copies); the frozen port-era comparison kept but corrected (its two "Cyrius wins" were
+  measured on copies); the correctness table's "Complete" rows for the memory store and IPC — never
+  true, both crashed on first call — and "firewall: Blocked" (integrated since 2.1.8) corrected.
+- ✅ `docs/development/roadmap.md` — 2.2.x closed and removed; the gaps 2.2.3 found recorded under
+  2.3.x (tasks never start; IPC items), 2.5.x (memory API, registration ownership) and a P3.
+- ✅ `SECURITY.md` — supported versions rolled `1.3.x` → `2.2.x` (+ `< 2.2` unsupported); it had
+  named 1.3.x as the supported line through the whole 2.x series.
+- ✅ `CHANGELOG.md` / `VERSION` / `src/config.cyr` — 2.2.3 cut (`scripts/version-bump.sh`).
+
+⚠ This ledger said "stale set: cleared" through the whole 2.x line while README quoted 1.3-era test
+counts and BENCHMARKS.md called untested modules "Complete". A doc can only be as fresh as the check
+that reads it: the rows below are what was last *recorded*, not a guarantee.
+
+**Stale set:** `CLAUDE.md`'s dependency rows still quote older pins (cyrius 6.6.4, samay 1.1.2,
+bote 3.3.9, libro 2.10.1, majra 2.7.2); `cyrius.cyml` is authoritative. Left for the maintainer, as
+CLAUDE.md is the instruction file.
 
 ---
 

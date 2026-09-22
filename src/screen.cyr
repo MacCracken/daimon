@@ -17,6 +17,18 @@ enum RecordingStatus {
 # RecordingSession: {id: Str, status, frame_count, started_at, agent_id: Str}
 # 5 fields x 8 = 40 bytes
 
+# ⛔ 2.2.3 — both structs in this file that keep an agent id now OWN it. They
+# stored the caller's Str, and cap_mgr_grant then keyed its map by
+# str_data(<that Str>): once a route passes a jget VIEW, the next request
+# rewrites the key under the map (the permission stops being found) and the
+# stored id alike — the 2.2.1 class, recorded as latent on the roadmap until a
+# test could reach it. The key is also only a valid cstr because str_clone
+# terminates it; a view of a larger buffer does not end where the id does.
+fn _screen_own(s) {
+    if (s == 0) { return 0; }
+    return str_clone(s);
+}
+
 fn recording_session_new(agent_id) {
     var s = alloc(40);
     store64(s, str_from_int(_next_agent_id)); # reuse counter for unique IDs
@@ -24,7 +36,7 @@ fn recording_session_new(agent_id) {
     store64(s + 8, REC_ACTIVE);
     store64(s + 16, 0);            # frame_count
     store64(s + 24, clock_epoch_secs());
-    store64(s + 32, agent_id);
+    store64(s + 32, _screen_own(agent_id));
     return s;
 }
 
@@ -80,7 +92,7 @@ fn rec_mgr_get(rm, id_cstr) {
 
 fn cap_perm_new(agent_id, max_per_minute) {
     var cp = alloc(32);
-    store64(cp, agent_id);
+    store64(cp, _screen_own(agent_id));
     store64(cp + 8, max_per_minute);
     store64(cp + 16, 0);           # expires_at (0 = never)
     store64(cp + 24, vec_new());   # rate_timestamps

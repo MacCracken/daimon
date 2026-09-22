@@ -1,121 +1,173 @@
-# Fuzz: scheduler task state machine
-# Exercises all valid and invalid transitions
+# Fuzz: task state machine — THE REAL scheduler (samay), 2.2.3
+#
+# daimon's scheduler has been samay since 2.0.0, but until 2.2.3 this harness
+# fuzzed a local `transition()` it defined itself — a scheduler daimon no longer
+# ships — and exited through the x86-only `syscall(60, n)`. It now drives samay's
+# scheduled_task_transition on real ScheduledTask values: the original valid
+# paths and invalid pairs, the exhaustive 7x7 matrix, then 5,000 random walks and
+# a random-operation run against the scheduler itself. The properties:
+#   * an accepted transition lands exactly on its target; a refused one leaves
+#     the status untouched;
+#   * COMPLETED, FAILED and CANCELLED are terminal — nothing leaves them;
+#   * the status is always one of the seven states;
+#   * the scheduler's stats account for every task it holds.
 include "lib/alloc.cyr"
 include "lib/string.cyr"
 include "lib/fmt.cyr"
 include "lib/str.cyr"
 include "lib/vec.cyr"
+include "lib/io.cyr"
+include "lib/hashmap.cyr"
 include "lib/tagged.cyr"
+include "lib/bayan.cyr"
+include "lib/math.cyr"
+include "lib/chrono.cyr"
 include "lib/syscalls.cyr"
 
-enum TaskStatus {
-    TASK_QUEUED = 0;
-    TASK_SCHEDULED = 1;
-    TASK_RUNNING = 2;
-    TASK_COMPLETED = 3;
-    TASK_FAILED = 4;
-    TASK_CANCELLED = 5;
-    TASK_PREEMPTED = 6;
-}
-
-fn transition(t, new_status) {
-    var from = load64(t + 40);
-    var valid = 0;
-    if (from == TASK_QUEUED) {
-        if (new_status == TASK_SCHEDULED) { valid = 1; }
-        if (new_status == TASK_CANCELLED) { valid = 1; }
-    }
-    if (from == TASK_SCHEDULED) {
-        if (new_status == TASK_RUNNING) { valid = 1; }
-        if (new_status == TASK_CANCELLED) { valid = 1; }
-        if (new_status == TASK_QUEUED) { valid = 1; }
-    }
-    if (from == TASK_RUNNING) {
-        if (new_status == TASK_COMPLETED) { valid = 1; }
-        if (new_status == TASK_FAILED) { valid = 1; }
-        if (new_status == TASK_CANCELLED) { valid = 1; }
-        if (new_status == TASK_PREEMPTED) { valid = 1; }
-    }
-    if (from == TASK_PREEMPTED) {
-        if (new_status == TASK_QUEUED) { valid = 1; }
-    }
-    if (valid == 0) { return Err(1); }
-    store64(t + 40, new_status);
-    return Ok(0);
-}
+include "fuzz/rng.cyr"
 
 alloc_init();
+# samay logs every task that cannot be placed at WARN; the random-operation run
+# below makes thousands of those on purpose (a 64-core node fills up), and CI
+# logs do not need 3.7 MB of them. Errors still print.
+sakshi_set_level(SK_ERROR);
 
-# Valid path: QUEUED -> SCHEDULED -> RUNNING -> COMPLETED
-var t1 = alloc(72);
-store64(t1 + 40, TASK_QUEUED);
-if (is_err_result(transition(t1, TASK_SCHEDULED)) == 1) { syscall(60, 1); }
-if (is_err_result(transition(t1, TASK_RUNNING)) == 1) { syscall(60, 2); }
-if (is_err_result(transition(t1, TASK_COMPLETED)) == 1) { syscall(60, 3); }
-
-# Valid path: QUEUED -> CANCELLED
-var t2 = alloc(72);
-store64(t2 + 40, TASK_QUEUED);
-if (is_err_result(transition(t2, TASK_CANCELLED)) == 1) { syscall(60, 4); }
-
-# Valid path: preemption cycle
-var t3 = alloc(72);
-store64(t3 + 40, TASK_QUEUED);
-transition(t3, TASK_SCHEDULED);
-transition(t3, TASK_RUNNING);
-if (is_err_result(transition(t3, TASK_PREEMPTED)) == 1) { syscall(60, 5); }
-if (is_err_result(transition(t3, TASK_QUEUED)) == 1) { syscall(60, 6); }
-
-# Valid path: RUNNING -> FAILED
-var t4 = alloc(72);
-store64(t4 + 40, TASK_RUNNING);
-if (is_err_result(transition(t4, TASK_FAILED)) == 1) { syscall(60, 7); }
-
-# Valid path: SCHEDULED -> QUEUED (descheduling)
-var t5 = alloc(72);
-store64(t5 + 40, TASK_SCHEDULED);
-if (is_err_result(transition(t5, TASK_QUEUED)) == 1) { syscall(60, 8); }
-
-# Invalid transitions (must all fail)
-var invalid_pairs = vec_new();
-# (from, to) pairs that should be rejected
-var p0 = alloc(16); store64(p0, TASK_COMPLETED); store64(p0 + 8, TASK_RUNNING); vec_push(invalid_pairs, p0);
-var p1 = alloc(16); store64(p1, TASK_COMPLETED); store64(p1 + 8, TASK_QUEUED); vec_push(invalid_pairs, p1);
-var p2 = alloc(16); store64(p2, TASK_FAILED); store64(p2 + 8, TASK_QUEUED); vec_push(invalid_pairs, p2);
-var p3 = alloc(16); store64(p3, TASK_CANCELLED); store64(p3 + 8, TASK_QUEUED); vec_push(invalid_pairs, p3);
-var p4 = alloc(16); store64(p4, TASK_QUEUED); store64(p4 + 8, TASK_RUNNING); vec_push(invalid_pairs, p4);
-var p5 = alloc(16); store64(p5, TASK_QUEUED); store64(p5 + 8, TASK_COMPLETED); vec_push(invalid_pairs, p5);
-var p6 = alloc(16); store64(p6, TASK_PREEMPTED); store64(p6 + 8, TASK_RUNNING); vec_push(invalid_pairs, p6);
-var p7 = alloc(16); store64(p7, TASK_PREEMPTED); store64(p7 + 8, TASK_COMPLETED); vec_push(invalid_pairs, p7);
-
-var pi = 0;
-while (pi < vec_len(invalid_pairs)) {
-    var pair = vec_get(invalid_pairs, pi);
-    var t = alloc(72);
-    store64(t + 40, load64(pair));
-    if (is_ok(transition(t, load64(pair + 8))) == 1) {
-        # Should have been rejected
-        syscall(60, 10 + pi);
-    }
-    pi = pi + 1;
+fn _task() {
+    return scheduled_task_new(str_from("t"), str_from("d"), str_from("a"), 5, resource_req_default());
+}
+fn _at(status) {
+    var t = _task();
+    ScheduledTask_set_status(t, status);
+    return t;
+}
+fn _terminal(s) {
+    if (s == TASK_COMPLETED) { return 1; }
+    if (s == TASK_FAILED) { return 1; }
+    if (s == TASK_CANCELLED) { return 1; }
+    return 0;
 }
 
-# Exhaustive: try all 7x7 = 49 transitions, verify only valid ones succeed
-var from_state = 0;
-while (from_state <= 6) {
-    var to_state = 0;
-    while (to_state <= 6) {
-        var tex = alloc(72);
-        store64(tex + 40, from_state);
-        var result = transition(tex, to_state);
-        # Just verify no crash — result is Ok or Err
-        if (is_ok(result) == 1) {
-            # State should have changed
-            if (load64(tex + 40) != to_state) { syscall(60, 50); }
+# --- fixed paths (carried forward) ---------------------------------------------
+var t1 = _task();
+if (is_err_result(scheduled_task_transition(t1, TASK_SCHEDULED)) == 1) { sys_exit(1); }
+if (is_err_result(scheduled_task_transition(t1, TASK_RUNNING)) == 1) { sys_exit(2); }
+if (is_err_result(scheduled_task_transition(t1, TASK_COMPLETED)) == 1) { sys_exit(3); }
+var t2 = _task();
+if (is_err_result(scheduled_task_transition(t2, TASK_CANCELLED)) == 1) { sys_exit(4); }
+var t3 = _task();
+scheduled_task_transition(t3, TASK_SCHEDULED);
+scheduled_task_transition(t3, TASK_RUNNING);
+if (is_err_result(scheduled_task_transition(t3, TASK_PREEMPTED)) == 1) { sys_exit(5); }
+if (is_err_result(scheduled_task_transition(t3, TASK_QUEUED)) == 1) { sys_exit(6); }
+if (is_err_result(scheduled_task_transition(_at(TASK_RUNNING), TASK_FAILED)) == 1) { sys_exit(7); }
+if (is_err_result(scheduled_task_transition(_at(TASK_SCHEDULED), TASK_QUEUED)) == 1) { sys_exit(8); }
+
+var bad = alloc(16 * 8);
+store64(bad, TASK_COMPLETED);   store64(bad + 8, TASK_RUNNING);
+store64(bad + 16, TASK_COMPLETED); store64(bad + 24, TASK_QUEUED);
+store64(bad + 32, TASK_FAILED);    store64(bad + 40, TASK_QUEUED);
+store64(bad + 48, TASK_CANCELLED); store64(bad + 56, TASK_QUEUED);
+store64(bad + 64, TASK_QUEUED);    store64(bad + 72, TASK_RUNNING);
+store64(bad + 80, TASK_QUEUED);    store64(bad + 88, TASK_COMPLETED);
+store64(bad + 96, TASK_PREEMPTED); store64(bad + 104, TASK_RUNNING);
+store64(bad + 112, TASK_PREEMPTED); store64(bad + 120, TASK_COMPLETED);
+var bp = 0;
+while (bp < 8) {
+    var from = load64(bad + bp * 16);
+    if (is_ok(scheduled_task_transition(_at(from), load64(bad + bp * 16 + 8))) == 1) { sys_exit(10 + bp); }
+    bp = bp + 1;
+}
+
+# --- exhaustive 7x7 ---------------------------------------------------------------
+var cases = 0;
+var from_s = 0;
+while (from_s <= 6) {
+    var to_s = 0;
+    while (to_s <= 6) {
+        var tx = _at(from_s);
+        var rt, rv = scheduled_task_transition(tx, to_s);
+        if (is_ok(rt) == 1) {
+            if (ScheduledTask_status(tx) != to_s) { sys_exit(30); }   # lands on target
+            if (_terminal(from_s) == 1) { sys_exit(31); }             # left a terminal state
+        } else {
+            if (ScheduledTask_status(tx) != from_s) { sys_exit(32); } # refused, untouched
         }
-        to_state = to_state + 1;
+        cases = cases + 1;
+        to_s = to_s + 1;
     }
-    from_state = from_state + 1;
+    from_s = from_s + 1;
 }
 
-syscall(60, 0);
+# --- random walks -------------------------------------------------------------------
+var NW = 5000;
+var w = 0;
+while (w < NW) {
+    var tw = _task();
+    var steps = fz_below(20);
+    var st = 0;
+    while (st < steps) {
+        var before = ScheduledTask_status(tw);
+        var rt2, rv2 = scheduled_task_transition(tw, fz_below(7));
+        var after = ScheduledTask_status(tw);
+        if (after < 0) { sys_exit(40); }
+        if (after > 6) { sys_exit(41); }
+        if (is_err_result(rt2) == 1) {
+            if (after != before) { sys_exit(42); }
+        }
+        if (_terminal(before) == 1) {
+            if (after != before) { sys_exit(43); }
+        }
+        st = st + 1;
+    }
+    cases = cases + 1;
+    w = w + 1;
+}
+
+# --- the scheduler: random operations, stats must account for every task ------------
+var s = task_scheduler_new();
+task_scheduler_register_node(s, node_capacity_new(str_from("w1"), f64_from(64), 1048576, 1048576, 0));
+var ids = vec_new();
+var did_cancel = 0;
+var did_finish = 0;
+var NS = 2000;
+var o = 0;
+while (o < NS) {
+    var op = fz_below(5);
+    if (op == 0) {
+        var nt = _task();
+        var sr_t, sr_v = task_scheduler_submit_task(s, nt);
+        if (is_ok(sr_t) == 1) { vec_push(ids, sr_v); }
+    }
+    if (op == 1) { task_scheduler_schedule_pending(s); }
+    if (vec_len(ids) > 0) {
+        var pick = vec_get(ids, fz_below(vec_len(ids)));
+        if (op == 2) {
+            if (is_ok(task_scheduler_cancel_task(s, pick)) == 1) { did_cancel = did_cancel + 1; }
+        }
+        if (op == 4) {
+            # Start it. samay has no scheduler-level "start" (neither does
+            # daimon's API — see the roadmap): a consumer transitions a
+            # SCHEDULED task to RUNNING itself, and only then can it complete.
+            var tk = task_scheduler_get_task(s, pick);
+            if (tk != 0) { scheduled_task_transition(tk, TASK_RUNNING); }
+        }
+        if (op == 3) {
+            var fin = TASK_COMPLETED;
+            if (fz_below(2) == 0) { fin = TASK_FAILED; }
+            if (is_ok(task_scheduler_complete_task(s, pick, fin)) == 1) { did_finish = did_finish + 1; }
+        }
+    }
+    var stt = task_scheduler_stats(s);
+    var accounted = SchedulerStats_queued(stt) + SchedulerStats_running(stt)
+    + SchedulerStats_completed(stt) + SchedulerStats_failed(stt);
+    if (accounted != SchedulerStats_total_tasks(stt)) { sys_exit(50); }
+    cases = cases + 1;
+    o = o + 1;
+}
+
+# The run must actually have cancelled and finished tasks, or the stats check
+# above held vacuously.
+if (did_cancel == 0) { sys_exit(51); }
+if (did_finish == 0) { sys_exit(52); }
+
+fz_done("scheduler_fsm", cases);

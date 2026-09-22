@@ -5,10 +5,12 @@
 # mirrored 10 of this module's 28 functions — the in-memory message bus and
 # RPC registry — and its mirror is DELETED in the same change.
 #
-# The socket half (agent_ipc_bind / accept_one / send / cleanup) is exercised
-# by tests/syscall_portability.tcyr, which round-trips a real AF_UNIX socket
-# through exactly the wrappers those functions call, plus SO_PEERCRED — on
-# x86_64 AND aarch64. This file covers the registry half.
+# ⛔ CORRECTED at 2.2.3. This header used to say the socket half (agent_ipc_bind /
+# accept_one / send / cleanup) was exercised by tests/syscall_portability.tcyr.
+# That file round-trips the syscall WRAPPERS those functions call, never the
+# functions — and the functions did not work: agent_ipc_new crashed on its first
+# call and agent_ipc_bind made a directory where its socket belonged. Both are
+# now run here, end to end, across a fork (see the socket section at the end).
 #
 # ipc.cyr depends on agent.cyr: ipc_msg_new draws message ids from agent.cyr's
 # `_next_agent_id` counter, so the include chain is agent.tcyr's.
@@ -129,5 +131,119 @@ memcpy(sb, "agent-5", 7); store8(sb + 7, 0);
 msg_bus_subscribe(mb, sb);
 memset(sb, 88, 16);
 assert(map_get(load64(mb), "agent-5") != 0, "bus: subscriber key survives buffer reuse");
+
+# --- 2.2.3: a message owns its fields --------------------------------------
+# A published message waits on subscriber queues after the call returns, so its
+# Strs must not be views of a buffer the next request reuses.
+var msb = alloc(32);
+var mtb = alloc(32);
+var mpb = alloc(32);
+memcpy(msb, "SRC_ORIGINAL", 12);
+memcpy(mtb, "TGT_ORIGINAL", 12);
+memcpy(mpb, "PAYLOAD_ORIGINAL", 16);
+var owned_msg = ipc_msg_new(str_new(msb, 12), str_new(mtb, 12), MSG_EVENT, str_new(mpb, 16));
+memset(msb, 88, 32);
+memset(mtb, 88, 32);
+memset(mpb, 88, 32);                   # the next request reuses all three
+assert(str_eq(ipc_msg_source(owned_msg), str_from("SRC_ORIGINAL")) == 1,
+  "msg SOURCE survives the source buffer being reused");
+assert(str_eq(ipc_msg_target(owned_msg), str_from("TGT_ORIGINAL")) == 1,
+  "msg TARGET survives the source buffer being reused");
+assert(str_eq(ipc_msg_payload(owned_msg), str_from("PAYLOAD_ORIGINAL")) == 1,
+  "msg PAYLOAD survives the source buffer being reused");
+# Owned also means terminated: msg_bus_publish routes on str_data(target) as a
+# map key, which a view of a larger buffer would not end where the target does.
+var rbus = msg_bus_new();
+msg_bus_subscribe(rbus, "agent-3");
+var rtb = alloc(32);
+memcpy(rtb, "agent-3,rest-of-the-request", 27);
+msg_bus_publish(rbus, ipc_msg_new(str_from("sys"), str_new(rtb, 7), MSG_EVENT, str_from("p")));
+assert_eq(vec_len(map_get(load64(rbus), "agent-3")), 1,
+  "a target that is a VIEW of a larger buffer still routes to its agent");
+
+# --- 2.2.3: the socket half, run for the first time ------------------------
+# S_IFSOCK via xstat + STAT_MODE (st_mode sits at a different offset per arch).
+fn _ipc_is_socket(path_cstr) {
+    var st: u8[144];
+    if (xstat(path_cstr, &st) != 0) { return 0; }
+    if ((load32(&st + STAT_MODE) & 0xF000) == 0xC000) { return 1; }
+    return 0;
+}
+
+var base_sb = str_builder_new();
+str_builder_add_cstr(base_sb, "build/test-ipc-");
+str_builder_add_int(base_sb, sys_getpid());
+var ipc_base = str_builder_build(base_sb);
+var sock_dir = str_cat(ipc_base, str_from("/sock"));   # does not exist yet
+
+var idb = alloc(16);
+memcpy(idb, "7", 1);
+var ipc = agent_ipc_new(str_new(idb, 1), sock_dir);    # crashed before 2.2.3
+memset(idb, 88, 16);
+assert(str_eq(agent_ipc_id(ipc), str_from("7")) == 1, "agent_ipc_new owns the agent id");
+var spath = agent_ipc_socket_path(ipc);
+assert(str_eq(spath, str_cat(sock_dir, str_from("/7.sock"))) == 1,
+  "agent_ipc_new builds <dir>/<id>.sock");
+
+var bind_t, bind_fd = agent_ipc_bind(ipc);
+assert_eq(is_ok(bind_t), 1, "agent_ipc_bind succeeds (it could not before 2.2.3)");
+assert_eq(is_dir(sock_dir), 1, "bind created the missing parent directory");
+assert_eq(is_dir(spath), 0, "the socket path is NOT a directory (the 2.2.3 bug made one)");
+assert_eq(_ipc_is_socket(str_data(spath)), 1, "the socket path IS a socket");
+
+# Round trip: agent_ipc_send blocks for an ACK, so it runs in a child while the
+# parent accepts. The child reports its own result through its exit status.
+var child = sys_fork();
+if (child == 0) {
+    var s_t, s_v = agent_ipc_send(spath, str_from("{\"hello\":1}"));
+    if (is_ok(s_t) == 1) { sys_exit(0); }
+    sys_exit(1);
+}
+var acc_t, acc_n = agent_ipc_accept_one(bind_fd, ipc);
+assert_eq(is_ok(acc_t), 1, "agent_ipc_accept_one accepts the child's message");
+assert_eq(acc_n, 11, "accept reads the whole 11-byte body");
+assert_eq(vec_len(agent_ipc_queue(ipc)), 1, "the message is queued");
+var qmsg = 0;
+if (vec_len(agent_ipc_queue(ipc)) > 0) { qmsg = vec_get(agent_ipc_queue(ipc), 0); }
+assert(qmsg != 0, "a queued message exists to compare");
+if (qmsg != 0) {
+    assert(str_eq(qmsg, str_from("{\"hello\":1}")) == 1, "the queued message is the one sent");
+}
+var cst: i32[1];
+store32(&cst, 255);
+sys_waitpid(child, &cst, 0);
+assert_eq((load32(&cst) >> 8) & 255, 0, "the sender got its ACK (child exited 0)");
+
+# The shape the old code ALWAYS failed on: the parent directory already exists.
+# path_dirname's view was not terminated at the directory, so mkdir received the
+# whole socket path and — its parent now existing — created a directory THERE.
+xmkdir_p(str_data(sock_dir), 493);                       # make sure it does
+var ipc2 = agent_ipc_new(str_from("9"), sock_dir);
+var b2_t, b2_fd = agent_ipc_bind(ipc2);
+var spath2 = agent_ipc_socket_path(ipc2);
+assert_eq(is_ok(b2_t), 1, "bind succeeds when the parent directory already exists");
+assert_eq(is_dir(spath2), 0, "and does not create a directory at the socket path");
+assert_eq(_ipc_is_socket(str_data(spath2)), 1, "the second socket path is a socket");
+agent_ipc_cleanup(ipc2);
+if (is_ok(b2_t) == 1) { sys_close(b2_fd); }
+xrmdir(str_data(spath2));   # only if a buggy build left a directory there
+
+# A path sun_path cannot hold is refused, not truncated into a different socket.
+var long_sb = str_builder_new();
+str_builder_add(long_sb, ipc_base);
+str_builder_add_cstr(long_sb, "/");
+var li = 0;
+while (li < 110) { str_builder_add_cstr(long_sb, "d"); li = li + 1; }
+var long_ipc = agent_ipc_new(str_from("8"), str_builder_build(long_sb));
+var lb_t, lb_v = agent_ipc_bind(long_ipc);
+assert_eq(is_err_result(lb_t), 1, "bind refuses a socket path longer than sun_path holds");
+var ls_t, ls_v = agent_ipc_send(agent_ipc_socket_path(long_ipc), str_from("x"));
+assert_eq(is_err_result(ls_t), 1, "send refuses it too");
+
+agent_ipc_cleanup(ipc);
+assert_eq(_ipc_is_socket(str_data(spath)), 0, "agent_ipc_cleanup removes the socket");
+if (is_ok(bind_t) == 1) { sys_close(bind_fd); }
+xrmdir(str_data(sock_dir));
+xrmdir(str_data(ipc_base));
 
 syscall(SYS_EXIT, assert_summary());
