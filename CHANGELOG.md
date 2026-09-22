@@ -43,25 +43,75 @@ front of a maintainer.
 `docs/doc-health.md` corrected alongside: it claimed daimon carries no issues directory (false since
 1.2.x), and its `SYS_EPOLL_WAIT` tracker is now marked resolved.
 
-### Deferred — nein firewall MCP tools, with the blocker measured
+### Added — nein firewall MCP tools (`nein_status` · `allow` · `deny` · `validate` · `list` · `diff`)
 
-Attempted and backed out, because it **regresses the agnos build that 2.1.7 delivered**. Recorded
-rather than shipped half-done.
+Wired per nein's own [`mcp-host-integration.md`](https://github.com/MacCracken/nein/blob/main/docs/guides/mcp-host-integration.md)
+§"Path B — dispatch by name (recommended for daimon)", a section written against daimon's actual
+function names. `/v1/health` now reports **13 MCP tools**, up from 7. Descriptors are read from
+nein's own tool table (`nein_tool_count` / `_name` / `_desc`) rather than restated here — a restated
+table is a table that drifts — and dispatch routes by **table lookup, not a `nein_` prefix test**, so
+a future daimon tool starting with those characters cannot be swallowed.
 
-The integration itself works: wired per nein's Path B, `/v1/health` reported **13 tools** (up from
-7), all six `nein_*` in the manifest, and the gate verified live — `nein_status` permitted,
-`nein_allow` answering `access denied: tool gated by host policy`. Two upstream defects surfaced and
-were fixed in **nein 1.6.12** (see that changelog): `bridge_config_new` collided with bote's at a
-different arity, which cyrius correctly refuses to link; and nein was four cyrius minors behind, so
-its bundle carried bote 3.3.7 symbols against daimon's 3.3.13.
+⛔ **The mutating tools are denied by default, and that is not a placeholder.** `nein_allow` /
+`nein_deny` apply **live firewall rules**, and `POST /v1/mcp/call` has **no caller authentication** —
+it dispatches on a tool name taken from the request body. bote's `claims` argument, the seam an
+identity would arrive through, is a reserved `0` in the 3.x ABI. Registering live firewall mutation
+on an unauthenticated endpoint would be a remote root-equivalent hole, strictly worse than the SSRF
+and rate-limiter defects this project has already fixed. `daimon_nein_gate` fails **closed** on the
+admin set, audits each denial at `SEV_SECURITY`, and classifies via nein's own
+`nein_tool_read_only(i)` so daimon hardcodes nothing. Un-gating is roadmap **2.5.x** (agent identity
++ MCP auth). Verified live:
 
-⛔ **What stops it**: nein's apply path forks and execs the Linux `nft` binary (`sys_dup2` +
-`sys_execve`). agnos has neither syscall and no `nft` to exec, so the bundle leaves two *reachable*
-undefined functions there and cyrius refuses the binary. Gating daimon's own call sites behind
-`#ifndef CYRIUS_TARGET_AGNOS` is not sufficient: `[deps.*]` is not target-conditional, so the bundle
-compiles into every target regardless. Resolving it needs an agnos story on nein's side — or a
-target-conditional dep mechanism in cyrius — not a daimon-side workaround. Re-filed on the roadmap
-as blocked with the cause named, rather than the vague "no active consumer demand" it carried before.
+```
+nein_status -> {"content":[{"type":"text","text":"nein_status: nft query failed (needs root ...
+nein_allow  -> {"content":[{"type":"text","text":"access denied: tool gated by host policy"}],"isError":true}
+```
+
+**All three targets still build** — x86_64 · aarch64 · **agnos**. On agnos the tools register and
+return nein's specific refusal ("nftables backend unavailable on agnos"), because agnos has its own
+network stack and no nft binary. A diagnosable error beats a tool that silently vanishes from the
+manifest on one target.
+
+### Fixed (upstream, nein 1.6.12) — three defects found by attempting the integration
+
+⛔ **The roadmap said this was "blocked on upstream nein: no `mcp.cyr`, the Rust `mcp.rs` is
+unported". That was wrong and is retracted** — nein has shipped the MCP surface since **1.6.0**,
+where it was *deliberately redesigned* into flat-arg tools. Nothing was blocked; daimon had not done
+the work. What *was* real only surfaced by doing it:
+
+1. **`bridge_config_new` collided with bote's at a different arity** — nein's takes 3 args over a
+   32-byte struct (a *network* bridge), bote's takes 2 over 48 bytes (an *HTTP* bridge). cyrius
+   refuses to link on that, correctly: the alternative is nein's winning while bote's caller writes
+   `bearer_ctx` at +40, past a 32-byte allocation. Fixed **by scope, not rename** — `bridge.cyr` left
+   nein's `[lib.mcp]` profile, where nothing referenced it. Non-breaking.
+2. **nein's nft-apply path broke the agnos build** — `sys_dup2` and `sys_execve` are *reachable*
+   undefined functions there. Fixed by failing closed at the entry point rather than shimming to
+   agnos's `exec_redirect`/`spawn_path`, which would compile and then lie: agnos has no nftables to
+   drive. Also five 3-arg `sys_waitpid` calls, the same class daimon fixed in 2.1.7.
+3. **nein was four cyrius minors behind** (6.6.2) and behind on every shared pin, so its bundle
+   carried bote 3.3.7 symbols against daimon's 3.3.13 — 249 `duplicate fn` warnings from version
+   skew alone.
+
+⚠ **Residual, stated rather than hidden.** nein declares `[deps.bote-core]` for its own build and
+`cyrius deps` resolves it transitively, so daimon — which already vendors the full `dist/bote.cyr` —
+carries both packagings and **~249 benign `duplicate fn (last definition wins)` warnings**. Identical
+bodies at a matched version, so last-wins is a no-op; the build links and the suite is green. Recorded
+in nein's 1.6.12 entry as a packaging question to settle before the next consumer adopts the bundle.
+
+### Changed — dependency pins
+
+| dep | was | now |
+|---|---|---|
+| **nein** | *(new)* | **1.6.12** |
+
+Declared **after** bote and sigil, deliberately: `dist/nein-mcp.cyr` leaves their symbols unresolved
+by design and cyrius resolves forward references in a single pass. Lock: 117 → **119** entries.
+
+### Performance
+
+19 benchmarks unchanged — nein's tools register at `app_init` and dispatch on demand; nothing on a
+benchmarked path changed. The binary grows 2,993,176 → **3,196,424 bytes** (+6.8%), the nein bundle's
+reachable surface.
 
 ## [2.1.7] - 2026-09-22
 

@@ -5,6 +5,7 @@ commit	c95f296093f04272b186f2ff05c5d5b6232720fc	libro	https://github.com/MacCrac
 commit	baca558bc178e86c8a1fa57d3c6bfaa1bc1ded29	majra	https://github.com/MacCracken/majra.git	2.9.1
 commit	d0e8d868eb8b69ad98feb0a8d8c7850310c2ca0f	bote	https://github.com/MacCracken/bote.git	3.3.13
 commit	b9d3cf8c9e8a6ff14cf169c2f1ce336113beef5a	patra	https://github.com/MacCracken/patra.git	1.14.3
+commit	d0e8d868eb8b69ad98feb0a8d8c7850310c2ca0f	bote-core	https://github.com/MacCracken/bote.git	3.3.13
 88901cb4c80590ebf2531e825f912d2238d449f15577363ea2baa77694535a17  lib/ai-hwaccel.cyr
 417031acfb92b8f018315ebf375a410c7aecafecd1175c2e691097bb3373a0ee  lib/alloc.cyr
 69e92cc4b67f1a936f94c92ce8a4c66673758b84dba385e96fbeaa46fa692b4c  lib/alloc_agnos.cyr
@@ -25,6 +26,7 @@ c95aac7657aa91b4713f33691880ba8a62f3dd6f9993bba1fb2b2e01d45bc2d4  lib/audit_walk
 a8dc8df3ea0731ebc099df304b4d8b8f35d9006ed219f5e78a7684e83874881c  lib/bayan-json.cyr
 ddad6719545a2619cc6c32ec5c642365b985c6af3e3a881544131b1077a5ea9b  lib/bayan.cyr
 a82f4d28665d98a7336b81fb344ca0c78177ffe911c61ac02bd9c18e10dadb44  lib/bench.cyr
+1f1456da72332e9e205eb9fc4039cdd505cb328421c26e55f7410a183ab472bb  lib/bote-core.cyr
 7c087161cd29582bcc4c6266b04435cb0638a89af05318e742c1dda6a4033873  lib/bote.cyr
 7b6437095c35a9214eb19260ea3d6104d021e55d766d337a85354b441ce25181  lib/bounds.cyr
 e4a5d91e12a71feb2d245ec38804ded6333558cb74168853d226cb8ec22e4b19  lib/boxed.cyr
@@ -55,6 +57,7 @@ f4cbac59e6c7df2403a86ab448c2641942bf966124d1e0bb20e707c035dcf26e  lib/libro.cyr
 4a170556ec1ba8637dd92a57bae550738d10595bbda35a4d7664e05b23926da8  lib/majra.cyr
 a765010977ff6829def00d050e27cc94c52e5b9c6e28defb10f1fdabe2cd74e2  lib/math.cyr
 072725897707e6cc38c67510f972807c07e04cd8ba69d6881c9648f74055c8a5  lib/mmap.cyr
+9a4dc119823590acbf6e3fbe146bdc05df37ff90316419c741e3ae9c4783561b  lib/nein-mcp.cyr
 fe799dda111731ca5d4b92ef1160659c1cec5a507481770b5ed9c92b943d2730  lib/net.cyr
 0b07decc865c5b0772bb1551232f7f07ce9f1757ad1d0a86c1b6132e546d5342  lib/niyama.cyr
 16d92c974874d54467facb1a59d120f164d0215ad24a75a8aebe2abcb4c38a57  lib/overflow.cyr

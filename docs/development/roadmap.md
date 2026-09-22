@@ -4,10 +4,10 @@
 >
 > **Severity legend**: **P0** blocking (security / correctness — must-fix before ship) · **P1** high (must-have for the current arc) · **P2** medium (schedule when capacity opens) · **P3 / Low** nice-to-have, no urgency. Upstream-blocker items quote the upstream tracker's own severity.
 
-**Where daimon stands** — `2.1.8`, on cyrius 6.6.6, eight dep pins current. Builds and runs on
+**Where daimon stands** — `2.1.8`, on cyrius 6.6.6, nine dep pins current. Builds and runs on
 **three targets**: x86_64, aarch64 and AGNOS. 293 tests, 5 fuzz harnesses, 21 benchmarks, all gates
-clean. **Zero open issue filings** — all 8 are in `issues/archive/`. MCP surface: 13 tools (libro
-audit x5, bote web x2, nein firewall x6).
+clean. **Zero open issue filings** — all 8 are in `issues/archive/`. MCP surface: **13 tools** —
+libro audit x5, bote web x2, nein firewall x6 (the mutating half gated shut until 2.5.x).
 
 ## The arc to 3.0.0
 
@@ -99,7 +99,8 @@ request body. That is why 2.1.8 registered nein's firewall tools with the mutati
 (`nein_allow` / `nein_deny`) **gated shut** — there is nothing to authorise against. bote's `claims`
 argument, the seam an identity would arrive through, is a reserved `0` in the 3.x ABI.
 
-Three things unblock together when this lands: un-gating the firewall admin tools
+nein's firewall admin tools (`nein_allow` / `nein_deny`) are registered and **gated shut** as of
+2.1.8 for exactly this reason. Three things unblock together when this lands: un-gating the firewall admin tools
 (`_nein_admin_enabled` stops being an operator-trust flag), per-agent authorisation on every other
 MCP tool, and a meaningful definition of "tenant" for the 3.0.0 isolation work.
 
@@ -114,27 +115,6 @@ those; **P0 the moment one does.** Re-evaluate at every `2.x.0` cut.
 Zero-on-reset and secret hygiene close the *reuse* and *leak* channels but do not **isolate trust
 domains** — one bump allocator still backs every agent. Isolation is the open half and the hard
 prerequisite. (Both shipped halves are in the CHANGELOG.)
-
-## Blocked on upstream — nein firewall MCP tools
-
-Attempted at 2.1.8 and backed out. **Not blocked on nein having an MCP surface** — it has had one
-since 1.6.0 and ships a guide with a section written for daimon by name; the earlier roadmap claim
-that `mcp.rs` was "unported" was false and is retracted. The integration works on Linux: 13 tools in
-the manifest, gate verified (`nein_status` permitted, `nein_allow` denied).
-
-⛔ **It regresses the agnos build.** nein's apply path forks and execs the Linux `nft` binary
-(`sys_dup2` + `sys_execve`); agnos has neither syscall and no `nft` to exec, so the bundle leaves
-two *reachable* undefined functions and cyrius refuses to emit the binary. Gating daimon's own call
-sites behind `#ifndef CYRIUS_TARGET_AGNOS` does **not** help: `[deps.*]` is not target-conditional,
-so the bundle compiles into every target regardless.
-
-**Unblocks on either of**: (a) nein growing an agnos backend for apply, or a build profile that
-excludes it; or (b) cyrius gaining target-conditional deps. Both are upstream. daimon-side the work
-is ~60 lines and already proven — see the 2.1.8 CHANGELOG entry for the shape.
-
-Two nein defects found by attempting it were fixed upstream in **1.6.12**: the `bridge_config_new`
-arity collision with bote, and a four-minor cyrius lag that skewed bote symbols. Those are real
-wins even though the integration is deferred.
 
 ## Beyond the arc (unsequenced)
 

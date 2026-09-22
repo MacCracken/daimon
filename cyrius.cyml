@@ -127,6 +127,26 @@ git = "https://github.com/MacCracken/bote.git"
 tag = "3.3.13"
 modules = ["dist/bote.cyr"]
 
+# nein — firewall MCP tools (2.1.8). nein owns no transport: it exports six
+# flat-arg tools plus a tool table and a dispatch-by-name adapter; daimon
+# supplies the registry, the transport and the access gate. Wired per nein's
+# docs/guides/mcp-host-integration.md §"Path B — recommended for daimon".
+#
+# ⚠ DECLARED AFTER bote AND sigil, deliberately. dist/nein-mcp.cyr leaves bote
+# (jsonx / dispatcher / annotations) and sigil (ed25519 / hex / sha256) symbols
+# UNRESOLVED by design — the host supplies them — and cyrius resolves forward
+# references in a single pass, so the bundle must come after both.
+#
+# ⚠ PIN >= 1.6.12. 1.6.11 could not be linked by daimon at all: `bridge_config_new`
+# collided with bote's at a different arity (cyrius refuses the binary), and
+# nein's own nft-apply path called `sys_dup2` / `sys_execve`, which do not exist
+# on agnos — breaking daimon's --agnos build. 1.6.12 fixes both upstream.
+[deps.nein]
+git = "https://github.com/MacCracken/nein.git"
+path = "../nein"
+tag = "1.6.12"
+modules = ["dist/nein-mcp.cyr"]
+
 # Distribution manifest. Single binary today (`daimon`), with a best-effort
 # aarch64 cross-build; release.yml ships both when cc5_aarch64 is available
 # in the toolchain bundle. Kept declarative so future tooling

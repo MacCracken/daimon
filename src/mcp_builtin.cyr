@@ -62,5 +62,90 @@ fn mcp_dispatch_builtin(name_c, args) {
     if (streq(name_c, "libro_retention") == 1) { return libro_tool_retention(args, 0); }
     if (streq(name_c, "web_fetch") == 1) { return web_fetch_handler(args, 0); }
     if (streq(name_c, "web_search") == 1) { return web_search_handler(args, 0); }
+    # nein firewall tools. The gate runs inside nein_mcp_dispatch; claims is
+    # bote's reserved 0 (3.x ABI) and the seam lights up when it populates.
+    if (is_nein_tool(name_c) == 1) { return nein_mcp_dispatch(name_c, args, 0); }
+    return 0;
+}
+
+# =========================================================================
+# nein — firewall MCP tools (2.1.8)
+# =========================================================================
+#
+# nein owns no transport. It exports six flat-arg tools, a tool table and a
+# dispatch-by-name adapter; daimon supplies the registry, the transport and the
+# access gate. Wired per nein's own docs/guides/mcp-host-integration.md
+# §"Path B — dispatch by name (recommended for daimon)", which is written
+# against these exact daimon functions.
+#
+# ⛔ THE MUTATING TOOLS ARE DENIED BY DEFAULT, AND THAT IS NOT A PLACEHOLDER.
+# `nein_allow` / `nein_deny` APPLY LIVE FIREWALL RULES, and `POST /v1/mcp/call`
+# has NO caller authentication — it dispatches on a tool name taken from the
+# request body. bote's `claims` argument, the seam an identity would arrive
+# through, is a reserved 0 in the 3.x ABI, so there is nothing to authorise
+# against yet. Registering live firewall mutation on an unauthenticated endpoint
+# would be a remote root-equivalent hole, strictly worse than the SSRF and
+# rate-limiter defects this project has already fixed.
+#
+# The gate therefore fails CLOSED on the admin set until daimon has agent
+# identity (roadmap 2.5.x). Read-only tools — status / validate / list / diff —
+# are exposed; nein classifies the split itself via nein_tool_read_only(i), so
+# daimon hardcodes nothing.
+#
+# Flipping `_nein_admin_enabled` to 1 before authentication is wired re-opens
+# exactly the hole above. It exists so an operator on a trusted single-tenant
+# host can make that choice deliberately, not by default.
+#
+# ⚠ On agnos the tools ARE registered and return a specific refusal — nein 1.6.12
+# fails closed there with "nftables backend unavailable on agnos", because agnos
+# has its own network stack and no nft binary. A diagnosable error beats a tool
+# that silently vanishes from the manifest on one target.
+var _nein_admin_enabled = 0;
+
+# gate_fp contract (nein): fn(tool_name: cstring, claims: i64) -> 1 permit / 0 deny.
+# nein calls this BEFORE each tool acts and returns an "access denied" envelope
+# on 0, never touching the firewall.
+fn daimon_nein_gate(tool_name_c, claims) {
+    var i = 0;
+    while (i < nein_tool_count()) {
+        if (streq(nein_tool_name(i), tool_name_c) == 1) {
+            if (nein_tool_read_only(i) == 1) { return 1; }
+            if (_nein_admin_enabled == 1) { return 1; }
+            daimon_audit(SEV_SECURITY, "mcp", "nein.gate.deny",
+              "mutating nein firewall tool denied — daimon has no MCP caller authentication");
+            return 0;
+        }
+        i = i + 1;
+    }
+    # Unknown name: deny. A gate that permits what it cannot classify is the
+    # wrong default, even though nein_mcp_dispatch answers "unknown nein tool".
+    return 0;
+}
+
+# Register nein's six tools, reading descriptors out of nein's own tool table
+# rather than restating them here — a restated table is a table that drifts.
+# Installs the gate BEFORE any call can be served. Call once from app_init.
+fn mcp_nein_init(reg) {
+    nein_mcp_set_gate(&daimon_nein_gate);
+    var schema = str_from("{\"type\":\"object\"}");
+    var i = 0;
+    while (i < nein_tool_count()) {
+        mcp_register_builtin(reg, mcp_tool_new(
+            str_from(nein_tool_name(i)),
+            str_from(nein_tool_desc(i)),
+            schema));
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Is this a nein tool name? Table lookup, not a "nein_" prefix test, so a future
+# daimon tool starting with those characters cannot be swallowed by the routing.
+fn is_nein_tool(name_c) {
+    var i = 0;
+    while (i < nein_tool_count()) {
+        if (streq(nein_tool_name(i), name_c) == 1) { return 1; }
+        i = i + 1;
+    }
     return 0;
 }
