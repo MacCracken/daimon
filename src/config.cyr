@@ -33,14 +33,25 @@ fn config_set_max_agents(c, n) { store64(c + 24, n); }
 # trailing newline). If VERSION can't be read (e.g. launched from a CWD that
 # doesn't hold it), returns the sentinel "unknown" — deliberately not a real
 # number, so it can never masquerade as a stale release.
+# ⛔ COMPILE-TIME, not a runtime file read. Through 2.1.6 this function did
+# `file_read_all("VERSION", ...)` — a RELATIVE path — and fell back to the
+# string "unknown". That works only when daimon is launched from its own source
+# tree, which is true in dev and false everywhere daimon actually ships: an
+# installed /bin/daimon, a container, a service manager with its own cwd.
+#
+# Found by BOOTING the agnos build (2.1.7): on a real agnos kernel in ring 3 the
+# banner read `daimon vunknown listening on port 8090` — there is no VERSION file
+# in the rootfs, and nothing was wrong with the agnos build. The host binary has
+# the identical bug; `./build/daimon version` only ever looked right because it
+# was always run from the repo root. No test could see it either, because tests
+# run from the repo root too.
+#
+# ⚠ KEEP IN SYNC WITH THE `VERSION` FILE. `scripts/version-bump.sh` rewrites both
+# in one step, and `tests/version_sync.tcyr` FAILS if they ever disagree — so the
+# duplication is enforced, not merely documented.
+var DAIMON_VERSION = "2.1.7";
+
 fn daimon_version() {
-    var buf = alloc(16);
-    var n = file_read_all("VERSION", buf, 15);
-    if (n > 0) {
-        if (load8(buf + n - 1) == 10) { n = n - 1; }
-        store8(buf + n, 0);
-        return buf;
-    }
-    return "unknown";
+    return DAIMON_VERSION;
 }
 

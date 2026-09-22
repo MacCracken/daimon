@@ -12,18 +12,13 @@
 # ⚠ WHY THIS MATTERS BEYOND A BUILD ERROR: daimon is the declared back end for crab's M7 index and
 # tags (crab `[deps.daimon]` 2.1.3, 2026-09-14), and crab runs ON agnos. A daimon that cannot be
 # built for agnos cannot be talked to there, so the index half of that milestone is blocked here
-# rather than in crab. ⇒ Filed as docs/development/issues/2026-09-14-daimon-does-not-build-for-agnos.md
+# rather than in crab. ⇒ Filed as docs/development/issues/archive/2026-09-14-daimon-does-not-build-for-agnos.md
 #
 # ⚠ THE SHAPE IS crab's, because it is the same problem solved once already — `crab_fs_unlink_raw`
 # (crab src/app.cyr:1306) is this function with a different name. Taking the length as a parameter
 # rather than calling `str_len` inside keeps the host arm free of a scan it does not need.
-fn daimon_unlink(path_cstr, path_len) {
-    #ifdef CYRIUS_TARGET_AGNOS
-    return sys_unlink(path_cstr, path_len);
-    #else
-    return sys_unlink(path_cstr);
-    #endif
-}
+# (daimon_unlink moved to src/syscalls.cyr at 2.1.7 — the portability layer now
+#  lives in one file that tests/syscall_portability.tcyr can include on its own.)
 
 # =========================================================================
 # error — error codes and HTTP status mapping

@@ -102,11 +102,11 @@ Daimon is the AGNOS agent orchestrator — every consumer (hoosh, agnoshi, aethe
 
 **Tier — Engineering issues (upstream trackers)**
 
-Daimon does not carry its own `docs/development/issues/` directory — blockers that need upstream fixes live in the upstream repo (cyrius / sandhi / sakshi / etc.) per the "blockers live where they're fixed" convention. Daimon's roadmap + CHANGELOG carry pointers + severity tags; the upstream tracker is the source of truth.
+⚠ **Corrected 2.1.7.** This line read *"Daimon does not carry its own `docs/development/issues/` directory"* — false since 1.2.x. Daimon carries `docs/development/issues/` for filings it owns or co-owns, with resolved ones moved to `issues/archive/`. As of **2.1.7** there is exactly **one open filing** ([`2026-09-14-daimon-does-not-build-for-agnos.md`](development/issues/archive/2026-09-14-daimon-does-not-build-for-agnos.md)) and **seven archived**. The table below tracks filings that live in an UPSTREAM repo's tracker.
 
 | Tracker | Severity | Filed | Status | Notes |
 |---|---|---|---|---|
-| [cyrius § daimon-async-aarch64-sys-epoll-wait](https://github.com/MacCracken/cyrius/blob/main/docs/development/issues/2026-05-10-daimon-async-aarch64-sys-epoll-wait.md) | **P2** | 2026-05-10 | 🟢 Open upstream / daimon CI tolerant | `SYS_EPOLL_WAIT` undefined on aarch64 (lib/async.cyr × lib/syscalls_aarch64_linux.cyr). Blocks `--aarch64` cross-build. CI warn-on-detect; x86_64 unaffected. Close when upstream lands the arch-dispatch shim. Pinned in cyrius roadmap under `v5.10.x — Held`. |
+| [cyrius § daimon-async-aarch64-sys-epoll-wait](https://github.com/MacCracken/cyrius/blob/main/docs/development/issues/2026-05-10-daimon-async-aarch64-sys-epoll-wait.md) | **P2** | 2026-05-10 | ✅ **RESOLVED upstream — verified 2.1.7** | `lib/async.cyr` no longer references `SYS_EPOLL_WAIT` at all; the aarch64 peer defines `SYS_EPOLL_PWAIT = 1022` (a private alias, since native 22 is taken by x86 `pipe`). Confirmed end-to-end: daimon's `--aarch64` cross-build succeeds and the binary serves under `qemu-aarch64`. CI's warn-on-detect allowlist for this symbol now matches nothing — kept for older pins. |
 | [sandhi § daimon-server-max-conns](https://github.com/MacCracken/sandhi/blob/main/docs/issues/2026-05-10-daimon-server-max-conns.md) | **Low** | 2026-05-10 | 🟢 Open upstream / no daimon-side action | Sandhi 1.7.0's `sandhi_server_options_max_conns` accepted-but-not-honored. Blocks daimon's `serve_async` collapse into `sandhi_server_run_opts`. No security impact — 1.2.2 closed async slowloris independently via `set_recv_timeout_ms`. Close when upstream wires worker-pool or epoll-cooperative enforcement. Pinned in sandhi roadmap under `Post-arc — wait-for-trigger`. |
 
 ---

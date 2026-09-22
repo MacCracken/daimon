@@ -1,8 +1,22 @@
 # bote reads /dev/urandom via `syscall(SYS_OPEN, ...)` — `open(2)` doesn't exist on aarch64 Linux, breaking the daimon aarch64 cross-build
 
-**Status:** OPEN upstream (bote) — filed 2026-07-17 by daimon (consumer),
-bote 3.1.4 / daimon 1.4.2. This is a **vendored-stdlib gap** the consumer
-*cannot* fix (`lib/bote.cyr` is gitignored, repopulated by `cyrius deps`).
+**Status:** ✅ **RESOLVED upstream in bote 3.2.0; verified at the vendored bote 3.3.13 (daimon
+2.1.7).** bote's session-id and token generators now take entropy from `random_bytes` /
+`SYS_GETRANDOM` instead of `syscall(SYS_OPEN, "/dev/urandom", 0, 0)`. Verified two ways against the
+vendored bundle: `grep -c 'syscall(SYS_OPEN' lib/bote.cyr` excluding comments returns **0** (the
+remaining mentions are past-tense comments at `:3047` and `:3851` describing what was replaced), and
+**daimon's aarch64 cross-build succeeds** — `build/daimon-aarch64` is a valid aarch64 ELF, which it
+could not be while an `undefined variable 'SYS_OPEN'` was reachable. `SYS_OPEN` is defined only in
+`lib/syscalls_x86_64_linux.cyr`; aarch64's generic table has `openat` and no `open(2)`, which is why
+the raw reference broke the cross-build for bote and every consumer vendoring `dist/bote.cyr`.
+`SYS_GETRANDOM` exists on both arches, so the fix needed no `#ifdef`. Archived at 2.1.7.
+
+⚠ **CI still carries this symbol in its known-blocker allowlist.** `.github/workflows/ci.yml`
+downgrades `undefined variable 'SYS_(FORK|EPOLL_WAIT|OPEN)'` on the aarch64 step to a warning. That
+allowlist now matches nothing; it is kept for older pins and because dropping it is a separate
+change from closing this filing.
+
+Historical filing follows.
 
 **Severity:** **Low.** Portability-only — no runtime security impact. The
 authoritative daimon build target is x86_64 and it is green; aarch64 is a

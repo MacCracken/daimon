@@ -140,7 +140,7 @@ jobs:
         #     3.1.0/3.1.1/3.1.4, so pre-existing since daimon 1.4.0, not a
         #     regression. Upstream fix: open via SYS_OPENAT (AT_FDCWD) on
         #     aarch64. Tracked at
-        #     docs/development/issues/2026-07-17-bote-aarch64-sys-open-urandom.md.
+        #     docs/development/issues/archive/2026-07-17-bote-aarch64-sys-open-urandom.md.
         #
         # Any other failure still fails the step — we want signal when a
         # daimon-side regression breaks the cross-build, just not when
@@ -162,7 +162,7 @@ jobs:
             # VULN-009) and setrlimit as uname (agent rlimits never applied,
             # VULN-010) for the life of the project. The build exits 0 either
             # way, so only this check can see it. Zero is the expected count.
-            # See docs/development/issues/2026-09-14-aarch64-binary-issues-
+            # See docs/development/issues/archive/2026-09-14-aarch64-binary-issues-
             # x86-syscall-numbers.md.
             if grep -q "duplicate symbol 'SYS_" /tmp/aarch64.log; then
               echo "::error::a daimon global shadows an arch-aware stdlib SYS_* constant — on aarch64 that silently issues a DIFFERENT syscall. Declare it under the _DAIMON_SYS_ prefix in src/syscalls.cyr (per arch), or use the stdlib sys_* wrapper."
@@ -179,6 +179,24 @@ jobs:
           fi
           echo "ERROR: aarch64 cross-build failed for a non-blocker reason"
           exit 1
+
+      - name: Cross-build agnos
+        # 2.1.7. AGNOS is daimon's PRIMARY target — daimon IS the AGNOS agent
+        # orchestrator and every consumer is an AGNOS agent — so this is a hard
+        # gate, not best-effort like the aarch64 lane. It first built at 2.1.7;
+        # before that the build had never succeeded.
+        #
+        # The seven `undefined function` warnings this emits (sys_execve,
+        # sys_socket, sys_bind, sys_listen, sys_accept4, sys_connect,
+        # sys_pidfd_open) are EXPECTED and are not agnos-specific: daimon's
+        # spawn/IPC surface has zero callers on every target, so DCE NOPs it on
+        # Linux too. The build must still link — cycc refuses to emit a binary
+        # with a REACHABLE undefined function, which is the real check here.
+        run: |
+          cyrius build --agnos src/main.cyr build/daimon-agnos
+          xxd -l 4 build/daimon-agnos | grep -q "7f45 4c46" || {
+            echo "::error::daimon-agnos is not an ELF"; exit 1; }
+          echo "daimon-agnos: $(wc -c < build/daimon-agnos) bytes"
 
       - name: Syscall portability under qemu-aarch64
         # 2.1.6. The x86_64 suite cannot catch an aarch64 syscall-number defect:

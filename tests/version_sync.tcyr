@@ -1,0 +1,57 @@
+# =========================================================================
+# version_sync — the compiled-in version must equal the VERSION file.
+#
+# 2.1.7 moved `daimon_version()` from a runtime `file_read_all("VERSION", ...)`
+# to a compile-time `var DAIMON_VERSION`, because the relative path only
+# resolved when daimon was launched from its own source tree. Booting the agnos
+# build on a real kernel printed `daimon vunknown listening on port 8090` — and
+# the host binary had the identical bug, hidden because `./build/daimon version`
+# was always run from the repo root.
+#
+# The cost of compiling it in is that the number now lives in two files.
+# `scripts/version-bump.sh` writes both; THIS TEST is what makes that a
+# guarantee rather than a convention. It reads the VERSION file at test time
+# (tests do run from the repo root, which is exactly why they could not catch
+# the original bug) and compares it against the constant the binary carries.
+#
+# ⚠ If this fails, do not edit one side to match. Run:
+#     ./scripts/version-bump.sh <version>
+# =========================================================================
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/io.cyr"
+include "lib/fs.cyr"
+include "lib/syscalls.cyr"
+include "lib/assert.cyr"
+
+include "src/config.cyr"
+
+test_group("version_sync");
+
+# Read the VERSION file, trimming a trailing newline.
+var vbuf = alloc(64);
+var vn = file_read_all("VERSION", vbuf, 63);
+assert(vn > 0, "VERSION file is readable from the repo root");
+if (load8(vbuf + vn - 1) == 10) { vn = vn - 1; }
+store8(vbuf + vn, 0);
+
+var file_ver = str_new(vbuf, vn);
+var compiled = str_from(daimon_version());
+
+assert(str_len(compiled) > 0, "daimon_version() returns a non-empty string");
+assert(str_eq(compiled, str_from("unknown")) == 0,
+  "daimon_version() is not the old 'unknown' fallback — that fallback is gone");
+assert(str_eq(file_ver, compiled) == 1,
+  "VERSION file and compiled-in DAIMON_VERSION agree (run scripts/version-bump.sh if not)");
+
+# daimon_version() must not depend on the filesystem at all. If it still read a
+# file, the value would change with cwd; a constant cannot. Calling it twice and
+# getting the same pointer-stable content is a cheap proxy for "no I/O".
+assert(str_eq(str_from(daimon_version()), str_from(daimon_version())) == 1,
+  "daimon_version() is stable across calls");
+
+syscall(SYS_EXIT, assert_summary());

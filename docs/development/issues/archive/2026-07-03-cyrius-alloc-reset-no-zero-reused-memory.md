@@ -1,6 +1,22 @@
 # cyrius 6.3.43 — `alloc_reset()` rewinds the bump pointer without zeroing; reused first-chunk memory leaks the prior occupant's bytes
 
-**Status:** OPEN upstream (cyrius) — filed 2026-07-03 by daimon (consumer), cyrius 6.3.43. This is the **structural half** of daimon's VULN-007 gate that the consumer *cannot* fix (`lib/alloc.cyr` is vendored stdlib). daimon ships a partial consumer-side mitigation at 1.3.2 (targeted secret-scrubbing of daimon-owned buffers); the reset boundary itself lives entirely in the stdlib and must be fixed here.
+**Status:** ✅ **RESOLVED upstream in cyrius 6.4.1; re-verified at the 6.6.6 pin (daimon 2.1.7).**
+`alloc_reset()` now scrubs the reused span before rewinding — `lib/alloc.cyr:296-298`:
+`var span = _heap_ptr - _heap_first_base; ... if (span > 0) { _alloc_zero(_heap_first_base, span); }`
+— with the fix's own comment naming this exact class (*"a later alloc() can't read the prior
+occupant's bytes (memory-reuse info-leak, CVE-2026-34988 class)"*) and noting that spills past the
+first chunk re-mmap FRESH kernel-zeroed chunks, so the first chunk is the only reuse channel.
+Vendored daimon-side at 1.3.4. The consumer-side hygiene layer (`secure_zero`, `src/secmem.cyr`)
+shipped at 1.3.2 and stays as defence in depth. ⚠ This status line read "OPEN upstream (cyrius)"
+through 2.1.6 while daimon's own roadmap had recorded it CLOSED since 1.3.4 — the filing was simply
+never updated. Archived at 2.1.7.
+
+⛔ **This closes the STRUCTURAL half of VULN-007 only.** The roadmap's remaining open half is
+**per-agent arena isolation**: zero-on-reset closes the reuse/leak channel but does not *isolate*
+trust domains, and that is still the hard prerequisite before any multi-tenant / sandbox /
+untrusted-federation gate flips. Do not read this resolution as VULN-007 being closed.
+
+Historical filing follows.
 
 **Severity:** **Low → High.** Low for a single-trust-domain consumer (daimon today). High the moment a consumer hands one allocator to two logical owners across a reset — multi-tenant hosting, sandboxing, untrusted federation, or external tool-callback response data sharing the heap. Same bug class as **CVE-2026-34988** (Wasmtime pooling-allocator cross-guest leak) and **CVE-2022-39393**.
 

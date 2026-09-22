@@ -171,6 +171,45 @@ sys_close(afd);
 sys_close(cfd);
 sys_close(lfd);
 
+# --- portability shims: one call shape, per-target bodies (2.1.7) --------
+# These are the agnos port's load-bearing pieces. Each is written once here and
+# runs on whatever target the binary was built for, so the agnos arm is covered
+# by the same assertions as the host arm rather than by inspection.
+
+# daimon_rename — agnos takes (ptr,len) pairs and numbers rename 31, not 82.
+# Through 2.1.5 src/memory.cyr COMPILED on agnos against daimon's own
+# SYS_RENAME = 82 and issued a silently wrong syscall on the atomic-write path.
+var RN_A = "/tmp/daimon-sysport-a";
+var RN_B = "/tmp/daimon-sysport-b";
+daimon_unlink(RN_A, 21);
+daimon_unlink(RN_B, 21);
+var wfd = file_write_all(RN_A, "payload", 7);
+assert(file_exists(RN_A) == 1, "source file created");
+assert_eq(daimon_rename(RN_A, 21, RN_B, 21), 0, "daimon_rename returns 0");
+assert_eq(file_exists(RN_A), 0, "source path is gone after rename");
+assert(file_exists(RN_B) == 1, "destination path exists after rename");
+var rbuf = alloc(32);
+var rn = file_read_all(RN_B, rbuf, 31);
+assert_eq(rn, 7, "renamed file still holds its 7 bytes");
+assert_eq(load8(rbuf), 112, "and its first byte is still 'p' — contents moved intact");
+
+# daimon_unlink — the other explicit-length shim.
+assert_eq(daimon_unlink(RN_B, 21), 0, "daimon_unlink removes the file");
+assert_eq(file_exists(RN_B), 0, "file is gone after unlink");
+
+# daimon_reap — normalises two kernels that disagree on arity AND meaning:
+# Linux waitpid(pid,&st,WNOHANG) -> pid/0/-ECHILD; agnos waitpid(pid) is
+# already a poll -> exit_code/-2/-1. Both normalise to 1 / 0 / -1.
+# A pid we never forked is "no such child" on both, which is -1 and NOT 0 —
+# collapsing those two is the exact confusion the agnos kernel calls out.
+assert_eq(daimon_reap(0 - 12345), 0 - 1,
+  "daimon_reap on a non-child returns -1 (no such child), not 0 (alive)");
+
+# daimon_reap_wait must terminate on a non-child rather than spin its budget.
+assert_eq(daimon_reap_wait(0 - 12345), 0 - 1,
+  "daimon_reap_wait returns -1 immediately for a non-child");
+assert(DAIMON_REAP_TRIES > 0, "the reap budget is bounded and non-zero");
+
 # --- no daimon-owned name may be spelled SYS_* --------------------------
 # The defect class is a daimon global SHADOWING an arch-aware stdlib one.
 # The `_DAIMON_SYS_` prefix is what makes that impossible; assert the

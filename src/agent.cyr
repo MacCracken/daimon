@@ -233,7 +233,7 @@ fn agent_is_alive(h) {
 # it is not an ESYSXLAT row, so every daimon-aarch64 artifact ever shipped ran
 # these two calls as `uname(<a small int>)`, got -EFAULT, did not check it, and
 # exec'd the agent with NO RLIMIT_AS and NO RLIMIT_CPU. VULN-010 was silently
-# off on that target (docs/development/issues/2026-09-14-aarch64-binary-issues-
+# off on that target (docs/development/issues/archive/2026-09-14-aarch64-binary-issues-
 # x86-syscall-numbers.md).
 #
 # prlimit64 is the portable answer: the generic (aarch64) ABI supersedes
@@ -340,11 +340,13 @@ fn agent_stop(h, reason) {
     var pid = agent_pid(h);
     if (pid > 0) {
         agent_send_signal(pid, 15);  # SIGTERM
-        var status_buf: i32[1];  # wait4 writes a 4-byte int status
-        var wr = sys_waitpid(pid, &status_buf, 1);  # WNOHANG
-        if (wr == 0) {
+        # daimon_reap / daimon_reap_wait, not sys_waitpid: the two kernels
+        # disagree on both arity AND meaning. Linux answers pid/0/-ECHILD to a
+        # WNOHANG wait; agnos's #4 is already a poll and answers
+        # exit_code/-2/-1. The shims normalise both to 1/0/-1. (src/syscalls.cyr)
+        if (daimon_reap(pid) == 0) {
             agent_send_signal(pid, 9);  # SIGKILL
-            sys_waitpid(pid, &status_buf, 0);
+            daimon_reap_wait(pid);
         }
     }
     agent_set_status(h, AGENT_STOPPED);

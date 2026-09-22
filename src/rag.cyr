@@ -144,9 +144,9 @@ fn rag_ingest_text(rp, text, metadata) {
         # sandhi REUSES for later requests (src/server.cyr SERVE_MAX_CONNS note).
         # Storing them raw let a subsequent request overwrite the index: queries
         # returned fragments of OTHER clients' request bodies. Same CVE-class bug
-        # as docs/development/issues/2026-06-11-mcp-registry-aliases-request-
+        # as docs/development/issues/archive/2026-06-11-mcp-registry-aliases-request-
         # buffer.md, which 1.2.5 fixed for the MCP registry and did not sweep here;
-        # re-found 2026-09-22 and filed as 2026-09-22-rag-chunks-alias-the-request-
+        # re-found 2026-09-22 and filed as archive/2026-09-22-rag-chunks-alias-the-request-
         # buffer.md. The bump allocator never frees, so a plain str_clone is stable
         # for the process lifetime.
         var entry = vec_entry_new(id, emb, dim, str_clone(chunk), str_clone(metadata));

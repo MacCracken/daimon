@@ -180,7 +180,7 @@ unrouted sites the sweep found there (`_SYS_FCHMOD` 91 on its IPC access-control
 ## Related
 
 - majra `docs/development/issues/2026-09-14-raw-x86-syscall-numbers-aarch64.md` — the upstream filing.
-- `docs/development/issues/2026-09-14-daimon-does-not-build-for-agnos.md` — the agnos target hits the
+- `docs/development/issues/archive/2026-09-14-daimon-does-not-build-for-agnos.md` — the agnos target hits the
   same block from the other side (`SYS_RENAME = 31` there; `sys_unlink` arity).
 - cyrius CHANGELOG [6.6.4] "Raw x86_64 syscall numbers in arch-neutral stdlib code";
   `tests/gates/platform/raw_syscall_literals_routed.sh` — the derivation of the routed set.

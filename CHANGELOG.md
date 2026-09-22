@@ -4,6 +4,131 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.1.7] - 2026-09-22
+
+**daimon builds and runs on AGNOS.** First time in the project's history. Verified by booting it
+in ring 3 on a production agnos kernel under QEMU, not by reading the build log. Plus the
+issue-tracker close-out: **five filings archived, the sixth resolved here, one left open.**
+
+No toolchain or dependency movement — cyrius stays at **6.6.6** and all eight dep pins are
+unchanged. **293 tests** (was 277) across four files, five fuzz harnesses clean, `fmt` / `lint` /
+`vet` clean, 21 benchmarks flat.
+
+⛔ **The boot found two real defects the host build had been hiding.** Both are fixed here, and
+both were invisible to the whole 277-test suite. That is the argument for the port, independent of
+agnos: a second target is a second opinion.
+
+### Fixed — `daimon version` reported `unknown` anywhere but the repo root
+
+The agnos boot printed `daimon vunknown listening on port 8090`. Nothing was wrong with the agnos
+build — `daimon_version()` did `file_read_all("VERSION", ...)`, a **relative** path, and fell back
+to the string `"unknown"`. That resolves only when daimon is launched from its own source tree,
+which is true in development and false everywhere daimon actually ships: an installed `/bin/daimon`,
+a container, a service manager with its own working directory.
+
+**The host binary had the identical bug.** `./build/daimon version` only ever looked right because
+it was always run from the repo root — and no test could see it, because tests run from the repo
+root too. Measured after the fix:
+
+```
+from repo root:  2.1.7        # before: 2.1.7 (looked fine)
+from /tmp:       2.1.7        # before: unknown
+```
+
+`var DAIMON_VERSION` is now compiled in (`src/config.cyr`). The cost is that the number lives in two
+files, so **`tests/version_sync.tcyr` (5 assertions) fails the suite if they ever disagree** and
+`scripts/version-bump.sh` rewrites both in one step. The duplication is enforced, not documented.
+
+### Fixed — the VULN-009 rate limiter would have failed OPEN on agnos, a third time
+
+`rate_check` opened with `if (ip == 0) { return 1; }  # Can't determine IP, allow`. On aarch64 that
+was live for the life of the project (`getpeername` ran as `fchmod`, fixed in 2.1.6). On agnos it
+would have been live again by a completely different route: **the kernel exposes no getpeername at
+all** — `sock_accept` (#57) returns a raw conn_id and keeps the address behind it — so every caller
+would have come back as ip 0 and every request would have been allowed.
+
+The same hole twice, from two unrelated causes, is the argument for closing the *path* rather than
+the cause. Unidentified peers now share one bucket and are **still limited**. The ceiling is derived
+rather than invented: `RATE_LIMIT_MAX × 8` (the agnos inbound-TCP ceiling) = 960/60s, i.e. exactly
+what every simultaneous peer running at its own individual limit would produce — so a legitimate
+server is never throttled below its per-IP entitlement, while a flood from one unidentifiable source
+meets a ceiling instead of none.
+
+### Added — the AGNOS port
+
+AGNOS is daimon's **primary** target: daimon *is* the AGNOS agent orchestrator and every consumer is
+an AGNOS agent. Through 2.1.6 it had never built for it.
+
+**Verified end to end.** `build/daimon-agnos` (2,948,952 bytes) seeded onto an ext2 rootfs and booted
+on a *production* agnos kernel (no selftest hook) under QEMU + gnoboot + OVMF + NVMe, exec'd by
+kybernet as PID 1 in ring 3:
+
+```
+[    6.242024] kybernet: exec /bin/agnsh
+[2747164000] [INFO] daimon listening
+  daimon v2.1.7 listening on port 8090 (sync)
+```
+
+That is allocator init, args init, `app_init`, the sakshi logging path and the server banner, all
+running on agnos. (`syscall: stub 258 bytes of 2048` in the same tail is a kernel boot diagnostic
+reporting trampoline headroom — unrelated to daimon.)
+
+**The portability layer is `src/syscalls.cyr`**, one file a test can include on its own:
+
+| shim | why it exists |
+|---|---|
+| `daimon_rename` | agnos carries an **explicit-length invariant** — every path arg carries its length — so `sys_rename(old, oldlen, new, newlen)`. Through 2.1.5 `src/memory.cyr` *compiled* on agnos against daimon's own `SYS_RENAME = 82` while agnos's rename is **31**: the atomic-write path issued a silently wrong syscall. |
+| `daimon_unlink` | same invariant (moved here from `src/error.cyr`). |
+| `daimon_reap` | the two kernels disagree on arity **and meaning**. Linux `waitpid(pid,&st,WNOHANG)` answers pid/0/-ECHILD; agnos `waitpid` (#4) is *already* non-blocking and answers exit_code/**-2 (WOULD_BLOCK)**/-1. Normalised to 1/0/-1. ⛔ A reaped agnos child's exit code may legitimately be **0**, so "reaped" is `>= 0`, not `> 0` — testing `> 0` would report every cleanly-exiting agent as still running and `agent_stop` would SIGKILL a process that had already exited. |
+| `daimon_reap_wait` | agnos has no blocking wait (#4 is a poll; the blocking form is deferred upstream pending per-proc kernel stacks). The host arm now polls too, deliberately: the old `sys_waitpid(pid,&st,0)` blocked **forever** if the child sat in uninterruptible sleep, hanging the supervisor on one wedged agent. A bounded poll degrades that to a leaked zombie the next `agent_is_alive` sweep reports. |
+| `daimon_peer_ip` | agnos has no getpeername; returns 0 meaning **unidentified**, which `rate_check` now treats as "limit via the shared bucket" rather than "allow". |
+
+`tests/syscall_portability.tcyr` grew 28 → **39 assertions** covering every shim, and is run on
+x86_64 **and** aarch64 under qemu — 39/39 on both.
+
+⚠ **Scope, stated precisely.** daimon's process-spawn and IPC subsystems are **unreachable from any
+entry point on every target** — `agent_spawn_with_limits`, `agent_start`, `agent_ipc_bind`,
+`ipc_send` and `msg_bus_publish` all have **zero callers**; the HTTP API's agent-create handler calls
+`agent_handle_new` and registers a record without spawning a process. So the seven `undefined
+function` warnings in the agnos build (`sys_execve`, `sys_socket`, `sys_bind`, `sys_listen`,
+`sys_accept4`, `sys_connect`, `sys_pidfd_open`) sit in code **nothing reaches on Linux either**, and
+DCE NOPs them. **The agnos build has the same functional surface as the host build** — that is the
+honest claim, and it is not "agent spawning works on agnos". When spawn/IPC are wired to the API,
+the agnos work resumes: `sys_spawn_path` (#43, which **does** tokenize argv) for exec, and `chan_op`
+(#97) capability channels for IPC — an unnamed pair whose one end `CH_ENDOW` places into the spawned
+child, which the kernel notes *"deletes the entire unlink-before-bind race class AF_UNIX carries."*
+Two constraints are already measured and recorded in the filing: `CH_SEND` caps a payload at **64
+bytes** against daimon's `MAX_MESSAGE_SIZE` of 65536 (bulk needs `sys_shm_*`), and **agnos has no
+rlimit syscall at all**, so VULN-010 has no direct equivalent there.
+
+### Changed — issue tracker closed out
+
+Every filing was re-verified against the current tree rather than trusted. **Five archived**, the
+agnos one resolved here, leaving **one open**.
+
+| filing | outcome |
+|---|---|
+| `2026-09-14-daimon-does-not-build-for-agnos` | ✅ **RESOLVED here** — builds and boots. |
+| `2026-09-14-aarch64-binary-issues-x86-syscall-numbers` | ✅ archived (resolved 2.1.6). |
+| `2026-09-22-rag-chunks-alias-the-request-buffer` | ✅ archived (resolved 2.1.6). |
+| `2026-06-11-mcp-registry-aliases-request-buffer` | ✅ archived (resolved 1.2.5). |
+| `2026-07-03-cyrius-alloc-reset-no-zero-reused-memory` | ✅ archived — **had been marked OPEN since 2026-07-03 while daimon's own roadmap recorded it CLOSED since 1.3.4.** Re-verified at the 6.6.6 pin: `alloc_reset` scrubs the reused span (`lib/alloc.cyr:296-298`), the fix's own comment naming this exact class. ⛔ This closes the **structural** half of VULN-007 only — per-agent arena isolation remains the open half. |
+| `2026-07-17-bote-aarch64-sys-open-urandom` | ✅ archived — bote 3.2.0 moved to `SYS_GETRANDOM`; verified at the vendored 3.3.13 (zero non-comment `syscall(SYS_OPEN` sites) and by the aarch64 cross-build succeeding. |
+
+Also corrected in `docs/doc-health.md`: it claimed *"Daimon does not carry its own
+`docs/development/issues/` directory"* — false since 1.2.x. Its `cyrius § SYS_EPOLL_WAIT` tracker is
+marked resolved (`lib/async.cyr` no longer references the symbol); the `sandhi § max_conns` tracker
+stays open (`lib/sandhi.cyr` still reads *"reserved for 0.8.0+"*).
+
+### Performance
+
+19 benchmarks, medians of 6 runs against the 2.1.6 build: **all flat within ±5%** except
+`config_default` at +5.8%, which is one 158 ns outlier against five samples of 87–93 ns (2.1.6:
+86–93 ns). It is noise **by construction**, not merely by inspection: `tests/daimon.bcyr` mirrors
+`src/config.cyr` rather than including it, so this release's only change to that module —
+`daimon_version()` — cannot reach the benchmark at all. The two `rag_ingest.bcyr` benchmarks added
+at 2.1.6 are unchanged.
+
 ## [2.1.6] - 2026-09-22
 
 **Two security fixes and the sweep that closes the class behind each.** A P1 cross-request data
@@ -37,7 +162,7 @@ inherits the rule instead of rediscovering it.
 
 ⚠ **Not a 2.1.5 regression** — reproduced identically on 6.6.4 and 6.6.6 builds of the same tree
 before the fix. Filed at
-[`2026-09-22-rag-chunks-alias-the-request-buffer.md`](docs/development/issues/2026-09-22-rag-chunks-alias-the-request-buffer.md),
+[`2026-09-22-rag-chunks-alias-the-request-buffer.md`](docs/development/issues/archive/2026-09-22-rag-chunks-alias-the-request-buffer.md),
 now **RESOLVED**.
 
 ### Fixed — VULN-009 and VULN-010 were silently OFF on every `daimon-aarch64` ever shipped
@@ -77,7 +202,7 @@ requests from one IP"*; under `qemu-aarch64` the cross-built binary serves `/v1/
 130 requests from one IP, returns **119 × 200 then 11 × 429** — the limiter engaging at exactly
 `RATE_LIMIT_MAX = 120`. Before the fix `ip == 0` for every caller, so all 130 would have been 200.
 
-[The P2 filing](docs/development/issues/2026-09-14-aarch64-binary-issues-x86-syscall-numbers.md) is
+[The P2 filing](docs/development/issues/archive/2026-09-14-aarch64-binary-issues-x86-syscall-numbers.md) is
 **RESOLVED** on the daimon side; its majra half closed at 2.1.5.
 
 ### Added — tests that can actually see these classes
@@ -218,7 +343,7 @@ at 6.6.6, up from 44 — confirming the growth, and confirming what it does *not
 | **`SYS_SETRLIMIT`** | **160** | **still not a row** | runs as `uname` — VULN-010 agent rlimits never applied |
 
 Neither of daimon's two broken numbers was among the sixteen added, so
-[the P2 filing](docs/development/issues/2026-09-14-aarch64-binary-issues-x86-syscall-numbers.md)
+[the P2 filing](docs/development/issues/archive/2026-09-14-aarch64-binary-issues-x86-syscall-numbers.md)
 stays open and unchanged on the daimon side. Its majra half is now resolved (above).
 
 ### Note — a P1 cross-request data leak, found by running the binary
@@ -242,7 +367,7 @@ file"* and instructing *"`str_clone` EVERY FIELD"*. That fix was never swept to 
 stores (`grep -c str_clone`: `mcp.cyr` 16, `rag.cyr` 0). **Reproduced identically on 6.6.4 and 6.6.6
 builds of the same tree, so it is not a bump regression** — recorded, not fixed here, because it
 needs its own test and bench cycle. Filed as
-[`2026-09-22-rag-chunks-alias-the-request-buffer.md`](docs/development/issues/2026-09-22-rag-chunks-alias-the-request-buffer.md)
+[`2026-09-22-rag-chunks-alias-the-request-buffer.md`](docs/development/issues/archive/2026-09-22-rag-chunks-alias-the-request-buffer.md)
 (P1) and roadmapped. The fix is one call site (`src/rag.cyr:140`); the regression-test pattern
 already exists in-repo from 1.2.5.
 
@@ -296,7 +421,7 @@ clean, all 19 benchmarks flat within noise against a clean 2.1.3 build under 6.6
 ### Fixed — `agent_ipc_bind` called a function that does not exist
 
 The 2.1.3 tree's uncommitted-then-committed `daimon_unlink` shim (the agnos arity fix
-filed at `docs/development/issues/2026-09-14-daimon-does-not-build-for-agnos.md`) had one
+filed at `docs/development/issues/archive/2026-09-14-daimon-does-not-build-for-agnos.md`) had one
 call site spelled `daimon_unlink(path_cstr, cstr_len(path_cstr))` at `src/ipc.cyr:183`.
 There is no `cstr_len` in the stdlib — the build printed `warning: undefined function
 'cstr_len'` and linked anyway. Now `str_len(spath)`: the `Str` is already in scope two
@@ -391,7 +516,7 @@ allow" path: the VULN-009 per-IP rate limiter is off for every client. `SYS_SETR
 the VULN-010 limits are never applied, and this one emits **no** warning. CI checks only that the
 output is an aarch64 ELF. This is the class cyrius 6.6.4 swept from its stdlib and named for the
 consumer pin sweep. Not fixed here — filed as
-`docs/development/issues/2026-09-14-aarch64-binary-issues-x86-syscall-numbers.md` (P2) and,
+`docs/development/issues/archive/2026-09-14-aarch64-binary-issues-x86-syscall-numbers.md` (P2) and,
 for majra's bundle — where the same sweep found `_SYS_FCHMOD` 91 on its IPC bind path and a raw
 `syscall(35)` in its DAG backoff, both unrouted — as majra
 `docs/development/issues/2026-09-14-raw-x86-syscall-numbers-aarch64.md`. ⚠ The first cut of
@@ -943,7 +1068,7 @@ upstream fix + per-agent arenas.
 ### Security
 
 - **VULN-007 upstream fix filed** —
-  [`docs/development/issues/2026-07-03-cyrius-alloc-reset-no-zero-reused-memory.md`](docs/development/issues/2026-07-03-cyrius-alloc-reset-no-zero-reused-memory.md)
+  [`docs/development/issues/archive/2026-07-03-cyrius-alloc-reset-no-zero-reused-memory.md`](docs/development/issues/archive/2026-07-03-cyrius-alloc-reset-no-zero-reused-memory.md)
   (mirrored to the cyrius repo). `alloc_reset()` rewinds the bump pointer to the
   first chunk without zeroing the reclaimed span, so reset-then-reallocate reuses
   addresses holding the prior occupant's bytes (CVE-2026-34988 / Wasmtime class).
@@ -1235,7 +1360,7 @@ workaround uncovered along the way.** Toolchain pin moves **6.1.39 → 6.1.40**.
     (`(ip >> (pi*8)) & 255`) instead of staging through an address-taken
     `var parts[4]` — no `&`-of-local-array, no static placement, bug avoided.
   - **Root fix is upstream (cyrius).** Reported with a ~20-line standalone
-    reproducer in `docs/development/issues/2026-06-11-cyrius-addr-taken-local-array-static-overlap.md`.
+    reproducer in `docs/development/issues/archive/2026-06-11-cyrius-addr-taken-local-array-static-overlap.md`.
 
 ### Changed
 
@@ -1290,7 +1415,7 @@ reported by thoth (consumer), and moves the language pin **6.1.24 → 6.1.39**.
     buffer, overwrites every source byte (as a later request would), and asserts the registry
     still resolves the original name + URL. Live repro from the issue now passes — a tool
     registered with a 1-byte description survives arbitrary intervening requests.
-  - Reported in `docs/development/issues/2026-06-11-mcp-registry-aliases-request-buffer.md`
+  - Reported in `docs/development/issues/archive/2026-06-11-mcp-registry-aliases-request-buffer.md`
     (thoth 0.3.0, M4). Consumer-side padding workaround is no longer needed.
 
 ### Changed

@@ -1,11 +1,44 @@
 # daimon does not build for `--agnos`, and that blocks crab's M7 index
 
-**Status:** 🔴 **OPEN — RAISED to P1 at 2.1.6.** `cyrius build --agnos src/main.cyr` fails at daimon
-**2.1.6** with **3 errors across 2 symbols**, all daimon-owned and all wrapper-arity (was 53 errors /
-36 symbols at 2.1.3–2.1.4; the upstream half closed at 2.1.5). **There is no capability gap** — the
-agnos kernel supplies a primitive for everything daimon does; daimon has simply never been mapped
-onto them. See the 2.1.6 update for the subsystem-by-subsystem mapping, the two real constraints,
-and the retraction of the "scoping decision" framing this filing previously carried.
+**Status:** ✅ **RESOLVED in daimon 2.1.7 — daimon builds AND boots on AGNOS.**
+`cyrius build --agnos src/main.cyr` produces `build/daimon-agnos` (2,948,952 bytes), and that binary
+was seeded onto an ext2 rootfs and booted on a **production** agnos kernel (no selftest hook) under
+QEMU + gnoboot + OVMF + NVMe, exec'd by kybernet as PID 1 in ring 3:
+
+```
+[    6.242024] kybernet: exec /bin/agnsh
+[2747164000] [INFO] daimon listening
+  daimon v2.1.7 listening on port 8090 (sync)
+```
+
+Allocator init, args init, `app_init`, the sakshi logging path and the server banner all run on
+agnos. crab's M7 blocker — "a daimon built for agnos cannot be talked to there" — is cleared to the
+extent daimon's own surface allows; see §"Scope" below for what that does and does not include.
+
+⭐ **The boot paid for itself twice over.** It found two defects that the 277-test suite could not
+see, both of which also affected the HOST build: `daimon_version()` read the `VERSION` file by
+RELATIVE path and reported `unknown` from any cwd but the repo root (the boot printed
+`daimon vunknown`), and `rate_check`'s `if (ip == 0) { return 1; }` would have failed OPEN on agnos
+— the same VULN-009 shape 2.1.6 fixed for aarch64, reached by a completely different cause, because
+agnos's `sock_accept` returns a raw conn_id and exposes no getpeername. Both fixed in 2.1.7.
+
+### Scope — what "resolved" does and does not mean
+
+daimon's process-spawn and IPC subsystems are **unreachable from any entry point on every target**:
+`agent_spawn_with_limits`, `agent_start`, `agent_ipc_bind`, `ipc_send` and `msg_bus_publish` have
+**zero callers**, and the HTTP agent-create handler registers a record via `agent_handle_new` without
+spawning a process. The seven `undefined function` warnings in the agnos build (`sys_execve`,
+`sys_socket`, `sys_bind`, `sys_listen`, `sys_accept4`, `sys_connect`, `sys_pidfd_open`) therefore sit
+in code nothing reaches **on Linux either**, and DCE NOPs them.
+
+⇒ **The agnos build has the same functional surface as the host build.** That is the claim. It is
+*not* "agent spawning works on agnos". When spawn/IPC are wired to the API, the agnos mapping
+resumes — `sys_spawn_path` (#43) for exec and `chan_op` (#97) for IPC — and the two constraints
+measured in the 2.1.6 update still apply (`CH_SEND`'s 64-byte cap vs `MAX_MESSAGE_SIZE` 65536; no
+rlimit syscall on agnos, so VULN-010 has no direct equivalent). Tracked in the roadmap, not here.
+
+Archived at 2.1.7. Historical filing follows.
+
 **Filed:** 2026-09-14, by **crab**.
 **Affects:** daimon **2.1.3** (and every version before it — no agnos build has ever been attempted).
 **Severity:** **P1 — blocking for crab M7/M8, and first-order for daimon.** ⛔ This line used to read

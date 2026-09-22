@@ -15,7 +15,7 @@
 # stdlib's own `sys_*` wrappers. That is precisely how every daimon-aarch64
 # artifact ever shipped ran `getpeername` as `fchmod` (per-IP rate limiter off,
 # VULN-009) and `setrlimit` as `uname` (agent rlimits never applied, VULN-010):
-# see docs/development/issues/2026-09-14-aarch64-binary-issues-x86-syscall-
+# see docs/development/issues/archive/2026-09-14-aarch64-binary-issues-x86-syscall-
 # numbers.md. The nine `SYS_*` globals that lived here are gone as of 2.1.6 —
 # seven became `sys_*` wrapper calls, and the two below kept a number because
 # the stdlib has neither wrapper nor constant for them. The `_DAIMON_SYS_`
@@ -35,3 +35,137 @@ var _DAIMON_SYS_PRLIMIT64 = 261;    # asm-generic/unistd.h __NR_prlimit64
 # asm-generic agree), so it needs no arm; it is still namespaced so it can
 # never shadow a future peer constant.
 var _DAIMON_SYS_PIDFD_SEND_SIGNAL = 424;
+
+# =========================================================================
+# Portability shims — one call shape, per-target bodies
+# =========================================================================
+#
+# ⚠ THE AGNOS ARM IS NOT A FALLBACK. AGNOS is daimon's primary target: daimon
+# IS the AGNOS agent orchestrator and every consumer is an AGNOS agent. The
+# host (Linux) build is where daimon is developed; agnos is where it runs.
+#
+# agnos is a separate kernel, not a Linux flavour, and differs in three ways
+# that reach every shim below (`agnos/kernel/core/syscall.cyr` is canonical —
+# NOT the cyrius peer, which mirrors an older kernel and whose own header says
+# so after a doc→peer→doc citation loop once let a wrong number verify itself):
+#
+#   1. EXPLICIT-LENGTH INVARIANT — every path argument carries its length.
+#      Nothing assumes NUL-termination, so `rename`/`unlink` take (ptr, len)
+#      pairs. Callers pass the length they already hold, so the host arm pays
+#      no `strlen` scan it does not need.
+#   2. DIFFERENT SYSCALL NUMBERS — agnos `rename` is 31, not Linux's 82.
+#      Through 2.1.5 `src/memory.cyr` COMPILED on agnos against daimon's own
+#      `SYS_RENAME = 82` and issued a silently wrong syscall on the
+#      atomic-write path. 2.1.6 made that a loud compile error; 2.1.7 makes it
+#      correct.
+#   3. DIFFERENT SEMANTICS — see `daimon_reap` below, where the two kernels
+#      disagree about what "wait for a child" even means.
+
+# Remove a file. agnos: sys_unlink(path, len). Linux/macOS/Win: sys_unlink(path).
+# (Moved here from src/error.cyr at 2.1.7 so the whole portability layer sits in
+# one file that a test can include on its own.)
+fn daimon_unlink(path_cstr, path_len) {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return sys_unlink(path_cstr, path_len);
+    #else
+    return sys_unlink(path_cstr);
+    #endif
+}
+
+# Rename a file. Returns 0 on success, negative on failure.
+# agnos: sys_rename(old, oldlen, new, newlen) — explicit-length invariant.
+# Linux: sys_rename(old, new); on aarch64 the peer routes it to renameat(AT_FDCWD).
+fn daimon_rename(old_cstr, old_len, new_cstr, new_len) {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return sys_rename(old_cstr, old_len, new_cstr, new_len);
+    #else
+    return sys_rename(old_cstr, new_cstr);
+    #endif
+}
+
+# Non-blocking reap of one child. THE TWO KERNELS DISAGREE, so this normalises:
+#     1  — the child has exited and was reaped
+#     0  — the child is still alive
+#    -1  — no such child
+#
+# Linux `waitpid(pid, &status, WNOHANG)` answers pid / 0 / -ECHILD.
+# agnos `waitpid(pid)` (#4) is ALREADY non-blocking by design and answers
+# exit_code / -2 (WOULD_BLOCK) / -1. The kernel is explicit that "-2 vs -1 IS
+# THE WHOLE CONTRACT" — a parent loops while it gets -2 and stops on -1 —
+# because collapsing them makes "my children are all running" indistinguishable
+# from "I have none".
+#
+# ⛔ On agnos a reaped child's exit code may legitimately be 0, so "reaped" is
+# `>= 0`, NOT `> 0`. Testing `> 0` would report every cleanly-exiting agent as
+# still running, and `agent_stop` would then SIGKILL a process that had already
+# exited normally.
+fn daimon_reap(pid) {
+    #ifdef CYRIUS_TARGET_AGNOS
+    var wr = sys_waitpid(pid);
+    if (wr >= 0) { return 1; }
+    if (wr == 0 - 2) { return 0; }
+    return 0 - 1;
+    #else
+    var status_buf: i32[1];
+    var wr = sys_waitpid(pid, &status_buf, 1);   # WNOHANG
+    if (wr > 0) { return 1; }
+    if (wr == 0) { return 0; }
+    return 0 - 1;
+    #endif
+}
+
+# Wait for a child to exit, bounded. Returns 1 if reaped, 0 if it outlived the
+# bound, -1 if no such child. Called only after SIGKILL, which cannot be caught.
+#
+# agnos has NO blocking wait — #4 is a poll and the blocking form is deferred
+# upstream pending per-proc kernel stacks — so the loop is the only shape
+# available there. The host arm polls too, deliberately: the previous
+# `sys_waitpid(pid, &status, 0)` blocked FOREVER if the child sat in
+# uninterruptible sleep, hanging the whole supervisor on one wedged agent.
+# A bounded poll degrades that to a leaked zombie, which the next
+# agent_is_alive sweep reports.
+var DAIMON_REAP_TRIES = 1000;      # ~1s at 1ms, the SIGKILL-to-reap budget
+
+fn daimon_reap_wait(pid) {
+    # `sys_nanosleep(req, rem)` is the one sleep primitive BOTH the Linux and
+    # agnos peers define (agnos also has sys_sleep_ms, Linux does not), so it is
+    # what keeps this loop free of an #ifdef. timespec = {i64 tv_sec, i64 tv_nsec};
+    # element-typed `i64[2]` per CLAUDE.md — a bare `var ts[2]` is TWO BYTES in a
+    # function since cyrius 6.2.1 and would corrupt the frame when written via &ts.
+    var ts: i64[2];
+    store64(&ts, 0);
+    store64(&ts + 8, 1000000);      # 1 ms
+    var i = 0;
+    while (i < DAIMON_REAP_TRIES) {
+        var r = daimon_reap(pid);
+        if (r != 0) { return r; }
+        sys_nanosleep(&ts, 0);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Peer IPv4 address of a connected socket, as a 32-bit integer.
+# Returns 0 when the platform CANNOT report one — which is a distinct answer
+# from "the peer is 0.0.0.0", and callers must treat it as "unidentified", not
+# as "allow".
+#
+# agnos exposes no getpeername: `sock_accept` (#57) hands back a raw conn_id
+# (0..7) and the kernel keeps the address behind it. So the per-IP bucket has
+# no key there, and `rate_check` falls back to a SHARED bucket rather than
+# waving the request through — see src/server.cyr. Silently allowing everyone
+# is exactly the VULN-009 shape 2.1.6 fixed for aarch64, and it must not come
+# back through a different door.
+fn daimon_peer_ip(cfd) {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 0;
+    #else
+    var addr_buf = alloc(32);   # sockaddr_in = 16 bytes, pad
+    var addr_len = alloc(8);
+    store32(addr_len, 16);
+    var r = sys_getpeername(cfd, addr_buf, addr_len);
+    if (r < 0) { return 0; }
+    # sockaddr_in: family(2) + port(2) + addr(4) — IP at offset 4
+    return load32(addr_buf + 4);
+    #endif
+}

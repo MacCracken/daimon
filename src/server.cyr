@@ -18,14 +18,10 @@ fn rate_limiter_init() {
 
 # Get peer IPv4 address as integer from a connected socket fd
 fn get_peer_ip(cfd) {
-    var addr_buf = alloc(32);   # sockaddr_in = 16 bytes, pad
-    var addr_len = alloc(8);
-    store32(addr_len, 16);
-    var r = sys_getpeername(cfd, addr_buf, addr_len);
-    if (r < 0) { return 0; }
-    # sockaddr_in: family(2) + port(2) + addr(4)
-    # IP address is at offset 4, 4 bytes
-    return load32(addr_buf + 4);
+    # Delegates to src/syscalls.cyr — agnos has no getpeername (sock_accept
+    # returns a raw conn_id and keeps the address in the kernel), so the shim
+    # answers 0 there, meaning UNIDENTIFIED rather than 0.0.0.0.
+    return daimon_peer_ip(cfd);
 }
 
 # Format IPv4 integer as "a.b.c.d" cstr for map key
@@ -59,9 +55,28 @@ fn ip_to_cstr(ip) {
 }
 
 # Check rate limit for an IP. Returns 1 if allowed, 0 if rate-limited.
+# VULN-009 rate limiting when the peer CANNOT be identified.
+#
+# ⛔ Through 2.1.6 this path read `if (ip == 0) { return 1; }  # Can't determine
+# IP, allow` — an unconditional fail-OPEN. On aarch64 that was live for the life
+# of the project, because `getpeername` ran as `fchmod` and every caller came
+# back as ip 0 (fixed in 2.1.6). On agnos it would have been live again by a
+# different route: the kernel exposes no getpeername at all. The same hole twice,
+# from two different causes, is the argument for closing the path rather than the
+# cause.
+#
+# Unidentified peers now share ONE bucket and are still limited. The cap is
+# derived, not invented: RATE_LIMIT_MAX x the concurrent-connection ceiling — i.e.
+# it permits exactly what every simultaneous peer running at its own individual
+# limit would produce, so a legitimate agnos server (kernel-capped at 8 inbound
+# TCP conns) is never throttled below its per-IP entitlement, while a flood from
+# one unidentifiable source still hits a ceiling instead of none.
+var RATE_LIMIT_SHARED_KEY = "?unidentified-peer";
+var RATE_LIMIT_MAX_SHARED = 960;   # RATE_LIMIT_MAX(120) x 8 inbound conns
+
 fn rate_check(cfd) {
     var ip = get_peer_ip(cfd);
-    if (ip == 0) { return 1; }  # Can't determine IP, allow
+    if (ip == 0) { return rate_check_shared(); }
     var ip_key = ip_to_cstr(ip);
     var now = clock_epoch_secs();
 
@@ -86,6 +101,30 @@ fn rate_check(cfd) {
     var count = load64(bucket) + 1;
     store64(bucket, count);
     if (count > RATE_LIMIT_MAX) { return 0; }
+    return 1;
+}
+
+# The unidentified-peer bucket. Same window/reset shape as the per-IP path, one
+# shared counter, its own (higher, derived) ceiling. Returns 1 = allow, 0 = 429.
+fn rate_check_shared() {
+    var now = clock_epoch_secs();
+    var bucket = map_get(_rate_limiter, RATE_LIMIT_SHARED_KEY);
+    if (bucket == 0) {
+        bucket = alloc(16);
+        store64(bucket, 1);
+        store64(bucket + 8, now);
+        map_set(_rate_limiter, RATE_LIMIT_SHARED_KEY, bucket);
+        return 1;
+    }
+    var window_start = load64(bucket + 8);
+    if (now - window_start >= RATE_LIMIT_WINDOW) {
+        store64(bucket, 1);
+        store64(bucket + 8, now);
+        return 1;
+    }
+    var count = load64(bucket) + 1;
+    store64(bucket, count);
+    if (count > RATE_LIMIT_MAX_SHARED) { return 0; }
     return 1;
 }
 

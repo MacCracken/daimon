@@ -31,7 +31,7 @@ fn mcp_tool_schema(t) { return load64(t + 16); }
 # re-emit it compactly. The returned Str is fresh str_builder heap, not aliased
 # to the request buffer. Returns str_from("{}") when the field is absent or is
 # not a JSON object — back-compatible with registrants that send no schema.
-# See docs/development/issues/2026-06-11-mcp-manifest-omits-tool-input-schema.md.
+# See docs/development/issues/archive/2026-06-11-mcp-manifest-omits-tool-input-schema.md.
 fn mcp_extract_input_schema(body) {
     if (body == 0) { return str_from("{}"); }
     var root = bayan_json_v_parse(body);
@@ -90,7 +90,7 @@ fn mcp_register_builtin(reg, tool) {
 # (names/descriptions/URLs render as fragments of later request bytes; a
 # clobbered URL sidesteps the registration-time SSRF guard). The bump
 # allocator never frees, so a plain str_clone is stable for the process
-# lifetime. See docs/development/issues/2026-06-11-mcp-registry-aliases-
+# lifetime. See docs/development/issues/archive/2026-06-11-mcp-registry-aliases-
 # request-buffer.md.
 fn mcp_register_external(reg, tool, callback_url) {
     var name = str_clone(mcp_tool_name(tool));
@@ -166,7 +166,7 @@ fn mcp_deregister(reg, name_cstr) {
 # in by an api_* handler point into the transient per-connection request buffer,
 # which sync mode REUSES for later requests: storing them raw lets a subsequent
 # request overwrite the registry, which is a documented CVE-class bug in this
-# very file (docs/development/issues/2026-06-11-mcp-registry-aliases-request-
+# very file (docs/development/issues/archive/2026-06-11-mcp-registry-aliases-request-
 # buffer.md) — a clobbered callback_url sidesteps the registration-time SSRF
 # guard. The bump allocator never frees, so a plain str_clone is stable for the
 # process lifetime.

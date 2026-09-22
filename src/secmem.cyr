@@ -16,7 +16,7 @@
 #    daimon-allocated data is never handed to a new owner via address reuse;
 #    the reuse boundary that IS unsafe (`alloc_reset()` rewinds without
 #    zeroing) lives in vendored stdlib and must be fixed upstream — see
-#    docs/development/issues/2026-07-03-cyrius-alloc-reset-no-zero-reused-memory.md.
+#    docs/development/issues/archive/2026-07-03-cyrius-alloc-reset-no-zero-reused-memory.md.
 #    Multi-tenant / sandbox / untrusted-federation isolation additionally
 #    requires per-agent arenas (VULN-007 gate, still gated).
 #

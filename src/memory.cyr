@@ -86,7 +86,10 @@ fn memory_store_set(ms, agent_id_str, key, value_json) {
     # Atomic write: tmp then rename
     var tmp_path = str_cat(fpath, str_from(".tmp"));
     file_write_all(str_data(tmp_path), str_data(content), str_len(content));
-    sys_rename(str_data(tmp_path), str_data(fpath));
+    # daimon_rename, not sys_rename: agnos takes (ptr,len) pairs and numbers
+    # rename 31, not Linux's 82. Both Strs are in scope, so the lengths cost
+    # nothing. (src/syscalls.cyr)
+    daimon_rename(str_data(tmp_path), str_len(tmp_path), str_data(fpath), str_len(fpath));
 
     return Ok(0);
 }
