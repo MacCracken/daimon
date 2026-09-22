@@ -27,3 +27,45 @@ Unsequenced; severity is assigned at the v1.4.0 cut once the arc's shape is chos
 - [ ] gRPC transport option alongside HTTP
 - [ ] WebSocket streaming for real-time agent events
 - [ ] Agent migration between nodes
+
+## Moving the cyrius pin to 6.6.6
+
+Current pin: `cyrius = "6.6.4"` (`cyrius.cyml`). Two patches forward. Nothing needs to change
+first.
+
+The one item that looks like it lands here is **item 9** — `lib/assert.cyr` now transitively
+includes `lib/vec.cyr`, so a consumer defining its own `vec_*` at the same arity newly
+collides. daimon is the obvious candidate, because `src/vector_store.cyr` defines a `vec_*`
+family: `vec_entry_new` (`:28`), `vec_entry_id` (`:39`), `vec_entry_embedding` (`:40`),
+`vec_entry_dim` (`:41`), `vec_entry_content` (`:42`), `vec_entry_metadata` (`:43`). **It does
+not collide.** `lib/vec.cyr` exports exactly fourteen names — `vec_cap`, `vec_find`, `vec_get`,
+`vec_len`, `vec_new`, `vec_new_a`, `vec_pop`, `vec_push`, `vec_push_a`, `vec_remove`,
+`vec_select_nth`, `vec_set`, `vec_sort_by`, `vec_truncate` — and every daimon symbol is
+`vec_entry_*`, which matches none of them. The prefix is shared; the names are not.
+
+Everything else checked and empty:
+
+- **No Windows exposure** — `CYRIUS_TARGET_AGNOS` is the only `CYRIUS_TARGET_*` in `src/`, CI
+  is `ubuntu-latest`, `cross_bins = ["daimon-aarch64"]` with no `windows-*` job — and no
+  `O_APPEND` / `O_TRUNC` outside the vendored `lib/`. The single write is `file_write_all` at
+  `src/memory.cyr:88`. Item 1 is a non-event here.
+- None of item 3's new compile errors have sites: no `async fn`, no `operator` fn, no
+  `ret2`/`rethi`, no SIMD intrinsics, no struct declarations in `src/` at all, and no struct-
+  or vector-typed parameter or `var` declaration — so item 5's by-value-struct-param deep copy
+  is a no-op as well.
+- No top-level bare `{` blocks (item 4), no `regression_*` call sites of its own (item 8 — the
+  two `include` hits are `lib/regression.cyr` pulling `lib/regression_agnos.cyr`).
+- Arity and `: cstring` scans over the repo's own sources: clean.
+
+One thing to watch that is not new in 6.6.6 but interacts with **item 6** (a global redeclared
+later now wins everywhere from program start, and a global declared in two co-linked files
+with a different type or size is now a compile error): `cyrius.cyml:91` records **227
+"duplicate fn (last definition wins)" warnings** between vendored dists, and `:104` a related
+`undefined function 'json_v_parse_str'`. Those are duplicate *functions*, not globals, so the
+new global rule does not fire on them — but a tree already carrying that many last-definition
+warnings is the kind where a duplicated global could hide. A `^var NAME` duplicate scan across
+the co-linked set is cheap insurance before the bump.
+
+After bumping, verify: the full `.tcyr` suite per-file, plus one agent lifecycle through the
+HTTP API and a vector-store round trip (`src/vector_store.cyr` is the module the `vec_*` note
+above concerns).
