@@ -4,18 +4,47 @@
 >
 > **Severity legend**: **P0** blocking (security / correctness — must-fix before ship) · **P1** high (must-have for the current arc) · **P2** medium (schedule when capacity opens) · **P3 / Low** nice-to-have, no urgency. Upstream-blocker items quote the upstream tracker's own severity.
 
-**Where daimon stands** — `2.1.7`, on cyrius 6.6.6, all eight dep pins current. Builds and runs on
+**Where daimon stands** — `2.1.8`, on cyrius 6.6.6, eight dep pins current. Builds and runs on
 **three targets**: x86_64, aarch64 and AGNOS. 293 tests, 5 fuzz harnesses, 21 benchmarks, all gates
-clean. v1.0 criteria were met at 1.0.0 and are not re-litigated here. **Zero open issue filings** —
-`docs/development/issues/` is empty; all 8 sit in `issues/archive/`.
+clean. **Zero open issue filings** — all 8 are in `issues/archive/`. MCP surface: 13 tools (libro
+audit x5, bote web x2, nein firewall x6).
 
-**The next arc is 2.2, and it has one shape**: daimon is an agent *registry* that cannot start an
-agent. The two P1s below are that arc, in that order — test integrity first, because it is the net
-everything else has to land in.
+## The arc to 3.0.0
+
+daimon is an agent *registry* that cannot start an agent. Everything below is that gap and its
+prerequisites, sequenced. Each line is a release train, not a single release.
+
+| arc | theme | why it must come after the one above |
+|---|---|---|
+| **2.2.x** | **Test integrity** — migrate the mirrored suites onto `src/` | It is the net everything else lands in. The lifecycle code has **never been executed**; migrating its tests answers whether it works *before* anything depends on it. |
+| **2.3.x** | **Agent lifecycle** — start / stop / signal / reap through the API | The product gap. Needs 2.2.x first: wiring `fork`/`execve`/signals while the suite tests a parallel reimplementation is how two releases already shipped defects green. |
+| **2.4.x** | **AGNOS spawn + IPC** — `sys_spawn_path`, `chan_op` capability channels, `sys_proclist` | Nothing to map until a route actually spawns. Unblocks the moment 2.3.x lands. |
+| **2.5.x** | **Agent identity + MCP authentication** | Prerequisite for un-gating nein's mutating firewall tools, and for any `claims`-based authorisation. Needs 2.3.x, because identity is per-agent. |
+| **3.0.0** | **Per-agent arena isolation** — VULN-007's open half; unlocks multi-tenant hosting, kavach sandboxing, untrusted federation, external MCP callbacks | Major because it changes the allocation model under every agent and flips the gates the P0 below guards. Needs identity (2.5.x) to know what a tenant *is*. |
+
+⚠ The 3.0.0 line is where the security gates open, not where they are first considered. Each `2.x.0`
+cut re-evaluates the P0 below.
+
 
 ---
 
-## P1 — Wire the agent lifecycle to the API
+## 2.2.x · P1 — Tests, benches and fuzz harnesses include no `src/` file
+
+`tests/daimon.tcyr`, `tests/daimon.bcyr` and all five `fuzz/*.fcyr` reimplement simplified copies of
+the functions they name, so a passing suite has never been a statement about daimon's shipping
+source. Two shipped security defects were green under it, each because the mirror never called the
+code that was wrong.
+
+**The path is proven.** Four files now include `src/` directly — `tests/rag_alias.tcyr`,
+`tests/syscall_portability.tcyr`, `tests/version_sync.tcyr`, `tests/rag_ingest.bcyr` — and
+`src/*.cyr` are self-contained modules with no `main`, so inclusion works. The remaining work is
+deleting each mirrored function in favour of the real one and resolving the collisions.
+
+**One module per bite, suite green at each step** — not one cut-over. Start with the modules the
+next arc touches: `agent`, `supervisor`, `ipc`. Expect the migration to surface defects; that is the
+point of it.
+
+## 2.3.x · P1 — Wire the agent lifecycle to the API
 
 **daimon is the AGNOS agent orchestrator and it cannot start, stop or signal an agent.** The
 process-lifecycle code exists and looks correct, but nothing calls it:
@@ -44,33 +73,7 @@ code works at all — **it has never been executed.**
 **Sequence**: migrate `agent` + `supervisor` tests → wire start/stop → signals and reaping → IPC.
 One bite each, suite green at every step.
 
-## P1 — Tests, benches and fuzz harnesses include no `src/` file
-
-`tests/daimon.tcyr`, `tests/daimon.bcyr` and all five `fuzz/*.fcyr` reimplement simplified copies of
-the functions they name, so a passing suite has never been a statement about daimon's shipping
-source. Two shipped security defects were green under it, each because the mirror never called the
-code that was wrong.
-
-**The path is proven.** Four files now include `src/` directly — `tests/rag_alias.tcyr`,
-`tests/syscall_portability.tcyr`, `tests/version_sync.tcyr`, `tests/rag_ingest.bcyr` — and
-`src/*.cyr` are self-contained modules with no `main`, so inclusion works. The remaining work is
-deleting each mirrored function in favour of the real one and resolving the collisions.
-
-**One module per bite, suite green at each step** — not one cut-over. Start with the modules the
-next arc touches: `agent`, `supervisor`, `ipc`. Expect the migration to surface defects; that is the
-point of it.
-
-## P0 (gated, dormant) — VULN-007: per-agent arena isolation
-
-**MUST be resolved before enabling any of**: multi-tenant hosting, kavach sandboxing, untrusted
-federation, or external MCP callbacks (bote). Dormant today because no consumer has flipped any of
-those; **P0 the moment one does.** Re-evaluate at every `2.x.0` cut.
-
-Zero-on-reset and secret hygiene close the *reuse* and *leak* channels but do not **isolate trust
-domains** — one bump allocator still backs every agent. Isolation is the open half and the hard
-prerequisite. (Both shipped halves are in the CHANGELOG.)
-
-## P2 — AGNOS spawn + IPC mapping
+## 2.4.x · P2 — AGNOS spawn + IPC mapping
 
 Blocked on the agent-lifecycle item: the surface that needs mapping is the surface nothing calls.
 daimon already builds and boots on AGNOS with the same functional surface as the host build. This
@@ -89,12 +92,51 @@ Reference for when it does — every row read from `agnos/kernel/core/syscall.cy
 cyrius peer's own header records that a doc→peer→doc citation loop once let a wrong number verify
 itself, and states the kernel is canonical; it mirrors an older kernel.
 
-## Blocked on upstream
+## 2.5.x · P1 — Agent identity and MCP caller authentication
 
-- [ ] **Low (upstream nein)** — **Firewall MCP tools.** nein 1.6.11 has firewall / mesh / nat / netns ported but ships only `src/main.cyr` — no `mcp.cyr` (the Rust `mcp.rs` is unported) — so daimon cannot wire firewall control through its MCP surface. Verified at 2.1.7. No active consumer demand; bumps to **P2** when a consumer asks.
-- [ ] **Low (upstream sandhi)** — **`serve_async` collapse into `sandhi_server_run_opts`.** `sandhi_server_options_max_conns` is accepted but not honoured — `lib/sandhi.cyr` still reads *"reserved for 0.8.0+"*. No security impact. Closes when upstream wires worker-pool or epoll-cooperative enforcement.
+`POST /v1/mcp/call` has **no caller authentication**: it dispatches on a tool name taken from the
+request body. That is why 2.1.8 registered nein's firewall tools with the mutating half
+(`nein_allow` / `nein_deny`) **gated shut** — there is nothing to authorise against. bote's `claims`
+argument, the seam an identity would arrive through, is a reserved `0` in the 3.x ABI.
 
-## Future (2.2+, unsequenced)
+Three things unblock together when this lands: un-gating the firewall admin tools
+(`_nein_admin_enabled` stops being an operator-trust flag), per-agent authorisation on every other
+MCP tool, and a meaningful definition of "tenant" for the 3.0.0 isolation work.
+
+Needs 2.3.x first — identity is per-agent, and there are no agents until the lifecycle exists.
+
+## 3.0.0 · P0 (gated, dormant) — VULN-007: per-agent arena isolation
+
+**MUST be resolved before enabling any of**: multi-tenant hosting, kavach sandboxing, untrusted
+federation, or external MCP callbacks (bote). Dormant today because no consumer has flipped any of
+those; **P0 the moment one does.** Re-evaluate at every `2.x.0` cut.
+
+Zero-on-reset and secret hygiene close the *reuse* and *leak* channels but do not **isolate trust
+domains** — one bump allocator still backs every agent. Isolation is the open half and the hard
+prerequisite. (Both shipped halves are in the CHANGELOG.)
+
+## Blocked on upstream — nein firewall MCP tools
+
+Attempted at 2.1.8 and backed out. **Not blocked on nein having an MCP surface** — it has had one
+since 1.6.0 and ships a guide with a section written for daimon by name; the earlier roadmap claim
+that `mcp.rs` was "unported" was false and is retracted. The integration works on Linux: 13 tools in
+the manifest, gate verified (`nein_status` permitted, `nein_allow` denied).
+
+⛔ **It regresses the agnos build.** nein's apply path forks and execs the Linux `nft` binary
+(`sys_dup2` + `sys_execve`); agnos has neither syscall and no `nft` to exec, so the bundle leaves
+two *reachable* undefined functions and cyrius refuses to emit the binary. Gating daimon's own call
+sites behind `#ifndef CYRIUS_TARGET_AGNOS` does **not** help: `[deps.*]` is not target-conditional,
+so the bundle compiles into every target regardless.
+
+**Unblocks on either of**: (a) nein growing an agnos backend for apply, or a build profile that
+excludes it; or (b) cyrius gaining target-conditional deps. Both are upstream. daimon-side the work
+is ~60 lines and already proven — see the 2.1.8 CHANGELOG entry for the shape.
+
+Two nein defects found by attempting it were fixed upstream in **1.6.12**: the `bridge_config_new`
+arity collision with bote, and a four-minor cyrius lag that skewed bote symbols. Those are real
+wins even though the integration is deferred.
+
+## Beyond the arc (unsequenced)
 
 Severity assigned when the arc's shape is chosen.
 

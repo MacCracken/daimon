@@ -4,6 +4,65 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.1.8] - 2026-09-22
+
+**Roadmap restructured around the arc to 3.0.0, two false "upstream blockers" retracted, and the
+nein firewall integration attempted, measured and deferred.** No functional change to daimon: all
+three targets build (x86_64 · aarch64 · agnos), **293 tests**, 5 fuzz harnesses, `fmt` / `lint` /
+`vet` clean, 21 benchmarks unchanged. cyrius stays at 6.6.6; dep pins unchanged.
+
+### Changed — the roadmap is forward-facing and sequenced
+
+It carried shipped work as content (the VULN-007 entry led with two closed halves; the AGNOS entry
+led with "builds and boots as of 2.1.7") and stale facts ("235 tests", "Future v1.4.0+" on a 2.x
+project). Rewritten: every section is open work, every number verified against the tree, and the
+items are now **release trains toward 3.0.0** — 2.2.x test integrity · 2.3.x agent lifecycle ·
+2.4.x AGNOS spawn+IPC · 2.5.x agent identity + MCP auth · 3.0.0 per-agent arena isolation, each
+line stating why it must follow the one above.
+
+⭐ **The largest gap was not on the roadmap at all**: daimon is the AGNOS agent orchestrator and
+**cannot start an agent**. `agent_spawn_with_limits`, `agent_start`, `agent_stop`, `agent_ipc_bind`,
+`ipc_send` and `msg_bus_publish` have **zero callers**; `src/router.cyr` exposes list / register /
+get and no lifecycle route. Now the 2.3.x line.
+
+### Fixed — two "blocked on upstream" items were false and are retracted
+
+Both were stale daimon-side assumptions. Filing either upstream would have put a wrong issue in
+front of a maintainer.
+
+- **nein** — the roadmap said nein "has no `mcp.cyr`; the Rust `mcp.rs` is unported". nein has
+  shipped `src/lib/mcp.cyr`, `dist/nein-mcp.cyr` and all six tools since **1.6.0**, where that
+  surface was *deliberately redesigned* into flat-arg tools. It even ships a guide with a section
+  written for daimon by name. Nothing was blocked.
+- **sandhi** — the roadmap said `max_conns` was accepted-but-not-honoured. Sandhi shipped the
+  enforcement in `sandhi_server_run_async` at **1.4.9** and archived its filing; daimon collapsed
+  onto that call at **1.2.6** (`src/server.cyr:224`). The `"reserved for 0.8.0+"` text still in
+  `lib/sandhi.cyr` documents the **sync** options struct, not the async path daimon uses — reading
+  a comment near the symbol instead of the code that runs is what produced the wrong conclusion.
+
+`docs/doc-health.md` corrected alongside: it claimed daimon carries no issues directory (false since
+1.2.x), and its `SYS_EPOLL_WAIT` tracker is now marked resolved.
+
+### Deferred — nein firewall MCP tools, with the blocker measured
+
+Attempted and backed out, because it **regresses the agnos build that 2.1.7 delivered**. Recorded
+rather than shipped half-done.
+
+The integration itself works: wired per nein's Path B, `/v1/health` reported **13 tools** (up from
+7), all six `nein_*` in the manifest, and the gate verified live — `nein_status` permitted,
+`nein_allow` answering `access denied: tool gated by host policy`. Two upstream defects surfaced and
+were fixed in **nein 1.6.12** (see that changelog): `bridge_config_new` collided with bote's at a
+different arity, which cyrius correctly refuses to link; and nein was four cyrius minors behind, so
+its bundle carried bote 3.3.7 symbols against daimon's 3.3.13.
+
+⛔ **What stops it**: nein's apply path forks and execs the Linux `nft` binary (`sys_dup2` +
+`sys_execve`). agnos has neither syscall and no `nft` to exec, so the bundle leaves two *reachable*
+undefined functions there and cyrius refuses the binary. Gating daimon's own call sites behind
+`#ifndef CYRIUS_TARGET_AGNOS` is not sufficient: `[deps.*]` is not target-conditional, so the bundle
+compiles into every target regardless. Resolving it needs an agnos story on nein's side — or a
+target-conditional dep mechanism in cyrius — not a daimon-side workaround. Re-filed on the roadmap
+as blocked with the cause named, rather than the vague "no active consumer demand" it carried before.
+
 ## [2.1.7] - 2026-09-22
 
 **daimon builds and runs on AGNOS.** First time in the project's history. Verified by booting it
