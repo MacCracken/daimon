@@ -1,9 +1,12 @@
 # RAG-stored chunks alias the transient request buffer — the 1.2.5 MCP-registry bug, unswept in `src/rag.cyr`
 
-**Status:** 🔴 **OPEN — MEASURED, REPRODUCED ON BOTH TOOLCHAINS.** `POST /v1/rag/ingest` stores its
-chunk text and metadata as `str_sub` **views** into the per-connection request buffer, not copies. The
-buffer is reused, so `POST /v1/rag/query` returns whatever now occupies those bytes — including
-**another client's request body**.
+**Status:** ✅ **RESOLVED in daimon 2.1.6.** `src/rag.cyr` now `str_clone`s both retained fields
+before `vec_entry_new`, exactly as `mcp_register_external` does, and carries the ⚠ convention block
+so a third module inherits the rule. Verified three ways: the live HTTP probe below returns the
+ingested text byte-for-byte; `tests/rag_alias.tcyr` (14 assertions, includes `src/` directly) pins
+the store and query paths against a source clobber; and that test was re-run against a build with
+the fix reverted, where **6 of its 14 assertions fail**. Historical description follows.
+
 **Filed:** 2026-09-22, during the 2.1.5 toolchain bump, by the roadmap's own post-bump check ("one
 agent lifecycle through the HTTP API and a vector-store round trip"). No test caught it; see
 §"Why the suite is green".

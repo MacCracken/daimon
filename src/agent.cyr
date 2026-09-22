@@ -220,15 +220,29 @@ fn agent_update_resources(h) {
 fn agent_is_alive(h) {
     var pid = agent_pid(h);
     if (pid == 0) { return 0; }
-    var r = syscall(SYS_KILL, pid, 0);
+    var r = sys_kill(pid, 0);
     if (r == 0) { return 1; }
     return 0;
 }
 
 # Start an agent process
 # VULN-010: Spawn with resource limits
-# setrlimit(resource, &rlimit{cur, max}) — syscall 160
-var SYS_SETRLIMIT = 160;
+#
+# ⚠ prlimit64, NOT setrlimit. Through 2.1.5 this read `var SYS_SETRLIMIT = 160;`
+# — the x86_64 number, declared unconditionally. On aarch64, 160 is `uname`, and
+# it is not an ESYSXLAT row, so every daimon-aarch64 artifact ever shipped ran
+# these two calls as `uname(<a small int>)`, got -EFAULT, did not check it, and
+# exec'd the agent with NO RLIMIT_AS and NO RLIMIT_CPU. VULN-010 was silently
+# off on that target (docs/development/issues/2026-09-14-aarch64-binary-issues-
+# x86-syscall-numbers.md).
+#
+# prlimit64 is the portable answer: the generic (aarch64) ABI supersedes
+# get/setrlimit with it outright — asm-generic/unistd.h says so in a comment —
+# and x86_64 has carried it since 2.6.36. One code path, one per-arch number
+# (_DAIMON_SYS_PRLIMIT64, src/main.cyr). `struct rlimit64` is {u64 cur, u64 max},
+# the same 16-byte layout the old `struct rlimit` buffer already used, so the
+# buffers below are unchanged.
+#   prlimit64(pid, resource, new_limit, old_limit); pid 0 == calling process.
 var RLIMIT_AS = 9;    # Address space
 var RLIMIT_CPU = 0;   # CPU time in seconds
 
@@ -240,18 +254,27 @@ fn agent_spawn_with_limits(cmd, arg1, arg2, mem_limit, cpu_limit) {
     var pid = sys_fork();
     if (pid < 0) { return Err(DAIMON_ERR_SUPERVISOR); }
     if (pid == 0) {
-        # Child: apply rlimits before exec
+        # Child: apply rlimits before exec.
+        # CHECKED — a limit that silently fails to apply is the whole point of
+        # the VULN-010 filing. prlimit64 returns 0 or -errno; on failure the
+        # child exits 126 rather than exec'ing UNBOUNDED. 126 is distinct from
+        # the 127 used for a failed exec, so the parent can tell "could not be
+        # confined" from "could not be started".
         if (mem_limit > 0) {
             var rlim = alloc(16);
             store64(rlim, mem_limit);
             store64(rlim + 8, mem_limit);
-            syscall(SYS_SETRLIMIT, RLIMIT_AS, rlim);
+            if (syscall(_DAIMON_SYS_PRLIMIT64, 0, RLIMIT_AS, rlim, 0) != 0) {
+                sys_exit(126);
+            }
         }
         if (cpu_limit > 0) {
             var rlim_cpu = alloc(16);
             store64(rlim_cpu, cpu_limit);
             store64(rlim_cpu + 8, cpu_limit);
-            syscall(SYS_SETRLIMIT, RLIMIT_CPU, rlim_cpu);
+            if (syscall(_DAIMON_SYS_PRLIMIT64, 0, RLIMIT_CPU, rlim_cpu, 0) != 0) {
+                sys_exit(126);
+            }
         }
         # exec
         var argv_buf: i64[4];
@@ -259,8 +282,8 @@ fn agent_spawn_with_limits(cmd, arg1, arg2, mem_limit, cpu_limit) {
         store64(&argv_buf + 8, arg1);
         store64(&argv_buf + 16, arg2);
         store64(&argv_buf + 24, 0);
-        syscall(SYS_EXECVE, cmd, &argv_buf, 0);
-        syscall(SYS_EXIT, 127);
+        sys_execve(cmd, &argv_buf, 0);
+        sys_exit(127);
     }
     return Ok(pid);
 }
@@ -300,14 +323,14 @@ fn agent_start(h, executable) {
 fn agent_send_signal(pid, sig) {
     if (pid <= 0) { return 0; }
     # Try pidfd_open + pidfd_send_signal for race-free delivery
-    var pidfd = syscall(SYS_PIDFD_OPEN, pid, 0);
+    var pidfd = sys_pidfd_open(pid, 0);
     if (pidfd >= 0) {
-        syscall(SYS_PIDFD_SEND_SIGNAL, pidfd, sig, 0, 0);
-        syscall(SYS_CLOSE, pidfd);
+        syscall(_DAIMON_SYS_PIDFD_SEND_SIGNAL, pidfd, sig, 0, 0);
+        sys_close(pidfd);
         return 1;
     }
     # Fallback: plain kill (susceptible to PID reuse race)
-    syscall(SYS_KILL, pid, sig);
+    sys_kill(pid, sig);
     return 1;
 }
 
@@ -318,10 +341,10 @@ fn agent_stop(h, reason) {
     if (pid > 0) {
         agent_send_signal(pid, 15);  # SIGTERM
         var status_buf: i32[1];  # wait4 writes a 4-byte int status
-        var wr = syscall(SYS_WAIT4, pid, &status_buf, 1, 0);  # WNOHANG
+        var wr = sys_waitpid(pid, &status_buf, 1);  # WNOHANG
         if (wr == 0) {
             agent_send_signal(pid, 9);  # SIGKILL
-            syscall(SYS_WAIT4, pid, &status_buf, 0, 0);
+            sys_waitpid(pid, &status_buf, 0);
         }
     }
     agent_set_status(h, AGENT_STOPPED);

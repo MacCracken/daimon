@@ -153,6 +153,22 @@ jobs:
           if cyrius build --aarch64 src/main.cyr build/daimon-aarch64 2>&1 | tee /tmp/aarch64.log; then
             file build/daimon-aarch64 | grep -q "aarch64" || {
               echo "ERROR: daimon-aarch64 is not aarch64 ELF"; exit 1; }
+            # 2.1.6 guard. A daimon `var SYS_FOO = <x86 number>` OVERRIDES the
+            # arch-aware stdlib peer for the whole translation unit — including
+            # inside the stdlib's own sys_* wrappers — and the compiler says so
+            # with exactly this warning. Through 2.1.5 there were five of them,
+            # and two named syscalls that are NOT ESYSXLAT rows, so the shipped
+            # aarch64 asset ran getpeername as fchmod (per-IP rate limiter off,
+            # VULN-009) and setrlimit as uname (agent rlimits never applied,
+            # VULN-010) for the life of the project. The build exits 0 either
+            # way, so only this check can see it. Zero is the expected count.
+            # See docs/development/issues/2026-09-14-aarch64-binary-issues-
+            # x86-syscall-numbers.md.
+            if grep -q "duplicate symbol 'SYS_" /tmp/aarch64.log; then
+              echo "::error::a daimon global shadows an arch-aware stdlib SYS_* constant — on aarch64 that silently issues a DIFFERENT syscall. Declare it under the _DAIMON_SYS_ prefix in src/syscalls.cyr (per arch), or use the stdlib sys_* wrapper."
+              grep "duplicate symbol 'SYS_" /tmp/aarch64.log
+              exit 1
+            fi
             echo "daimon-aarch64: $(wc -c < build/daimon-aarch64) bytes"
             exit 0
           fi
@@ -163,6 +179,28 @@ jobs:
           fi
           echo "ERROR: aarch64 cross-build failed for a non-blocker reason"
           exit 1
+
+      - name: Syscall portability under qemu-aarch64
+        # 2.1.6. The x86_64 suite cannot catch an aarch64 syscall-number defect:
+        # the two that shipped (getpeername-as-fchmod, setrlimit-as-uname) both
+        # compiled clean and ran correctly on x86_64. tests/syscall_portability
+        # .tcyr asserts ARCH-RELATIVE behaviour — it calls each syscall and
+        # checks the kernel did the thing — so it only means something when it
+        # is also run on the other arch. Measured against a mutant that restores
+        # the 2.1.5 shadowing: 9 of 17 assertions fail there, 17/17 pass here.
+        # Best-effort: skipped when the cross-compiler or qemu is unavailable,
+        # same posture as the cross-build step above.
+        run: |
+          if [ ! -x "$HOME/.cyrius/bin/cycc_aarch64" ]; then
+            echo "::warning::cycc_aarch64 not shipped with this toolchain — skipping"
+            exit 0
+          fi
+          sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user || {
+            echo "::warning::qemu-user unavailable — skipping cross-arch syscall check"; exit 0; }
+          cyrius build --aarch64 tests/syscall_portability.tcyr build/sysport-aarch64
+          out=$(qemu-aarch64 build/sysport-aarch64 2>&1); echo "$out"
+          echo "$out" | grep -qE '^[0-9]+ passed, 0 failed' || {
+            echo "::error::syscall_portability FAILED on aarch64 — a daimon syscall number names a different call there"; exit 1; }
 
       - name: Test
         run: |

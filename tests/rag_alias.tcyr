@@ -1,0 +1,129 @@
+# =========================================================================
+# rag_alias — regression test for
+#   docs/development/issues/2026-09-22-rag-chunks-alias-the-request-buffer.md
+#
+# ⚠ THIS FILE INCLUDES src/ DIRECTLY, unlike tests/daimon.tcyr, which mirrors
+# the production functions with simplified local copies. The mirror is exactly
+# why this defect shipped: the daimon.tcyr copy of `rag_ingest_text` never
+# calls `vec_entry_new` / `vindex_insert` at all, so no assertion in the
+# 235-test suite could observe what the store retains. A regression test for a
+# retention bug has to exercise the retaining code.
+#
+# The bug: `rag_ingest_text` stored `chunk` and `metadata` — `str_sub` VIEWS of
+# the caller's buffer — into the vector index. `src/server.cyr` hands those in
+# from the per-connection request buffer, which sandhi REUSES, so a later
+# request overwrote the stored record and queries served back other clients'
+# request bodies. Fix: str_clone both retained fields (src/rag.cyr).
+#
+# The shape below is the one 1.2.5 shipped for the same class in the MCP
+# registry (tests/daimon.tcyr, "buffer-backed tool survives source clobber"):
+# build the input over a MUTABLE heap buffer, store it, overwrite every source
+# byte as a later request would, then assert the store still reads back the
+# original bytes.
+# =========================================================================
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/io.cyr"
+include "lib/math.cyr"
+include "lib/tagged.cyr"
+include "lib/chrono.cyr"
+include "lib/syscalls.cyr"
+include "lib/assert.cyr"
+
+include "src/error.cyr"
+include "src/vector_store.cyr"
+include "src/rag.cyr"
+
+# The text we ingest, and the garbage a later request clobbers it with.
+var ORIGINAL = "daimon orchestrates agnos agents";   # 32 bytes
+var ORIG_LEN = 32;
+
+test_group("rag_alias");
+
+# --- Direct: the stored entry must own its bytes -------------------------
+# Ingest from a mutable buffer, clobber every source byte, then read the
+# entry straight out of the index. This is the tightest statement of the
+# contract: what vindex holds must not depend on the caller's buffer.
+var rp = rag_pipeline_new(rag_config_default());
+
+var srcbuf = alloc(128);
+memcpy(srcbuf, ORIGINAL, ORIG_LEN);
+var src_text = str_new(srcbuf, ORIG_LEN);
+
+var metabuf = alloc(64);
+memcpy(metabuf, "meta-original", 13);
+var src_meta = str_new(metabuf, 13);
+
+var ids = rag_ingest_text(rp, src_text, src_meta);
+assert_eq(vec_len(ids), 1, "one chunk ingested");
+
+# Clobber both source buffers with 'X', exactly as a subsequent request
+# reusing the arena would. Under the bug this rewrote the stored record.
+memset(srcbuf, 88, 128);
+memset(metabuf, 88, 64);
+
+var idx = load64(rp);
+assert_eq(vindex_len(idx), 1, "one entry in the index");
+var entry = vec_get(load64(idx), 0);
+
+var stored = vec_entry_content(entry);
+assert_eq(str_len(stored), ORIG_LEN, "stored content keeps its original length");
+assert(str_eq(stored, str_from(ORIGINAL)) == 1,
+  "chunk deep-copied, not aliased to the caller's buffer");
+assert(str_eq(stored, str_from("XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX")) == 0,
+  "stored content is not the clobber bytes");
+
+var stored_meta = vec_entry_metadata(entry);
+assert(str_eq(stored_meta, str_from("meta-original")) == 1,
+  "metadata deep-copied, not aliased to the caller's buffer");
+
+# --- End-to-end: the query path must not serve clobbered bytes -----------
+# This is the shape the live probe caught: retrieval returning fragments of
+# whatever now occupies the reused arena.
+var ctx = rag_query_text(rp, str_from("daimon agents"));
+assert(str_len(ctx) > 0, "query returns a context");
+assert(str_contains(ctx, str_from(ORIGINAL)) == 1,
+  "retrieved context carries the ORIGINAL ingested text");
+assert(str_contains(ctx, str_from("XXXXXXXXXXXXXXXX")) == 0,
+  "retrieved context carries no clobber bytes");
+
+# --- The chunker itself still returns views, deliberately ----------------
+# str_sub is correct as a view; chunking a body without copying is the point.
+# Only RETENTION must copy. Pin that so a future "fix" does not make
+# chunk_text allocate per window.
+var viewbuf = alloc(64);
+memcpy(viewbuf, ORIGINAL, ORIG_LEN);
+var view_parent = str_new(viewbuf, ORIG_LEN);
+var view_chunks = chunk_text(view_parent, 512, 64);
+assert_eq(vec_len(view_chunks), 1, "short text yields one chunk");
+assert_eq(str_data(vec_get(view_chunks, 0)), viewbuf,
+  "chunk_text still returns a VIEW (shares the parent's data pointer)");
+
+# --- Multi-chunk: every retained chunk is copied, not just the first -----
+var big = alloc(2048);
+var bi = 0;
+while (bi < 2000) { store8(big + bi, 97 + (bi % 26)); bi = bi + 1; }
+var big_text = str_new(big, 2000);
+var rp2 = rag_pipeline_new(rag_config_default());
+var big_ids = rag_ingest_text(rp2, big_text, str_from("m"));
+assert(vec_len(big_ids) > 1, "long text yields multiple chunks");
+var first_byte = load8(big);
+memset(big, 88, 2048);
+var idx2 = load64(rp2);
+var entries = load64(idx2);
+var ei2 = 0;
+var clean = 1;
+while (ei2 < vec_len(entries)) {
+    var e = vec_get(entries, ei2);
+    var c = vec_entry_content(e);
+    if (load8(str_data(c)) == 88) { clean = 0; }
+    ei2 = ei2 + 1;
+}
+assert_eq(clean, 1, "every retained chunk survives the source clobber");
+assert_eq(first_byte, 97, "sanity: source buffer did start as 'a'");
+
+syscall(SYS_EXIT, assert_summary());

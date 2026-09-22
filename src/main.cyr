@@ -30,18 +30,8 @@
 include "lib/math.cyr"
 include "lib/process.cyr"
 
-# Syscall numbers not in stdlib
-var SYS_RENAME = 82;
-var SYS_SOCKET = 41;
-var SYS_CONNECT = 42;
-var SYS_ACCEPT = 43;
-var SYS_BIND = 49;
-var SYS_LISTEN = 50;
-var SYS_PIDFD_OPEN = 434;
-var SYS_PIDFD_SEND_SIGNAL = 424;
-var SYS_GETSOCKOPT = 55;
-
 # --- daimon modules (dependency order; split out of the former 4.1k-line main) ---
+include "src/syscalls.cyr"
 include "src/error.cyr"
 include "src/config.cyr"
 include "src/audit.cyr"
@@ -141,4 +131,4 @@ fn main() {
 }
 
 var r = main();
-syscall(SYS_EXIT, r);
+sys_exit(r);

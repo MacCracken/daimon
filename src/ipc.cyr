@@ -183,7 +183,7 @@ fn agent_ipc_bind(ipc) {
     daimon_unlink(path_cstr, str_len(spath));
 
     # Create Unix domain socket (AF_UNIX=1, SOCK_STREAM=1)
-    var fd = syscall(SYS_SOCKET, 1, 1, 0);
+    var fd = sys_socket(1, 1, 0);
     if (fd < 0) { return Err(DAIMON_ERR_IPC_FAULT); }
 
     # Build sockaddr_un: {sa_family=1, sun_path=...}
@@ -194,9 +194,9 @@ fn agent_ipc_bind(ipc) {
     memcpy(addr_buf + 2, path_cstr, plen);
     store8(addr_buf + 2 + plen, 0);
 
-    var br = syscall(SYS_BIND, fd, addr_buf, 2 + plen + 1);
+    var br = sys_bind(fd, addr_buf, 2 + plen + 1);
     if (br < 0) {
-        syscall(SYS_CLOSE, fd);
+        sys_close(fd);
         return Err(DAIMON_ERR_IPC_FAULT);
     }
 
@@ -204,9 +204,9 @@ fn agent_ipc_bind(ipc) {
     sys_chmod(path_cstr, 448);  # 0700
 
     # Listen
-    var lr = syscall(SYS_LISTEN, fd, MAX_CONCURRENT_CONNECTIONS);
+    var lr = sys_listen(fd, MAX_CONCURRENT_CONNECTIONS);
     if (lr < 0) {
-        syscall(SYS_CLOSE, fd);
+        sys_close(fd);
         return Err(DAIMON_ERR_IPC_FAULT);
     }
 
@@ -221,40 +221,40 @@ fn ipc_get_peer_uid(cfd) {
     var cred_len: u32[1];  # socklen_t in/out (4 bytes)
     store32(&cred_len, 12);
     # getsockopt(fd, SOL_SOCKET=1, SO_PEERCRED=17, buf, &len)
-    var r = syscall(SYS_GETSOCKOPT, cfd, 1, 17, cred_buf, &cred_len);
+    var r = syscall(_DAIMON_SYS_GETSOCKOPT, cfd, 1, 17, cred_buf, &cred_len);
     if (r < 0) { return 0 - 1; }
     # uid is at offset 4 (after pid)
     return load32(cred_buf + 4);
 }
 
 fn agent_ipc_accept_one(fd, ipc) {
-    var cfd = syscall(SYS_ACCEPT, fd, 0, 0);
+    var cfd = sys_accept4(fd, 0, 0, 0);
     if (cfd < 0) { return Err(DAIMON_ERR_IPC_FAULT); }
 
     # VULN-006: Verify peer credentials
     var peer_uid = ipc_get_peer_uid(cfd);
-    var my_uid = syscall(SYS_GETUID);
+    var my_uid = sys_getuid();
     if (peer_uid >= 0) {
         if (peer_uid != my_uid) {
             if (peer_uid != 0) {  # Allow root
                 daimon_audit(SEV_SECURITY, "ipc", "ipc.auth.deny", "peer uid mismatch on control socket");
-                syscall(SYS_CLOSE, cfd);
+                sys_close(cfd);
                 return Err(DAIMON_ERR_IPC_FAULT);
             }
         }
     }
 
     if (_global_active_connections >= MAX_GLOBAL_FD_LIMIT) {
-        syscall(SYS_CLOSE, cfd);
+        sys_close(cfd);
         return Err(DAIMON_ERR_IPC_FAULT);
     }
     _global_active_connections = _global_active_connections + 1;
 
     # Read 4-byte big-endian length prefix
     var len_buf: u8[4];  # 4-byte big-endian length prefix
-    var nr = syscall(SYS_READ, cfd, &len_buf, 4);
+    var nr = sys_read(cfd, &len_buf, 4);
     if (nr != 4) {
-        syscall(SYS_CLOSE, cfd);
+        sys_close(cfd);
         _global_active_connections = _global_active_connections - 1;
         return Err(DAIMON_ERR_IPC_FAULT);
     }
@@ -268,8 +268,8 @@ fn agent_ipc_accept_one(fd, ipc) {
     if (msg_len > MAX_MESSAGE_SIZE) {
         # Send NACK
         store8(&len_buf, NACK_INVALID);
-        syscall(SYS_WRITE, cfd, &len_buf, 1);
-        syscall(SYS_CLOSE, cfd);
+        sys_write(cfd, &len_buf, 1);
+        sys_close(cfd);
         _global_active_connections = _global_active_connections - 1;
         return Err(DAIMON_ERR_IPC_FAULT);
     }
@@ -278,7 +278,7 @@ fn agent_ipc_accept_one(fd, ipc) {
     var msg_buf = alloc(msg_len + 1);
     var total_read = 0;
     while (total_read < msg_len) {
-        var chunk = syscall(SYS_READ, cfd, msg_buf + total_read, msg_len - total_read);
+        var chunk = sys_read(cfd, msg_buf + total_read, msg_len - total_read);
         if (chunk <= 0) { break; }
         total_read = total_read + chunk;
     }
@@ -291,9 +291,9 @@ fn agent_ipc_accept_one(fd, ipc) {
 
     # Send ACK
     store8(&len_buf, ACK);
-    syscall(SYS_WRITE, cfd, &len_buf, 1);
+    sys_write(cfd, &len_buf, 1);
 
-    syscall(SYS_CLOSE, cfd);
+    sys_close(cfd);
     _global_active_connections = _global_active_connections - 1;
     return Ok(total_read);
 }
@@ -303,7 +303,7 @@ fn agent_ipc_send(target_socket_path, message_str) {
     var path_cstr = str_data(target_socket_path);
 
     # Connect to Unix socket
-    var fd = syscall(SYS_SOCKET, 1, 1, 0);
+    var fd = sys_socket(1, 1, 0);
     if (fd < 0) { return Err(DAIMON_ERR_IPC_FAULT); }
 
     var addr_buf = alloc(112);
@@ -313,9 +313,9 @@ fn agent_ipc_send(target_socket_path, message_str) {
     memcpy(addr_buf + 2, path_cstr, plen);
     store8(addr_buf + 2 + plen, 0);
 
-    var cr = syscall(SYS_CONNECT, fd, addr_buf, 2 + plen + 1);
+    var cr = sys_connect(fd, addr_buf, 2 + plen + 1);
     if (cr < 0) {
-        syscall(SYS_CLOSE, fd);
+        sys_close(fd);
         return Err(DAIMON_ERR_IPC_FAULT);
     }
 
@@ -326,15 +326,15 @@ fn agent_ipc_send(target_socket_path, message_str) {
     store8(&hdr + 1, (msg_len >> 16) & 255);
     store8(&hdr + 2, (msg_len >> 8) & 255);
     store8(&hdr + 3, msg_len & 255);
-    syscall(SYS_WRITE, fd, &hdr, 4);
-    syscall(SYS_WRITE, fd, str_data(message_str), msg_len);
+    sys_write(fd, &hdr, 4);
+    sys_write(fd, str_data(message_str), msg_len);
 
     # Read ACK
     var ack_buf[1];
-    syscall(SYS_READ, fd, &ack_buf, 1);
+    sys_read(fd, &ack_buf, 1);
     var ack = load8(&ack_buf);
 
-    syscall(SYS_CLOSE, fd);
+    sys_close(fd);
 
     if (ack == ACK) { return Ok(0); }
     if (ack == NACK_QUEUE_FULL) { return Err(DAIMON_ERR_IPC_FAULT); }

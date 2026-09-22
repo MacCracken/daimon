@@ -137,7 +137,19 @@ fn rag_ingest_text(rp, text, metadata) {
 
         var id = load64(rp + 16);
         store64(rp + 16, id + 1);
-        var entry = vec_entry_new(id, emb, dim, chunk, metadata);
+        # ⚠ str_clone BOTH RETAINED FIELDS, exactly as mcp_register_external does.
+        # `chunk` is a str_sub VIEW of `text` (lib/str.cyr: "the data ptr is shared
+        # with the parent Str — this is a view, not a copy"), and `text`/`metadata`
+        # are jget results pointing into the per-connection request buffer, which
+        # sandhi REUSES for later requests (src/server.cyr SERVE_MAX_CONNS note).
+        # Storing them raw let a subsequent request overwrite the index: queries
+        # returned fragments of OTHER clients' request bodies. Same CVE-class bug
+        # as docs/development/issues/2026-06-11-mcp-registry-aliases-request-
+        # buffer.md, which 1.2.5 fixed for the MCP registry and did not sweep here;
+        # re-found 2026-09-22 and filed as 2026-09-22-rag-chunks-alias-the-request-
+        # buffer.md. The bump allocator never frees, so a plain str_clone is stable
+        # for the process lifetime.
+        var entry = vec_entry_new(id, emb, dim, str_clone(chunk), str_clone(metadata));
         vindex_insert(load64(rp), entry);
         vec_push(ids, id);
         ci = ci + 1;

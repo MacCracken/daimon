@@ -1,0 +1,81 @@
+# rag_ingest.bcyr — the REAL rag_ingest_text retention path
+#
+# Run: cyrius bench tests/rag_ingest.bcyr
+#
+# ⚠ THIS FILE INCLUDES src/ DIRECTLY. tests/daimon.bcyr does not — it mirrors
+# the production functions, and its `rag_ingest_5k_chars` benchmark calls
+# `chunk_text` alone, never `rag_ingest_text`. So the 19-benchmark suite cannot
+# see the cost of anything on the RETENTION path, which is where 2.1.6 added
+# the `str_clone` that fixes the request-buffer aliasing defect
+# (docs/development/issues/2026-09-22-rag-chunks-alias-the-request-buffer.md).
+#
+# A fix whose cost no benchmark can observe is an unmeasured claim. These two
+# benchmarks measure the path that actually changed:
+#   rag_ingest_real_5k   — full ingest of a 5 KB body (chunk + embed + clone +
+#                          insert), i.e. exactly what POST /v1/rag/ingest runs
+#   rag_chunk_only_5k    — chunk_text alone over the same body, the daimon.bcyr
+#                          shape, as the control that isolates the delta
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/io.cyr"
+include "lib/tagged.cyr"
+include "lib/chrono.cyr"
+include "lib/fnptr.cyr"
+include "lib/bench.cyr"
+include "lib/syscalls.cyr"
+include "lib/math.cyr"
+
+include "src/error.cyr"
+include "src/vector_store.cyr"
+include "src/rag.cyr"
+
+var _rag_text = 0;
+var _rag_meta = 0;
+
+fn bench_rag_ingest_real() {
+    # A fresh pipeline per iteration: the index must not grow across samples,
+    # or the benchmark measures vec_push growth instead of ingest.
+    var rp = rag_pipeline_new(rag_config_default());
+    rag_ingest_text(rp, _rag_text, _rag_meta);
+    return 0;
+}
+
+fn bench_rag_chunk_only() {
+    chunk_text(_rag_text, 512, 64);
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+
+    # 5 KB of lowercase words, the same size daimon.bcyr's rag bench uses.
+    var buf = alloc(5120);
+    var i = 0;
+    while (i < 5120) {
+        if (i % 6 == 5) { store8(buf + i, 32); }        # space
+        else { store8(buf + i, 97 + (i % 26)); }         # a-z
+        i = i + 1;
+    }
+    _rag_text = str_new(buf, 5120);
+    _rag_meta = str_from("bench");
+
+    var benches = vec_new();
+
+    var b0 = bench_new("rag_ingest_real_5k");
+    bench_run(b0, &bench_rag_ingest_real, 1000);
+    vec_push(benches, b0);
+
+    var b1 = bench_new("rag_chunk_only_5k");
+    bench_run(b1, &bench_rag_chunk_only, 1000);
+    vec_push(benches, b1);
+
+    bench_report_all(benches);
+    return 0;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);

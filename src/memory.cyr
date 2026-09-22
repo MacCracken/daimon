@@ -86,7 +86,7 @@ fn memory_store_set(ms, agent_id_str, key, value_json) {
     # Atomic write: tmp then rename
     var tmp_path = str_cat(fpath, str_from(".tmp"));
     file_write_all(str_data(tmp_path), str_data(content), str_len(content));
-    syscall(SYS_RENAME, str_data(tmp_path), str_data(fpath));
+    sys_rename(str_data(tmp_path), str_data(fpath));
 
     return Ok(0);
 }

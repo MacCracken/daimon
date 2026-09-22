@@ -4,6 +4,147 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.1.6] - 2026-09-22
+
+**Two security fixes and the sweep that closes the class behind each.** A P1 cross-request data
+leak in the RAG store, and the two aarch64 syscall defects that turned VULN-009 and VULN-010 off
+for the life of the `daimon-aarch64` artifact. No dependency or toolchain movement — cyrius stays
+at **6.6.6** and all eight dep pins are unchanged from 2.1.5.
+
+**277 tests** (was 235) across three files, five fuzz harnesses clean, `fmt` / `lint` / `vet`
+clean, 21 benchmarks (was 19). Both fixes are **mutation-proven** — each new test file was re-run
+against a build with the fix reverted, and each fails there.
+
+### Fixed — P1: RAG queries returned other clients' request bodies
+
+`POST /v1/rag/ingest` retained `str_sub` **views** of the request body as the stored chunk text and
+metadata. `str_sub` shares the parent's data pointer by contract (`lib/str.cyr`: *"this is a view,
+not a copy"*), and `src/server.cyr` hands those views in from the per-connection buffer sandhi
+**reuses** — so a later request overwrote the stored record and the next query served it back:
+
+```
+ingest {"text":"Daimon is the AGNOS agent orchestrator. …"} → {"chunk_ids":[1]}
+query  {"query":"what orchestrates AGNOS agents?"}
+  2.1.5 → "[1] hat orchestrates AGNOS agents?\"} rator. It supervises agents …"
+  2.1.6 → "[1] Daimon is the AGNOS agent orchestrator. It supervises agents …"
+```
+
+`src/rag.cyr` now `str_clone`s both retained fields. This is the bug **thoth filed in June and
+daimon fixed at 1.2.5 for the MCP registry** — `src/mcp.cyr` carries two ⚠ blocks calling it *"a
+documented CVE-class bug in this very file"* and instructing *"`str_clone` EVERY FIELD"*. That
+sweep never reached `src/rag.cyr`. The convention comment now lives at both sites so a third module
+inherits the rule instead of rediscovering it.
+
+⚠ **Not a 2.1.5 regression** — reproduced identically on 6.6.4 and 6.6.6 builds of the same tree
+before the fix. Filed at
+[`2026-09-22-rag-chunks-alias-the-request-buffer.md`](docs/development/issues/2026-09-22-rag-chunks-alias-the-request-buffer.md),
+now **RESOLVED**.
+
+### Fixed — VULN-009 and VULN-010 were silently OFF on every `daimon-aarch64` ever shipped
+
+daimon declared **11 `var SYS_* = <x86_64 number>` globals**. daimon's source is parsed *after* the
+auto-prepended stdlib, so each one **overrode the arch-aware peer's value for the whole translation
+unit — including inside the stdlib's own `sys_*` wrappers**. Seven numbers happen to be `ESYSXLAT`
+rows and were renumbered at runtime; two were not:
+
+| | daimon spelled | aarch64 ran | effect |
+|---|---:|---|---|
+| `SYS_GETPEERNAME` | 52 | `fchmod` — **succeeds**, buffer untouched | `get_peer_ip` → 0, and `rate_check`'s `if (ip == 0) { return 1; }` allowed **every** request. VULN-009 off. |
+| `SYS_SETRLIMIT` | 160 | `uname` — `-EFAULT`, unchecked | agents exec'd with no `RLIMIT_AS` / `RLIMIT_CPU`. VULN-010 off. |
+
+**The sweep:** all 11 globals are gone. **40 raw `syscall(SYS_*, …)` sites → 0**; `sys_*` wrapper
+calls go **5 → 43**. Four raw syscalls remain, and every one is namespaced `_DAIMON_SYS_*` in the
+new `src/syscalls.cyr` — a prefix that **cannot** shadow a peer symbol, which is the actual root
+cause rather than the eleven symptoms. Numbers were read out of the kernel UAPI headers per arch
+(`asm/unistd_64.h`, `asm-generic/unistd.h`), not from memory.
+
+- **`setrlimit` → `prlimit64`**, not an `#ifdef` around `setrlimit`: the generic (aarch64) ABI
+  supersedes get/setrlimit with `prlimit64` outright — `asm-generic/unistd.h` says so in a comment
+  — so one code path with a per-arch number (302 / 261) serves both arches. `struct rlimit64` has
+  the same 16-byte `{cur, max}` layout, so the buffers are unchanged.
+- **The return is now CHECKED.** A limit that silently fails to apply is the whole point of the
+  filing. On failure the child exits **126** rather than exec'ing unconfined — distinct from the
+  127 used for a failed exec, so the parent can tell *"could not be confined"* from *"could not be
+  started"*.
+- `SYS_ACCEPT` 43 → `sys_accept4(fd, 0, 0, 0)` (there is no bare `accept` on aarch64);
+  `SYS_RENAME` 82 → `sys_rename`, whose aarch64 arm routes to `renameat(AT_FDCWD, …)`;
+  `SYS_WAIT4` → `sys_waitpid`.
+
+**aarch64 `duplicate symbol 'SYS_…'` warnings: 5 → 0.**
+
+**Verified by running it, not by reading it.** The filing asked for *"a 429 after `RATE_LIMIT_MAX`
+requests from one IP"*; under `qemu-aarch64` the cross-built binary serves `/v1/health` and, over
+130 requests from one IP, returns **119 × 200 then 11 × 429** — the limiter engaging at exactly
+`RATE_LIMIT_MAX = 120`. Before the fix `ip == 0` for every caller, so all 130 would have been 200.
+
+[The P2 filing](docs/development/issues/2026-09-14-aarch64-binary-issues-x86-syscall-numbers.md) is
+**RESOLVED** on the daimon side; its majra half closed at 2.1.5.
+
+### Added — tests that can actually see these classes
+
+⚠ **`tests/daimon.tcyr`, `tests/daimon.bcyr` and the fuzz harnesses include no `src/` file.** They
+reimplement simplified copies of the functions under test — the test file's `rag_ingest_text` never
+calls `vec_entry_new` or `vindex_insert` at all, and `bench_rag_ingest_5k` calls only `chunk_text`.
+That is *why* both defects shipped green: no assertion and no benchmark reached the code that was
+wrong. The three new files include `src/` directly.
+
+- **`tests/syscall_portability.tcyr`** (28 assertions) — asserts **arch-relative behaviour**: it
+  calls each syscall and checks the kernel did the thing, never that a number equals a literal.
+  That is the only shape that catches the original defect, which compiled clean and ran correctly
+  on x86_64. `prlimit64` must read, write and restore `RLIMIT_NOFILE`; `getsockopt` must report
+  back `SO_TYPE`; `getpeername` on an **unconnected** socket must fail `-ENOTCONN` — `fchmod`
+  returns 0 there, which is exactly how the defect hid. It also round-trips a real AF_UNIX socket
+  through the eight wrappers `src/ipc.cyr` converted (bind / listen / connect / accept4 / write /
+  read / close) plus the `SO_PEERCRED` check VULN-006 runs on every accepted connection — that file
+  needs the libro bundle to include standalone, so it had no other coverage. **28/28 on x86_64 and
+  on aarch64 under `qemu-aarch64`.** Against a mutant restoring the 2.1.5 shadowing: **9 of 17 of
+  the syscall-number assertions fail** on aarch64.
+- **`tests/rag_alias.tcyr`** (14 assertions) — the 1.2.5 clobber shape applied to RAG: ingest from
+  a mutable heap buffer, overwrite every source byte as a later request would, assert the store and
+  the query path still read back the original. Also pins that `chunk_text` **still returns views**,
+  so a future "fix" cannot make chunking allocate per window. Against the pre-fix code: **6 of 14
+  fail**.
+- **`tests/rag_ingest.bcyr`** (2 benchmarks) — `rag_ingest_real_5k` exercises the true retention
+  path; `rag_chunk_only_5k` is the control that isolates the delta.
+- **`src/syscalls.cyr`** — the owned numbers, split out of `src/main.cyr`'s preamble so a test can
+  include them without dragging in the server. A number no test can reach is how this shipped.
+- **CI** — the aarch64 step now **fails** on any `duplicate symbol 'SYS_` warning (the build exits
+  0 either way, so only this check can see it), and a new best-effort step runs
+  `syscall_portability` under `qemu-aarch64`.
+
+### Performance
+
+**The 19 existing benchmarks are flat — and they cannot see either change**, because they mirror
+`src/` rather than include it. Stated rather than presented as coverage. Medians of 8 runs against
+the 2.1.5 build, same machine: every target within ±5%, the one mover `vector_insert_100x128d`
+**−5.1%**, which also retires the +7.3% flagged at 2.1.5 as the layout noise it was.
+
+The cost of the RAG fix is measured on the path that actually changed, interleaved, 7 pairs:
+
+| | unfixed (aliasing) | fixed (`str_clone`) | Δ |
+|---|---:|---:|---:|
+| `rag_ingest_real_5k` | 108.97 µs | 120.01 µs | **+10.1%** |
+
+≈11 µs per 5 KB ingest — twelve 512-byte chunk copies plus their allocations. Paid once per ingest,
+on the endpoint that was returning other clients' data; `rag_query_text` is untouched. The syscall
+sweep is not measurable: it replaces a raw `syscall` with a wrapper that emits the same instruction.
+
+### Known issues (carried)
+
+Unchanged from 2.1.5 and re-checked here: `duplicate fn 'uname_release'` and the static-array
+warning (both upstream in sigil), and the `memory_store_get` *"SINGLE value"* diagnostic, still a
+documented false positive on dead code.
+
+The **`--agnos` build still fails, now at 3 errors with a different cause.** The 2.1.5 errors were
+undefined `SYS_EXECVE` / `SYS_WAIT4`; those resolve now, and what surfaces is that agnos's peer
+declares *different arities* for the same wrapper names — `sys_waitpid(pid)` (1 arg, not 3) and
+`sys_rename(old, oldlen, new, newlen)` (4 args, not 2) — and defines no `sys_socket` / `sys_bind` /
+`sys_listen` / `sys_accept4` / `sys_execve` / `sys_pidfd_open` at all. **This is a better failure
+than 2.1.5's**: `src/memory.cyr` previously compiled on agnos against daimon's `SYS_RENAME = 82`
+while agnos's own `rename` is **31** (`lib/syscalls_x86_64_agnos.cyr:86`) — a silent wrong-syscall
+that is now a loud compile error. Still P2, still awaiting the agnos scoping decision the filing
+calls for.
+
 ## [2.1.5] - 2026-09-22
 
 **Toolchain `6.6.4` → `6.6.6` plus three dependency pins; the other five were already at their

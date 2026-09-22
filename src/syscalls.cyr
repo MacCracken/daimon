@@ -1,0 +1,37 @@
+# =========================================================================
+# syscalls — the syscall numbers daimon owns, per arch
+# =========================================================================
+#
+# Split out of src/main.cyr's preamble at 2.1.6 so the numbers can be
+# INCLUDED BY A TEST on their own (tests/syscall_portability.tcyr) without
+# dragging in the whole server. A number that no test can reach is how the
+# two defects described below shipped for the life of the project.
+
+# --- Syscall numbers the stdlib exposes no wrapper OR constant for ---
+#
+# ⚠ NEVER declare a `SYS_*` name here. daimon's source is parsed AFTER the
+# auto-prepended stdlib, so a daimon `var SYS_FOO = <x86 number>` OVERRIDES the
+# arch-aware peer's value for the WHOLE translation unit — including inside the
+# stdlib's own `sys_*` wrappers. That is precisely how every daimon-aarch64
+# artifact ever shipped ran `getpeername` as `fchmod` (per-IP rate limiter off,
+# VULN-009) and `setrlimit` as `uname` (agent rlimits never applied, VULN-010):
+# see docs/development/issues/2026-09-14-aarch64-binary-issues-x86-syscall-
+# numbers.md. The nine `SYS_*` globals that lived here are gone as of 2.1.6 —
+# seven became `sys_*` wrapper calls, and the two below kept a number because
+# the stdlib has neither wrapper nor constant for them. The `_DAIMON_SYS_`
+# prefix cannot collide with, or override, a peer symbol.
+#
+# Numbers verified against the kernel UAPI headers, per arch, not from memory:
+# x86_64 `asm/unistd_64.h`; aarch64 `asm-generic/unistd.h`.
+#ifdef CYRIUS_ARCH_X86
+var _DAIMON_SYS_GETSOCKOPT = 55;    # asm/unistd_64.h __NR_getsockopt
+var _DAIMON_SYS_PRLIMIT64 = 302;    # asm/unistd_64.h __NR_prlimit64
+#endif
+#ifdef CYRIUS_ARCH_AARCH64
+var _DAIMON_SYS_GETSOCKOPT = 209;   # asm-generic/unistd.h __NR_getsockopt
+var _DAIMON_SYS_PRLIMIT64 = 261;    # asm-generic/unistd.h __NR_prlimit64
+#endif
+# pidfd_send_signal is 424 on BOTH arches (unified numbering — x86_64 and
+# asm-generic agree), so it needs no arm; it is still namespaced so it can
+# never shadow a future peer constant.
+var _DAIMON_SYS_PIDFD_SEND_SIGNAL = 424;

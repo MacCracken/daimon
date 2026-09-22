@@ -1,6 +1,6 @@
 # The `daimon-aarch64` binary silently loses its per-IP rate limiter and agent rlimits — two x86_64 syscall numbers run as different syscalls there
 
-**Status:** 🔴 **OPEN — MEASURED.** `cyrius build --aarch64 src/main.cyr` exits 0, prints five daimon
+**Status:** ✅ **RESOLVED in daimon 2.1.6** (see the 2.1.6 update below). Historical status: 🔴 **OPEN — MEASURED.** `cyrius build --aarch64 src/main.cyr` exits 0, prints five daimon
 `duplicate symbol 'SYS_…' redefined with conflicting value` warnings (plus one from majra's bundle),
 and produces a valid aarch64 ELF that starts, binds and serves. Seven of daimon's nine hand-spelled
 x86_64 syscall numbers reach the kernel as the correct native calls anyway; **two do not**, and each
@@ -12,6 +12,37 @@ corrected the same day after adversarial verification against the cyrius emitter
 port). Not a 6.6.4 regression — the same warnings print under 6.6.2, and the routing table is the
 same for every number involved.
 **Severity:** **P2 — two silent hardening regressions, not an outage.** The x86_64 binary is unaffected.
+
+## ✅ 2.1.6 update (2026-09-22): RESOLVED — both defects fixed and verified under qemu
+
+daimon 2.1.6 deleted **all 11** `var SYS_* = <x86_64 number>` globals and swept **40 raw
+`syscall(SYS_*, …)` sites to 0** (`sys_*` wrapper calls go 5 → 43). Four raw syscalls remain and
+every one is namespaced `_DAIMON_SYS_*` in the new `src/syscalls.cyr` — a prefix that **cannot
+shadow a peer symbol**, which is the root cause rather than the eleven symptoms.
+
+- **`SYS_GETPEERNAME` 52 → `sys_getpeername`**, which resolves the peer's 205 on aarch64.
+- **`SYS_SETRLIMIT` 160 → `prlimit64`** (302 x86_64 / 261 aarch64, from the UAPI headers), **with
+  the return checked** — on failure the child exits 126 rather than exec'ing unconfined, distinct
+  from the 127 used for a failed exec. Not an `#ifdef` around `setrlimit`: the generic ABI
+  supersedes get/setrlimit with `prlimit64` outright, so one code path serves both arches.
+- `SYS_ACCEPT` 43 → `sys_accept4(fd, 0, 0, 0)`; `SYS_RENAME` 82 → `sys_rename` (aarch64 arm routes
+  to `renameat`); `SYS_WAIT4` → `sys_waitpid`.
+
+**aarch64 `duplicate symbol 'SYS_…'` warnings: 5 → 0.**
+
+**Verified by running the binary, which is what this filing asked for.** Under `qemu-aarch64` the
+cross-built `daimon-aarch64` serves `/v1/health`, and over 130 requests from one IP returns
+**119 × 200 then 11 × 429** — the limiter engaging at exactly `RATE_LIMIT_MAX = 120`. Before the
+fix `get_peer_ip` returned 0 for every caller and `rate_check`'s `if (ip == 0) { return 1; }`
+allowed all 130. `tests/syscall_portability.tcyr` (17 assertions, arch-relative by construction)
+passes **17/17 on x86_64 and on aarch64 under qemu**; against a mutant restoring the 2.1.5
+shadowing, **9 of 17 fail** on aarch64.
+
+**The lane now sees it**: CI fails the aarch64 step on any `duplicate symbol 'SYS_` warning (the
+build exits 0 either way, so only that check can catch it), and a best-effort step runs the
+portability test under `qemu-aarch64`. Fix items 1–3 of §"Fix" are done; the `/proc/self/limits`
+half of item 3 is covered by `syscall_portability`'s prlimit64 read/write/restore assertions
+instead of a spawned child.
 
 ## ⚠ 2.1.5 update (2026-09-22): re-verified under cyrius 6.6.6 — daimon's half UNCHANGED, majra's half CLOSED
 

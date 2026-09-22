@@ -1,0 +1,183 @@
+# =========================================================================
+# syscall_portability — the numbers daimon owns must name the syscall they
+# claim to name, ON THE ARCH THIS BINARY WAS BUILT FOR.
+#
+# Regression test for
+#   docs/development/issues/2026-09-14-aarch64-binary-issues-x86-syscall-numbers.md
+#
+# Through 2.1.5 daimon declared nine `var SYS_* = <x86_64 number>` globals.
+# daimon's source is parsed AFTER the stdlib, so those OVERRODE the arch-aware
+# peer's values for the whole translation unit — including inside the stdlib's
+# own `sys_*` wrappers. Two were not ESYSXLAT rows, so on aarch64:
+#   SYS_GETPEERNAME 52  ran as fchmod  -> get_peer_ip always 0 -> rate_check's
+#                                         `if (ip == 0) { return 1; }` allowed
+#                                         EVERY request (VULN-009 off)
+#   SYS_SETRLIMIT  160  ran as uname   -> -EFAULT, unchecked -> agents exec'd
+#                                         with no RLIMIT_AS/CPU (VULN-010 off)
+# 2.1.6 deletes the globals, routes through `sys_*` wrappers, and keeps only
+# what the stdlib has no wrapper for — per-arch, under `_DAIMON_SYS_`.
+#
+# ⚠ These assertions are ARCH-RELATIVE by construction: they do not hardcode a
+# number, they call the syscall and check that the KERNEL did the thing. That
+# is the only form that catches the original defect, because the original
+# defect was a number that compiled fine and ran the wrong call.
+# =========================================================================
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/io.cyr"
+include "lib/fs.cyr"
+include "lib/syscalls.cyr"
+include "lib/assert.cyr"
+
+include "src/syscalls.cyr"
+
+var RLIMIT_NOFILE = 7;   # asm-generic + x86_64 agree: RLIMIT_NOFILE == 7
+
+test_group("syscall_portability");
+
+# --- prlimit64 must actually be prlimit64 -------------------------------
+# Read the current RLIMIT_NOFILE with prlimit64(0, res, NULL, &old). If the
+# number named some other syscall, this returns non-zero (or scribbles
+# nothing) and the readback below fails. Under the 2.1.5 aarch64 build the
+# equivalent call was `uname` and returned -EFAULT.
+var old_lim = alloc(16);
+store64(old_lim, 0);
+store64(old_lim + 8, 0);
+var rc_read = syscall(_DAIMON_SYS_PRLIMIT64, 0, RLIMIT_NOFILE, 0, old_lim);
+assert_eq(rc_read, 0, "prlimit64 read returns 0");
+var cur = load64(old_lim);
+var max = load64(old_lim + 8);
+assert(cur > 0, "prlimit64 read a non-zero RLIMIT_NOFILE soft limit");
+assert(max >= cur, "prlimit64 hard limit >= soft limit");
+
+# --- and it must WRITE, which is what VULN-010 depends on ----------------
+# Lower the soft limit, read it back through a fresh call, then restore.
+# A wrong syscall number cannot produce a correct readback here.
+var new_lim = alloc(16);
+var target = cur - 1;
+store64(new_lim, target);
+store64(new_lim + 8, max);
+var rc_set = syscall(_DAIMON_SYS_PRLIMIT64, 0, RLIMIT_NOFILE, new_lim, 0);
+assert_eq(rc_set, 0, "prlimit64 write returns 0");
+
+var check = alloc(16);
+store64(check, 0);
+store64(check + 8, 0);
+assert_eq(syscall(_DAIMON_SYS_PRLIMIT64, 0, RLIMIT_NOFILE, 0, check), 0,
+  "prlimit64 re-read returns 0");
+assert_eq(load64(check), target,
+  "prlimit64 WROTE the new soft limit — this is the call VULN-010 relies on");
+
+# Restore, so the rest of the suite runs with the original limit.
+var restore = alloc(16);
+store64(restore, cur);
+store64(restore + 8, max);
+assert_eq(syscall(_DAIMON_SYS_PRLIMIT64, 0, RLIMIT_NOFILE, restore, 0), 0,
+  "prlimit64 restore returns 0");
+var final_lim = alloc(16);
+syscall(_DAIMON_SYS_PRLIMIT64, 0, RLIMIT_NOFILE, 0, final_lim);
+assert_eq(load64(final_lim), cur, "original soft limit restored");
+
+# --- getsockopt must be getsockopt --------------------------------------
+# SO_TYPE (level SOL_SOCKET=1, optname SO_TYPE=3) on a socket we just made
+# must report back the type we asked for. If the number named something else
+# the option value is never written and the assert fails.
+var SOCK_STREAM = 1;
+var sfd = sys_socket(1, SOCK_STREAM, 0);   # AF_UNIX, SOCK_STREAM
+assert(sfd >= 0, "socket created");
+var optval = alloc(8);
+store64(optval, 0);
+var optlen = alloc(8);
+store32(optlen, 4);
+var rc_opt = syscall(_DAIMON_SYS_GETSOCKOPT, sfd, 1, 3, optval, optlen);
+assert_eq(rc_opt, 0, "getsockopt(SO_TYPE) returns 0");
+assert_eq(load32(optval), SOCK_STREAM,
+  "getsockopt reported SOCK_STREAM — the number names getsockopt");
+sys_close(sfd);
+
+# --- getpeername must be getpeername ------------------------------------
+# On an UNCONNECTED socket getpeername must fail with -ENOTCONN (-107).
+# fchmod — what 52 ran as on aarch64 through 2.1.5 — SUCCEEDS on a valid fd,
+# returning 0 and leaving the buffer untouched, which is exactly how
+# get_peer_ip silently returned 0 and rate_check allowed everyone.
+var ufd = sys_socket(1, SOCK_STREAM, 0);
+assert(ufd >= 0, "second socket created");
+var paddr = alloc(32);
+var plen = alloc(8);
+store32(plen, 16);
+var rc_peer = sys_getpeername(ufd, paddr, plen);
+assert(rc_peer < 0,
+  "getpeername on an UNCONNECTED socket FAILS (fchmod would have returned 0)");
+assert_eq(rc_peer, 0 - 107, "getpeername failed with -ENOTCONN specifically");
+sys_close(ufd);
+
+# --- AF_UNIX round trip through the wrappers src/ipc.cyr now uses -------
+# src/ipc.cyr converted 20 raw syscalls to wrappers at 2.1.6 and has no other
+# coverage: it needs daimon_audit (and so the whole libro bundle) to include
+# standalone, and tests/daimon.tcyr mirrors it rather than including it. This
+# exercises the exact wrapper surface it depends on — socket / bind / listen /
+# connect / accept4 / write / read / close, plus SO_PEERCRED via the
+# daimon-owned getsockopt — on whatever arch the binary was built for.
+#
+# Single-threaded on purpose: connect() against a listening socket with a
+# backlog completes in the kernel, so accept4() returns the pending connection
+# immediately without a second thread. Abstract namespace (sun_path[0] == 0)
+# so there is no filesystem entry to clean up.
+var lfd = sys_socket(1, SOCK_STREAM, 0);
+assert(lfd >= 0, "listen socket created");
+
+var NAME = "daimon-sysport-test";
+var NAMELEN = 19;
+var laddr = alloc(112);
+store16(laddr, 1);                       # AF_UNIX
+store8(laddr + 2, 0);                    # abstract namespace marker
+memcpy(laddr + 3, NAME, NAMELEN);
+var ADDRLEN = 2 + 1 + NAMELEN;
+
+assert_eq(sys_bind(lfd, laddr, ADDRLEN), 0, "sys_bind on AF_UNIX returns 0");
+assert_eq(sys_listen(lfd, 8), 0, "sys_listen returns 0");
+
+var cfd = sys_socket(1, SOCK_STREAM, 0);
+assert(cfd >= 0, "client socket created");
+assert_eq(sys_connect(cfd, laddr, ADDRLEN), 0, "sys_connect returns 0");
+
+var afd = sys_accept4(lfd, 0, 0, 0);
+assert(afd >= 0, "sys_accept4 returned the pending connection");
+
+# SO_PEERCRED — the VULN-006 check src/ipc.cyr runs on every accepted
+# connection. uid is at offset 4, after pid.
+var cred = alloc(16);
+var credlen = alloc(8);
+store32(credlen, 12);
+assert_eq(syscall(_DAIMON_SYS_GETSOCKOPT, afd, 1, 17, cred, credlen), 0,
+  "getsockopt(SO_PEERCRED) returns 0");
+assert_eq(load32(cred + 4), sys_getuid(),
+  "SO_PEERCRED reports OUR uid — the VULN-006 auth check reads a real value");
+
+# Length-prefixed write/read, the shape ipc.cyr uses on the wire.
+var out = alloc(8);
+store32(out, 305419896);                 # 0x12345678
+assert_eq(sys_write(cfd, out, 4), 4, "sys_write wrote 4 bytes");
+var inb = alloc(8);
+store32(inb, 0);
+assert_eq(sys_read(afd, inb, 4), 4, "sys_read read 4 bytes");
+assert_eq(load32(inb), 305419896, "the bytes round-tripped intact");
+
+sys_close(afd);
+sys_close(cfd);
+sys_close(lfd);
+
+# --- no daimon-owned name may be spelled SYS_* --------------------------
+# The defect class is a daimon global SHADOWING an arch-aware stdlib one.
+# The `_DAIMON_SYS_` prefix is what makes that impossible; assert the
+# constants are reachable under that name so a rename back is a test failure.
+assert(_DAIMON_SYS_PRLIMIT64 > 0, "_DAIMON_SYS_PRLIMIT64 is defined");
+assert(_DAIMON_SYS_GETSOCKOPT > 0, "_DAIMON_SYS_GETSOCKOPT is defined");
+assert_eq(_DAIMON_SYS_PIDFD_SEND_SIGNAL, 424,
+  "pidfd_send_signal is 424 on every arch daimon targets (unified numbering)");
+
+syscall(SYS_EXIT, assert_summary());

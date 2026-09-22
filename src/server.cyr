@@ -8,7 +8,6 @@
 
 var RATE_LIMIT_WINDOW = 60;     # seconds
 var RATE_LIMIT_MAX = 120;       # max requests per window per IP
-var SYS_GETPEERNAME = 52;
 
 # Rate limiter: {buckets: map<ip_cstr, {count, window_start}>}
 var _rate_limiter = 0;
@@ -22,7 +21,7 @@ fn get_peer_ip(cfd) {
     var addr_buf = alloc(32);   # sockaddr_in = 16 bytes, pad
     var addr_len = alloc(8);
     store32(addr_len, 16);
-    var r = syscall(SYS_GETPEERNAME, cfd, addr_buf, addr_len);
+    var r = sys_getpeername(cfd, addr_buf, addr_len);
     if (r < 0) { return 0; }
     # sockaddr_in: family(2) + port(2) + addr(4)
     # IP address is at offset 4, 4 bytes
