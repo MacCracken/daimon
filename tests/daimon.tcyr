@@ -87,66 +87,6 @@ fn agent_next_id() {
     return id;
 }
 
-fn agent_handle_new(id, name) {
-    var h = alloc(80);
-    store64(h, id);
-    store64(h + 8, name);
-    store64(h + 16, AGENT_PENDING);
-    store64(h + 24, clock_epoch_secs());
-    store64(h + 32, 0);
-    store64(h + 40, 0);
-    store64(h + 48, 0);
-    store64(h + 56, 0);
-    store64(h + 64, 0);
-    store64(h + 72, 0);
-    return h;
-}
-
-fn agent_id(h) { return load64(h); }
-fn agent_name(h) { return load64(h + 8); }
-fn agent_status(h) { return load64(h + 16); }
-fn agent_pid(h) { return load64(h + 40); }
-fn agent_set_status(h, s) { store64(h + 16, s); }
-
-fn read_vm_rss(pid) {
-    if (pid == 0) { return 0; }
-    var path_sb = str_builder_new();
-    str_builder_add_cstr(path_sb, "/proc/");
-    str_builder_add_int(path_sb, pid);
-    str_builder_add_cstr(path_sb, "/status");
-    var path = str_builder_build(path_sb);
-    var buf = alloc(8192);
-    var n = file_read_all(str_data(path), buf, 8191);
-    if (n <= 0) { return 0; }
-    return 0;
-}
-
-fn count_fds(pid) {
-    if (pid == 0) { return 0; }
-    var path_sb = str_builder_new();
-    str_builder_add_cstr(path_sb, "/proc/");
-    str_builder_add_int(path_sb, pid);
-    str_builder_add_cstr(path_sb, "/fd");
-    var path = str_builder_build(path_sb);
-    var entries = dir_list(str_data(path));
-    if (entries == 0) { return 0; }
-    return vec_len(entries);
-}
-
-fn count_threads(pid) {
-    if (pid == 0) { return 1; }
-    var path_sb = str_builder_new();
-    str_builder_add_cstr(path_sb, "/proc/");
-    str_builder_add_int(path_sb, pid);
-    str_builder_add_cstr(path_sb, "/task");
-    var path = str_builder_build(path_sb);
-    var entries = dir_list(str_data(path));
-    if (entries == 0) { return 1; }
-    var n = vec_len(entries);
-    if (n == 0) { return 1; }
-    return n;
-}
-
 # --- circuit breaker ---
 
 enum CircuitState { CB_CLOSED = 0; CB_OPEN = 1; CB_HALF_OPEN = 2; }
@@ -1169,48 +1109,18 @@ fn main() {
     assert_eq(config_port(cfg), 9090, "modified port");
 
     # =============================================================
-    # agent — creation and state
+    # agent — MIGRATED to tests/agent.tcyr at 2.2.0
     # =============================================================
-    test_group("agent");
-    var a1 = agent_handle_new(1, str_from("test-agent"));
-    assert_eq(agent_id(a1), 1, "agent id");
-    assert(str_eq(agent_name(a1), str_from("test-agent")) == 1, "agent name");
-    assert_eq(agent_status(a1), AGENT_PENDING, "initial status pending");
-    assert_eq(agent_pid(a1), 0, "no pid initially");
-
-    # Unique IDs
-    var a2 = agent_handle_new(agent_next_id(), str_from("agent-2"));
-    var a3 = agent_handle_new(agent_next_id(), str_from("agent-3"));
-    assert(agent_id(a2) != agent_id(a3), "unique agent ids");
-
-    # Status transitions
-    agent_set_status(a1, AGENT_RUNNING);
-    assert_eq(agent_status(a1), AGENT_RUNNING, "set running");
-    agent_set_status(a1, AGENT_STOPPED);
-    assert_eq(agent_status(a1), AGENT_STOPPED, "set stopped");
-
-    # All status values representable
-    var si = 0;
-    while (si <= 6) {
-        agent_set_status(a1, si);
-        assert_eq(agent_status(a1), si, "status value");
-        si = si + 1;
-    }
-
-    # =============================================================
-    # /proc helpers — edge cases
-    # =============================================================
-    test_group("proc_helpers");
-
-    # Nonexistent/zero PID returns safe defaults
-    assert_eq(read_vm_rss(0), 0, "rss pid 0");
-    assert_eq(count_fds(0), 0, "fds pid 0");
-    assert_eq(count_threads(0), 1, "threads pid 0 default 1");
-
-    # Bogus PID returns safe defaults
-    assert_eq(read_vm_rss(999999999), 0, "rss bogus pid");
-    assert_eq(count_fds(999999999), 0, "fds bogus pid");
-    assert_eq(count_threads(999999999), 1, "threads bogus pid");
+    # The agent group lived here against LOCAL MIRRORS of src/agent.cyr and
+    # covered 10 of its 28 functions. tests/agent.tcyr includes the real
+    # module and its real dependency chain instead — 33 assertions, and it
+    # found two defects on code that had never been executed:
+    #   * read_vm_rss's whitespace skip could never advance (a byte cannot be
+    #     both space and tab), so it returned 0 for EVERY process, always.
+    #   * dir_list enumerates nothing under /proc/<pid>/fd, so count_fds and
+    #     count_threads are structurally 0/1 (upstream gap, pinned there).
+    # `agent_next_id` stays below: the screen / scheduler / mcp mirrors still
+    # call it, and untangling those is their own bite of the 2.2.x arc.
 
     # =============================================================
     # circuit breaker

@@ -4,10 +4,11 @@
 >
 > **Severity legend**: **P0** blocking (security / correctness — must-fix before ship) · **P1** high (must-have for the current arc) · **P2** medium (schedule when capacity opens) · **P3 / Low** nice-to-have, no urgency. Upstream-blocker items quote the upstream tracker's own severity.
 
-**Where daimon stands** — `2.1.8`, on cyrius 6.6.6, nine dep pins current. Builds and runs on
-**three targets**: x86_64, aarch64 and AGNOS. 293 tests, 5 fuzz harnesses, 21 benchmarks, all gates
-clean. **Zero open issue filings** — all 8 are in `issues/archive/`. MCP surface: **13 tools** —
-libro audit x5, bote web x2, nein firewall x6 (the mutating half gated shut until 2.5.x).
+**Where daimon stands** — `2.2.0`, on cyrius 6.6.6, nine dep pins current. Builds and runs on
+**three targets**: x86_64, aarch64 and AGNOS. **306 tests**, 5 fuzz harnesses, 21 benchmarks, all
+gates clean. Zero open issue filings. MCP surface: 13 tools — libro audit x5, bote web x2, nein
+firewall x6 (mutating half gated shut until 2.5.x). **The 2.2.x arc is underway** — `agent` is
+migrated off its mirror; `supervisor` and `ipc` are next.
 
 ## The arc to 3.0.0
 
@@ -35,10 +36,15 @@ the functions they name, so a passing suite has never been a statement about dai
 source. Two shipped security defects were green under it, each because the mirror never called the
 code that was wrong.
 
-**The path is proven.** Four files now include `src/` directly — `tests/rag_alias.tcyr`,
-`tests/syscall_portability.tcyr`, `tests/version_sync.tcyr`, `tests/rag_ingest.bcyr` — and
-`src/*.cyr` are self-contained modules with no `main`, so inclusion works. The remaining work is
-deleting each mirrored function in favour of the real one and resolving the collisions.
+**In progress.** `agent` landed at **2.2.0**: `tests/agent.tcyr` covers the real module and its
+real dependency chain (33 assertions), and the mirror plus its 20 assertions are gone from
+`daimon.tcyr`. It found two defects immediately — `read_vm_rss` could never parse a number (fixed,
+live since the port) and `dir_list` enumerates nothing under `/proc/<pid>/fd` (upstream, pinned as
+a KNOWN GAP assertion that fails when the stdlib fixes it). Five files now include `src/` directly.
+
+⚠ `agent_next_id` is still mirrored: the screen / scheduler / mcp mirrors call it, so it comes out
+with whichever of those migrates first. **Next: `supervisor`, then `ipc`** — the modules 2.3.x
+needs.
 
 **One module per bite, suite green at each step** — not one cut-over. Start with the modules the
 next arc touches: `agent`, `supervisor`, `ipc`. Expect the migration to surface defects; that is the

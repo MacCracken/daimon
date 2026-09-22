@@ -4,6 +4,64 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.2.0] - 2026-09-22
+
+**The test-integrity arc opens, and its first bite found a bug that had been live since the port.**
+`src/agent.cyr` is now tested against itself rather than a mirror — and the first time that code
+ever ran, `read_vm_rss` turned out to return **0 for every process, always**.
+
+**306 tests** (was 293): +33 real agent assertions, −20 that tested a local reimplementation. 5 fuzz
+harnesses, `fmt` / `lint` / `vet` clean, all three targets build. Also picks up **nein 1.7.0**.
+
+### Fixed — `read_vm_rss` could never parse a number
+
+```cyrius
+while (j < n) {
+    if (load8(buf + j) != 32) { break; }   # not a space -> break
+    if (load8(buf + j) != 9)  { break; }   # not a tab   -> break
+    j = j + 1;
+}
+```
+
+A byte cannot be both a space and a tab, so whichever it is, one of the two tests fires on the
+**first iteration** and `j` never advances. `/proc/<pid>/status` writes `VmRSS:\t   12345 kB` — a
+**tab** — so `j` stayed on the tab, the digit loop below it saw `9` (< 48) and stopped immediately,
+and the function returned `0 * 1024` for every process it was ever asked about.
+
+The break now requires **both** to be false. Found the first time `read_vm_rss` was executed: it has
+no caller in `src/` (the supervisor is roadmap 2.3.x) and the old mirror-based test only ever passed
+it `0` and a bogus pid — both of which short-circuit before reaching the parse.
+
+### Added — `tests/agent.tcyr`, against the real module
+
+33 assertions over `src/agent.cyr` **and its real dependency chain** (`src/syscalls.cyr`,
+`src/error.cyr`, `src/audit.cyr` → libro). The 20 assertions it replaces in `tests/daimon.tcyr` ran
+against local copies covering 10 of the module's 28 functions and none of the `/proc` readers.
+
+⚠ **`agent_next_id` stays mirrored in `daimon.tcyr`** — the screen, scheduler and mcp mirrors still
+call it, and untangling those is their own bite. Recorded rather than glossed: this arc is
+explicitly one module at a time, suite green at each step.
+
+### Note — a second finding, pinned rather than fixed
+
+`dir_list` returns an **empty vec** for `/proc/<pid>/fd` while enumerating an ordinary directory
+fine (the test asserts `/tmp` as a control). So `count_fds` and `count_threads` — both written
+correctly against `dir_list`'s contract — are structurally `0` and `1`, and `agent_update_resources`
+stores those. Once the supervisor is wired, `/v1/agents` would serve `fds_used: 0` forever.
+
+The defect is **below daimon**: procfs returns entries the stdlib's `getdents` walk does not
+surface. daimon's code needs no change, so the test asserts the behaviour **as it actually is**,
+labelled `KNOWN GAP` — which keeps the suite honest *and* makes the assertion fail the day the
+stdlib fixes it, pointing at the line to flip back.
+
+### Changed — nein 1.6.12 → 1.7.0
+
+nein's error enum is now fully `NEIN_ERR_*` namespaced. Its four remaining bare `ERR_*` members were
+the last `lint_error_enum_namespace` findings in that tree, and one — `ERR_CHAIN_NOT_FOUND` (= 4) —
+collides *by value* with bote's bare `ERR_PARSE` (= 4) in any host linking both, which daimon now
+is. **Values are unchanged**, so `nein_err_code()`'s contract holds and daimon, which names none of
+them, needed no change. Source-breaking for nein's own consumers, hence its minor bump.
+
 ## [2.1.8] - 2026-09-22
 
 **Roadmap restructured around the arc to 3.0.0, two false "upstream blockers" retracted, and the
@@ -72,7 +130,7 @@ return nein's specific refusal ("nftables backend unavailable on agnos"), becaus
 network stack and no nft binary. A diagnosable error beats a tool that silently vanishes from the
 manifest on one target.
 
-### Fixed (upstream, nein 1.6.12) — three defects found by attempting the integration
+### Fixed (upstream, nein 1.6.12 + 1.7.0) — four defects found by attempting the integration
 
 ⛔ **The roadmap said this was "blocked on upstream nein: no `mcp.cyr`, the Rust `mcp.rs` is
 unported". That was wrong and is retracted** — nein has shipped the MCP surface since **1.6.0**,
@@ -91,6 +149,11 @@ the work. What *was* real only surfaced by doing it:
 3. **nein was four cyrius minors behind** (6.6.2) and behind on every shared pin, so its bundle
    carried bote 3.3.7 symbols against daimon's 3.3.13 — 249 `duplicate fn` warnings from version
    skew alone.
+4. **nein's error enum was half-namespaced** — four bare `ERR_*` members remained, and one of them
+   (`ERR_CHAIN_NOT_FOUND` = 4) collides *by value* with bote's bare `ERR_PARSE` (= 4) in any host
+   linking both, which daimon now is. Fixed in **nein 1.7.0**: all four became `NEIN_ERR_*` with
+   their values unchanged, so `nein_err_code()`'s integer contract holds and daimon — which names
+   none of them — needed no change. Source-breaking for nein's own consumers, hence the minor bump.
 
 ⚠ **Residual, stated rather than hidden.** nein declares `[deps.bote-core]` for its own build and
 `cyrius deps` resolves it transitively, so daimon — which already vendors the full `dist/bote.cyr` —
@@ -102,7 +165,7 @@ in nein's 1.6.12 entry as a packaging question to settle before the next consume
 
 | dep | was | now |
 |---|---|---|
-| **nein** | *(new)* | **1.6.12** |
+| **nein** | *(new)* | **1.7.0** |
 
 Declared **after** bote and sigil, deliberately: `dist/nein-mcp.cyr` leaves their symbols unresolved
 by design and cyrius resolves forward references in a single pass. Lock: 117 → **119** entries.

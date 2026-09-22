@@ -83,10 +83,25 @@ fn read_vm_rss(pid) {
     while (i < n) {
         if (memeq(buf + i, "VmRSS:", 6) == 1) {
             var j = i + 6;
-            # Skip whitespace
+            # Skip whitespace.
+            #
+            # ⛔ 2.2.0 — this loop was `if (c != 32) break; if (c != 9) break;`,
+            # which can NEVER advance: a byte cannot be both a space and a tab,
+            # so whichever it is, one of the two tests fires on the first
+            # iteration. `/proc/<pid>/status` writes `VmRSS:\t   12345 kB` — a
+            # TAB — so `j` stayed on the tab, the digit parser below saw 9 (< 48)
+            # and stopped immediately, and **read_vm_rss returned 0 for every
+            # process, always**. Caught the first time this function was ever
+            # executed (tests/agent.tcyr, the 2.2.0 test-integrity migration);
+            # it had no caller and no test before that.
+            #
+            # The intent is "advance while it IS whitespace", so the break must
+            # require BOTH to be false.
             while (j < n) {
-                if (load8(buf + j) != 32) { break; }
-                if (load8(buf + j) != 9) { break; }
+                var wc = load8(buf + j);
+                if (wc != 32) {
+                    if (wc != 9) { break; }
+                }
                 j = j + 1;
             }
             # Parse number (in kB)

@@ -137,14 +137,16 @@ modules = ["dist/bote.cyr"]
 # UNRESOLVED by design — the host supplies them — and cyrius resolves forward
 # references in a single pass, so the bundle must come after both.
 #
-# ⚠ PIN >= 1.6.12. 1.6.11 could not be linked by daimon at all: `bridge_config_new`
+# ⚠ PIN >= 1.7.0. Its error enum is fully `NEIN_ERR_*` namespaced (1.7.0 renamed
+# the last four bare `ERR_*`; values unchanged, so nein_err_code is unaffected).
+# 1.6.11 could not be linked by daimon at all: `bridge_config_new`
 # collided with bote's at a different arity (cyrius refuses the binary), and
 # nein's own nft-apply path called `sys_dup2` / `sys_execve`, which do not exist
 # on agnos — breaking daimon's --agnos build. 1.6.12 fixes both upstream.
 [deps.nein]
 git = "https://github.com/MacCracken/nein.git"
 path = "../nein"
-tag = "1.6.12"
+tag = "1.7.0"
 modules = ["dist/nein-mcp.cyr"]
 
 # Distribution manifest. Single binary today (`daimon`), with a best-effort

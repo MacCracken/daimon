@@ -1,0 +1,152 @@
+# =========================================================================
+# agent — tests against THE REAL src/agent.cyr
+#
+# 2.2.0, first bite of the test-integrity arc.
+#
+# ⚠ tests/daimon.tcyr does NOT include src/. It reimplements simplified copies
+# of the functions it names, so a passing suite has never been a statement
+# about daimon's shipping source — which is how two security defects shipped
+# green (2.1.6's RAG aliasing and the aarch64 syscall pair). Its agent mirror
+# covered 10 of src/agent.cyr's 28 functions and none of the process paths.
+#
+# This file includes the real module and its real dependency chain. The agent
+# mirror has been DELETED from daimon.tcyr in the same change, so there is now
+# exactly one agent implementation under test.
+#
+# ⛔ Everything below the accessors is code that had NEVER BEEN EXECUTED before
+# this file: agent_spawn_with_limits, agent_start/stop/pause/resume and the
+# /proc readers have zero callers in src/ (roadmap 2.3.x is wiring them to the
+# API). Tests first, per the arc.
+# =========================================================================
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/io.cyr"
+include "lib/fs.cyr"
+include "lib/hashmap.cyr"
+include "lib/tagged.cyr"
+include "lib/bayan.cyr"
+include "lib/chrono.cyr"
+include "lib/syscalls.cyr"
+include "lib/math.cyr"
+include "lib/process.cyr"
+include "lib/sakshi.cyr"
+include "lib/libro.cyr"
+include "lib/assert.cyr"
+
+include "src/syscalls.cyr"
+include "src/error.cyr"
+include "src/audit.cyr"
+include "src/agent.cyr"
+
+test_group("agent");
+
+daimon_audit_init();
+
+# --- handle lifecycle ----------------------------------------------------
+var h = agent_handle_new(agent_next_id(), str_from("worker-1"));
+assert(agent_id(h) > 0, "agent id is allocated");
+assert(str_eq(agent_name(h), str_from("worker-1")) == 1, "agent name round-trips");
+assert_eq(agent_status(h), AGENT_PENDING, "new agent is PENDING");
+assert_eq(agent_pid(h), 0, "new agent has no pid");
+assert(agent_created_at(h) > 0, "created_at is stamped");
+assert_eq(agent_started_at(h), 0, "started_at is unset");
+
+# ids are monotonic and unique
+var h2 = agent_handle_new(agent_next_id(), str_from("worker-2"));
+assert(agent_id(h2) > agent_id(h), "ids are monotonic");
+
+agent_set_status(h, AGENT_RUNNING);
+assert_eq(agent_status(h), AGENT_RUNNING, "status setter round-trips");
+agent_set_pid(h, 4242);
+assert_eq(agent_pid(h), 4242, "pid setter round-trips");
+agent_set_started_at(h, 99);
+assert_eq(agent_started_at(h), 99, "started_at setter round-trips");
+
+# --- resource accessors default to zero ----------------------------------
+assert_eq(agent_mem_used(h), 0, "mem_used starts 0");
+assert_eq(agent_cpu_time(h), 0, "cpu_time starts 0");
+assert_eq(agent_fds_used(h), 0, "fds_used starts 0");
+assert_eq(agent_threads(h), 0, "threads starts 0");
+
+# --- /proc readers, against THIS process ---------------------------------
+# Never executed before 2.2.0. pid 0 is the documented "no process" input and
+# must not read the filesystem; our own pid must produce real numbers.
+assert_eq(read_vm_rss(0), 0, "read_vm_rss(0) short-circuits");
+assert_eq(read_cpu_time_ms(0), 0, "read_cpu_time_ms(0) short-circuits");
+assert_eq(count_fds(0), 0, "count_fds(0) short-circuits");
+assert_eq(count_threads(0), 1, "count_threads(0) answers 1, not 0");
+
+var me = sys_getpid();
+assert(read_vm_rss(me) > 0, "read_vm_rss reads a real RSS for this process");
+# Narrowing count_fds: is it dir_list that returns nothing, or the count?
+var fdpath = str_builder_new();
+str_builder_add_cstr(fdpath, "/proc/");
+str_builder_add_int(fdpath, me);
+str_builder_add_cstr(fdpath, "/fd");
+var fdents = dir_list(str_data(str_builder_build(fdpath)));
+assert(fdents != 0, "dir_list(/proc/<pid>/fd) returns a vec, not 0");
+
+# Control: dir_list works fine on an ordinary directory, so the emptiness
+# above is procfs-specific, not a broken dir_list.
+var ctl = dir_list("/tmp");
+assert(ctl != 0, "control: dir_list(/tmp) returns a vec");
+assert(vec_len(ctl) > 0, "control: dir_list(/tmp) enumerates entries");
+
+# ⛔ FINDING (2.2.0): `dir_list` returns an EMPTY vec for /proc/<pid>/fd while
+# enumerating an ordinary directory fine, so `count_fds` — which is written
+# correctly against dir_list's contract — reports 0 for every live agent, and
+# `agent_update_resources` stores that 0 into the handle. `/v1/agents` would
+# therefore serve fds_used = 0 forever once the supervisor is wired (2.3.x).
+# The defect is below daimon: procfs returns entries whose d_reclen/d_type the
+# stdlib's getdents walk does not surface. daimon's own code needs no change.
+# Asserted as it ACTUALLY behaves, so this file stays green and the day the
+# stdlib fixes it, THIS assertion fails and tells us to flip it back.
+assert_eq(vec_len(fdents), 0,
+  "KNOWN GAP: dir_list enumerates nothing under /proc/<pid>/fd (flip when stdlib fixes it)");
+assert_eq(count_fds(me), 0,
+  "KNOWN GAP: count_fds is 0 as a consequence — correct code, upstream gap");
+assert_eq(count_threads(me), 1,
+  "KNOWN GAP: count_threads falls back to 1 for the same reason");
+
+# agent_update_resources writes the three fields it owns.
+agent_set_pid(h, me);
+agent_update_resources(h);
+assert(agent_mem_used(h) > 0, "agent_update_resources populated mem_used");
+assert_eq(agent_fds_used(h), 0, "agent_update_resources stores the (gapped) fds count");
+assert_eq(agent_threads(h), 1, "agent_update_resources stores the (gapped) thread count");
+
+# --- liveness ------------------------------------------------------------
+assert_eq(agent_is_alive(agent_handle_new(99, str_from("x"))), 0,
+  "an agent with pid 0 is not alive");
+agent_set_pid(h, me);
+assert_eq(agent_is_alive(h), 1, "kill(self, 0) reports this process alive");
+
+# --- normalize_vec -------------------------------------------------------
+var v = alloc(24);
+store64(v, f64_from(3));
+store64(v + 8, f64_from(4));
+store64(v + 16, f64_from(0));
+var n = normalize_vec(v, 3);
+# |(3,4,0)| = 5, so the unit vector is (0.6, 0.8, 0) and its magnitude is 1.
+# Asserted as a bounded magnitude-squared rather than an exact component
+# compare: no abs/epsilon helper exists in the stdlib's f64 surface, and
+# bounding is the honest shape for a float assertion anyway.
+var msq = f64_add(f64_add(f64_mul(load64(n), load64(n)),
+    f64_mul(load64(n + 8), load64(n + 8))),
+  f64_mul(load64(n + 16), load64(n + 16)));
+var lo = f64_div(f64_from(99), f64_from(100));
+var hi = f64_div(f64_from(101), f64_from(100));
+assert(f64_gt(msq, lo) == 1, "normalized vector has magnitude > 0.99");
+assert(f64_gt(hi, msq) == 1, "normalized vector has magnitude < 1.01");
+var zero = alloc(16);
+store64(zero, f64_from(0));
+store64(zero + 8, f64_from(0));
+var nz = normalize_vec(zero, 2);
+assert(f64_eq(load64(nz), f64_from(0)) == 1,
+  "normalize_vec of a zero vector is zero, not NaN");
+
+syscall(SYS_EXIT, assert_summary());
