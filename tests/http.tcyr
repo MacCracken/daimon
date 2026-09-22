@@ -1,0 +1,60 @@
+# =========================================================================
+# http — tests against THE REAL src/http.cyr (2.2.2)
+#
+# Pins the ROOT CAUSE of a CSRF-by-GET defect. http_parse_method returned 0
+# (GET) for any verb it did not recognise, and 14 of the router's routes had
+# no method check at all. Two of those changed state, so a plain GET — which a
+# cross-origin <img src> issues with no CORS preflight, against a daimon that
+# has no auth — decommissioned an edge node (status 0 -> 4) or cancelled a
+# task (Queued -> Cancelled). Measured live on the binary before the fix.
+#
+# The router is covered by the live method matrix in the 2.2.2 CHANGELOG; this
+# file covers the two pieces it rests on, because a test that can reach them
+# is what keeps a regression from shipping green.
+# =========================================================================
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/io.cyr"
+include "lib/syscalls.cyr"
+include "lib/sandhi.cyr"
+include "lib/assert.cyr"
+
+include "src/error.cyr"
+include "src/http.cyr"
+
+test_group("http");
+
+# Build "<VERB> /v1/agents HTTP/1.1\r\nHost: x\r\n\r\n" and parse its method.
+fn _method_of(verb) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, verb);
+    str_builder_add_cstr(sb, " /v1/agents HTTP/1.1\r\nHost: x\r\n\r\n");
+    var req = str_builder_build(sb);
+    return http_parse_method(str_data(req), str_len(req));
+}
+
+assert_eq(_method_of("GET"), 0, "GET -> 0");
+assert_eq(_method_of("POST"), 1, "POST -> 1");
+assert_eq(_method_of("PUT"), 2, "PUT -> 2");
+assert_eq(_method_of("DELETE"), 3, "DELETE -> 3");
+# HEAD is GET without a body by definition, and health-checkers send it.
+assert_eq(_method_of("HEAD"), 0, "HEAD -> 0 (a safe method, like GET)");
+
+# ⛔ The root cause. Each of these used to come back 0 and reach GET handlers.
+assert_eq(_method_of("OPTIONS"), 0 - 1, "OPTIONS is NOT silently GET");
+assert_eq(_method_of("PATCH"), 0 - 1, "PATCH is NOT silently GET");
+assert_eq(_method_of("FROB"), 0 - 1, "an unknown verb is NOT silently GET");
+assert(_method_of("OPTIONS") != 0, "no unknown verb can satisfy a GET route");
+
+# Reason phrases the router now emits.
+assert(streq(_http_reason(405), "Method Not Allowed") == 1, "405 has its RFC 7231 phrase");
+# 500 used to fall through to the literal "Error": error_to_status maps every
+# non-4xx DaimonError to 500, so this was on the common error path.
+assert(streq(_http_reason(500), "Internal Server Error") == 1, "500 has its RFC 7231 phrase");
+assert(streq(_http_reason(404), "Not Found") == 1, "existing phrases unchanged");
+
+syscall(SYS_EXIT, assert_summary());

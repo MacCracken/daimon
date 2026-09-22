@@ -4,6 +4,98 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.2.2] - 2026-09-22
+
+**Two state-changing endpoints could be triggered by a plain GET — and so by any web page a local
+operator opened.** Fixed at the router and at its root cause. Plus **samay 1.1.3**, which moves the
+2.2.1 string-ownership fix into the library where it belongs.
+
+**368 tests** (was 356) across nine files, 5 fuzz harnesses, `fmt` / `lint` / `vet` clean, all three
+targets build. cyrius 6.6.6.
+
+### Security — CSRF by GET: decommission and cancel accepted any method
+
+`/v1/edge/nodes/{id}/decommission` and `/v1/scheduler/tasks/{id}/cancel` dispatch by path suffix
+and checked no method. A plain **GET** performed the state change. Measured on the live binary:
+
+```
+GET /v1/edge/nodes/1/decommission     -> 200  node status 0 -> 4  (decommissioned)
+GET /v1/scheduler/tasks/<id>/cancel   -> 200  Queued -> Cancelled
+```
+
+GET is the one method a browser issues freely: a cross-origin `<img src=…>`, a link prefetch or a
+crawler needs **no CORS preflight**, and daimon has no authentication. So any page a local operator
+visited could reach a daimon on `localhost:8090`. Edge node ids are sequential integers, which lets
+`<img src="http://localhost:8090/v1/edge/nodes/1/decommission">` walk the entire fleet. Task ids
+are UUIDs, which limits the cancel half to an attacker who has seen one.
+
+Both now require **POST** and answer **405** to anything else. After the fix, same probe:
+
+```
+GET  …/1/decommission -> 405   status stays 0      POST -> 200   status 4
+GET  …/<id>/cancel    -> 405   stays Queued        POST -> 200   Cancelled
+```
+
+### Fixed — the root cause: an unrecognised HTTP verb was treated as GET
+
+`http_parse_method` ended `return 0;`, so `OPTIONS`, `PATCH` or any garbage token parsed as **GET**.
+The router's 2.1.0 MCP section had documented this — *"http_parse_method maps ANY unrecognized verb
+to 0 (GET), so a route must never be written as 'if not POST then GET'"* — and guarded **only its
+own routes** against it. The source was never fixed and no other route was guarded: the same
+fix-one-site-never-sweep pattern as the aliasing class in 2.2.1.
+
+An unknown verb now returns **-1**, which matches no route. `HEAD` maps to GET explicitly — it is
+GET without a body by definition, health-checkers send it, and as a safe method it can never reach
+a state-changing route. Pinned by `tests/http.tcyr` against the real module, on crafted request
+buffers; reverting to `return 0` fails 4 of its 12 assertions.
+
+### Fixed — every route now states its method (27 arms)
+
+A sweep of `src/router.cyr` found **14 routes with no method check**. Beyond the two above, the
+state-changing ones were `/v1/mcp/call` (executes a tool), `/v1/rag/ingest`,
+`/v1/edge/nodes/{id}/heartbeat`, `/v1/scheduler/nodes` and `/v1/scheduler/schedule`; the rest were
+read-only routes that accepted `POST`/`DELETE` as if they were `GET`. All 16 single-method routes now
+go through a `route_method` guard. The 11 multi-method routes that *did* check fell through on a
+mismatch to the end of the router and answered **404** — "no such resource" for a resource that
+exists — and now answer **405**. Verified with a live matrix: every correct method still returns
+200, including `HEAD /v1/health`; every wrong method and every unknown verb returns 405.
+
+⚠ **Behaviour change for a non-conforming client.** A client that reached a mutation with the
+wrong verb — a `GET` to `/cancel`, say — now gets 405. That was the vulnerability; a client using
+the documented method is unaffected.
+
+This also resolves the 2.2.1 note that `/v1/scheduler/nodes` answered a GET with a misleading
+`400 missing body`: it is now an honest 405. Listing nodes is still not supported — that is a
+missing feature, not a routing bug, and is not added here.
+
+### Fixed — `500` went out as `500 Error`
+
+`_http_reason` had no entry for 500 and fell through to the literal `"Error"`. `error_to_status`
+maps every non-4xx `DaimonError` to 500, so this was the common error path. It now sends the RFC
+7231 `Internal Server Error`, and `405 Method Not Allowed` is added alongside.
+
+### Changed — samay 1.1.2 → **1.1.3**
+
+samay now owns every Str it retains — **20 fields across 8 constructors**, found by sweeping the
+library rather than fixing only the two sites daimon exposed. 2.2.1 had to clone task and node
+strings at daimon's own boundary as a stopgap; those clones are **removed**, and the live leak stays
+closed with them gone:
+
+```
+POST /v1/scheduler/tasks {"name":"ORIGINAL_TASK_NAME"}  + one unrelated request
+GET  /v1/scheduler/tasks/<id>  ->  "name":"ORIGINAL_TASK_NAME"     (daimon clones removed)
+```
+
+which is the proof that the fix now lives in the library, covering every consumer. samay's own
+changelog has the detail, including the measured cost (+179 ns on `scheduled_task_new`).
+
+### Performance
+
+The 19 mirrored benchmarks cannot observe router or `src/` changes (2.2.1 showed their binary is
+byte-identical across `src/` edits). The one path that changed cost is samay's constructor, measured
+in samay: **+179 ns (+8.8%)** per task submission, isolated from the toolchain by A/B'ing the same
+tree with ownership as a pass-through.
+
 ## [2.2.1] - 2026-09-22
 
 **Three live cross-request data leaks fixed — found by finishing a sweep that 2.1.6 asked for and

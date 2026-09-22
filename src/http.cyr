@@ -21,13 +21,22 @@ var MAX_HEADER_SIZE = 8192;
 # smuggling vector that the old loose parser accepted), and tolerant
 # Transfer-Encoding token scan.
 
+# Method codes: 0 GET · 1 POST · 2 PUT · 3 DELETE · -1 anything else.
+#
+# ⛔ 2.2.2 — an unrecognised verb used to return 0, i.e. it was silently
+# treated as GET. OPTIONS, PATCH or a garbage token reached every GET handler.
+# The router's 2.1.0 MCP section documented the hazard and guarded ITSELF
+# against it; the source was never fixed and no other route was guarded.
+# HEAD still maps to GET — it is GET without a body by definition, and
+# health-checkers issue it — so it can never reach a state-changing route.
 fn http_parse_method(buf, len) {
     var m = sandhi_server_get_method(buf, len);
     if (streq(m, "GET") == 1) { return 0; }
+    if (streq(m, "HEAD") == 1) { return 0; }
     if (streq(m, "POST") == 1) { return 1; }
     if (streq(m, "PUT") == 1) { return 2; }
     if (streq(m, "DELETE") == 1) { return 3; }
-    return 0;
+    return 0 - 1;
 }
 
 # Returns path WITHOUT query string. sandhi_server_get_path returns
@@ -67,17 +76,22 @@ fn http_parse_body(buf, len) {
 # Status-code → reason-phrase. Centralized so http_send_response
 # (sandhi-backed shim) can hand the right RFC 7231 phrase to
 # sandhi_server_send_response. Codes daimon emits today: 200, 201,
-# 204, 400, 404, 409, 413, 422, 429, 501.
+# 204, 400, 404, 405, 409, 413, 422, 429, 500, 501, 502.
 fn _http_reason(status) {
     if (status == 200) { return "OK"; }
     if (status == 201) { return "Created"; }
     if (status == 204) { return "No Content"; }
     if (status == 400) { return "Bad Request"; }
     if (status == 404) { return "Not Found"; }
+    if (status == 405) { return "Method Not Allowed"; }
     if (status == 409) { return "Conflict"; }
     if (status == 413) { return "Payload Too Large"; }
     if (status == 422) { return "Unprocessable Entity"; }
     if (status == 429) { return "Too Many Requests"; }
+    # 500 was missing: error_to_status maps every non-4xx DaimonError to 500,
+    # so those responses went out as "500 Error" rather than the RFC 7231
+    # "500 Internal Server Error". Found alongside the 405 work (2.2.2).
+    if (status == 500) { return "Internal Server Error"; }
     if (status == 501) { return "Not Implemented"; }
     if (status == 502) { return "Bad Gateway"; }
     return "Error";
@@ -100,6 +114,20 @@ fn http_ok(fd, body) {
 fn http_not_found(fd) {
     var body = str_from("{\"error\":\"not found\"}");
     http_send_response(fd, 404, str_data(body), str_len(body));
+}
+
+fn http_method_not_allowed(fd) {
+    var body = str_from("{\"error\":\"method not allowed\"}");
+    http_send_response(fd, 405, str_data(body), str_len(body));
+}
+
+# Route guard: 1 if `method` is `want`, otherwise answers 405 and returns 0.
+# Every route in src/router.cyr goes through this or ends its arms in an
+# explicit 405 — none may fall through to the next route on a wrong method.
+fn route_method(fd, method, want) {
+    if (method == want) { return 1; }
+    http_method_not_allowed(fd);
+    return 0;
 }
 
 fn http_bad_request(fd, msg) {

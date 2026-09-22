@@ -6,7 +6,11 @@
 
 fn http_route(fd, method, path, buf, buf_len) {
     # GET /v1/health
-    if (streq(path, "/v1/health") == 1) { api_health(fd); return 0; }
+    if (streq(path, "/v1/health") == 1) {
+        if (route_method(fd, method, 0) == 0) { return 0; }
+        api_health(fd);
+        return 0;
+    }
 
     # /v1/agents
     if (streq(path, "/v1/agents") == 1) {
@@ -15,11 +19,14 @@ fn http_route(fd, method, path, buf, buf_len) {
             api_register_agent(fd, http_parse_body(buf, buf_len));
             return 0;
         }
+        http_method_not_allowed(fd);
+        return 0;
     }
 
     # /v1/agents/{id}
     if (memeq(path, "/v1/agents/", 11) == 1) {
         if (strlen(path + 11) > 0) {
+            if (route_method(fd, method, 0) == 0) { return 0; }
             api_get_agent(fd, path + 11);
             return 0;
         }
@@ -29,12 +36,20 @@ fn http_route(fd, method, path, buf, buf_len) {
     if (streq(path, "/v1/mcp/tools") == 1) {
         if (method == 0) { api_mcp_manifest(fd); return 0; }
         if (method == 1) { api_mcp_register(fd, http_parse_body(buf, buf_len)); return 0; }
+        http_method_not_allowed(fd);
+        return 0;
     }
-    if (streq(path, "/v1/mcp/manifest") == 1) { api_mcp_manifest(fd); return 0; }
+    if (streq(path, "/v1/mcp/manifest") == 1) {
+        if (route_method(fd, method, 0) == 0) { return 0; }
+        api_mcp_manifest(fd);
+        return 0;
+    }
 
     # DELETE /v1/mcp/tools/{name}
     if (memeq(path, "/v1/mcp/tools/", 14) == 1) {
         if (method == 3) { api_mcp_deregister(fd, path + 14); return 0; }
+        http_method_not_allowed(fd);
+        return 0;
     }
 
     # --- MCP resources + prompts (2.1.0) ---
@@ -47,42 +62,58 @@ fn http_route(fd, method, path, buf, buf_len) {
     #
     # ⚠ METHOD GUARD. http_parse_method maps ANY unrecognized verb to 0 (GET), so a
     # route must never be written as "if not POST then GET". Each arm below tests its
-    # method explicitly and falls through otherwise.
+    # method explicitly and answers 405 otherwise. (2.2.2: http_parse_method now
+    # returns -1 for an unknown verb, so it can no longer masquerade as GET.)
     if (streq(path, "/v1/mcp/resources/read") == 1) {
         if (method == 1) { api_mcp_resource_read(fd, http_parse_body(buf, buf_len)); return 0; }
+        http_method_not_allowed(fd);
+        return 0;
     }
     if (streq(path, "/v1/mcp/resources/deregister") == 1) {
         if (method == 1) { api_mcp_resource_deregister(fd, http_parse_body(buf, buf_len)); return 0; }
+        http_method_not_allowed(fd);
+        return 0;
     }
     if (streq(path, "/v1/mcp/resources") == 1) {
         if (method == 0) { api_mcp_resources_list(fd); return 0; }
         if (method == 1) { api_mcp_resource_register(fd, http_parse_body(buf, buf_len)); return 0; }
+        http_method_not_allowed(fd);
+        return 0;
     }
     if (streq(path, "/v1/mcp/prompts/get") == 1) {
         if (method == 1) { api_mcp_prompt_get(fd, http_parse_body(buf, buf_len)); return 0; }
+        http_method_not_allowed(fd);
+        return 0;
     }
     if (streq(path, "/v1/mcp/prompts/deregister") == 1) {
         if (method == 1) { api_mcp_prompt_deregister(fd, http_parse_body(buf, buf_len)); return 0; }
+        http_method_not_allowed(fd);
+        return 0;
     }
     if (streq(path, "/v1/mcp/prompts") == 1) {
         if (method == 0) { api_mcp_prompts_list(fd); return 0; }
         if (method == 1) { api_mcp_prompt_register(fd, http_parse_body(buf, buf_len)); return 0; }
+        http_method_not_allowed(fd);
+        return 0;
     }
 
     # POST /v1/mcp/call
     if (streq(path, "/v1/mcp/call") == 1) {
+        if (route_method(fd, method, 1) == 0) { return 0; }
         api_mcp_call(fd, http_parse_body(buf, buf_len));
         return 0;
     }
 
     # POST /v1/rag/ingest
     if (streq(path, "/v1/rag/ingest") == 1) {
+        if (route_method(fd, method, 1) == 0) { return 0; }
         api_rag_ingest(fd, http_parse_body(buf, buf_len));
         return 0;
     }
 
     # POST /v1/rag/query
     if (streq(path, "/v1/rag/query") == 1) {
+        if (route_method(fd, method, 1) == 0) { return 0; }
         api_rag_query(fd, http_parse_body(buf, buf_len));
         return 0;
     }
@@ -91,10 +122,16 @@ fn http_route(fd, method, path, buf, buf_len) {
     if (streq(path, "/v1/edge/nodes") == 1) {
         if (method == 0) { api_edge_list(fd, buf, buf_len); return 0; }
         if (method == 1) { api_edge_register(fd, http_parse_body(buf, buf_len)); return 0; }
+        http_method_not_allowed(fd);
+        return 0;
     }
 
     # GET /v1/edge/stats
-    if (streq(path, "/v1/edge/stats") == 1) { api_edge_stats(fd); return 0; }
+    if (streq(path, "/v1/edge/stats") == 1) {
+        if (route_method(fd, method, 0) == 0) { return 0; }
+        api_edge_stats(fd);
+        return 0;
+    }
 
     # /v1/edge/nodes/{id}/heartbeat
     if (memeq(path, "/v1/edge/nodes/", 15) == 1) {
@@ -103,6 +140,7 @@ fn http_route(fd, method, path, buf, buf_len) {
         var sublen = strlen(sub);
         if (sublen > 10) {
             if (memeq(sub + sublen - 10, "/heartbeat", 10) == 1) {
+                if (route_method(fd, method, 1) == 0) { return 0; }
                 var id_len = sublen - 10;
                 var id_buf = alloc(id_len + 1);
                 memcpy(id_buf, sub, id_len);
@@ -114,6 +152,12 @@ fn http_route(fd, method, path, buf, buf_len) {
         # Check for /decommission suffix (13 chars)
         if (sublen > 13) {
             if (memeq(sub + sublen - 13, "/decommission", 13) == 1) {
+                # ⛔ POST only (2.2.2). A plain GET here decommissioned the node:
+                # measured, GET .../1/decommission took status 0 -> 4. Edge ids
+                # are sequential, so a cross-origin <img src> could walk the
+                # whole fleet — a GET needs no CORS preflight and daimon has no
+                # auth. State changes must never ride a safe method.
+                if (route_method(fd, method, 1) == 0) { return 0; }
                 var dc_len = sublen - 13;
                 var dc_buf = alloc(dc_len + 1);
                 memcpy(dc_buf, sub, dc_len);
@@ -123,6 +167,7 @@ fn http_route(fd, method, path, buf, buf_len) {
             }
         }
         # Plain /v1/edge/nodes/{id}
+        if (route_method(fd, method, 0) == 0) { return 0; }
         api_edge_get(fd, sub);
         return 0;
     }
@@ -131,22 +176,30 @@ fn http_route(fd, method, path, buf, buf_len) {
     if (streq(path, "/v1/scheduler/tasks") == 1) {
         if (method == 0) { api_sched_list(fd); return 0; }
         if (method == 1) { api_sched_submit(fd, http_parse_body(buf, buf_len)); return 0; }
+        http_method_not_allowed(fd);
+        return 0;
     }
 
     # POST /v1/scheduler/nodes
     if (streq(path, "/v1/scheduler/nodes") == 1) {
+        # POST only (2.2.2). Every method used to land here, so a GET answered
+        # "400 missing body" — misleading, and it hid that nodes cannot be
+        # listed at all. A GET is now an honest 405.
+        if (route_method(fd, method, 1) == 0) { return 0; }
         api_sched_register_node(fd, http_parse_body(buf, buf_len));
         return 0;
     }
 
     # POST /v1/scheduler/schedule
     if (streq(path, "/v1/scheduler/schedule") == 1) {
+        if (route_method(fd, method, 1) == 0) { return 0; }
         api_sched_schedule(fd);
         return 0;
     }
 
     # GET /v1/scheduler/stats
     if (streq(path, "/v1/scheduler/stats") == 1) {
+        if (route_method(fd, method, 0) == 0) { return 0; }
         api_sched_stats(fd);
         return 0;
     }
@@ -157,6 +210,9 @@ fn http_route(fd, method, path, buf, buf_len) {
         var sublen = strlen(sub);
         if (sublen > 7) {
             if (memeq(sub + sublen - 7, "/cancel", 7) == 1) {
+                # ⛔ POST only (2.2.2). A plain GET cancelled the task — measured,
+                # Queued -> Cancelled. Same CSRF-by-GET class as decommission.
+                if (route_method(fd, method, 1) == 0) { return 0; }
                 var cn_len = sublen - 7;
                 var cn_buf = alloc(cn_len + 1);
                 memcpy(cn_buf, sub, cn_len);
@@ -165,12 +221,17 @@ fn http_route(fd, method, path, buf, buf_len) {
                 return 0;
             }
         }
+        if (route_method(fd, method, 0) == 0) { return 0; }
         api_sched_get_task(fd, sub);
         return 0;
     }
 
     # GET /v1/metrics
-    if (streq(path, "/v1/metrics") == 1) { api_metrics(fd); return 0; }
+    if (streq(path, "/v1/metrics") == 1) {
+        if (route_method(fd, method, 0) == 0) { return 0; }
+        api_metrics(fd);
+        return 0;
+    }
 
     http_not_found(fd);
 }

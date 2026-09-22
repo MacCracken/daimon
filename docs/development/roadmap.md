@@ -4,10 +4,10 @@
 >
 > **Severity legend**: **P0** blocking (security / correctness — must-fix before ship) · **P1** high (must-have for the current arc) · **P2** medium (schedule when capacity opens) · **P3 / Low** nice-to-have, no urgency. Upstream-blocker items quote the upstream tracker's own severity.
 
-**Where daimon stands** — `2.2.1`, on cyrius 6.6.6, nine dep pins current. Builds and runs on
-**three targets**: x86_64, aarch64 and AGNOS. **356 tests**, 5 fuzz harnesses, 21 benchmarks, all
-gates clean. Zero open issue filings. MCP surface: 13 tools. **The 2.2.x arc is mostly done** —
-`agent`, `error`, `supervisor` and `ipc` are off their mirrors; the rest of `daimon.tcyr` remains.
+**Where daimon stands** — `2.2.2`, on cyrius 6.6.6, nine dep pins current (samay 1.1.3). Builds
+and runs on **three targets**: x86_64, aarch64 and AGNOS. **368 tests**, 5 fuzz harnesses, 21
+benchmarks, all gates clean. Zero open issue filings. MCP surface: 13 tools. Every route now states
+its HTTP method, and no state change can be reached by a GET.
 
 ## The arc to 3.0.0
 
@@ -110,6 +110,13 @@ itself, and states the kernel is canonical; it mirrors an older kernel.
 request body. That is why 2.1.8 registered nein's firewall tools with the mutating half
 (`nein_allow` / `nein_deny`) **gated shut** — there is nothing to authorise against. bote's `claims`
 argument, the seam an identity would arrive through, is a reserved `0` in the 3.x ABI.
+
+⚠ **What 2.2.2 did and did not close.** Every route now enforces its method, so a state change
+can no longer be triggered by a cross-origin GET (`<img src>`, prefetch — measured, both
+`/decommission` and `/cancel` were reachable that way). That removes the *easy* CSRF path, not the
+hard one: daimon still has **no authentication**, so a page that can issue a cross-origin POST, or
+anything on the host, can still drive every mutating endpoint. Method enforcement is the floor;
+this item is the fix.
 
 nein's firewall admin tools (`nein_allow` / `nein_deny`) are registered and **gated shut** as of
 2.1.8 for exactly this reason. Three things unblock together when this lands: un-gating the firewall admin tools
