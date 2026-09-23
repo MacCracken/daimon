@@ -4,6 +4,35 @@
 
 # --- Main HTTP router ---
 
+# ⛔ 2.3.0 — agent control refuses browser-originated requests. Verified before
+# the guard: a `Content-Type: text/plain` POST carrying `Origin:
+# https://attacker.example` STARTED an agent — a browser sends that from any web
+# page without a CORS preflight — and daimon answers any Host header, so a
+# DNS-rebinding page reaches it too. The classes of CVE-2022-28108 (Selenium
+# Grid: CSRF via text/plain) and CVE-2024-28224 (Ollama: DNS rebinding).
+# daimon's own clients send no Origin. Every other route is unchanged until
+# authentication (roadmap 2.5.x). Returns 1 if it answered 403.
+fn _route_refuse_browser(fd, buf, buf_len) {
+    if (http_has_origin(buf, buf_len) == 0) { return 0; }
+    daimon_audit(SEV_WARNING, "http", "agent.control.origin",
+      "browser-originated agent control refused");
+    http_error(fd, 403, str_from("agent control does not accept browser-originated requests"));
+    return 1;
+}
+
+# The id in "<id><suffix>" — a fresh NUL-terminated copy — when `sub` ends with
+# `suffix` and the id is not empty; otherwise 0. (2.3.0: the agent actions. The
+# edge and scheduler routes below inline the same copy.)
+fn _route_id_before(sub, sublen, suffix, slen) {
+    if (sublen <= slen) { return 0; }
+    if (memeq(sub + sublen - slen, suffix, slen) != 1) { return 0; }
+    var id_len = sublen - slen;
+    var id_buf = alloc(id_len + 1);
+    memcpy(id_buf, sub, id_len);
+    store8(id_buf + id_len, 0);
+    return id_buf;
+}
+
 fn http_route(fd, method, path, buf, buf_len) {
     # GET /v1/health
     if (streq(path, "/v1/health") == 1) {
@@ -23,11 +52,47 @@ fn http_route(fd, method, path, buf, buf_len) {
         return 0;
     }
 
-    # /v1/agents/{id}
+    # /v1/agents/{id} (GET, DELETE) and /v1/agents/{id}/{start,stop,pause,resume}
+    # (POST only — a state change never rides a GET, 2.2.2). 2.3.0.
     if (memeq(path, "/v1/agents/", 11) == 1) {
-        if (strlen(path + 11) > 0) {
-            if (route_method(fd, method, 0) == 0) { return 0; }
-            api_get_agent(fd, path + 11);
+        var asub = path + 11;
+        var aslen = strlen(asub);
+        var aid = _route_id_before(asub, aslen, "/start", 6);
+        if (aid != 0) {
+            if (route_method(fd, method, 1) == 0) { return 0; }
+            if (_route_refuse_browser(fd, buf, buf_len) == 1) { return 0; }
+            api_agent_start(fd, aid);
+            return 0;
+        }
+        aid = _route_id_before(asub, aslen, "/stop", 5);
+        if (aid != 0) {
+            if (route_method(fd, method, 1) == 0) { return 0; }
+            if (_route_refuse_browser(fd, buf, buf_len) == 1) { return 0; }
+            api_agent_stop(fd, aid);
+            return 0;
+        }
+        aid = _route_id_before(asub, aslen, "/pause", 6);
+        if (aid != 0) {
+            if (route_method(fd, method, 1) == 0) { return 0; }
+            if (_route_refuse_browser(fd, buf, buf_len) == 1) { return 0; }
+            api_agent_pause(fd, aid);
+            return 0;
+        }
+        aid = _route_id_before(asub, aslen, "/resume", 7);
+        if (aid != 0) {
+            if (route_method(fd, method, 1) == 0) { return 0; }
+            if (_route_refuse_browser(fd, buf, buf_len) == 1) { return 0; }
+            api_agent_resume(fd, aid);
+            return 0;
+        }
+        if (aslen > 0) {
+            if (method == 0) { api_get_agent(fd, asub); return 0; }
+            if (method == 3) {
+                if (_route_refuse_browser(fd, buf, buf_len) == 1) { return 0; }
+                api_agent_delete(fd, asub);
+                return 0;
+            }
+            http_method_not_allowed(fd);
             return 0;
         }
     }

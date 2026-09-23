@@ -40,6 +40,49 @@ those numbers are not comparable.
 
 `tests/rag_ingest.bcyr` (real since 2.1.6): `rag_ingest_real_5k` 133.1µs, `rag_chunk_only_5k` 508ns.
 
+### 2.3.0 — the agent lifecycle
+
+Three benchmarks for the code 2.3.0 put on the API. Every agent route runs the reap sweep first,
+and the start route runs the spawn.
+
+| Benchmark | avg | min | iters |
+|---|---:|---:|---:|
+| agent_spawn_reap — fork, child setup, exec `/bin/true`, exec report, reap | 1.35 ms | 1.28 ms | 200 |
+| agent_reap_sweep_100_idle — 100 agents with no process (a load and a compare each) | 0.95 µs | 0.91 µs | 100000 |
+| agent_reap_live — per RUNNING agent: one non-blocking `waitpid` | 0.51 µs | 0.48 µs | 100000 |
+
+At the 1000-agent limit with every agent running, the sweep adds about 0.5 ms to an agent request.
+It walks the registry with `map_iter`, so it allocates nothing per request.
+
+**No regression in the 19 existing benchmarks.** The committed 2.2.3 bench binary and the 2.3.0 one
+were run back to back on the same machine, three runs each; the table gives the medians. Every
+benchmark agrees within −4.7% … +2.9%, and 16 of the 19 are faster. The absolute numbers sit a few
+percent above the 2.2.3 table above for **both** binaries, so that difference is the machine's
+state, not the code. The committed 2.2.3 binary itself read `mcp_find_tool_in_100` at 102 ns
+against its recorded 93 ns.
+
+| Benchmark | 2.2.3 | 2.3.0 | Δ |
+|---|---:|---:|---:|
+| config_default | 101ns | 100ns | −1.0% |
+| cosine_128d | 679ns | 677ns | −0.3% |
+| vector_insert_100x128d | 173.4µs | 172.8µs | −0.4% |
+| vector_search_1k_64d | 412.1µs | 396.8µs | −3.7% |
+| rag_chunk_5k_chars | 4.60µs | 4.45µs | −3.3% |
+| scheduler_100_tasks | 338.9µs | 334.5µs | −1.3% |
+| supervisor_register_1000 | 2.569ms | 2.517ms | −2.0% |
+| mcp_register_100_tools | 69.1µs | 65.8µs | −4.7% |
+| mcp_manifest_100_tools | 150.8µs | 146.5µs | −2.8% |
+| mcp_find_tool_in_100 | 102ns | 105ns | +2.9% |
+| mcp_extract_input_schema | 4.88µs | 4.69µs | −4.1% |
+| edge_register_100 | 959.4µs | 940.9µs | −1.9% |
+| edge_heartbeat_100 | 146.9µs | 145.8µs | −0.8% |
+| edge_stats_500 | 60.2µs | 58.3µs | −3.1% |
+| circuit_breaker_cycle | 4.20µs | 4.21µs | +0.2% |
+| hashmap_1000_insert_lookup | 525.1µs | 510.4µs | −2.8% |
+| json_parse | 453ns | 455ns | +0.4% |
+| secure_zero_4k | 5.91µs | 5.72µs | −3.2% |
+| trace_id_hex | 50ns | 48ns | −4.0% |
+
 ### The search fix these numbers exposed (2.2.3)
 
 Run against the real function for the first time, `vector_search_1k_64d` read **7.51 ms**, not the
@@ -163,7 +206,7 @@ Scheduler scheduling (1.5x), supervisor registration (2.5x), MCP registration (1
 |---|---|---|---|
 | error | Complete | Complete | Enum codes + HTTP status mapping |
 | config | Complete | Complete | Defaults, accessors |
-| agent | Complete | Complete | Lifecycle, /proc, pidfd signals, rlimits |
+| agent | Complete | Complete (2.3.0) | On the API since 2.3.0 (start / stop / pause / resume / delete, reaping). Its process code first ran at 2.3.0 and eight defects were fixed then (CHANGELOG) |
 | supervisor | Complete | Complete | Circuit breaker, output capture, health, quotas |
 | memory | Complete | Complete (2.2.3) | ⛔ Listed "Complete" since the port and never run: the first call of any kind killed the process until 2.2.3. No route reaches it yet; no `tags` field, so `list_by_tag` is a substring search |
 | vector_store | Complete | Complete | Cosine similarity, search, normalize |
@@ -173,8 +216,8 @@ Scheduler scheduling (1.5x), supervisor registration (2.5x), MCP registration (1
 | scheduler | Complete | Complete | NodeCapacity, scheduling, cron, preemption, stats |
 | federation | Complete | Complete | Cluster, election, scoring, placement, vector store |
 | edge | Complete | Complete | Register, heartbeat, health, decommission, stats |
-| ipc | Complete | Partial | Message bus + RPC registry tested; the Unix-socket half first ran at 2.2.3 (`agent_ipc_new` crashed, `agent_ipc_bind` made a directory at the socket path). No route wires it yet (roadmap 2.3.x) |
-| api | Complete | Complete | 24/24 endpoints |
+| ipc | Complete | Partial | Message bus + RPC registry tested; the Unix-socket half first ran at 2.2.3 (`agent_ipc_new` crashed, `agent_ipc_bind` made a directory at the socket path). No route wires it yet (the last step of roadmap 2.3.x) |
+| api | Complete | Complete | 38 method + path routes (the Rust original had no agent control; 2.3.0 added 5) |
 | logging | Complete | Complete | sakshi integration |
 | firewall | Complete | Integrated (2.1.8) | nein's MCP tools; the mutating half is gated shut until caller authentication (roadmap 2.5.x) |
 | http-forward | Complete | Complete | External MCP forwarding via sandhi_rpc_mcp_call (1.2.1) |
@@ -184,8 +227,8 @@ Scheduler scheduling (1.5x), supervisor registration (2.5x), MCP registration (1
 | | Rust | Cyrius |
 |---|---|---|
 | Unit tests | 305 | — (inline in test groups) |
-| Integration tests | 28 | 645 assertions / 16 suites, each against its real `src/` module (2.2.3) |
-| Benchmarks | 19 | 21, against the real code (2.2.3) |
+| Integration tests | 28 | 741 assertions / 16 suites, each against its real `src/` module (2.3.0) |
+| Benchmarks | 19 | 24, against the real code (2.3.0) |
 | Fuzz harnesses | 0 | 6, property-based, run in CI (2.2.3) |
-| HTTP smoke | — | tests/smoke.sh, run in CI (2.2.3) |
-| Security audit | — | 10 findings, 9 fixed, 1 gated |
+| HTTP smoke | — | tests/smoke.sh, 43 checks, run in CI (2.3.0) |
+| Security audit | — | 15 findings (2026-04-13: 10; 2026-09-22 lifecycle: 5) — see docs/audit/ |

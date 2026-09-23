@@ -193,9 +193,29 @@ fn server_banner(port, mode) {
     str_builder_add_int(sb, port);
     str_builder_add_cstr(sb, " (");
     str_builder_add_cstr(sb, mode);
+    # The bind address (2.3.0). Not on agnos: its kernel binds the single NIC
+    # and sock_bind ignores the address (lib/net.cyr), so naming one would lie.
+    #ifndef CYRIUS_TARGET_AGNOS
+    str_builder_add_cstr(sb, ", ");
+    str_builder_add(sb, config_listen_addr(_config));
+    #endif
     str_builder_add_cstr(sb, ")\n");
     var banner = str_builder_build(sb);
     print(str_data(banner), str_len(banner));
+}
+
+# The address to bind: config listen_addr (127.0.0.1 unless `serve --listen`).
+#
+# ⛔ 2.3.0 — through 2.2.3 both serve modes bound INADDR_ANY: every interface.
+# config_new set listen_addr to "127.0.0.1" and nothing read it; the Rust
+# original bound `config.listen_addr:config.port`, so the port quietly widened
+# an unauthenticated API from loopback to the network. Measured before the
+# fix: `ss -ltn` showed 0.0.0.0:<port>. main validates `--listen`, so the
+# loopback fallback below is only for a value that could not have got here.
+fn server_bind_addr() {
+    var a = sandhi_net_parse_ipv4(str_cstr(config_listen_addr(_config)));
+    if (a < 0) { return INADDR_LOOPBACK(); }
+    return a;
 }
 
 # --- Synchronous server ---
@@ -218,7 +238,7 @@ fn serve(port) {
     # after the handler returns. Returns when the loop exits (today: never).
     var opts = sandhi_server_options_new();
     sandhi_server_options_idle_ms(opts, SERVE_IDLE_MS);
-    return sandhi_server_run_opts(INADDR_ANY(), port, &handle_request, 0, opts);
+    return sandhi_server_run_opts(server_bind_addr(), port, &handle_request, 0, opts);
 }
 
 # --- Async server (sandhi epoll-cooperative accept loop) ---
@@ -257,6 +277,6 @@ fn serve_async(port) {
     # sandhi owns bind/listen/accept/recv + smuggling rejection + per-conn
     # SO_RCVTIMEO; closes each cfd after handle_request returns. Returns 1
     # on bind/listen/arena failure; otherwise loops forever.
-    return sandhi_server_run_async(INADDR_ANY(), port, &handle_request, 0, opts);
+    return sandhi_server_run_async(server_bind_addr(), port, &handle_request, 0, opts);
 }
 

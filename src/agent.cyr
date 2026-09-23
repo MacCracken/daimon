@@ -20,12 +20,33 @@ enum StopReason {
     STOP_PREEMPTED = 4;
 }
 
+# agnostik's AgentType, in its order. The type chooses the executable
+# (agent_find_executable), as it did in the Rust original. 2.3.0.
+enum AgentType {
+    AGENT_TYPE_SYSTEM = 0;
+    AGENT_TYPE_USER = 1;
+    AGENT_TYPE_SERVICE = 2;
+}
+
+# Why a lifecycle operation was refused — the Err payload of agent_start,
+# agent_spawn_with_limits, agent_pause and agent_resume. 2.3.0.
+enum AgentOpError {
+    AGENT_OP_BAD_STATE = 1;       # the agent's status does not allow it
+    AGENT_OP_NO_EXECUTABLE = 2;   # nothing is installed for the agent's type
+    AGENT_OP_NO_PROCESS = 3;      # pipe2 or fork failed
+    AGENT_OP_NO_LIMITS = 4;       # an rlimit could not be applied (VULN-010)
+    AGENT_OP_NO_EXEC = 5;         # execve failed
+    AGENT_OP_UNSUPPORTED = 6;     # this target cannot run agents yet (agnos: 2.4.x)
+    AGENT_OP_SIGNAL = 7;          # the signal could not be delivered
+}
+
 # AgentHandle: {id, name, status, created_at, started_at, pid,
-#               mem_used, cpu_time, fds_used, threads_used}
-# 10 fields x 8 bytes = 80 bytes
+#               mem_used, cpu_time, fds_used, threads_used,
+#               type, exit_code}
+# 12 fields x 8 bytes = 96 bytes (type + exit_code added at 2.3.0)
 
 fn agent_handle_new(id, name) {
-    var h = alloc(80);
+    var h = alloc(96);
     store64(h, id);                # id (integer counter)
     # ⛔ str_clone THE NAME — copy at the RETENTION boundary. 2.2.1.
     #
@@ -54,6 +75,8 @@ fn agent_handle_new(id, name) {
     store64(h + 56, 0);            # cpu_time
     store64(h + 64, 0);            # fds_used
     store64(h + 72, 0);            # threads_used
+    store64(h + 80, AGENT_TYPE_USER);   # type — agnostik's AgentConfig default
+    store64(h + 88, 0 - 1);        # exit_code: -1 until the process has exited
     return h;
 }
 
@@ -68,9 +91,36 @@ fn agent_cpu_time(h) { return load64(h + 56); }
 fn agent_fds_used(h) { return load64(h + 64); }
 fn agent_threads(h) { return load64(h + 72); }
 
+fn agent_type(h) { return load64(h + 80); }
+# The exit code of the agent's last process (128 + signal if a signal killed
+# it), or -1 if it has not exited — or exited somewhere daimon could not see.
+fn agent_exit_code(h) { return load64(h + 88); }
+
 fn agent_set_status(h, s) { store64(h + 16, s); }
 fn agent_set_pid(h, pid) { store64(h + 40, pid); }
 fn agent_set_started_at(h, t) { store64(h + 32, t); }
+fn agent_set_type(h, t) { store64(h + 80, t); }
+fn agent_set_exit_code(h, c) { store64(h + 88, c); }
+
+# agnostik's serialised name for a type.
+fn agent_type_name(t) {
+    if (t == AGENT_TYPE_SYSTEM) { return "System"; }
+    if (t == AGENT_TYPE_SERVICE) { return "Service"; }
+    return "User";
+}
+
+# A type from its name — agnostik's form ("User") or all lower case ("user").
+# Returns the type, or -1 for anything else.
+fn agent_type_parse(s) {
+    if (s == 0) { return 0 - 1; }
+    if (str_eq_cstr(s, "System") == 1) { return AGENT_TYPE_SYSTEM; }
+    if (str_eq_cstr(s, "system") == 1) { return AGENT_TYPE_SYSTEM; }
+    if (str_eq_cstr(s, "User") == 1) { return AGENT_TYPE_USER; }
+    if (str_eq_cstr(s, "user") == 1) { return AGENT_TYPE_USER; }
+    if (str_eq_cstr(s, "Service") == 1) { return AGENT_TYPE_SERVICE; }
+    if (str_eq_cstr(s, "service") == 1) { return AGENT_TYPE_SERVICE; }
+    return 0 - 1;
+}
 
 # Global agent ID counter
 var _next_agent_id = 1;
@@ -270,8 +320,7 @@ fn agent_is_alive(h) {
     return 0;
 }
 
-# Start an agent process
-# VULN-010: Spawn with resource limits
+# Spawn an agent process — VULN-010: under resource limits.
 #
 # ⚠ prlimit64, NOT setrlimit. Through 2.1.5 this read `var SYS_SETRLIMIT = 160;`
 # — the x86_64 number, declared unconditionally. On aarch64, 160 is `uname`, and
@@ -284,139 +333,394 @@ fn agent_is_alive(h) {
 # prlimit64 is the portable answer: the generic (aarch64) ABI supersedes
 # get/setrlimit with it outright — asm-generic/unistd.h says so in a comment —
 # and x86_64 has carried it since 2.6.36. One code path, one per-arch number
-# (_DAIMON_SYS_PRLIMIT64, src/main.cyr). `struct rlimit64` is {u64 cur, u64 max},
+# (_DAIMON_SYS_PRLIMIT64, src/syscalls.cyr). `struct rlimit64` is {u64 cur, u64 max},
 # the same 16-byte layout the old `struct rlimit` buffer already used, so the
 # buffers below are unchanged.
 #   prlimit64(pid, resource, new_limit, old_limit); pid 0 == calling process.
 var RLIMIT_AS = 9;    # Address space
 var RLIMIT_CPU = 0;   # CPU time in seconds
 
-fn agent_spawn_with_limits(cmd, arg1, arg2, mem_limit, cpu_limit) {
+# 2.3.0 — the first time this runs for real (a route now reaches it), so it
+# grew what a supervisor's spawn needs. `exe` is a NUL-terminated path; `argv`
+# and `envp` are NULL-terminated arrays of NUL-terminated strings (argv[0] =
+# exe; envp 0 = empty environment); mem_limit is bytes (RLIMIT_AS), cpu_limit
+# seconds (RLIMIT_CPU), 0 = leave unlimited.
+#
+# Returns Ok(pid) only once the child has EXEC'D. Anything that stops it first
+# comes back as Err(AGENT_OP_*): the child reports {reason, errno} down a
+# close-on-exec pipe, whose read returns EOF the moment execve succeeds. (The
+# Rust original got this from std's Command::spawn, which uses the same pipe.)
+# Before 2.3.0 a missing executable looked like a successful start, and only a
+# later exit status of 127 told the difference.
+fn agent_spawn_with_limits(exe, argv, envp, mem_limit, cpu_limit) {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return Err(AGENT_OP_UNSUPPORTED);
+    #else
+    # Everything the child uses is built here, BEFORE the fork, so the child runs
+    # straight-line syscalls from fork to exec.
+    var rlim_as = alloc(16);
+    store64(rlim_as, mem_limit);
+    store64(rlim_as + 8, mem_limit);
+    var rlim_cpu = alloc(16);
+    store64(rlim_cpu, cpu_limit);
+    store64(rlim_cpu + 8, cpu_limit);
+
+    var pfd: i32[2];
+    if (syscall(_DAIMON_SYS_PIPE2, &pfd, _DAIMON_O_CLOEXEC) != 0) {
+        return Err(AGENT_OP_NO_PROCESS);
+    }
+    var rfd = load32(&pfd);
+    var wfd = load32(&pfd + 4);
+
     # sys_fork() (not raw syscall(SYS_FORK)) for arch portability: x86_64
     # wraps SYS_FORK, aarch64 — which has no fork(2) — wraps clone(SIGCHLD)
     # via SYS_CLONE. Both return child-pid-in-parent / 0-in-child / -1-on-error.
-    # Unblocks the aarch64 cross-build (cyrius 6.1.39 ships the aarch64 shim).
     var pid = sys_fork();
-    if (pid < 0) { return Err(DAIMON_ERR_SUPERVISOR); }
+    if (pid < 0) {
+        sys_close(rfd);
+        sys_close(wfd);
+        return Err(AGENT_OP_NO_PROCESS);
+    }
     if (pid == 0) {
-        # Child: apply rlimits before exec.
-        # CHECKED — a limit that silently fails to apply is the whole point of
-        # the VULN-010 filing. prlimit64 returns 0 or -errno; on failure the
-        # child exits 126 rather than exec'ing UNBOUNDED. 126 is distinct from
-        # the 127 used for a failed exec, so the parent can tell "could not be
-        # confined" from "could not be started".
-        if (mem_limit > 0) {
-            var rlim = alloc(16);
-            store64(rlim, mem_limit);
-            store64(rlim + 8, mem_limit);
-            if (syscall(_DAIMON_SYS_PRLIMIT64, 0, RLIMIT_AS, rlim, 0) != 0) {
-                sys_exit(126);
-            }
-        }
-        if (cpu_limit > 0) {
-            var rlim_cpu = alloc(16);
-            store64(rlim_cpu, cpu_limit);
-            store64(rlim_cpu + 8, cpu_limit);
-            if (syscall(_DAIMON_SYS_PRLIMIT64, 0, RLIMIT_CPU, rlim_cpu, 0) != 0) {
-                sys_exit(126);
-            }
-        }
-        # exec
-        var argv_buf: i64[4];
-        store64(&argv_buf, cmd);
-        store64(&argv_buf + 8, arg1);
-        store64(&argv_buf + 16, arg2);
-        store64(&argv_buf + 24, 0);
-        sys_execve(cmd, &argv_buf, 0);
-        sys_exit(127);
+        _agent_child(exe, argv, envp, rlim_as, mem_limit, rlim_cpu, cpu_limit, rfd, wfd);
+    }
+
+    sys_close(wfd);
+    var rep: i64[1];
+    store64(&rep, 0);
+    var n = sys_read(rfd, &rep, 8);
+    while (n == 0 - 4) { n = sys_read(rfd, &rep, 8); }   # EINTR
+    sys_close(rfd);
+    if (n > 0) {
+        # The child reported and is exiting; collect it so it is not a zombie.
+        daimon_reap_within(pid, DAIMON_REAP_BUDGET_MS);
+        return Err(load32(&rep));
     }
     return Ok(pid);
+    #endif
 }
 
-fn agent_start(h, executable) {
+# Host-only: agnos has no fork/execve/dup2 (its spawn is sys_spawn_path, 2.4.x),
+# and agent_spawn_with_limits's agnos arm never reaches these.
+#ifndef CYRIUS_TARGET_AGNOS
+# The child's half, from fork to execve. It never returns: it execs, or writes
+# {reason, errno} to the report pipe and exits 126 (limits) / 127 (exec) — the
+# codes that still tell the two apart if the report is ever lost.
+fn _agent_child(exe, argv, envp, rlim_as, mem_limit, rlim_cpu, cpu_limit, rfd, wfd) {
+    sys_close(rfd);
+
+    # Descriptors. lib/net.cyr's tcp_socket and sock_accept do not set
+    # close-on-exec, so without this every agent inherited daimon's LISTENING
+    # socket and the connection of the client that asked for the start.
+    _agent_close_inherited(wfd);
+    var nul = sys_open("/dev/null", 0, 0);   # O_RDONLY: stdin, as Rust's Stdio::null()
+    if (nul > 0) {
+        sys_dup2(nul, 0);
+        sys_close(nul);
+    }
+
+    # daimon ignores SIGPIPE (src/main.cyr), and an IGNORED disposition survives
+    # execve. Reset it, as std::process::Command does (lib/syscalls.cyr says why).
+    signal_default(SIGPIPE);
+
+    # VULN-010: CHECKED. prlimit64 returns 0 or -errno, and an agent that cannot
+    # be confined is not run at all.
+    if (mem_limit > 0) {
+        var ra = syscall(_DAIMON_SYS_PRLIMIT64, 0, RLIMIT_AS, rlim_as, 0);
+        if (ra != 0) { _agent_child_fail(wfd, AGENT_OP_NO_LIMITS, 0 - ra, 126); }
+    }
+    if (cpu_limit > 0) {
+        var rc = syscall(_DAIMON_SYS_PRLIMIT64, 0, RLIMIT_CPU, rlim_cpu, 0);
+        if (rc != 0) { _agent_child_fail(wfd, AGENT_OP_NO_LIMITS, 0 - rc, 126); }
+    }
+
+    var er = sys_execve(exe, argv, envp);
+    _agent_child_fail(wfd, AGENT_OP_NO_EXEC, 0 - er, 127);
+    return 0;
+}
+
+fn _agent_child_fail(wfd, reason, err, code) {
+    var rep: i64[1];
+    store32(&rep, reason);
+    store32(&rep + 4, err);
+    sys_write(wfd, &rep, 8);
+    sys_exit(code);
+    return 0;
+}
+
+# Close every descriptor from 3 up, except `keep` (the report pipe, which
+# close-on-exec closes at execve). close_range is Linux 5.9+; before that, one
+# close per descriptor below the soft RLIMIT_NOFILE, which no descriptor can
+# reach (bounded by 2^20, the kernel's default fs.nr_open, if the limit reads
+# as unlimited).
+fn _agent_close_inherited(keep) {
+    var ok = 1;
+    if (keep > 3) {
+        if (syscall(_DAIMON_SYS_CLOSE_RANGE, 3, keep - 1, 0) != 0) { ok = 0; }
+    }
+    if (ok == 1) {
+        if (syscall(_DAIMON_SYS_CLOSE_RANGE, keep + 1, 0xFFFFFFFF, 0) != 0) { ok = 0; }
+    }
+    if (ok == 1) { return 0; }
+    var lim: i64[2];
+    var top = 1024;
+    if (syscall(_DAIMON_SYS_PRLIMIT64, 0, _DAIMON_RLIMIT_NOFILE, 0, &lim) == 0) {
+        top = load64(&lim);
+    }
+    if (top <= 0) { top = 1048576; }
+    if (top > 1048576) { top = 1048576; }
+    var f = 3;
+    while (f < top) {
+        if (f != keep) { sys_close(f); }
+        f = f + 1;
+    }
+    return 0;
+}
+#endif
+
+# daimon's environment as an envp for execve. Agents inherit it, as they did in
+# the Rust original (tokio's Command passes the parent's environment). Read
+# once — /proc/self/environ is fixed at exec — and to EOF, however large. If it
+# cannot be read the agent gets an EMPTY environment rather than no start.
+var _agent_envp = 0;
+
+fn agent_environ() {
+    if (_agent_envp != 0) { return _agent_envp; }
+    var cap = 16384;
+    var blob = alloc(cap);
+    var n = 0;
+    var fd = sys_open("/proc/self/environ", 0, 0);
+    if (fd >= 0) {
+        var more = 1;
+        while (more == 1) {
+            if (n == cap) {
+                var bigger = alloc(cap * 2);
+                memcpy(bigger, blob, n);
+                blob = bigger;
+                cap = cap * 2;
+            }
+            var got = sys_read(fd, blob + n, cap - n);
+            if (got <= 0) { more = 0; }
+            else { n = n + got; }
+        }
+        sys_close(fd);
+    }
+    # Entries are NUL-terminated, one after another.
+    var count = 0;
+    var i = 0;
+    while (i < n) {
+        if (load8(blob + i) == 0) { count = count + 1; }
+        i = i + 1;
+    }
+    var envp = alloc((count + 1) * 8);
+    var ei = 0;
+    var start = 0;
+    i = 0;
+    while (i < n) {
+        if (load8(blob + i) == 0) {
+            store64(envp + ei * 8, blob + start);
+            ei = ei + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    store64(envp + ei * 8, 0);
+    _agent_envp = envp;
+    return envp;
+}
+
+# --- Where agent executables live ---
+#
+# The Rust original ran `agnos-agent-<type>-agent` from the first of
+# /usr/lib/agnos/agents, /opt/agnos/agents and ./agents that had one, else
+# /usr/bin/agnos-agent-runner. daimon keeps the two absolute directories and the
+# fallback, and DROPS ./agents: a working-directory-relative search lets whoever
+# controls daimon's cwd choose what it executes, and cwd is not something daimon
+# controls (the 2.1.7 VERSION bug).
+#
+# ⛔ The executable is NEVER taken from a request. A request picks a TYPE, one
+# of three constants; the path is built from daimon's own strings. Anything else
+# on an unauthenticated API is remote code execution.
+#
+# `serve --agents-dir <dir>` (the operator's choice) replaces the whole search:
+# the type's executable is looked for in <dir> alone, and the generic runner is
+# <dir>/agnos-agent-runner.
+var _agents_dir = 0;    # cstr, or 0 for the defaults
+
+fn agent_set_agents_dir(dir) { _agents_dir = dir; }
+
+fn _agent_type_slug(t) {
+    if (t == AGENT_TYPE_SYSTEM) { return "system"; }
+    if (t == AGENT_TYPE_SERVICE) { return "service"; }
+    return "user";
+}
+
+# <dir>/<file> if it exists and is executable, else 0.
+fn _agent_exe_in(dir, file) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, dir);
+    str_builder_add_cstr(sb, "/");
+    str_builder_add_cstr(sb, file);
+    var p = str_data(str_builder_build(sb));   # builder output is NUL-terminated
+    if (sys_access(p, 1) == 0) { return p; }   # X_OK
+    return 0;
+}
+
+# The executable for an agent type (a NUL-terminated path), or 0 if none is
+# installed.
+fn agent_find_executable(t) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "agnos-agent-");
+    str_builder_add_cstr(sb, _agent_type_slug(t));
+    str_builder_add_cstr(sb, "-agent");
+    var file = str_data(str_builder_build(sb));
+    if (_agents_dir != 0) {
+        var own = _agent_exe_in(_agents_dir, file);
+        if (own != 0) { return own; }
+        return _agent_exe_in(_agents_dir, "agnos-agent-runner");
+    }
+    var p = _agent_exe_in("/usr/lib/agnos/agents", file);
+    if (p != 0) { return p; }
+    p = _agent_exe_in("/opt/agnos/agents", file);
+    if (p != 0) { return p; }
+    if (sys_access("/usr/bin/agnos-agent-runner", 1) == 0) { return "/usr/bin/agnos-agent-runner"; }
+    return 0;
+}
+
+# Start an agent's process: the executable for its type, run as
+#     <exe> --agent-id <id> --agent-name <name>
+# (the Rust original's argv), under the given limits (see
+# agent_spawn_with_limits). Startable from PENDING, STOPPED and FAILED — a
+# FAILED agent's process is already gone (agent_reap cleared its pid), so there
+# is nothing to stop first. (The Rust original refused FAILED and restarted
+# through stop; daimon's API has no restart, and stop-then-start for a process
+# that no longer exists would be ceremony.) Returns Ok(pid) or Err(AGENT_OP_*).
+fn agent_start(h, mem_limit, cpu_secs) {
     var status = agent_status(h);
     if (status != AGENT_PENDING) {
         if (status != AGENT_STOPPED) {
-            return Err(DAIMON_ERR_SUPERVISOR);
+            if (status != AGENT_FAILED) { return Err(AGENT_OP_BAD_STATE); }
         }
     }
+    #ifdef CYRIUS_TARGET_AGNOS
+    return Err(AGENT_OP_UNSUPPORTED);
+    #else
+    var exe = agent_find_executable(agent_type(h));
+    if (exe == 0) { return Err(AGENT_OP_NO_EXECUTABLE); }
+
+    var id_sb = str_builder_new();
+    str_builder_add_int(id_sb, agent_id(h));
+    var id_str = str_builder_build(id_sb);
+    var argv = alloc(48);
+    store64(argv, exe);
+    store64(argv + 8, "--agent-id");
+    store64(argv + 16, str_data(id_str));        # builder output: NUL-terminated
+    store64(argv + 24, "--agent-name");
+    store64(argv + 32, str_cstr(agent_name(h))); # execve reads to a NUL — make sure there is one
+    store64(argv + 40, 0);
+
     agent_set_status(h, AGENT_STARTING);
-
-    var name = agent_name(h);
-    var id = agent_id(h);
-
-    var id_str_sb = str_builder_new();
-    str_builder_add_int(id_str_sb, id);
-    var id_str = str_builder_build(id_str_sb);
-
     sakshi_info("starting agent", 14);
-
-    # str_cstr, not str_data, for `executable`: execve reads a NUL-terminated
-    # path, and a Str's data is only terminated when something made it so. Once
-    # 2.3.x wires this to a route, `executable` is a jget VIEW into the request
-    # buffer, and execve would read on past the value into the rest of the JSON.
-    # (id_str is builder-built and `name` is owned since 2.2.1 — both terminated.)
-    var pid_t, pid_v = spawn(str_cstr(executable), str_data(id_str), str_data(name));
-    if (is_err_result(pid_t) == 1) {
+    var r_t, r_v = agent_spawn_with_limits(exe, argv, agent_environ(), mem_limit, cpu_secs);
+    if (is_err_result(r_t) == 1) {
         agent_set_status(h, AGENT_FAILED);
-        return Err(DAIMON_ERR_SUPERVISOR);
+        daimon_audit_agent(SEV_WARNING, "agent", "agent.spawn.fail", "agent process failed to start",
+          str_data(agent_name(h)));
+        return Err(r_v);
     }
-    var pid = pid_v;
-    agent_set_pid(h, pid);
+    agent_set_pid(h, r_v);
+    agent_set_exit_code(h, 0 - 1);
     agent_set_started_at(h, clock_epoch_secs());
     agent_set_status(h, AGENT_RUNNING);
-    daimon_audit_agent(SEV_INFO, "agent", "agent.spawn", "agent process started", str_data(name));
-    return Ok(pid);
+    daimon_audit_agent(SEV_INFO, "agent", "agent.spawn", "agent process started", str_data(agent_name(h)));
+    return Ok(r_v);
+    #endif
 }
 
-# VULN-004: Race-free signal delivery via pidfd (Linux 5.3+), fallback to kill()
-fn agent_send_signal(pid, sig) {
-    if (pid <= 0) { return 0; }
-    # Try pidfd_open + pidfd_send_signal for race-free delivery
-    var pidfd = sys_pidfd_open(pid, 0);
-    if (pidfd >= 0) {
-        syscall(_DAIMON_SYS_PIDFD_SEND_SIGNAL, pidfd, sig, 0, 0);
-        sys_close(pidfd);
-        return 1;
-    }
-    # Fallback: plain kill (susceptible to PID reuse race)
-    sys_kill(pid, sig);
-    return 1;
-}
+# How long a stopping agent gets between SIGTERM and SIGKILL. The Rust original
+# gave 10 s, but it stopped agents on an async runtime; daimon's server answers
+# one request at a time, so a stop holds every other request for as long as
+# this runs. 5 s is SERVE_IDLE_MS, the hold daimon already accepts from one
+# slow connection (src/server.cyr). A variable, so tests can shorten it.
+var AGENT_STOP_GRACE_MS = 5000;
 
-# Stop an agent (SIGTERM then SIGKILL)
+# Stop an agent: SIGTERM, up to AGENT_STOP_GRACE_MS for it to exit, then
+# SIGKILL. Always Ok — stopping is idempotent, and it is how a FAILED agent is
+# returned to STOPPED.
+#
+# ⛔ Through 2.2.3 this checked ONCE, immediately after SIGTERM, with a
+# non-blocking wait, and sent SIGKILL if the agent had not exited in those few
+# instructions — so in practice every agent was SIGKILLed and none got to shut
+# down. (Never executed until 2.3.0: nothing called it.)
 fn agent_stop(h, reason) {
-    agent_set_status(h, AGENT_STOPPING);
     var pid = agent_pid(h);
     if (pid > 0) {
-        agent_send_signal(pid, 15);  # SIGTERM
-        # daimon_reap / daimon_reap_wait, not sys_waitpid: the two kernels
-        # disagree on both arity AND meaning. Linux answers pid/0/-ECHILD to a
-        # WNOHANG wait; agnos's #4 is already a poll and answers
-        # exit_code/-2/-1. The shims normalise both to 1/0/-1. (src/syscalls.cyr)
-        if (daimon_reap(pid) == 0) {
-            agent_send_signal(pid, 9);  # SIGKILL
-            daimon_reap_wait(pid);
+        var paused = 0;
+        if (agent_status(h) == AGENT_PAUSED) { paused = 1; }
+        agent_set_status(h, AGENT_STOPPING);
+        daimon_signal(pid, SIGTERM);
+        # A SIGSTOPped process cannot act on SIGTERM until it runs again.
+        if (paused == 1) { daimon_signal(pid, 18); }   # SIGCONT
+        var code = daimon_reap_within(pid, AGENT_STOP_GRACE_MS);
+        if (code == 0 - 2) {
+            daimon_signal(pid, SIGKILL);
+            code = daimon_reap_within(pid, DAIMON_REAP_BUDGET_MS);
         }
+        if (code == 0 - 2) {
+            # Outlived SIGKILL's budget (uninterruptible sleep). It is still
+            # daimon's unreaped child, so KEEP the pid: agent_reap collects it
+            # later, and STOPPING says exactly where it is.
+            daimon_audit_agent(SEV_WARNING, "agent", "agent.stop.pending",
+              "agent did not exit after SIGKILL; still stopping", str_data(agent_name(h)));
+            return Ok(0);
+        }
+        # Reaped (or not daimon's to reap): the pid may now belong to another
+        # process, so it is cleared in the same step — never signalled again.
+        agent_set_pid(h, 0);
+        agent_set_exit_code(h, code);
     }
     agent_set_status(h, AGENT_STOPPED);
     daimon_audit_agent(SEV_INFO, "agent", "agent.stop", "agent stopped", str_data(agent_name(h)));
     return Ok(0);
 }
 
-# Pause (SIGSTOP)
+# Pause (SIGSTOP) a RUNNING agent.
 fn agent_pause(h) {
-    if (agent_status(h) != AGENT_RUNNING) { return Err(DAIMON_ERR_SUPERVISOR); }
-    agent_send_signal(agent_pid(h), 19);  # SIGSTOP
+    if (agent_status(h) != AGENT_RUNNING) { return Err(AGENT_OP_BAD_STATE); }
+    if (daimon_signal(agent_pid(h), 19) != 0) { return Err(AGENT_OP_SIGNAL); }   # SIGSTOP
     agent_set_status(h, AGENT_PAUSED);
     return Ok(0);
 }
 
-# Resume (SIGCONT)
+# Resume (SIGCONT) a PAUSED agent.
 fn agent_resume(h) {
-    if (agent_status(h) != AGENT_PAUSED) { return Err(DAIMON_ERR_SUPERVISOR); }
-    agent_send_signal(agent_pid(h), 18);  # SIGCONT
+    if (agent_status(h) != AGENT_PAUSED) { return Err(AGENT_OP_BAD_STATE); }
+    if (daimon_signal(agent_pid(h), 18) != 0) { return Err(AGENT_OP_SIGNAL); }   # SIGCONT
     agent_set_status(h, AGENT_RUNNING);
     return Ok(0);
 }
 
+# Collect an agent whose process exited ON ITS OWN (agent_stop reaps its own).
+# Non-blocking; returns 1 if it reaped. An exit code of 0 leaves the agent
+# STOPPED, anything else FAILED; an agent that was STOPPING is STOPPED either way.
+# Without this a dead agent stayed RUNNING with its old pid — which the kernel
+# may hand to another process — and its process stayed a zombie. 2.3.0.
+fn agent_reap(h) {
+    var pid = agent_pid(h);
+    if (pid <= 0) { return 0; }
+    var code = daimon_reap_code(pid);
+    if (code == 0 - 2) { return 0; }   # still running
+    agent_set_pid(h, 0);
+    agent_set_exit_code(h, code);      # -1: there was no such child to reap
+    var was = agent_status(h);
+    if (was == AGENT_STOPPING) { agent_set_status(h, AGENT_STOPPED); }
+    elif (code == 0) { agent_set_status(h, AGENT_STOPPED); }
+    else { agent_set_status(h, AGENT_FAILED); }
+    if (code == 0) {
+        daimon_audit_agent(SEV_INFO, "agent", "agent.exit", "agent process exited", str_data(agent_name(h)));
+    } else {
+        daimon_audit_agent(SEV_WARNING, "agent", "agent.exit", "agent process exited abnormally",
+          str_data(agent_name(h)));
+    }
+    return 1;
+}

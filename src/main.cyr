@@ -96,6 +96,30 @@ fn main() {
                 var arg = argv(argi);
                 if (streq(arg, "--async") == 1) { use_async = 1; }
                 elif (streq(arg, "--trace") == 1) { trace_set_enabled(1); }
+                elif (streq(arg, "--agents-dir") == 1) {
+                    # 2.3.0: the operator's agent-executable directory
+                    # (agent_find_executable, src/agent.cyr).
+                    argi = argi + 1;
+                    if (argi >= argc()) {
+                        println("serve: --agents-dir needs a directory");
+                        return 1;
+                    }
+                    agent_set_agents_dir(argv(argi));
+                }
+                elif (streq(arg, "--listen") == 1) {
+                    # 2.3.0: the bind address (default 127.0.0.1, config.cyr).
+                    # An IPv4 literal; 0.0.0.0 opens every interface.
+                    argi = argi + 1;
+                    if (argi >= argc()) {
+                        println("serve: --listen needs an IPv4 address");
+                        return 1;
+                    }
+                    if (sandhi_net_parse_ipv4(argv(argi)) < 0) {
+                        println("serve: --listen takes an IPv4 address such as 127.0.0.1 or 0.0.0.0");
+                        return 1;
+                    }
+                    config_set_listen_addr(_config, str_from(argv(argi)));
+                }
                 else {
                     # Parse as port number
                     port = 0;
@@ -119,7 +143,8 @@ fn main() {
             println("Usage: daimon <command> [options]");
             println("");
             println("Commands:");
-            println("  serve [port] [--async]  Start HTTP API server (default: 8090)");
+            println("  serve [port] [--async] [--trace] [--agents-dir DIR] [--listen ADDR]");
+            println("                          Start HTTP API server (default: 127.0.0.1:8090)");
             println("  version                 Print version");
             println("  help                    Show this help");
             return 0;

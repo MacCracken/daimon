@@ -12,16 +12,17 @@ Requires [Cyrius](https://github.com/MacCracken/cyrius) 6.6.6+ (pinned in `cyriu
 cyrius lib sync                        # vendor stdlib subset from the pin (lib/ is gitignored)
 cyrius deps                            # resolve git deps (sakshi, bote, libro, majra) into lib/
 cyrius build src/main.cyr build/daimon # build
-./build/daimon serve                   # start server on port 8090
+./build/daimon serve                   # start server on 127.0.0.1:8090 (--listen ADDR to change)
 ```
 
 ## Testing
 
 ```bash
-cyrius tests                        # every suite in tests/ — 645 assertions, 16 files
+cyrius tests                        # every suite in tests/ — 741 assertions, 16 files
 cyrius fuzz                         # 6 property-based harnesses, ~160,000 generated cases
-cyrius bench tests/daimon.bcyr      # 19 benchmarks (+2 in tests/rag_ingest.bcyr)
-sh tests/smoke.sh                   # the linked binary over HTTP: libro, tracing, regressions
+cyrius bench tests/daimon.bcyr      # 22 benchmarks (+2 in tests/rag_ingest.bcyr)
+sh tests/smoke.sh                   # the linked binary over HTTP: libro, tracing, regressions,
+                                    # the agent lifecycle, the bind address
 sh tests/test.sh                    # all of the above except the benchmarks
 ```
 

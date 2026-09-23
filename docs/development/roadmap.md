@@ -4,12 +4,13 @@
 >
 > **Severity legend**: **P0** blocking (security / correctness — must-fix before ship) · **P1** high (must-have for the current arc) · **P2** medium (schedule when capacity opens) · **P3 / Low** nice-to-have, no urgency. Upstream-blocker items quote the upstream tracker's own severity.
 
-**Where daimon stands** — `2.2.3`, cyrius 6.6.6, nine dep pins current (samay
-1.1.3). Builds and runs on **three targets**: x86_64, aarch64 and AGNOS (the agnos build boots on AGNOS
-1.57.5 and listens). **645 tests** in 16 suites, **every one against its real `src/` module** — the
-2.2.x test-integrity arc is complete, and so are the benchmarks (21) and fuzz harnesses (6,
-property-based, run by CI). Zero open issue filings. MCP surface: 13 tools, and an external
-registration can no longer take a builtin's name.
+**Where daimon stands** — `2.3.0`, cyrius 6.6.6, nine dep pins current (samay
+1.1.3). Builds on **three targets**: x86_64, aarch64 and AGNOS. **Agents can be started, stopped,
+paused, resumed and deleted through the API** (2.3.0), under their rlimits, with exit status
+reported. On AGNOS a start answers 501 until 2.4.x. **741 tests** in 16 suites, every one against
+its real `src/` module, plus 43 HTTP smoke checks, 24 benchmarks and 6 fuzz harnesses, all run by
+CI. The API binds 127.0.0.1 unless told otherwise (`--listen`), and agent control refuses
+browser-originated requests. Zero open issue filings.
 
 ## The arc to 3.0.0
 
@@ -18,7 +19,7 @@ prerequisites, sequenced. Each line is a release train, not a single release.
 
 | arc | theme | why it must come after the one above |
 |---|---|---|
-| **2.3.x** | **Agent lifecycle** — start / stop / signal / reap through the API | The product gap, and next. Its prerequisite — every suite testing the real code, not a copy — is in place, so the `fork`/`execve`/signal paths get wired under tests that can see them. |
+| **2.3.x** | **Agent lifecycle** — start / stop / signal / reap through the API | The product gap. **2.3.0 shipped the process half** (start, stop, pause, resume, delete, reaping); task start/complete and IPC remain. |
 | **2.4.x** | **AGNOS spawn + IPC** — `sys_spawn_path`, `chan_op` capability channels, `sys_proclist` | Nothing to map until a route actually spawns. Unblocks the moment 2.3.x lands. |
 | **2.5.x** | **Agent identity + MCP authentication** | Prerequisite for un-gating nein's mutating firewall tools, and for any `claims`-based authorisation. Needs 2.3.x, because identity is per-agent. |
 | **3.0.0** | **Per-agent arena isolation** — VULN-007's open half; unlocks multi-tenant hosting, kavach sandboxing, untrusted federation, external MCP callbacks | Major because it changes the allocation model under every agent and flips the gates the P0 below guards. Needs identity (2.5.x) to know what a tenant *is*. |
@@ -31,48 +32,55 @@ cut re-evaluates the P0 below.
 
 ## 2.3.x · P1 — Wire the agent lifecycle to the API
 
-**daimon is the AGNOS agent orchestrator and it cannot start, stop or signal an agent.** The
-process-lifecycle code exists and looks correct, but nothing calls it:
+**2.3.0 did the process half** (CHANGELOG 2.3.0,
+[docs/audit/2026-09-22-agent-lifecycle-audit.md](../audit/2026-09-22-agent-lifecycle-audit.md)):
+- `POST /v1/agents/{id}/start|stop|pause|resume` and `DELETE /v1/agents/{id}`;
+- agents chosen by type, never by request;
+- the child's descriptors, stdin, SIGPIPE and rlimits set up;
+- a grace-period stop;
+- reaping with exit status;
+- `max_agents` enforced;
+- the API bound to 127.0.0.1;
+- agent control closed to browsers.
 
-```
-agent_spawn_with_limits   0 callers      agent_ipc_bind    0 callers
-agent_start               0 callers      ipc_send          0 callers
-agent_pause / agent_resume 0 callers     msg_bus_publish   0 callers
-agent_stop                0 callers
-```
+**Next — task start and complete.** samay places tasks on nodes, but nothing moves one from
+SCHEDULED to RUNNING, so through the API every task stops at SCHEDULED. samay already has what the
+routes need:
+- `scheduled_task_transition(task, TASK_RUNNING)` accepts SCHEDULED → RUNNING;
+- `task_scheduler_complete_task(s, id, final_status)` finishes a RUNNING task and returns its node
+  reservation.
 
-`src/router.cyr` exposes exactly three agent routes — `GET /v1/agents`, `POST /v1/agents`,
-`GET /v1/agents/{id}` — and `api_register_agent` calls `agent_handle_new`, which allocates a record.
-No route starts a process; there is no start / stop / pause / resume / delete endpoint at all.
+daimon calls neither. Whatever executes an agent on a node is what should report a task running and
+done.
 
-This is the product gap, not a cleanup, and it is why several items below are dormant: the AGNOS
-spawn/IPC mapping, the VULN-010 rlimit question, and most of the supervisor's value all sit behind
-it.
-
-The test-integrity prerequisite is done: `src/agent.cyr`, `supervisor` and `ipc` are tested against
-their real source, and the process paths have run under test (spawn, `/proc` readers, a real IPC
-socket round trip). Every Str a retaining struct keeps is now owned where it is retained (2.2.3
-closed the last latent cases), so a route can hand these functions request-buffer views safely.
-
-**The same gap, one level down: a scheduled task never starts.** samay places tasks on nodes, but
-nothing moves a task from SCHEDULED to RUNNING — there is no start or complete route — so through
-the API every task stops at SCHEDULED, and `complete_task` is unreachable. Whatever executes an agent
-on a node is what should report a task running and done; wire both in this arc.
-
-**The IPC step, when it comes** — found when the socket code first ran (2.2.3), deliberately left for
-the step that wires it:
+**Then — IPC.** `agent_ipc_bind`, `agent_ipc_send` and `msg_bus_publish` still have no caller.
+Three defects were found when the socket code first ran (2.2.3) and deliberately left for this step:
 - the SO_PEERCRED check (VULN-006) **fails open**: if `getsockopt` fails, the peer is not checked;
 - a message cut short by its sender is queued and ACKed as if whole;
 - `agent_ipc_accept_one` reads with no timeout, so one silent peer holds the accept loop.
 
-**Sequence**: wire start/stop → signals and reaping → task start/complete → IPC. One bite each,
-suite green at every step.
+**Lifecycle follow-ups, recorded by the 2.3.0 audit:**
+- **A stop holds the server** (VULN-014, P2): up to ~6 s, in both serve modes. Measured: a request
+  sent during a 5 s stop waited 4.8 s. A non-blocking stop (202, then SIGKILL from a supervisor
+  tick) needs a periodic hook the sync loop lacks.
+- **An agent's own children are not signalled.** A stop signals the agent's process, not a process
+  group.
+- **Agents outlive a daimon crash**: there is no parent-death signal, and the registry is in memory.
+  Decide whether a restarted daimon adopts, kills or ignores them.
+- **stdout and stderr are inherited, not captured.** The supervisor's `OutputCapture` is not wired.
+- **The environment is inherited** (VULN-015, Rust parity). An allowlist per agent type would keep
+  daimon's secrets out of agents.
+- **aarch64 RLIMIT_AS is unverified on hardware.** qemu-aarch64 does not apply it: QEMU's user-mode
+  `prlimit64` passes RLIMIT_AS / DATA / STACK through as a no-op.
+
+**Sequence**: task start/complete → IPC. One bite each, suite green at every step.
 
 ## 2.4.x · P2 — AGNOS spawn + IPC mapping
 
-Blocked on the agent-lifecycle item: the surface that needs mapping is the surface nothing calls.
-daimon already builds and boots on AGNOS with the same functional surface as the host build. This
-unblocks the moment a route spawns a process.
+**Unblocked by 2.3.0**: a route now spawns a process. On AGNOS, `POST /v1/agents/{id}/start`
+answers 501, because `agent_spawn_with_limits`, `daimon_signal` and `daimon_reap_code` have AGNOS
+arms that refuse. Those arms are the mapping targets: spawn, signal and reap. `daimon_reap_code`'s arm
+already passes agnos's #4 through.
 
 Reference for when it does — every row read from `agnos/kernel/core/syscall.cyr`:
 
@@ -94,12 +102,20 @@ request body. That is why 2.1.8 registered nein's firewall tools with the mutati
 (`nein_allow` / `nein_deny`) **gated shut** — there is nothing to authorise against. bote's `claims`
 argument, the seam an identity would arrive through, is a reserved `0` in the 3.x ABI.
 
-⚠ **What 2.2.2 did and did not close.** Every route now enforces its method, so a state change
-can no longer be triggered by a cross-origin GET (`<img src>`, prefetch — measured, both
-`/decommission` and `/cancel` were reachable that way). That removes the *easy* CSRF path, not the
-hard one: daimon still has **no authentication**, so a page that can issue a cross-origin POST, or
-anything on the host, can still drive every mutating endpoint. Method enforcement is the floor;
-this item is the fix.
+⚠ **What 2.2.2 and 2.3.0 did and did not close.**
+- 2.2.2: every route enforces its method, so a state change can no longer be triggered by a
+  cross-origin GET (`<img src>`, prefetch — measured, both `/decommission` and `/cancel` were
+  reachable that way).
+- 2.3.0: the API binds 127.0.0.1 by default (VULN-011), and the agent-control routes answer 403 to
+  any request carrying `Origin` (VULN-012).
+
+**Still open** — a cross-origin `text/plain` POST, which needs no preflight, still drives:
+- MCP tool registration, RAG ingest, edge decommission, and scheduler submit and cancel;
+- and, with no `Host` allowlist, a DNS-rebinding page can read every GET response.
+
+Anything on the host can still do everything. Each of those layers is a floor; this item is the
+fix. **Cheaper steps before it:** a `Host` allowlist (loopback names plus a configured list) and the
+Origin guard on every mutating route. Both would break a browser-based consumer, if one exists.
 
 nein's firewall admin tools (`nein_allow` / `nein_deny`) are registered and **gated shut** as of
 2.1.8 for exactly this reason. Three things unblock together when this lands: un-gating the firewall admin tools

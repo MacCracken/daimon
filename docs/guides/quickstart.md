@@ -17,7 +17,7 @@ cyrius build src/main.cyr build/daimon
 ## Run
 
 ```bash
-# Start on default port 8090
+# Start on the default 127.0.0.1:8090 (--listen 0.0.0.0 to accept other hosts)
 ./build/daimon serve
 
 # Start on custom port
@@ -37,9 +37,24 @@ curl http://localhost:8090/v1/health
 ## Register an Agent
 
 ```bash
-curl -X POST http://localhost:8090/v1/agents -d '{"name":"my-first-agent"}'
-# → {"id":1,"name":"my-first-agent","status":0}
+curl -X POST http://localhost:8090/v1/agents -d '{"name":"my-first-agent","type":"User"}'
+# → {"id":1,"name":"my-first-agent","type":"User","status":0}
 ```
+
+## Start and Stop It
+
+daimon runs the executable installed for the agent's type, `agnos-agent-user-agent` here. It looks
+in `/usr/lib/agnos/agents`, then `/opt/agnos/agents`, and falls back to
+`/usr/bin/agnos-agent-runner`. Start the server with `--agents-dir DIR` to use your own directory.
+
+```bash
+curl -X POST http://localhost:8090/v1/agents/1/start
+# → {"id":1,"name":"my-first-agent","type":"User","status":2,"pid":4242,"exit_code":null}
+curl -X POST http://localhost:8090/v1/agents/1/stop     # SIGTERM, up to 5 s, then SIGKILL
+# → {"id":1,"name":"my-first-agent","type":"User","status":5,"pid":0,"exit_code":0}
+```
+
+See the [API guide](api.md#agents) for pause, resume, delete and the status codes.
 
 ## Run Tests
 
@@ -59,8 +74,8 @@ cyrius bench tests/daimon.bcyr
 
 ```
 src/                  Source (30 modules, entry src/main.cyr)
-tests/*.tcyr          Test suites, one per module (645 assertions, 16 files)
-tests/daimon.bcyr     Benchmarks (19; tests/rag_ingest.bcyr has 2 more)
+tests/*.tcyr          Test suites, one per module (741 assertions, 16 files)
+tests/daimon.bcyr     Benchmarks (22; tests/rag_ingest.bcyr has 2 more)
 tests/smoke.sh        HTTP smoke checks against the built binary
 fuzz/                 Property-based fuzz harnesses (6), sharing fuzz/rng.cyr
 build/daimon          Binary (181 KB)

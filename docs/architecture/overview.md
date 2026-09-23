@@ -17,11 +17,13 @@ main.cyr   Preamble (syscall constants) + module includes + the `main` serve loo
 ├── error.cyr        Error codes (enum) + HTTP status mapping
 ├── config.cyr         Service configuration (listen_addr, port, data_dir, max_agents)
 │
-├── agent.cyr          Agent lifecycle
-│   ├── AgentHandle        Snapshot: id, name, status, pid, resources
-│   ├── agent_start/stop/pause/resume   Process management (fork/exec, pidfd signals)
+├── agent.cyr          Agent lifecycle (on the API since 2.3.0)
+│   ├── AgentHandle        Snapshot: id, name, type, status, pid, exit_code, resources
+│   ├── agent_start/stop/pause/resume/reap   Process management (grace-period stop, reaping)
+│   ├── agent_find_executable   type → agnos-agent-<type>-agent (never from a request)
 │   ├── read_vm_rss/cpu_time/fds/threads   /proc resource monitoring
-│   └── agent_spawn_with_limits   RLIMIT_AS + RLIMIT_CPU enforcement
+│   └── agent_spawn_with_limits   fork/exec: closed descriptors, /dev/null stdin, SIGPIPE reset,
+│                                 RLIMIT_AS + RLIMIT_CPU, exec failure reported synchronously
 │
 ├── supervisor.cyr     Health monitoring
 │   ├── CircuitBreaker     Closed → Open → HalfOpen state machine
@@ -98,15 +100,16 @@ main.cyr   Preamble (syscall constants) + module includes + the `main` serve loo
 ├── api_mcp.cyr      MCP tool registry + dispatch endpoints
 ├── api_rag.cyr      RAG ingest/query endpoints
 ├── api_edge.cyr     Edge fleet endpoints
-├── api_sched.cyr    Scheduler endpoints  (24 endpoints total across api_*)
-├── router.cyr       http_route — HTTP method/path dispatch
+├── api_sched.cyr    Scheduler endpoints  (38 method + path routes in src/router.cyr)
+├── router.cyr       http_route — HTTP method/path dispatch; agent control refuses Origin (403)
 ├── server.cyr       Server lifecycle
 │   ├── rate_check         Per-IP 120 req/min sliding window
+│   ├── server_bind_addr   config listen_addr (127.0.0.1 unless serve --listen)
 │   └── serve / serve_async   sync + async (sandhi epoll) accept loops
 │
 └── main.cyr        Entry point
     ├── serve(port)        dispatches to server.cyr
-    └── CLI                serve, version, help
+    └── CLI                serve [port] [--async] [--trace] [--agents-dir DIR] [--listen ADDR], version, help
 ```
 
 ## Data Flow

@@ -55,6 +55,16 @@ fn http_has_transfer_encoding(buf, len) {
     return 1;
 }
 
+# 2.3.0: 1 if the request carries an Origin header (any value, including an
+# empty one or "null"). Browsers attach Origin to every cross-origin request —
+# the text/plain POST that needs no CORS preflight among them — and a page on
+# a DNS-rebinding name sends its own. daimon's clients (agents, CLIs, curl)
+# send none. sandhi matches the whole header name, case-insensitively.
+fn http_has_origin(buf, len) {
+    if (sandhi_server_find_header(buf, len, "Origin") == 0) { return 0; }
+    return 1;
+}
+
 # Query param value, or 0 if absent. URL-decoded by sandhi.
 fn http_parse_query_param(buf, len, param_name) {
     return sandhi_server_get_param(sandhi_server_get_path(buf, len), param_name);
@@ -76,12 +86,13 @@ fn http_parse_body(buf, len) {
 # Status-code → reason-phrase. Centralized so http_send_response
 # (sandhi-backed shim) can hand the right RFC 7231 phrase to
 # sandhi_server_send_response. Codes daimon emits today: 200, 201,
-# 204, 400, 404, 405, 409, 413, 422, 429, 500, 501, 502.
+# 204, 400, 403, 404, 405, 409, 413, 422, 429, 500, 501, 502.
 fn _http_reason(status) {
     if (status == 200) { return "OK"; }
     if (status == 201) { return "Created"; }
     if (status == 204) { return "No Content"; }
     if (status == 400) { return "Bad Request"; }
+    if (status == 403) { return "Forbidden"; }
     if (status == 404) { return "Not Found"; }
     if (status == 405) { return "Method Not Allowed"; }
     if (status == 409) { return "Conflict"; }

@@ -1,24 +1,87 @@
 # =========================================================================
 # api_agent — agent lifecycle endpoints
 # =========================================================================
+#
+# 2.3.0 wires the lifecycle: start / stop / pause / resume / delete. Until then
+# the API could register an agent and read it back, and nothing else — the
+# process code below the router had no caller.
+#
+# ⚠ No route here takes an executable, a path or an argv from the request. A
+# registration names a TYPE (System / User / Service) and daimon builds the
+# path itself (agent_find_executable). This API has no authentication (roadmap
+# 2.5.x); a caller-chosen executable would be remote code execution.
+
+# Collect every agent whose process exited on its own, so each answer below is
+# current. One non-blocking waitpid per agent with a process (measured ~0.5 µs
+# each; an agent without one is a load and a compare); max_agents bounds the
+# count. map_iter, not map_keys: every agent request runs this, and map_keys
+# would allocate a key vector from the never-freed bump each time.
+fn _api_agent_reap_entry(key, h) {
+    agent_reap(h);
+    return 0;
+}
+
+fn _api_agents_reap() {
+    map_iter(_agents, &_api_agent_reap_entry);
+    return 0;
+}
+
+# One agent as JSON. `status` stays the integer it has always been; `type` and
+# `exit_code` are 2.3.0 additions (exit_code is null until a process exits).
+fn _api_agent_json(sb, h) {
+    str_builder_add_cstr(sb, "{\"id\":");
+    str_builder_add_int(sb, agent_id(h));
+    str_builder_add_cstr(sb, ",\"name\":\"");
+    str_builder_add(sb, json_escape_str(agent_name(h)));
+    str_builder_add_cstr(sb, "\",\"type\":\"");
+    str_builder_add_cstr(sb, agent_type_name(agent_type(h)));
+    str_builder_add_cstr(sb, "\",\"status\":");
+    str_builder_add_int(sb, agent_status(h));
+    str_builder_add_cstr(sb, ",\"pid\":");
+    str_builder_add_int(sb, agent_pid(h));
+    str_builder_add_cstr(sb, ",\"exit_code\":");
+    if (agent_exit_code(h) < 0) { str_builder_add_cstr(sb, "null"); }
+    else { str_builder_add_int(sb, agent_exit_code(h)); }
+    str_builder_add_cstr(sb, "}");
+    return 0;
+}
+
+fn _api_agent_ok(fd, h) {
+    var sb = str_builder_new();
+    _api_agent_json(sb, h);
+    http_ok(fd, str_builder_build(sb));
+    return 0;
+}
+
+# An AGENT_OP_* refusal as an HTTP error.
+fn _api_agent_op_error(fd, code) {
+    if (code == AGENT_OP_BAD_STATE) {
+        http_error(fd, 409, str_from("the agent's status does not allow this"));
+    } elif (code == AGENT_OP_NO_EXECUTABLE) {
+        http_error(fd, 422, str_from("no executable is installed for this agent type"));
+    } elif (code == AGENT_OP_UNSUPPORTED) {
+        http_error(fd, 501, str_from("agent processes are not supported on this target yet"));
+    } elif (code == AGENT_OP_NO_LIMITS) {
+        http_error(fd, 500, str_from("agent resource limits could not be applied; not started"));
+    } elif (code == AGENT_OP_NO_EXEC) {
+        http_error(fd, 500, str_from("the agent executable could not be run"));
+    } elif (code == AGENT_OP_SIGNAL) {
+        http_error(fd, 500, str_from("the signal could not be delivered"));
+    } else {
+        http_error(fd, 500, str_from("the agent process could not be created"));
+    }
+    return 0;
+}
 
 fn api_list_agents(fd) {
+    _api_agents_reap();
     var keys = map_keys(_agents);
     var sb = str_builder_new();
     str_builder_add_cstr(sb, "{\"agents\":[");
     var i = 0;
     while (i < vec_len(keys)) {
         if (i > 0) { str_builder_add_cstr(sb, ","); }
-        var h = map_get(_agents, vec_get(keys, i));
-        str_builder_add_cstr(sb, "{\"id\":");
-        str_builder_add_int(sb, agent_id(h));
-        str_builder_add_cstr(sb, ",\"name\":\"");
-        str_builder_add(sb, json_escape_str(agent_name(h)));
-        str_builder_add_cstr(sb, "\",\"status\":");
-        str_builder_add_int(sb, agent_status(h));
-        str_builder_add_cstr(sb, ",\"pid\":");
-        str_builder_add_int(sb, agent_pid(h));
-        str_builder_add_cstr(sb, "}");
+        _api_agent_json(sb, map_get(_agents, vec_get(keys, i)));
         i = i + 1;
     }
     str_builder_add_cstr(sb, "],\"count\":");
@@ -36,9 +99,27 @@ fn api_register_agent(fd, body) {
     var pairs = json_parse(body);
     var name = jget(pairs, "name");
     if (name == 0) { name = str_from("unnamed"); }
+    # 2.3.0: the type chooses the executable. Optional; agnostik's default.
+    var atype = AGENT_TYPE_USER;
+    var tstr = jget(pairs, "type");
+    if (tstr != 0) {
+        atype = agent_type_parse(tstr);
+        if (atype < 0) {
+            http_bad_request(fd, str_from("type must be System, User or Service"));
+            return 0;
+        }
+    }
+    # ⛔ 2.3.0 — config max_agents (1000) was never enforced: registration was
+    # unbounded, every record permanent (there was no delete). Now that a record
+    # can become a process, the bound is also the ceiling on agent processes.
+    if (map_size(_agents) >= config_max_agents(_config)) {
+        http_error(fd, 409, str_from("agent limit reached"));
+        return 0;
+    }
 
     var id = agent_next_id();
     var h = agent_handle_new(id, name);
+    agent_set_type(h, atype);
     var id_str = str_from_int(id);
     map_set(_agents, str_data(id_str), h);
 
@@ -49,6 +130,8 @@ fn api_register_agent(fd, body) {
     str_builder_add_int(sb, id);
     str_builder_add_cstr(sb, ",\"name\":\"");
     str_builder_add(sb, json_escape_str(name));
+    str_builder_add_cstr(sb, "\",\"type\":\"");
+    str_builder_add_cstr(sb, agent_type_name(atype));
     str_builder_add_cstr(sb, "\",\"status\":");
     str_builder_add_int(sb, AGENT_PENDING);
     str_builder_add_cstr(sb, "}");
@@ -56,24 +139,77 @@ fn api_register_agent(fd, body) {
     http_send_response(fd, 201, str_data(resp), str_len(resp));
 }
 
-# --- Main HTTP router ---
-
-# --- Additional API handlers ---
-
 # GET /v1/agents/{id}
 fn api_get_agent(fd, id_cstr) {
+    _api_agents_reap();
     var h = map_get(_agents, id_cstr);
     if (h == 0) { http_error(fd, 404, str_from("agent not found")); return 0; }
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "{\"id\":");
-    str_builder_add_int(sb, agent_id(h));
-    str_builder_add_cstr(sb, ",\"name\":\"");
-    str_builder_add(sb, json_escape_str(agent_name(h)));
-    str_builder_add_cstr(sb, "\",\"status\":");
-    str_builder_add_int(sb, agent_status(h));
-    str_builder_add_cstr(sb, ",\"pid\":");
-    str_builder_add_int(sb, agent_pid(h));
-    str_builder_add_cstr(sb, "}");
-    http_ok(fd, str_builder_build(sb));
+    _api_agent_ok(fd, h);
+    return 0;
+}
+
+# POST /v1/agents/{id}/start — run the agent's process under its quota.
+fn api_agent_start(fd, id_cstr) {
+    _api_agents_reap();
+    var h = map_get(_agents, id_cstr);
+    if (h == 0) { http_error(fd, 404, str_from("agent not found")); return 0; }
+    # VULN-010: the supervisor's quota for this agent becomes its rlimits.
+    # cpu_time_limit is milliseconds; RLIMIT_CPU is whole seconds, rounded up
+    # so a limit is never loosened to 0 (which would mean unlimited).
+    var q = supervisor_quota(_supervisor, id_cstr);
+    if (q == 0) { q = quota_default(); }
+    var cpu_secs = (quota_cpu_time_limit(q) + 999) / 1000;
+    var r_t, r_v = agent_start(h, quota_mem_limit(q), cpu_secs);
+    if (is_err_result(r_t) == 1) { _api_agent_op_error(fd, r_v); return 0; }
+    _api_agent_ok(fd, h);
+    return 0;
+}
+
+# POST /v1/agents/{id}/stop — SIGTERM, a grace period, then SIGKILL.
+fn api_agent_stop(fd, id_cstr) {
+    _api_agents_reap();
+    var h = map_get(_agents, id_cstr);
+    if (h == 0) { http_error(fd, 404, str_from("agent not found")); return 0; }
+    agent_stop(h, STOP_USER);
+    _api_agent_ok(fd, h);
+    return 0;
+}
+
+# POST /v1/agents/{id}/pause
+fn api_agent_pause(fd, id_cstr) {
+    _api_agents_reap();
+    var h = map_get(_agents, id_cstr);
+    if (h == 0) { http_error(fd, 404, str_from("agent not found")); return 0; }
+    var r_t, r_v = agent_pause(h);
+    if (is_err_result(r_t) == 1) { _api_agent_op_error(fd, r_v); return 0; }
+    _api_agent_ok(fd, h);
+    return 0;
+}
+
+# POST /v1/agents/{id}/resume
+fn api_agent_resume(fd, id_cstr) {
+    _api_agents_reap();
+    var h = map_get(_agents, id_cstr);
+    if (h == 0) { http_error(fd, 404, str_from("agent not found")); return 0; }
+    var r_t, r_v = agent_resume(h);
+    if (is_err_result(r_t) == 1) { _api_agent_op_error(fd, r_v); return 0; }
+    _api_agent_ok(fd, h);
+    return 0;
+}
+
+# DELETE /v1/agents/{id} — forget an agent. Refused while it has a process:
+# stop it first, so a delete can never orphan a running agent.
+fn api_agent_delete(fd, id_cstr) {
+    _api_agents_reap();
+    var h = map_get(_agents, id_cstr);
+    if (h == 0) { http_error(fd, 404, str_from("agent not found")); return 0; }
+    if (agent_pid(h) > 0) {
+        http_error(fd, 409, str_from("the agent has a running process; stop it first"));
+        return 0;
+    }
+    daimon_audit_agent(SEV_INFO, "agent", "agent.delete", "agent deleted", str_data(agent_name(h)));
+    map_delete(_agents, id_cstr);
+    supervisor_unregister(_supervisor, str_from(id_cstr));
+    http_ok(fd, str_from("{\"ok\":true}"));
     return 0;
 }

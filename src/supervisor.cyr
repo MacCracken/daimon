@@ -238,6 +238,12 @@ fn supervisor_register(sup, agent_id_str) {
     map_set(bmap, id_cstr, cb_default());
 }
 
+# The resource quota registered for an agent, or 0 if it is not registered.
+# 2.3.0: the start route turns it into the agent's rlimits.
+fn supervisor_quota(sup, agent_id_cstr) {
+    return map_get(load64(sup + 8), agent_id_cstr);
+}
+
 fn supervisor_unregister(sup, agent_id_str) {
     var id_cstr = str_data(agent_id_str);
     map_delete(load64(sup), id_cstr);

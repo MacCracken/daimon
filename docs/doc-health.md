@@ -6,7 +6,7 @@ type: state
 
 # Documentation Health — daimon
 
-> **Last refresh**: 2026-09-22 (2.2.3 — test-integrity arc complete: README / quickstart / CONTRIBUTING test guidance, BENCHMARKS.md re-baselined against the real code with its port-era claims corrected, roadmap 2.2.x closed. Rows below that predate 2.2.3 are as last recorded.)
+> **Last refresh**: 2026-09-22 (2.3.0 — the agent lifecycle on the API: API guide, quickstart, overview, README, BENCHMARKS, SECURITY, roadmap and a new audit report. Rows below that predate 2.3.0 are as last recorded.)
 > **Refresh cadence**: when docs are touched, update the affected row. Full re-audit at each minor cut.
 > **Scope**: this repo only (`daimon`) — root-level files plus the entire `docs/` tree.
 
@@ -78,6 +78,31 @@ Daimon is the AGNOS agent orchestrator — every consumer (hoosh, agnoshi, aethe
 - ✅ `SECURITY.md` — supported versions rolled `1.3.x` → `2.2.x` (+ `< 2.2` unsupported); it had
   named 1.3.x as the supported line through the whole 2.x series.
 - ✅ `CHANGELOG.md` / `VERSION` / `src/config.cyr` — 2.2.3 cut (`scripts/version-bump.sh`).
+
+**Doc work shipped in 2.3.0 (2026-09-22):**
+- ✅ `docs/audit/2026-09-22-agent-lifecycle-audit.md` — new. VULN-011 (bound every interface),
+  VULN-012 (cross-site requests / DNS rebinding), VULN-013 (descriptors leaked into agents),
+  VULN-014 (a stop holds the server), VULN-015 (inherited environment). Each has observed evidence and
+  CVE / CWE references.
+- ✅ `docs/adr/004-agent-process-control.md` — new. The four decisions behind process control on an
+  unauthenticated API: the executable is chosen by type and never by a request, loopback bind,
+  browser-originated agent control refused, and a synchronous bounded stop. Rejected alternatives
+  are recorded with their reasons.
+- ✅ `docs/guides/api.md` — the lifecycle routes, `type` / `exit_code`, what runs and how the child
+  is set up, the Origin rule, the bind address, and 403 / 405 / 409 / 500 / 501 in the error table.
+- ✅ `docs/guides/quickstart.md` — a start / stop walk-through, the bind address, and counts
+  (741 assertions, 22 + 2 benchmarks).
+- ✅ `docs/architecture/overview.md` — agent.cyr and server.cyr entries, and CLI flags. The route
+  count read "24 endpoints", which was already stale; it is now 38, counted from `src/router.cyr`.
+- ✅ `README.md` — bind address, counts, and what the smoke script covers.
+- ✅ `BENCHMARKS.md` — a 2.3.0 section: 3 lifecycle benchmarks and a back-to-back 2.2.3 / 2.3.0 A/B
+  of the 19 existing ones. The correctness and coverage rows are updated.
+- ✅ `SECURITY.md` — supported versions `2.2.x` → `2.3.x`.
+- ✅ `docs/development/roadmap.md` — 2.3.x narrowed to task start/complete then IPC, with the
+  lifecycle follow-ups. 2.4.x is unblocked; 2.5.x says what 2.2.2 and 2.3.0 closed and what is still
+  open. Its two function names were wrong (`ipc_send`, `complete_task`); they are now
+  `agent_ipc_send` and samay's `task_scheduler_complete_task`.
+- ✅ `CHANGELOG.md` / `VERSION` / `src/config.cyr` — 2.3.0 (`scripts/version-bump.sh`).
 
 ⚠ This ledger said "stale set: cleared" through the whole 2.x line while README quoted 1.3-era test
 counts and BENCHMARKS.md called untested modules "Complete". A doc can only be as fresh as the check

@@ -31,6 +31,7 @@ include "lib/str.cyr"
 include "lib/io.cyr"
 include "lib/fs.cyr"
 include "lib/syscalls.cyr"
+include "lib/chrono.cyr"
 include "lib/assert.cyr"
 
 include "src/syscalls.cyr"
@@ -208,7 +209,7 @@ assert_eq(daimon_reap(0 - 12345), 0 - 1,
 # daimon_reap_wait must terminate on a non-child rather than spin its budget.
 assert_eq(daimon_reap_wait(0 - 12345), 0 - 1,
   "daimon_reap_wait returns -1 immediately for a non-child");
-assert(DAIMON_REAP_TRIES > 0, "the reap budget is bounded and non-zero");
+assert(DAIMON_REAP_BUDGET_MS > 0, "the reap budget is bounded and non-zero");
 
 # --- no daimon-owned name may be spelled SYS_* --------------------------
 # The defect class is a daimon global SHADOWING an arch-aware stdlib one.

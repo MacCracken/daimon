@@ -15,8 +15,8 @@
 #
 # ⛔ Everything below the accessors is code that had NEVER BEEN EXECUTED before
 # this file: agent_spawn_with_limits, agent_start/stop/pause/resume and the
-# /proc readers have zero callers in src/ (roadmap 2.3.x is wiring them to the
-# API). Tests first, per the arc.
+# /proc readers had zero callers in src/ until 2.3.0 wired them to the API.
+# The 2.3.0 section at the end drives all of them against real processes.
 # =========================================================================
 
 include "lib/string.cyr"
@@ -192,5 +192,364 @@ var hname = agent_handle_new(agent_next_id(), str_new(nbuf, 15));
 memset(nbuf, 88, 32);                  # the next request reuses the buffer
 assert(str_eq(agent_name(hname), str_from("live-agent-name")) == 1,
   "agent name survives the request buffer being reused");
+
+# =========================================================================
+# 2.3.0 — the lifecycle, against REAL processes
+#
+# Everything here runs the shipping spawn / signal / reap code on real
+# children: shell-script fixture agents in a private directory, and `sh -c`
+# probes that report what the child actually received. Each fixture that
+# traps a signal writes `<its path>.ready.<its pid>` AFTER installing the trap,
+# and the test waits for that file — a SIGTERM that arrived before the trap
+# would kill the shell outright (143) and make the graceful-stop checks racy.
+# =========================================================================
+
+# <dir>/<file>, NUL-terminated (builder output).
+fn _t_path(dir, file) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, dir);
+    str_builder_add_cstr(sb, "/");
+    str_builder_add_cstr(sb, file);
+    return str_data(str_builder_build(sb));
+}
+
+fn _t_script(dir, file, body) {
+    var p = _t_path(dir, file);
+    file_write_all(p, body, strlen(body));
+    sys_chmod(p, 493);   # 0755
+    return p;
+}
+
+var _t_sleep: i64[2];
+fn _t_nap_ms(ms) {
+    store64(&_t_sleep, 0);
+    store64(&_t_sleep + 8, ms * 1000000);
+    sys_nanosleep(&_t_sleep, 0);
+    return 0;
+}
+
+# Wait up to ~3 s for `path` to exist.
+fn _t_wait_file(path) {
+    var i = 0;
+    while (i < 300) {
+        if (file_exists(path) == 1) { return 1; }
+        _t_nap_ms(10);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# The fixture's ready marker for a started agent: <exe>.ready.<pid>
+fn _t_ready(exe, pid) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, exe);
+    str_builder_add_cstr(sb, ".ready.");
+    str_builder_add_int(sb, pid);
+    return str_data(str_builder_build(sb));
+}
+
+# The state letter in /proc/<pid>/stat ('S', 'R', 'T', 'Z', ...), or 0.
+fn _t_proc_state(pid) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "/proc/");
+    str_builder_add_int(sb, pid);
+    str_builder_add_cstr(sb, "/stat");
+    var buf = alloc(1024);
+    var n = file_read_all(str_data(str_builder_build(sb)), buf, 1023);
+    if (n <= 0) { return 0; }
+    var i = n - 1;
+    while (i > 0) {
+        if (load8(buf + i) == 41) { break; }   # the ')' closing comm
+        i = i - 1;
+    }
+    return load8(buf + i + 2);
+}
+
+# Wait up to ~3 s for the process state to become (want_eq=1) or leave (0) `st`.
+fn _t_wait_state(pid, st, want_eq) {
+    var i = 0;
+    while (i < 300) {
+        var s = _t_proc_state(pid);
+        if (want_eq == 1) { if (s == st) { return 1; } }
+        if (want_eq == 0) { if (s != st) { return 1; } }
+        _t_nap_ms(10);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Run `sh -c <script>` through THE REAL spawn path; its exit code, or
+# -100 - reason if the spawn itself was refused.
+fn _t_sh(script, envp, mem, cpu) {
+    var argv = alloc(32);
+    store64(argv, "/bin/sh");
+    store64(argv + 8, "-c");
+    store64(argv + 16, script);
+    store64(argv + 24, 0);
+    var r_t, r_v = agent_spawn_with_limits("/bin/sh", argv, envp, mem, cpu);
+    if (is_err_result(r_t) == 1) { return 0 - 100 - r_v; }
+    return daimon_reap_within(r_v, 5000);
+}
+
+# Poll agent_reap until it collects the agent (bounded ~3 s).
+fn _t_reap_wait(h) {
+    var i = 0;
+    while (i < 300) {
+        if (agent_reap(h) == 1) { return 1; }
+        _t_nap_ms(10);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# --- types -----------------------------------------------------------------
+test_group("agent_types");
+assert_eq(agent_type_parse(str_from("System")), AGENT_TYPE_SYSTEM, "parse System");
+assert_eq(agent_type_parse(str_from("user")), AGENT_TYPE_USER, "parse user (lower case)");
+assert_eq(agent_type_parse(str_from("Service")), AGENT_TYPE_SERVICE, "parse Service");
+assert_eq(agent_type_parse(str_from("root")), 0 - 1, "an unknown type is refused");
+assert_eq(agent_type_parse(str_from("USER")), 0 - 1, "only agnostik's form or all lower case");
+assert_eq(agent_type_parse(0), 0 - 1, "a missing type is refused");
+assert_eq(streq(agent_type_name(AGENT_TYPE_SERVICE), "Service"), 1, "Service round-trips");
+assert_eq(streq(agent_type_name(AGENT_TYPE_SYSTEM), "System"), 1, "System round-trips");
+var ht = agent_handle_new(agent_next_id(), str_from("typed"));
+assert_eq(agent_type(ht), AGENT_TYPE_USER, "a new agent is a User agent (agnostik's default)");
+assert_eq(agent_exit_code(ht), 0 - 1, "a new agent has no exit code");
+agent_set_type(ht, AGENT_TYPE_SYSTEM);
+assert_eq(agent_type(ht), AGENT_TYPE_SYSTEM, "type setter round-trips");
+
+# --- the spawn, probed from inside the child -----------------------------
+test_group("agent_spawn");
+# As daimon's main does. The child must NOT inherit this (lib/syscalls.cyr
+# signal_default: an ignored disposition survives execve).
+signal_ignore(SIGPIPE);
+
+assert_eq(_t_sh("exit 0", 0, 0, 0), 0, "spawn: a child that exec'd and exited 0 reaps as 0");
+assert_eq(_t_sh("exit 42", 0, 0, 0), 42, "spawn: the exit code comes back through the reap");
+assert_eq(_t_sh("kill -9 $$", 0, 0, 0), 137, "spawn: killed by SIGKILL reaps as 128 + 9");
+
+# A missing executable is an Err from the spawn itself, not a 'running' agent
+# that dies later with 127 — and the failed child does not stay a zombie.
+var nx_argv = alloc(16);
+store64(nx_argv, "/nonexistent/daimon-test-agent");
+store64(nx_argv + 8, 0);
+var nx_t, nx_v = agent_spawn_with_limits("/nonexistent/daimon-test-agent", nx_argv, 0, 0, 0);
+assert_eq(is_err_result(nx_t), 1, "spawn: a missing executable is an Err");
+assert_eq(nx_v, AGENT_OP_NO_EXEC, "spawn: ... reported as AGENT_OP_NO_EXEC");
+var nx_st: i32[1];
+assert_eq(sys_waitpid(0 - 1, &nx_st, 1), 0 - 10, "spawn: the failed child was reaped (ECHILD: no children left)");
+
+# Descriptors: one this process holds open (not close-on-exec) must not reach
+# the child. The control proves the /proc probe can see an inherited one.
+var kfd = sys_open("/dev/null", 0, 0);
+assert(kfd > 2, "test fd opened");
+var fdsb = str_builder_new();
+str_builder_add_cstr(fdsb, "test ! -e /proc/$$/fd/");
+str_builder_add_int(fdsb, kfd);
+assert_eq(_t_sh(str_data(str_builder_build(fdsb)), 0, 0, 0), 0,
+  "spawn: an open descriptor of the parent is NOT inherited (was: listening socket + client conn)");
+assert_eq(_t_sh("test -e /proc/$$/fd/2", 0, 0, 0), 0, "spawn: control — stdio IS inherited");
+sys_close(kfd);
+
+assert_eq(_t_sh("[ \"$(readlink /proc/$$/fd/0)\" = /dev/null ]", 0, 0, 0), 0,
+  "spawn: stdin is /dev/null");
+assert_eq(_t_sh("m=$(sed -n 's/^SigIgn:[[:space:]]*//p' /proc/$$/status); [ $(( 0x$m & 4096 )) -eq 0 ]", 0, 0, 0), 0,
+  "spawn: SIGPIPE is NOT ignored in the child although this process ignores it");
+assert_eq(_t_sh("m=$(sed -n 's/^SigIgn:[[:space:]]*//p' /proc/$PPID/status); [ $(( 0x$m & 4096 )) -ne 0 ]", 0, 0, 0), 0,
+  "spawn: control — the parent really does ignore SIGPIPE");
+
+# VULN-010: both limits reach the child.
+assert_eq(_t_sh("[ \"$(ulimit -v)\" = 1048576 ] && [ \"$(ulimit -t)\" = 7 ]", 0, 1073741824, 7), 0,
+  "spawn: RLIMIT_AS (1 GiB) and RLIMIT_CPU (7 s) are applied");
+
+# The environment passed is the one the child gets; agent_environ mirrors ours.
+var menv = alloc(16);
+store64(menv, "DAIMON_TEST_MARK=present");
+store64(menv + 8, 0);
+assert_eq(_t_sh("[ \"$DAIMON_TEST_MARK\" = present ]", menv, 0, 0), 0, "spawn: envp reaches the child");
+var ev = agent_environ();
+var evn = 0;
+while (load64(ev + evn * 8) != 0) { evn = evn + 1; }
+var envbuf = alloc(262144);
+var envlen = file_read_all("/proc/self/environ", envbuf, 262143);
+var envnul = 0;
+var eix = 0;
+while (eix < envlen) { if (load8(envbuf + eix) == 0) { envnul = envnul + 1; } eix = eix + 1; }
+assert_eq(evn, envnul, "agent_environ: one envp entry per /proc/self/environ variable");
+if (getenv("PATH") != 0) {
+    assert_eq(_t_sh("[ -n \"$PATH\" ]", ev, 0, 0), 0, "spawn: with agent_environ the child inherits PATH");
+}
+
+# --- the reap / signal guards ------------------------------------------------
+test_group("agent_guards");
+var g_argv = alloc(32);
+store64(g_argv, "/bin/sh");
+store64(g_argv + 8, "-c");
+store64(g_argv + 16, "sleep 0.3");
+store64(g_argv + 24, 0);
+var g_t, g_pid = agent_spawn_with_limits("/bin/sh", g_argv, 0, 0, 0);
+assert_eq(is_ok(g_t), 1, "guard fixture started");
+assert_eq(daimon_reap_code(0), 0 - 1, "reap(0) is refused — it would reap ANY child in the group");
+assert_eq(daimon_reap_code(0 - 1), 0 - 1, "reap(-1) is refused — it would reap ANY child");
+assert_eq(daimon_signal(0, 0), 0 - 1, "signal(0) is refused — it would signal daimon's own group");
+assert_eq(daimon_signal(0 - 1, 0), 0 - 1, "signal(-1) is refused — it would signal every process");
+assert_eq(daimon_reap_code(g_pid), 0 - 2, "the fixture is still running, so it was not stolen above");
+assert_eq(daimon_reap_within(g_pid, 3000), 0, "and it reaps normally by its own pid");
+
+# --- the lifecycle through agent_start / stop / pause / resume / reap ------
+test_group("agent_lifecycle");
+var tdsb = str_builder_new();
+str_builder_add_cstr(tdsb, "/tmp/daimon-test-agents-");
+str_builder_add_int(tdsb, sys_getpid());
+var adir = str_data(str_builder_build(tdsb));
+xmkdir_p(adir, 448);
+var user_exe = _t_script(adir, "agnos-agent-user-agent",
+  "#!/bin/sh\ntrap 'exit 0' TERM\n: > \"$0.ready.$$\"\nwhile :; do sleep 0.05; done\n");
+var svc_exe = _t_script(adir, "agnos-agent-service-agent",
+  "#!/bin/sh\ntrap '' TERM\n: > \"$0.ready.$$\"\nwhile :; do sleep 0.05; done\n");
+var sys_exe = _t_script(adir, "agnos-agent-system-agent", "#!/bin/sh\nexit 3\n");
+agent_set_agents_dir(adir);
+
+assert_eq(streq(agent_find_executable(AGENT_TYPE_USER), user_exe), 1, "a type resolves to its own executable");
+assert_eq(streq(agent_find_executable(AGENT_TYPE_SERVICE), svc_exe), 1, "... per type");
+
+var la = agent_handle_new(agent_next_id(), str_from("life"));
+var s_t, s_pid = agent_start(la, 1073741824, 3600);
+assert_eq(is_ok(s_t), 1, "start: a PENDING agent starts");
+assert_eq(agent_status(la), AGENT_RUNNING, "start: RUNNING");
+assert_eq(agent_pid(la), s_pid, "start: the pid is recorded");
+assert(agent_started_at(la) > 0, "start: started_at is stamped");
+assert_eq(_t_wait_file(_t_ready(user_exe, s_pid)), 1, "start: the agent is running its program");
+var re_t, re_v = agent_start(la, 0, 0);
+assert_eq(re_v, AGENT_OP_BAD_STATE, "start: a RUNNING agent cannot be started again");
+var rs_t, rs_v = agent_resume(la);
+assert_eq(rs_v, AGENT_OP_BAD_STATE, "resume: only a PAUSED agent resumes");
+
+var p_t, p_v = agent_pause(la);
+assert_eq(is_ok(p_t), 1, "pause: Ok");
+assert_eq(agent_status(la), AGENT_PAUSED, "pause: PAUSED");
+assert_eq(_t_wait_state(s_pid, 84, 1), 1, "pause: the process really is stopped (state T)");
+var p2_t, p2_v = agent_pause(la);
+assert_eq(p2_v, AGENT_OP_BAD_STATE, "pause: a PAUSED agent cannot be paused again");
+var r_t, r_v = agent_resume(la);
+assert_eq(is_ok(r_t), 1, "resume: Ok");
+assert_eq(agent_status(la), AGENT_RUNNING, "resume: RUNNING");
+assert_eq(_t_wait_state(s_pid, 84, 0), 1, "resume: the process runs again");
+
+# Stop a PAUSED agent: SIGTERM alone would wait out the grace (a stopped
+# process cannot act on it); the SIGCONT that follows lets it exit cleanly.
+agent_pause(la);
+assert_eq(_t_wait_state(s_pid, 84, 1), 1, "re-paused");
+var t0 = clock_now_ms();
+agent_stop(la, STOP_USER);
+var took = clock_now_ms() - t0;
+assert_eq(agent_status(la), AGENT_STOPPED, "stop: STOPPED");
+assert_eq(agent_exit_code(la), 0, "stop: exited 0 through its own SIGTERM handler (not SIGKILLed)");
+assert_eq(agent_pid(la), 0, "stop: the reaped pid is cleared — never signalled again");
+assert(took < AGENT_STOP_GRACE_MS, "stop: a paused agent was not left to the SIGKILL deadline");
+assert_eq(sys_kill(s_pid, 0), 0 - 3, "stop: the process is gone (ESRCH), not a zombie");
+assert_eq(agent_reap(la), 0, "reap: nothing to reap once stopped");
+
+# STOPPED -> start again.
+var s2_t, s2_pid = agent_start(la, 1073741824, 3600);
+assert_eq(is_ok(s2_t), 1, "restart: a STOPPED agent starts again");
+assert(s2_pid != s_pid, "restart: a new process");
+assert_eq(agent_exit_code(la), 0 - 1, "restart: the old exit code is cleared");
+assert_eq(_t_wait_file(_t_ready(user_exe, s2_pid)), 1, "restart: running its program");
+agent_stop(la, STOP_USER);
+assert_eq(agent_exit_code(la), 0, "restart: stops cleanly again");
+
+# SIGKILL escalation: an agent that ignores SIGTERM.
+AGENT_STOP_GRACE_MS = 300;
+var lk = agent_handle_new(agent_next_id(), str_from("stubborn"));
+agent_set_type(lk, AGENT_TYPE_SERVICE);
+var k_t, k_pid = agent_start(lk, 0, 0);
+assert_eq(is_ok(k_t), 1, "stubborn agent started");
+assert_eq(_t_wait_file(_t_ready(svc_exe, k_pid)), 1, "stubborn agent installed its SIGTERM ignore");
+var k0 = clock_now_ms();
+agent_stop(lk, STOP_USER);
+var ktook = clock_now_ms() - k0;
+assert_eq(agent_exit_code(lk), 137, "stop: an agent ignoring SIGTERM is SIGKILLed (128 + 9)");
+assert_eq(agent_status(lk), AGENT_STOPPED, "stop: and ends STOPPED");
+assert(ktook >= 300, "stop: SIGKILL waited out the grace period");
+assert(ktook < 300 + 1500, "stop: and the grace is bounded by the clock (was: counted sleeps)");
+AGENT_STOP_GRACE_MS = 5000;
+
+# An agent that exits on its own is collected by agent_reap.
+var lf = agent_handle_new(agent_next_id(), str_from("crasher"));
+agent_set_type(lf, AGENT_TYPE_SYSTEM);
+var f_t, f_pid = agent_start(lf, 0, 0);
+assert_eq(is_ok(f_t), 1, "self-exiting agent started (its exec succeeded)");
+assert_eq(_t_reap_wait(lf), 1, "reap: collected after it exited on its own");
+assert_eq(agent_status(lf), AGENT_FAILED, "reap: a non-zero exit is FAILED");
+assert_eq(agent_exit_code(lf), 3, "reap: with its exit code");
+assert_eq(agent_pid(lf), 0, "reap: and its pid cleared");
+var f2_t, f2_pid = agent_start(lf, 0, 0);
+assert_eq(is_ok(f2_t), 1, "a FAILED agent can be started again (its process is gone)");
+_t_reap_wait(lf);
+
+# Nothing installed for a type: refused before anything is attempted.
+var edsb = str_builder_new();
+str_builder_add_cstr(edsb, adir);
+str_builder_add_cstr(edsb, "/empty");
+var edir = str_data(str_builder_build(edsb));
+xmkdir_p(edir, 448);
+agent_set_agents_dir(edir);
+var ln = agent_handle_new(agent_next_id(), str_from("nobody"));
+var n_t, n_v = agent_start(ln, 0, 0);
+assert_eq(n_v, AGENT_OP_NO_EXECUTABLE, "start: no executable for the type is AGENT_OP_NO_EXECUTABLE");
+assert_eq(agent_status(ln), AGENT_PENDING, "start: and the agent is untouched (still PENDING)");
+# The generic runner is the fallback, as in the Rust original.
+var runner = _t_script(edir, "agnos-agent-runner", "#!/bin/sh\nexit 0\n");
+assert_eq(streq(agent_find_executable(AGENT_TYPE_USER), runner), 1,
+  "no type executable: the generic agnos-agent-runner is used");
+
+# VULN-010, the refusal: an rlimit that cannot be applied means NO start.
+# Lower this process's own hard RLIMIT_CPU (irreversible for it — the test
+# needs seconds, not a day), then ask for more than that: the child's
+# prlimit64 fails EPERM and it must not exec.
+# (Not as root: root may raise its own hard limit, so nothing would fail.)
+agent_set_agents_dir(adir);
+if (sys_getuid() != 0) {
+    var own = alloc(16);
+    store64(own, 86400);
+    store64(own + 8, 86400);
+    assert_eq(syscall(_DAIMON_SYS_PRLIMIT64, 0, RLIMIT_CPU, own, 0), 0, "lowered this process's hard CPU limit");
+    var lx = agent_handle_new(agent_next_id(), str_from("unconfinable"));
+    var x_t, x_v = agent_start(lx, 0, 172800);
+    assert_eq(x_v, AGENT_OP_NO_LIMITS, "start: a limit that cannot be applied refuses the start (was: exit 126 later)");
+    assert_eq(agent_status(lx), AGENT_FAILED, "start: the agent is FAILED, with no process");
+    assert_eq(agent_pid(lx), 0, "start: no pid recorded");
+
+    # The same for RLIMIT_AS: cap this process's hard address-space limit at
+    # 64 GiB (or its current hard limit, if lower) and ask for 1 GiB more.
+    var cur_as = alloc(16);
+    syscall(_DAIMON_SYS_PRLIMIT64, 0, RLIMIT_AS, 0, cur_as);
+    var as_cap = 68719476736;
+    if (load64(cur_as + 8) > 0) {
+        if (load64(cur_as + 8) < as_cap) { as_cap = load64(cur_as + 8); }
+    }
+    var own_as = alloc(16);
+    store64(own_as, as_cap);
+    store64(own_as + 8, as_cap);
+    assert_eq(syscall(_DAIMON_SYS_PRLIMIT64, 0, RLIMIT_AS, own_as, 0), 0,
+      "capped this process's hard address-space limit");
+    var lm = agent_handle_new(agent_next_id(), str_from("unconfinable-mem"));
+    var m_t, m_v = agent_start(lm, as_cap + 1073741824, 0);
+    assert_eq(m_v, AGENT_OP_NO_LIMITS, "start: an address-space limit that cannot be applied refuses the start");
+    assert_eq(agent_pid(lm), 0, "start: no pid recorded (RLIMIT_AS)");
+}
+
+# Clean up the fixtures (ready markers carry pids; remove what we know).
+xunlink(_t_ready(user_exe, s_pid));
+xunlink(_t_ready(user_exe, s2_pid));
+xunlink(_t_ready(svc_exe, k_pid));
+xunlink(user_exe);
+xunlink(svc_exe);
+xunlink(sys_exe);
+xunlink(runner);
+xrmdir(edir);
+xrmdir(adir);
+agent_set_agents_dir(0);
 
 syscall(SYS_EXIT, assert_summary());

@@ -225,6 +225,37 @@ fn bench_trace_id_hex() {
     return 0;
 }
 
+# 2.3.0 — the agent lifecycle.
+var _bench_true_argv = 0;
+var _bench_idle_agents = 0;
+var _bench_live_agent = 0;
+
+# One agent start as POST /v1/agents/{id}/start runs it — fork, the child's
+# descriptor / stdin / SIGPIPE / limit setup, exec of /bin/true, the parent's
+# wait for the exec report — plus the reap of the exited child.
+fn bench_agent_spawn_reap() {
+    var r_t, r_v = agent_spawn_with_limits("/bin/true", _bench_true_argv, 0, 0, 0);
+    if (is_ok(r_t) == 1) { daimon_reap_within(r_v, 5000); }
+    return 0;
+}
+
+# The reap sweep every agent route now runs first, over 100 agents with no
+# process — the common case, a load and a compare each.
+fn bench_agent_reap_sweep_100_idle() {
+    var i = 0;
+    while (i < 100) {
+        agent_reap(vec_get(_bench_idle_agents, i));
+        i = i + 1;
+    }
+    return 0;
+}
+
+# The sweep's cost for each RUNNING agent: one non-blocking waitpid.
+fn bench_agent_reap_live() {
+    agent_reap(_bench_live_agent);
+    return 0;
+}
+
 # ================================================================
 # Main
 # ================================================================
@@ -383,6 +414,41 @@ fn main() {
     var b18 = bench_new("trace_id_hex");
     bench_run(b18, &bench_trace_id_hex, 100000);
     vec_push(benches, b18);
+
+    # 2.3.0 — agent lifecycle fixtures: 100 agents with no process, and one
+    # whose process is a real, running `sleep`.
+    _bench_true_argv = alloc(16);
+    store64(_bench_true_argv, "/bin/true");
+    store64(_bench_true_argv + 8, 0);
+    _bench_idle_agents = vec_new();
+    var ai = 0;
+    while (ai < 100) {
+        vec_push(_bench_idle_agents, agent_handle_new(ai + 1, str_from("idle")));
+        ai = ai + 1;
+    }
+    var sl_argv = alloc(24);
+    store64(sl_argv, "/bin/sleep");
+    store64(sl_argv + 8, "600");
+    store64(sl_argv + 16, 0);
+    var sl_t, sl_pid = agent_spawn_with_limits("/bin/sleep", sl_argv, 0, 0, 0);
+    _bench_live_agent = agent_handle_new(1000, str_from("live"));
+    agent_set_pid(_bench_live_agent, sl_pid);
+    agent_set_status(_bench_live_agent, AGENT_RUNNING);
+
+    var b19 = bench_new("agent_spawn_reap");
+    bench_run(b19, &bench_agent_spawn_reap, 200);
+    vec_push(benches, b19);
+
+    var b20 = bench_new("agent_reap_sweep_100_idle");
+    bench_run(b20, &bench_agent_reap_sweep_100_idle, 100000);
+    vec_push(benches, b20);
+
+    var b21 = bench_new("agent_reap_live");
+    bench_run(b21, &bench_agent_reap_live, 100000);
+    vec_push(benches, b21);
+
+    daimon_signal(sl_pid, SIGKILL);
+    daimon_reap_within(sl_pid, 1000);
 
     bench_report_all(benches);
     return 0;

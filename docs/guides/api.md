@@ -1,6 +1,9 @@
 # HTTP API Guide
 
-Daimon exposes a REST API on port 8090 (configurable via `serve [port]`).
+Daimon exposes a REST API on `127.0.0.1:8090`. Set the port with `serve [port]` and the bind
+address with `serve --listen ADDR`. Through 2.2.3 daimon bound every interface; since 2.3.0 it binds
+loopback unless told otherwise. `--listen 0.0.0.0` opens every interface. The API has no
+authentication, so do that only behind a firewall.
 
 All responses are JSON. All POST bodies are JSON. Connection is closed after each response.
 
@@ -38,19 +41,58 @@ GET /v1/health
 ```
 # List agents
 GET /v1/agents
-→ {"agents":[{"id":1,"name":"my-agent","status":0,"pid":0}],"count":1}
+→ {"agents":[{"id":1,"name":"my-agent","type":"User","status":0,"pid":0,"exit_code":null}],"count":1}
 
-# Register agent
+# Register agent — type is optional: System, User (default) or Service
 POST /v1/agents
-{"name":"my-agent"}
-→ 201 {"id":1,"name":"my-agent","status":0}
+{"name":"my-agent","type":"User"}
+→ 201 {"id":1,"name":"my-agent","type":"User","status":0}
+→ 400 unknown type · 409 at max_agents (1000)
 
 # Get agent
 GET /v1/agents/1
-→ {"id":1,"name":"my-agent","status":0,"pid":0}
+→ {"id":1,"name":"my-agent","type":"User","status":0,"pid":0,"exit_code":null}
+
+# Start — runs the agent's process (2.3.0)
+POST /v1/agents/1/start
+→ {"id":1,"name":"my-agent","type":"User","status":2,"pid":4242,"exit_code":null}
+→ 409 not Pending/Stopped/Failed · 422 no executable for its type · 501 on AGNOS (until 2.4.x)
+
+# Stop — SIGTERM, up to 5 s to exit, then SIGKILL; always 200
+POST /v1/agents/1/stop
+→ {"id":1,"name":"my-agent","type":"User","status":5,"pid":0,"exit_code":0}
+
+# Pause / resume — SIGSTOP / SIGCONT
+POST /v1/agents/1/pause      → status 3 · 409 unless Running
+POST /v1/agents/1/resume     → status 2 · 409 unless Paused
+
+# Delete — refused while the agent has a process
+DELETE /v1/agents/1
+→ {"ok":true} · 409 while it has a process
 ```
 
 Agent status values: 0=Pending, 1=Starting, 2=Running, 3=Paused, 4=Stopping, 5=Stopped, 6=Failed.
+A process that exits on its own is collected on the next agent request. Exit 0 leaves the agent
+Stopped; a non-zero exit, or death by a signal, leaves it Failed. A Failed agent can be started
+again. `exit_code` is null until a process has exited, and 128 + the signal number if a signal
+killed it (137 = SIGKILL).
+
+**What runs.** The request never names an executable. daimon runs `agnos-agent-<type>-agent`
+(`system`, `user` or `service`) from `/usr/lib/agnos/agents`, then `/opt/agnos/agents`, else
+`/usr/bin/agnos-agent-runner`. The argv is `--agent-id <id> --agent-name <name>`. The operator can
+replace the search with `serve --agents-dir DIR`, where the runner is `DIR/agnos-agent-runner`. The
+child:
+- has stdin from `/dev/null`;
+- inherits no descriptor above stderr;
+- starts with SIGPIPE at its default;
+- gets daimon's environment;
+- runs under its supervisor quota as rlimits: 1 GiB address space and 3600 s CPU by default. A
+  limit that cannot be applied refuses the start with a 500.
+
+**Browsers may not control agents.** start / stop / pause / resume / DELETE answer **403** to any
+request carrying an `Origin` header. A web page can send a cross-origin `text/plain` POST with no
+CORS preflight, and could otherwise drive agents from a browser (2.3.0 audit, VULN-012). curl,
+agents and other native clients send no `Origin`.
 
 ## MCP Tools
 
@@ -174,11 +216,15 @@ GET /v1/metrics
 | Status | Meaning |
 |---|---|
 | 400 | Bad Request — missing/invalid field |
+| 403 | Forbidden — agent control from a browser (a request carrying `Origin`) |
 | 404 | Not Found — unknown route or ID |
+| 405 | Method Not Allowed — a route exists, not for this method |
+| 409 | Conflict — the agent's status does not allow the action, a name is taken, or the agent limit is reached |
 | 413 | Payload Too Large — body > 64 KB |
 | 422 | Unprocessable Entity — validation failure |
 | 429 | Too Many Requests — rate limit (120/min per IP) |
-| 501 | Not Implemented — chunked Transfer-Encoding |
+| 500 | Internal Server Error — e.g. an agent's rlimits could not be applied, or its executable could not be run |
+| 501 | Not Implemented — chunked Transfer-Encoding; agent processes on AGNOS (until 2.4.x) |
 
 All errors return `{"error":"message","code":NNN}`.
 
@@ -188,6 +234,10 @@ All errors return `{"error":"message","code":NNN}`.
 
 ## Security
 
+- There is **no authentication** (roadmap 2.5.x). The defaults limit who can reach the API. It binds
+  127.0.0.1, and agent control refuses browser-originated requests. Other mutating routes still
+  accept a cross-origin `text/plain` POST.
 - All user-controlled strings in responses are JSON-escaped.
 - Content-Length is validated; Transfer-Encoding is rejected.
 - Maximum request size: 64 KB.
+- An agent's executable is chosen by daimon from its type, never by a request. See Agents.

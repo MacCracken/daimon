@@ -42,9 +42,17 @@ assert(str_eq(config_data_dir(cfg), str_from("/srv/daimon")) == 1,
 assert(str_eq(config_listen_addr(cfg), str_from("127.0.0.1")) == 1,
   "setting data_dir leaves listen_addr alone");
 
+# 2.3.0: `serve --listen` writes listen_addr, which is now what the server binds.
+config_set_listen_addr(cfg, str_from("0.0.0.0"));
+assert(str_eq(config_listen_addr(cfg), str_from("0.0.0.0")) == 1,
+  "config_set_listen_addr writes listen_addr");
+assert_eq(config_port(cfg), 9090, "setting listen_addr leaves port alone");
+
 # Two configs share nothing: the defaults are per-instance, not a shared literal
 # that one caller's setter would change for everyone.
 var cfg2 = config_new();
 assert_eq(config_port(cfg2), 8090, "a fresh config is unaffected by another's setters");
+assert(str_eq(config_listen_addr(cfg2), str_from("127.0.0.1")) == 1,
+  "... and binds loopback by default");
 
 syscall(SYS_EXIT, assert_summary());

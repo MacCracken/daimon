@@ -36,6 +36,19 @@ var _DAIMON_SYS_PRLIMIT64 = 261;    # asm-generic/unistd.h __NR_prlimit64
 # never shadow a future peer constant.
 var _DAIMON_SYS_PIDFD_SEND_SIGNAL = 424;
 
+# 2.3.0 — agent spawning (src/agent.cyr agent_spawn_with_limits). The stdlib has
+# no pipe2 on x86_64 (its aarch64 peer uses 59 only inside sys_pipe, flags 0) and
+# no close_range on either arch. Same header check as above.
+#ifdef CYRIUS_ARCH_X86
+var _DAIMON_SYS_PIPE2 = 293;        # asm/unistd_64.h __NR_pipe2
+#endif
+#ifdef CYRIUS_ARCH_AARCH64
+var _DAIMON_SYS_PIPE2 = 59;         # asm-generic/unistd.h __NR_pipe2
+#endif
+var _DAIMON_SYS_CLOSE_RANGE = 436;  # both headers agree; Linux 5.9+
+var _DAIMON_O_CLOEXEC = 524288;     # asm-generic/fcntl.h (1 << 19); x86_64's asm/fcntl.h includes it
+var _DAIMON_RLIMIT_NOFILE = 7;      # asm-generic/resource.h, both arches
+
 # =========================================================================
 # Portability shims — one call shape, per-target bodies
 # =========================================================================
@@ -100,17 +113,62 @@ fn daimon_rename(old_cstr, old_len, new_cstr, new_len) {
 # still running, and `agent_stop` would then SIGKILL a process that had already
 # exited normally.
 fn daimon_reap(pid) {
+    var c = daimon_reap_code(pid);
+    if (c >= 0) { return 1; }
+    if (c == 0 - 2) { return 0; }
+    return 0 - 1;
+}
+
+# daimon_reap that KEEPS the exit status (2.3.0 — the lifecycle API reports it).
+#    >= 0 — reaped; the exit code, or 128 + the signal number if a signal
+#           killed it (the shell's convention, so one int carries both)
+#      -2 — still running
+#      -1 — no such child
+# agnos's #4 already answers exactly this shape, so its arm passes through.
+#
+# ⛔ pid <= 0 is refused, not forwarded. waitpid(0) reaps ANY child in daimon's
+# process group and waitpid(-1) ANY child at all: an agent record whose pid is
+# still 0 would steal — and discard — another agent's exit status.
+fn daimon_reap_code(pid) {
+    if (pid <= 0) { return 0 - 1; }
     #ifdef CYRIUS_TARGET_AGNOS
     var wr = sys_waitpid(pid);
-    if (wr >= 0) { return 1; }
-    if (wr == 0 - 2) { return 0; }
+    if (wr >= 0) { return wr; }
+    if (wr == 0 - 2) { return 0 - 2; }
     return 0 - 1;
     #else
     var status_buf: i32[1];
     var wr = sys_waitpid(pid, &status_buf, 1);   # WNOHANG
-    if (wr > 0) { return 1; }
-    if (wr == 0) { return 0; }
+    if (wr == 0) { return 0 - 2; }
+    if (wr < 0) { return 0 - 1; }
+    var st = load32(&status_buf);
+    if (WIFEXITED(st) == 1) { return WEXITSTATUS(st); }
+    if (WIFSIGNALED(st) == 1) { return 128 + WTERMSIG(st); }
+    return 0 - 2;   # not an exit (no WUNTRACED, so not expected)
+    #endif
+}
+
+# Deliver `sig` to agent process `pid`: 0 on success, negative on failure.
+# VULN-004: pidfd_open + pidfd_send_signal, falling back to kill(2) on kernels
+# before 5.3. (For daimon's OWN unreaped children kill(2) is already safe: a
+# pid cannot be reused until its parent reaps it, and daimon clears an agent's
+# pid in the same step that reaps it. The pidfd path is kept for the audit
+# trail VULN-004 records.)
+# ⛔ pid <= 0 is refused: kill(0, sig) signals daimon's whole process group,
+# daimon included, and kill(-1, sig) every process daimon may signal.
+# agnos: no agent process exists there until 2.4.x maps sys_spawn_path.
+fn daimon_signal(pid, sig) {
+    if (pid <= 0) { return 0 - 1; }
+    #ifdef CYRIUS_TARGET_AGNOS
     return 0 - 1;
+    #else
+    var pidfd = sys_pidfd_open(pid, 0);
+    if (pidfd >= 0) {
+        var r = syscall(_DAIMON_SYS_PIDFD_SEND_SIGNAL, pidfd, sig, 0, 0);
+        sys_close(pidfd);
+        return r;
+    }
+    return sys_kill(pid, sig);
     #endif
 }
 
@@ -122,11 +180,24 @@ fn daimon_reap(pid) {
 # available there. The host arm polls too, deliberately: the previous
 # `sys_waitpid(pid, &status, 0)` blocked FOREVER if the child sat in
 # uninterruptible sleep, hanging the whole supervisor on one wedged agent.
-# A bounded poll degrades that to a leaked zombie, which the next
-# agent_is_alive sweep reports.
-var DAIMON_REAP_TRIES = 1000;      # ~1s at 1ms, the SIGKILL-to-reap budget
+# A bounded poll degrades that to an unreaped child, which agent_stop leaves
+# STOPPING with its pid kept, and agent_reap collects later (2.3.0).
+var DAIMON_REAP_BUDGET_MS = 1000;  # the SIGKILL-to-reap budget
 
 fn daimon_reap_wait(pid) {
+    var r = daimon_reap_within(pid, DAIMON_REAP_BUDGET_MS);
+    if (r >= 0) { return 1; }
+    if (r == 0 - 2) { return 0; }
+    return 0 - 1;
+}
+
+# Poll daimon_reap_code, 1 ms apart, until `ms` milliseconds of MONOTONIC time
+# have passed. Returns what the last poll returned: the exit code, -2 if the
+# child outlived the bound, -1 if there is no such child. 2.3.0: the SIGTERM
+# grace in agent_stop and the SIGKILL-to-reap budget above are both this loop.
+# (Counting sleeps instead of reading the clock ran a 5 s grace to 5.36 s —
+# measured — because each 1 ms sleep costs more than 1 ms.)
+fn daimon_reap_within(pid, ms) {
     # `sys_nanosleep(req, rem)` is the one sleep primitive BOTH the Linux and
     # agnos peers define (agnos also has sys_sleep_ms, Linux does not), so it is
     # what keeps this loop free of an #ifdef. timespec = {i64 tv_sec, i64 tv_nsec};
@@ -135,14 +206,14 @@ fn daimon_reap_wait(pid) {
     var ts: i64[2];
     store64(&ts, 0);
     store64(&ts + 8, 1000000);      # 1 ms
-    var i = 0;
-    while (i < DAIMON_REAP_TRIES) {
-        var r = daimon_reap(pid);
-        if (r != 0) { return r; }
+    var deadline = clock_now_ms() + ms;
+    var r = daimon_reap_code(pid);
+    while (r == 0 - 2) {
+        if (clock_now_ms() >= deadline) { return r; }
         sys_nanosleep(&ts, 0);
-        i = i + 1;
+        r = daimon_reap_code(pid);
     }
-    return 0;
+    return r;
 }
 
 # Peer IPv4 address of a connected socket, as a 32-bit integer.

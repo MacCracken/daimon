@@ -57,4 +57,28 @@ assert(streq(_http_reason(405), "Method Not Allowed") == 1, "405 has its RFC 723
 assert(streq(_http_reason(500), "Internal Server Error") == 1, "500 has its RFC 7231 phrase");
 assert(streq(_http_reason(404), "Not Found") == 1, "existing phrases unchanged");
 
+# --- 2.3.0: the Origin test the agent-control routes refuse on ------------
+test_group("http_origin");
+assert(streq(_http_reason(403), "Forbidden") == 1, "403 has its RFC 7231 phrase");
+
+# A POST with the given extra header lines (each ending \r\n).
+fn _has_origin(hdrs) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "POST /v1/agents/1/start HTTP/1.1\r\nHost: 127.0.0.1\r\n");
+    str_builder_add_cstr(sb, hdrs);
+    str_builder_add_cstr(sb, "\r\n");
+    var req = str_builder_build(sb);
+    return http_has_origin(str_data(req), str_len(req));
+}
+
+assert_eq(_has_origin(""), 0, "no Origin header: not browser-originated");
+assert_eq(_has_origin("Origin: https://attacker.example\r\n"), 1, "a cross-site Origin is seen");
+assert_eq(_has_origin("origin: http://x\r\n"), 1, "the header name is case-insensitive");
+assert_eq(_has_origin("Origin: null\r\n"), 1, "Origin: null (sandboxed iframe) counts");
+assert_eq(_has_origin("Origin:\r\n"), 1, "an empty Origin value still counts");
+assert_eq(_has_origin("Content-Type: text/plain\r\nOrigin: https://a.example\r\n"), 1,
+  "found after other headers");
+assert_eq(_has_origin("X-Origin: https://a.example\r\n"), 0, "X-Origin is a different header");
+assert_eq(_has_origin("Origins: https://a.example\r\n"), 0, "Origins is a different header");
+
 syscall(SYS_EXIT, assert_summary());

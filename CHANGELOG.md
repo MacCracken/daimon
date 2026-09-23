@@ -4,6 +4,150 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.3.0] - 2026-09-22
+
+**daimon can start, stop, pause, resume and delete agents through its API.** Until now it could
+register an agent and read it back, and nothing else: the process code under the router existed and
+had never run. 2.3.0 wires it up. That is the first two steps of roadmap 2.3.x (start/stop, then
+signals and reaping). Running that code for the first time found eight defects in it, all fixed here.
+Process control also made two older exposures serious, and both are fixed: the API listened on
+every interface, and any web page could drive it.
+
+**Upgrading — the bind address changed.** daimon now listens on `127.0.0.1`, the address config has
+always named and the Rust original bound. Clients on other hosts (edge nodes, federation peers) need
+`serve --listen 0.0.0.0`. See Security.
+
+**741 tests** (was 645) across 16 suites, **43 HTTP smoke checks** (was 18), **24 benchmarks** (was
+21) and 6 fuzz harnesses, all green. The tests run real child processes, and each lifecycle fix has
+a test that fails when the fix is reverted (nine mutation runs, nine caught). fmt / lint / vet
+clean. x86_64, aarch64 and agnos build, and the aarch64 binary was run under qemu-aarch64. The full
+audit is [docs/audit/2026-09-22-agent-lifecycle-audit.md](docs/audit/2026-09-22-agent-lifecycle-audit.md).
+
+### Added — the agent lifecycle on the API
+
+| Route | Does | Answers |
+|---|---|---|
+| `POST /v1/agents/{id}/start` | runs the agent's process | 200; 409 wrong status; 422 no executable for its type; 501 on AGNOS (2.4.x) |
+| `POST /v1/agents/{id}/stop` | SIGTERM, up to 5 s, then SIGKILL | 200, with the `exit_code` |
+| `POST /v1/agents/{id}/pause` · `/resume` | SIGSTOP · SIGCONT | 200; 409 wrong status |
+| `DELETE /v1/agents/{id}` | forgets the agent | 200; 409 while it has a process |
+
+- **What runs is chosen by daimon, never by the request.** A registration may name a `type`
+  (`System`, `User` or `Service`, agnostik's `AgentType`; default `User`). The start runs
+  `agnos-agent-<type>-agent` from `/usr/lib/agnos/agents`, then `/opt/agnos/agents`, else
+  `/usr/bin/agnos-agent-runner`, as the Rust original did. It passes the Rust original's argv,
+  `--agent-id <id> --agent-name <name>`. The original's third directory, cwd-relative
+  `./agents`, is dropped. `serve --agents-dir DIR` replaces the search, runner included.
+- **The child is set up the way a supervisor's should be:**
+  - every inherited descriptor above stderr is closed (see Security);
+  - stdin is `/dev/null`;
+  - SIGPIPE is back to its default;
+  - the supervisor's quota becomes the rlimits: RLIMIT_AS 1 GiB and RLIMIT_CPU 3600 s, checked, so a
+    limit that cannot be applied refuses the start (VULN-010);
+  - the environment is daimon's own, as the Rust original passed it.
+- **A start reports a failed exec as a failure.** Before, a missing executable looked like a running
+  agent until it exited 127. The spawn uses a close-on-exec pipe, the one Rust's `Command::spawn`
+  uses.
+- **Exit status.** Agents that exit on their own are collected on every agent route. Exit 0 leaves
+  the agent STOPPED; anything else, or death by a signal, leaves it FAILED. A FAILED agent can be
+  started again directly. Responses gain `type` and `exit_code`, where `exit_code` is null until a
+  process exits and 128 + the signal number if a signal killed it. `status` is still the integer it
+  was.
+- `config` `max_agents` (1000) is now enforced: registration answers 409 at the limit. It was never
+  checked, and now every record can become a process.
+- `serve --agents-dir DIR` and `serve --listen ADDR`. `help` lists both, and `--trace` too, which
+  it had omitted.
+
+### Security
+
+- **VULN-011 — the HTTP API listened on every interface.** Both serve modes passed `INADDR_ANY()`.
+  `config` has always said `127.0.0.1` and nothing read it. Measured: `ss -ltn` →
+  `0.0.0.0:<port>`. Now `listen_addr` is bound, `--listen` widens it deliberately, a malformed value
+  exits 1, and the banner names the address. (AGNOS ignores the address: its kernel binds the one
+  NIC.) CWE-1327. For the class, see CVE-2023-48022 ("ShadowRay": an unauthenticated job API reachable
+  from networks).
+- **VULN-012 — web pages could drive agents.** A `text/plain` POST carrying
+  `Origin: https://attacker.example`, which a browser sends from any page with no CORS preflight,
+  **started an agent** (measured, 200). A foreign `Host` header is also answered, so DNS rebinding
+  reaches the API. Start / stop / pause / resume / DELETE now answer **403** to any request carrying
+  an `Origin`, and record it as audit event `agent.control.origin`. daimon's own clients send none.
+  This is the class of CVE-2022-28108 / CVE-2022-28109 (Selenium Grid) and CVE-2024-28224 (Ollama).
+  **Still open** (roadmap 2.5.x): the other mutating routes still accept a cross-site POST, and
+  there is no Host allowlist.
+- **VULN-013 — agents would have inherited daimon's sockets.** `tcp_socket` and `sock_accept` do not
+  set close-on-exec, and the spawn never closed descriptors. Reverting the fix and running
+  `tests/smoke.sh` shows the agent holding **2 sockets**: daimon's listener and the requesting
+  client's connection. The child now closes every descriptor from 3 up (`close_range`, with a
+  per-descriptor fallback before Linux 5.9). Fixed before any route could reach it. CWE-403; for the
+  class, see CVE-2024-21626 (runc "Leaky Vessels").
+- The pre-2.3.0 `agent_start(h, executable)` expected the route to pass it an executable from the
+  request body. On an unauthenticated API that would have been remote code execution. The type
+  lookup above replaces it.
+
+### Fixed — in the lifecycle code, when it first ran
+
+None of this had ever executed; each fix has a test that fails without it.
+
+- **`agent_stop` SIGKILLed every agent.** It checked once, with a non-blocking wait, straight after
+  SIGTERM, then sent SIGKILL. Now it waits out a grace period on a monotonic clock. A SIGTERM-ignoring
+  agent took 5,008 ms to stop; with counted sleeps it had taken 5,359 ms. A **paused** agent also
+  gets SIGCONT, because a stopped process cannot act on SIGTERM.
+- **Agents started with SIGPIPE ignored.** daimon ignores it, and an ignore survives `execve`. The
+  child now calls `signal_default(SIGPIPE)`, the stdlib's documented remedy.
+- **A failed exec, or an rlimit that would not apply, was `Ok(pid)`.** Both are now `Err` before the
+  start returns (see Added).
+- **`waitpid(0)` and `kill(0)` were reachable.** An agent record with pid 0 would have reaped any
+  child, or signalled daimon's own process group, daimon included. `daimon_reap_code` and
+  `daimon_signal` refuse pid ≤ 0.
+- **Exited agents were never reaped.** They stayed RUNNING with a pid the kernel may reuse, and
+  their processes stayed zombies. An agent's pid is now cleared in the same step that reaps it, so it
+  is never signalled again.
+
+### Performance
+
+The new work, measured against the real code (`tests/daimon.bcyr`):
+
+| Benchmark | avg | min | iters |
+|---|---:|---:|---:|
+| agent_spawn_reap — fork, child setup, exec `/bin/true`, report, reap | 1.35 ms | 1.28 ms | 200 |
+| agent_reap_sweep_100_idle — the sweep every agent route runs, no processes | 0.95 µs | 0.91 µs | 100000 |
+| agent_reap_live — the sweep's cost per running agent (one `waitpid`) | 0.51 µs | 0.48 µs | 100000 |
+
+At the 1000-agent limit with every agent running, the sweep adds about 0.5 ms to an agent request.
+It walks the registry with `map_iter`, not `map_keys`, so it allocates nothing: every agent route
+runs it, and daimon's heap does not free. **No regression elsewhere.** The committed 2.2.3 bench
+binary and this one, run back to back (3 runs each, medians), agree within −4.7% … +2.9% on all 19
+existing benchmarks, 16 of them faster. (Today's absolute numbers sit a few percent above the
+2.2.3 table for both binaries. That is the machine, not the code: the 2.2.3 binary reads
+`mcp_find_tool_in_100` at 102 ns now against its recorded 93 ns.)
+
+### Changed
+
+- Banner: `daimon v2.3.0 listening on port 8090 (sync, 127.0.0.1)`. The address is omitted on
+  AGNOS.
+- Internal signatures (no consumer links daimon's code, and crab reaches it over HTTP):
+  - `agent_start(h, mem_limit, cpu_secs)`;
+  - `agent_spawn_with_limits(exe, argv, envp, mem_limit, cpu_limit)`;
+  - `agent_send_signal` is replaced by `daimon_signal` (`src/syscalls.cyr`), and the new
+    `daimon_reap_code` keeps the exit status;
+  - `DAIMON_REAP_TRIES` is now `DAIMON_REAP_BUDGET_MS`, a clock bound.
+- AGNOS: a start answers 501 until 2.4.x maps `sys_spawn_path`. The agnos build's
+  undefined-function warnings drop `sys_execve` and `sys_pidfd_open`.
+
+### Recorded, not fixed (roadmap)
+
+- A stop holds the single-threaded server for up to ~6 s. Measured: a request sent during a 5 s
+  stop waited 4.8 s, in both serve modes. (VULN-014)
+- Agents inherit daimon's environment, so any secret in it reaches them. This is Rust parity.
+  (VULN-015)
+- A stop signals the agent's own process only; its children are not signalled.
+- Agents outlive a daimon crash.
+- stdout and stderr are inherited, not captured.
+- The remainder of roadmap 2.3.x: task start and complete, then IPC.
+- **aarch64 RLIMIT_AS is unverified.** Under qemu-aarch64 every other check passed, but QEMU's
+  user-mode `prlimit64` never applies RLIMIT_AS (`linux-user/syscall.c`). The call's effect on
+  aarch64 hardware was not measured.
+
 ## [2.2.3] - 2026-09-22
 
 **The 2.2.x test-integrity arc is finished: no test, benchmark or fuzz harness uses a copy of
