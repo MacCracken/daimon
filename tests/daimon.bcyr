@@ -41,6 +41,8 @@ include "lib/libro.cyr"
 
 include "src/syscalls.cyr"
 include "src/error.cyr"
+include "lib/sandhi.cyr"
+include "src/http.cyr"
 include "src/config.cyr"
 include "src/audit.cyr"
 include "src/secmem.cyr"
@@ -209,8 +211,20 @@ fn bench_hashmap_1000() {
     return 0;
 }
 
+# bayan's FLAT parser. daimon read every request body with it until 2.3.2 and no
+# longer does; kept as the baseline for http_body_read3 below (same body).
 fn bench_json_parse() {
     json_parse(str_from("{\"name\":\"test\",\"port\":\"8090\",\"host\":\"localhost\"}"));
+    return 0;
+}
+
+# 2.3.2 — how a handler reads its body now: the typed parse, the boundary checks
+# (object, no duplicate key, no U+0000) and three field reads, decoded.
+fn bench_http_body_read3() {
+    var root = http_body_json(str_from("{\"name\":\"test\",\"port\":\"8090\",\"host\":\"localhost\"}"));
+    http_json_str(root, "name");
+    http_json_int(root, "port");
+    http_json_str(root, "host");
     return 0;
 }
 
@@ -481,6 +495,10 @@ fn main() {
     var b22 = bench_new("sched_start_complete");
     bench_run(b22, &bench_sched_start_complete, 100000);
     vec_push(benches, b22);
+
+    var b23 = bench_new("http_body_read3");
+    bench_run(b23, &bench_http_body_read3, 10000);
+    vec_push(benches, b23);
 
     bench_report_all(benches);
     return 0;

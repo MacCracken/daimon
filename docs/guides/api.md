@@ -7,6 +7,21 @@ authentication, so do that only behind a firewall.
 
 All responses are JSON. All POST bodies are JSON. Connection is closed after each response.
 
+## Request bodies
+
+Since 2.3.2 a body is **one JSON object**, read with a full JSON parser. It gets **400** when it:
+- is not JSON (for example form-encoded), has trailing content, or is not an object;
+- repeats a top-level key. Parsers disagree on which one wins, so daimon accepts neither;
+- has U+0000 in a top-level string.
+
+Values:
+- **Strings are decoded**: `"say \"hi\" \\o/ \u00e9"` is stored, and echoed back, as
+  `say "hi" \o/ é`. Before 2.3.2 the escapes were kept as typed.
+- **A string field** takes a JSON string, or a number read as its text (`"agent_id": 3` is `"3"`).
+- **An integer field** takes a number, a numeric string (`"priority": "7"`), or true / false as 1 / 0.
+- **Only top-level fields are read.** A key inside a nested object never stands in for a top-level
+  one. Nested values that daimon forwards, such as MCP `arguments`, are passed on untouched.
+
 ## Distributed tracing
 
 When started with `serve --trace`, daimon participates in a distributed trace on
@@ -240,7 +255,7 @@ GET /v1/metrics
 
 | Status | Meaning |
 |---|---|
-| 400 | Bad Request — missing/invalid field |
+| 400 | Bad Request — missing/invalid field, or a body that is not one JSON object (see Request bodies) |
 | 403 | Forbidden — agent or task control from a browser (a request carrying `Origin`) |
 | 404 | Not Found — unknown route or ID |
 | 405 | Method Not Allowed — a route exists, not for this method |
@@ -266,6 +281,5 @@ All errors return `{"error":"message","code":NNN}`.
 - Content-Length is validated; Transfer-Encoding is rejected.
 - Maximum request size: 64 KB.
 - An agent's executable is chosen by daimon from its type, never by a request. See Agents.
-- **Known issue (until 2.3.2):** string values in request bodies are stored with their JSON escapes
-  undecoded. A name sent as `"say \"hi\""` is kept, and echoed back, as `say \"hi\"`. Plain ASCII
-  without quotes, backslashes or `\u` escapes is unaffected.
+- Request bodies are parsed strictly (see Request bodies). Every string field is decoded, and a
+  body with a duplicate top-level key or U+0000 in a top-level string is refused.

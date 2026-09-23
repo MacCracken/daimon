@@ -40,6 +40,18 @@ those numbers are not comparable.
 
 `tests/rag_ingest.bcyr` (real since 2.1.6): `rag_ingest_real_5k` 133.1µs, `rag_chunk_only_5k` 508ns.
 
+### 2.3.2 — request bodies
+
+| Benchmark | avg | min | iters |
+|---|---:|---:|---:|
+| http_body_read3 — typed parse, boundary checks, three decoded fields | 1.31 µs | 1.30 µs | 10000 |
+| json_parse — bayan's flat parse alone, same body (the pre-2.3.2 read; baseline only) | 0.46 µs | 0.46 µs | 10000 |
+
+Reading a body correctly costs under a microsecond more per request. The committed 2.3.1 bench
+binary and the 2.3.2 one were run back to back, three runs each, compared by median. All 23
+benchmarks they share agree within −5.0% … +6.2%. The two largest moves are `trace_id_hex` (+3 ns)
+and `mcp_register_100_tools` (+5.3%), on code 2.3.2 did not touch.
+
 ### 2.3.1 — task start / complete
 
 | Benchmark | avg | min | iters |
@@ -237,8 +249,8 @@ Scheduler scheduling (1.5x), supervisor registration (2.5x), MCP registration (1
 | | Rust | Cyrius |
 |---|---|---|
 | Unit tests | 305 | — (inline in test groups) |
-| Integration tests | 28 | 797 assertions / 17 suites, each against its real `src/` module (2.3.1) |
-| Benchmarks | 19 | 25, against the real code (2.3.1) |
-| Fuzz harnesses | 0 | 6, property-based, run in CI (2.2.3) |
-| HTTP smoke | — | tests/smoke.sh, 60 checks, run in CI (2.3.1) |
-| Security audit | — | 16 findings (2026-04-13: 10; 2026-09-22 lifecycle: 6) — see docs/audit/ |
+| Integration tests | 28 | 833 assertions / 17 suites, each against its real `src/` module (2.3.2) |
+| Benchmarks | 19 | 26, against the real code (2.3.2) |
+| Fuzz harnesses | 0 | 7, property-based, run in CI (2.3.2) |
+| HTTP smoke | — | tests/smoke.sh, 70 checks, run in CI (2.3.2) |
+| Security audit | — | 17 findings (2026-04-13: 10; 2026-09-22 lifecycle: 7) — see docs/audit/ |

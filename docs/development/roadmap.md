@@ -4,14 +4,17 @@
 >
 > **Severity legend**: **P0** blocking (security / correctness — must-fix before ship) · **P1** high (must-have for the current arc) · **P2** medium (schedule when capacity opens) · **P3 / Low** nice-to-have, no urgency. Upstream-blocker items quote the upstream tracker's own severity.
 
-**Where daimon stands** — `2.3.1`, cyrius 6.6.6, nine dep pins current (samay
+**Where daimon stands** — `2.3.2`, cyrius 6.6.6, nine dep pins current (samay
 1.1.3). Builds on **three targets**: x86_64, aarch64 and AGNOS.
 - **Agents can be started, stopped, paused, resumed and deleted through the API** (2.3.0), under
   their rlimits, with exit status reported. On AGNOS a start answers 501 until 2.4.x.
 - **Scheduled tasks can be started and completed** (2.3.1), and an executor can list its node's
   work.
-- **797 tests** in 17 suites, every one against its real `src/` module, plus 60 HTTP smoke checks,
-  25 benchmarks and 6 fuzz harnesses, all run by CI.
+- **Request bodies are read with the typed JSON parser** (2.3.2): strings are decoded, nesting is
+  respected, and a body that is not one JSON object, repeats a top-level key or carries U+0000 in a
+  top-level string is refused.
+- **833 tests** in 17 suites, every one against its real `src/` module, plus 70 HTTP smoke checks,
+  26 benchmarks and 7 fuzz harnesses, all run by CI.
 - The API binds 127.0.0.1 unless told otherwise (`--listen`), and agent and task control refuse
   browser-originated requests.
 - Zero open issue filings.
@@ -23,7 +26,7 @@ prerequisites, sequenced. Each line is a release train, not a single release.
 
 | arc | theme | why it must come after the one above |
 |---|---|---|
-| **2.3.x** | **Agent lifecycle** — start / stop / signal / reap through the API | The product gap. **2.3.0** shipped the process half (start, stop, pause, resume, delete, reaping); **2.3.1** task start/complete. **2.3.2** (request-string decoding), then IPC, remain. |
+| **2.3.x** | **Agent lifecycle** — start / stop / signal / reap through the API | The product gap. **2.3.0** shipped the process half (start, stop, pause, resume, delete, reaping); **2.3.1** task start/complete; **2.3.2** request-string decoding. IPC remains. |
 | **2.4.x** | **AGNOS spawn + IPC** — `sys_spawn_path`, `chan_op` capability channels, `sys_proclist` | Nothing to map until a route actually spawns. Unblocks the moment 2.3.x lands. |
 | **2.5.x** | **Agent identity + MCP authentication** | Prerequisite for un-gating nein's mutating firewall tools, and for any `claims`-based authorisation. Needs 2.3.x, because identity is per-agent. |
 | **3.0.0** | **Per-agent arena isolation** — VULN-007's open half; unlocks multi-tenant hosting, kavach sandboxing, untrusted federation, external MCP callbacks | Major because it changes the allocation model under every agent and flips the gates the P0 below guards. Needs identity (2.5.x) to know what a tenant *is*. |
@@ -54,19 +57,10 @@ cut re-evaluates the P0 below.
 - `GET /v1/scheduler/nodes/{id}/tasks` for an executor to find its work;
 - the Origin guard on both POSTs.
 
-**Next — 2.3.2: request strings keep their JSON escapes** (P1, correctness). daimon reads request
-bodies with `json_parse` → `bayan_json_parse`, whose own contract says the values are the raw
-source bytes and escapes are NOT decoded. A caller who needs decoded values is told to use the
-tagged-tree parser, `bayan_json_v_parse_str`. daimon stores the raw bytes as if decoded. Measured on
-the 2.3.1 binary: an agent registered as `say "hi" \o/ é` is stored as `say \"hi\" \\o/
-\u00e9`. That is also what reaches the agent's `--agent-name` argv, what RAG chunks and embeds, what
-`callback_url` validation reads, and what a task's `reason` records. Every string field read this
-way is affected: 23 `jget(pairs, "<key>")` call sites across five `src/api_*.cyr` files read
-request fields. The fix decodes JSON string
-values once, where daimon reads them, and leaves the fields that are meant to be raw JSON
-(`inputSchema`, `arguments`) raw. It has its own tests across every endpoint that reads a string.
+**2.3.2 fixed request strings** (CHANGELOG 2.3.2, audit VULN-017): every handler reads its body
+with `http_body_json` and the `http_json_*` readers (the typed parser), and the flat `jget` is gone.
 
-**Then — IPC.** `agent_ipc_bind`, `agent_ipc_send` and `msg_bus_publish` still have no caller.
+**Next — IPC.** `agent_ipc_bind`, `agent_ipc_send` and `msg_bus_publish` still have no caller.
 Three defects were found when the socket code first ran (2.2.3) and deliberately left for this step:
 - the SO_PEERCRED check (VULN-006) **fails open**: if `getsockopt` fails, the peer is not checked;
 - a message cut short by its sender is queued and ACKed as if whole;
@@ -86,7 +80,7 @@ Three defects were found when the socket code first ran (2.2.3) and deliberately
 - **aarch64 RLIMIT_AS is unverified on hardware.** qemu-aarch64 does not apply it: QEMU's user-mode
   `prlimit64` passes RLIMIT_AS / DATA / STACK through as a no-op.
 
-**Sequence**: 2.3.2 request-string decoding → IPC. One bite each, suite green at every step.
+**Sequence**: IPC is the last 2.3.x step. One bite at a time, suite green at every step.
 
 ## 2.4.x · P2 — AGNOS spawn + IPC mapping
 
@@ -157,6 +151,13 @@ those; **P0 the moment one does.** Re-evaluate at every `2.x.0` cut.
 Zero-on-reset and secret hygiene close the *reuse* and *leak* channels but do not **isolate trust
 domains** — one bump allocator still backs every agent. Isolation is the open half and the hard
 prerequisite. (Both shipped halves are in the CHANGELOG.)
+
+## P3 — Edge node ids come from the agent counter
+
+`edge_node_new` numbers nodes with `_next_agent_id` (`src/edge.cyr`), the counter agents use, so the
+two interleave: after five agents, the first edge node is `"6"`. The ids stay unique, and nothing
+depends on them being dense, but a client can reasonably expect edge nodes to be numbered on
+their own. Found while testing 2.3.2.
 
 ## P3 — Edge registration takes no capabilities
 

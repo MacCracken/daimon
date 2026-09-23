@@ -83,6 +83,122 @@ fn http_parse_body(buf, len) {
     return str_new(buf + bo, avail);
 }
 
+# --- JSON request bodies (2.3.2) ---
+#
+# ⛔ Through 2.3.1 almost every handler read its body with json_parse + jget:
+# bayan's FLAT parser, whose own contract (bayan_json_parse) says the values
+# are the raw source bytes with escapes NOT decoded, and that "a caller who
+# needs decoded values should use" the tagged-tree parser. daimon stored the
+# raw bytes as if decoded. Measured on the 2.3.1 binary:
+#   {"name":"say \"hi\" \\o/ \u00e9"}      -> stored `say \"hi\" \\o/ \u00e9`
+#   {"meta":{"x":1,"name":"nested"},"name":"top"}  -> name = nested
+#   {"meta":{"x":1},"name":"after"}               -> name absent ("unnamed")
+# The flat scan ends an unquoted value at its first `,` or `}`, so a nested
+# object's keys surfaced as top-level fields and everything after it vanished —
+# a parser differential against any real JSON parser on the same body.
+#
+# The typed parser decodes every escape (surrogate pairs included), keeps
+# nesting, rejects malformed JSON, and returns each string as a FRESH
+# allocation — so a decoded field is never a view into the request buffer
+# sandhi reuses (the 2.2.x retention-leak class, closed at the source).
+
+# 1 if the Str holds a NUL byte (a `\u0000` escape, or a raw NUL).
+fn _http_has_nul(s) {
+    var d = str_data(s);
+    var n = str_len(s);
+    var i = 0;
+    while (i < n) {
+        if (load8(d + i) == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# The body as a JSON object, or 0 when it is not an acceptable one:
+#   * not JSON, or JSON with trailing content;
+#   * not an object at the top;
+#   * a DUPLICATE top-level key. RFC 8259 leaves their meaning undefined, and
+#     parsers disagree — daimon's lookup takes the first, JSON.parse the last —
+#     which is exactly the gap CVE-2017-12635 (CouchDB) turned into admin
+#     rights. One body, one meaning;
+#   * a top-level string holding U+0000. Every such field ends up as a C
+#     string somewhere (registry keys, argv, audit entries), where it would be
+#     cut at the NUL and stop matching the value daimon checked.
+# Nested values are left alone: daimon reads only top-level fields, and forwards
+# nested ones (MCP `arguments`) without interpreting them.
+fn http_body_json(body) {
+    if (body == 0) { return 0; }
+    var root = bayan_json_v_parse(body);
+    if (bayan_json_v_is_obj(root) == 0) { return 0; }
+    var n = bayan_json_v_obj_len(root);
+    var i = 0;
+    while (i < n) {
+        var v = bayan_json_v_obj_val(root, i);
+        if (bayan_json_v_is_str(v) == 1) {
+            if (_http_has_nul(bayan_json_v_str(v)) == 1) { return 0; }
+        }
+        var k = bayan_json_v_obj_key(root, i);
+        var j = 0;
+        while (j < i) {
+            if (str_eq(bayan_json_v_obj_key(root, j), k) == 1) { return 0; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return root;
+}
+
+# 400 for a body http_body_json refused.
+fn http_bad_body(fd) {
+    http_bad_request(fd, str_from("the body must be one JSON object, without duplicate keys or U+0000 in a string"));
+    return 0;
+}
+
+# 1 if the top-level field is present and not JSON null.
+fn http_json_has(root, key) {
+    var v = bayan_json_v_obj_get(root, key);
+    if (v == 0) { return 0; }
+    if (bayan_json_v_is_null(v) == 1) { return 0; }
+    return 1;
+}
+
+# A top-level string field, decoded — or 0 when it is absent, null, or neither
+# a string nor a number. A number is taken as its JSON text ("agent_id": 3 ->
+# "3"): the flat reader handed back the raw token, and daimon's own ids are
+# numbers, so clients send them unquoted. true / false, objects and arrays are
+# not strings.
+fn http_json_str(root, key) {
+    var v = bayan_json_v_obj_get(root, key);
+    if (v == 0) { return 0; }
+    if (bayan_json_v_is_str(v) == 1) { return bayan_json_v_str(v); }
+    if (bayan_json_v_is_int(v) == 1) { return bayan_json_v_build(v); }
+    if (bayan_json_v_is_float(v) == 1) { return bayan_json_v_build(v); }
+    return 0;
+}
+
+# A top-level integer field; 0 when absent — jget_int's contract. Accepts a JSON
+# number (a fraction is truncated), a numeric string as the API always has
+# ("7", read the way jget_int read it), and true / false as 1 / 0 (jget_int
+# read `true` as 0).
+fn http_json_int(root, key) {
+    var v = bayan_json_v_obj_get(root, key);
+    if (v == 0) { return 0; }
+    if (bayan_json_v_is_str(v) == 1) { return str_to_int(bayan_json_v_str(v)); }
+    if (bayan_json_v_is_bool(v) == 1) { return bayan_json_v_bool(v); }
+    return bayan_json_v_int(v);
+}
+
+# A top-level field as text: a string decoded, any other value as compact JSON
+# (`{"src":"a"}`, `42`), or 0 when absent or null. For free-form fields such as
+# RAG `metadata`, which the Rust original took as any JSON value.
+fn http_json_text(root, key) {
+    var v = bayan_json_v_obj_get(root, key);
+    if (v == 0) { return 0; }
+    if (bayan_json_v_is_null(v) == 1) { return 0; }
+    if (bayan_json_v_is_str(v) == 1) { return bayan_json_v_str(v); }
+    return bayan_json_v_build(v);
+}
+
 # Status-code → reason-phrase. Centralized so http_send_response
 # (sandhi-backed shim) can hand the right RFC 7231 phrase to
 # sandhi_server_send_response. Codes daimon emits today: 200, 201,

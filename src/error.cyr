@@ -58,27 +58,15 @@ fn error_to_status(err) {
     return 500;
 }
 
-# Format an error as JSON response body
-# JSON key lookup using cstr comparison (avoids str_eq Str layout issues)
-fn jget(pairs, key_cstr) {
-    if (pairs == 0) { return 0; }
-    var len = vec_len(pairs);
-    var gi = 0;
-    while (gi < len) {
-        var p = vec_get(pairs, gi);
-        var k = load64(p);  # key Str
-        if (str_eq_cstr(k, key_cstr) == 1) {
-            return load64(p + 8);  # value Str
-        }
-        gi = gi + 1;
-    }
-    return 0;
-}
+# (jget / jget_int — lookups over bayan's FLAT parse — were removed at 2.3.2.
+#  Every handler read its body through them and so kept JSON escapes undecoded
+#  and read nested keys as top-level fields. Request fields are read with
+#  http_body_json + http_json_str / _int / _text (src/http.cyr); keeping the old
+#  pair around would leave the wrong way looking like the usual one.)
 
-fn jget_int(pairs, key_cstr) {
-    var v = jget(pairs, key_cstr);
-    if (v == 0) { return 0; }
-    return str_to_int(v);
+fn _json_hex_digit(d) {
+    if (d < 10) { return 48 + d; }
+    return 87 + d;   # 'a' - 10
 }
 
 fn json_escape_str(s) {
@@ -93,8 +81,18 @@ fn json_escape_str(s) {
         elif (c == 10) { str_builder_add_cstr(sb, "\\n"); }
         elif (c == 13) { str_builder_add_cstr(sb, "\\r"); }
         elif (c == 9) { str_builder_add_cstr(sb, "\\t"); }
+        elif (c == 8) { str_builder_add_cstr(sb, "\\b"); }
+        elif (c == 12) { str_builder_add_cstr(sb, "\\f"); }
         elif (c < 32) {
-            # Control character — skip
+            # Any other control byte as \u00XX. ⛔ 2.3.2 — these were DROPPED.
+            # That was invisible while request strings kept their JSON escapes
+            # (a client's `\u0001` stayed six literal bytes); once 2.3.2 decodes
+            # them, dropping would silently lose what the client sent.
+            var hx: u8[2];
+            store8(&hx, _json_hex_digit(c >> 4));
+            store8(&hx + 1, _json_hex_digit(c & 15));
+            str_builder_add_cstr(sb, "\\u00");
+            str_builder_add(sb, str_new(&hx, 2));
         }
         else {
             var cbuf[1];

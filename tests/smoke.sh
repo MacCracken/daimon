@@ -300,4 +300,58 @@ tk_check "an unknown task is 404"          "$(tcode -X POST "$K/v1/scheduler/tas
 kill $TK_SRV 2>/dev/null || true
 if [ $TK_OK -ne 1 ]; then echo "  task smoke FAILED"; SMOKE_EXIT=1; fi
 
+echo ""
+echo "=== 2.3.2 request strings ==="
+# Every body used to be read with bayan's flat parser: escapes kept raw, a
+# nested object's keys read as top-level fields. Each check sends what the flat
+# reader got wrong and matches the RAW response bytes (grep -F, byte locale),
+# so nothing between here and daimon re-escapes anything.
+JS_PORT=18086
+JS_OK=1
+./build/daimon serve $JS_PORT >/dev/null 2>&1 &
+JS_SRV=$!
+i=0
+while [ $i -lt 25 ]; do
+    if curl -s --max-time 1 "http://127.0.0.1:$JS_PORT/v1/health" >/dev/null 2>&1; then break; fi
+    i=$((i + 1)); sleep 0.1
+done
+J="http://127.0.0.1:$JS_PORT"
+js_has() {
+    printf "  %s: " "$1"
+    if printf '%s' "$2" | LC_ALL=C grep -qF -- "$3"; then echo "PASS"; else echo "FAIL (got '$2')"; JS_OK=0; fi
+}
+js_code() {
+    printf "  %s: " "$1"
+    if [ "$2" = "$3" ]; then echo "PASS"; else echo "FAIL (got '$2', want '$3')"; JS_OK=0; fi
+}
+jcode() { curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$@"; }
+# say "hi" \o/ é — sent escaped, stored decoded, echoed escaped exactly once.
+js_has "escapes are decoded (quote, backslash, \\u00e9)" \
+  "$(curl -s --max-time 10 -X POST "$J/v1/agents" --data-binary '{"name":"say \"hi\" \\o/ \u00e9"}')" \
+  '"name":"say \"hi\" \\o/ é"'
+js_has "a nested key does not shadow the top-level one" \
+  "$(curl -s --max-time 10 -X POST "$J/v1/agents" -d '{"meta":{"x":1,"name":"nested"},"name":"top"}')" '"name":"top"'
+js_has "a field after a nested object is read" \
+  "$(curl -s --max-time 10 -X POST "$J/v1/agents" -d '{"meta":{"x":1},"name":"after"}')" '"name":"after"'
+js_code "a body that is not JSON is 400"   "$(jcode -X POST "$J/v1/agents" -d 'name=formish')" "400"
+js_code "a duplicate key is 400"           "$(jcode -X POST "$J/v1/agents" -d '{"name":"a","name":"b"}')" "400"
+js_code "U+0000 in a field is 400"         "$(jcode -X POST "$J/v1/agents" --data-binary '{"name":"a\u0000b"}')" "400"
+js_code "an escaped-slash callback_url registers (was refused)" \
+  "$(jcode -X POST "$J/v1/mcp/tools" --data-binary '{"name":"slashy","description":"d","callback_url":"http:\/\/127.0.0.1:9\/"}')" "201"
+js_has "mcp call follows the TOP-LEVEL name, not a nested one" \
+  "$(curl -s --max-time 10 -X POST "$J/v1/mcp/call" -d '{"arguments":{"x":1,"name":"libro_export"},"name":"libro_verify"}')" \
+  '{\"ok\":true}'
+printf '{"text":"alpha\tbeta\001gamma"}' | curl -s -o /dev/null --max-time 10 -X POST "$J/v1/rag/ingest" --data-binary @-
+js_has "a control byte comes back escaped (was dropped)" \
+  "$(curl -s --max-time 10 -X POST "$J/v1/rag/query" -d '{"query":"alpha"}')" 'beta\u0001gamma'
+curl -s -o /dev/null --max-time 10 -X POST "$J/v1/scheduler/nodes" -d '{"node_id":"js-n1","total_cpu":1,"total_memory_mb":256}'
+JT=$(curl -s --max-time 10 -X POST "$J/v1/scheduler/tasks" -d '{"name":"j"}' | grep -o '"task_id":"[^"]*"' | cut -d'"' -f4)
+curl -s -o /dev/null --max-time 10 -X POST "$J/v1/scheduler/schedule"
+curl -s -o /dev/null --max-time 10 -X POST "$J/v1/scheduler/tasks/$JT/start"
+js_has "a failure reason round-trips, escaped once" \
+  "$(curl -s --max-time 10 -X POST "$J/v1/scheduler/tasks/$JT/complete" --data-binary '{"status":"failed","reason":"disk \"full\" at C:\\temp"}')" \
+  '"fail_reason":"disk \"full\" at C:\\temp"'
+kill $JS_SRV 2>/dev/null || true
+if [ $JS_OK -ne 1 ]; then echo "  request-string smoke FAILED"; SMOKE_EXIT=1; fi
+
 exit $SMOKE_EXIT

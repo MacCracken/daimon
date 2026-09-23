@@ -5,11 +5,15 @@
 # POST /v1/rag/ingest
 fn api_rag_ingest(fd, body) {
     if (body == 0) { http_bad_request(fd, str_from("missing body")); return 0; }
-    var pairs = json_parse(body);
-    var text = jget(pairs, "text");
+    var root = http_body_json(body);
+    if (root == 0) { http_bad_body(fd); return 0; }
+    var text = http_json_str(root, "text");
     if (text == 0) { http_bad_request(fd, str_from("text cannot be empty")); return 0; }
     if (str_len(text) == 0) { http_bad_request(fd, str_from("text cannot be empty")); return 0; }
-    var metadata = jget(pairs, "metadata");
+    # Any JSON value, as in the Rust original: a string as itself, anything else
+    # as compact JSON text (the flat parser kept an object only up to its first
+    # comma).
+    var metadata = http_json_text(root, "metadata");
     if (metadata == 0) { metadata = str_from("null"); }
     var ids = rag_ingest_text(_rag_pipeline, text, metadata);
     var sb = str_builder_new();
@@ -29,8 +33,9 @@ fn api_rag_ingest(fd, body) {
 # POST /v1/rag/query
 fn api_rag_query(fd, body) {
     if (body == 0) { http_bad_request(fd, str_from("missing body")); return 0; }
-    var pairs = json_parse(body);
-    var query = jget(pairs, "query");
+    var root = http_body_json(body);
+    if (root == 0) { http_bad_body(fd); return 0; }
+    var query = http_json_str(root, "query");
     if (query == 0) { http_bad_request(fd, str_from("query cannot be empty")); return 0; }
     if (str_len(query) == 0) { http_bad_request(fd, str_from("query cannot be empty")); return 0; }
     var ctx = rag_query_text(_rag_pipeline, query);

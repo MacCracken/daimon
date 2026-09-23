@@ -47,9 +47,11 @@ fn sched_task_complete(s, id, final_status, reason) {
     var r_t, r_v = task_scheduler_complete_task(s, id, final_status);
     if (is_err_result(r_t) == 1) { return Err(SCHED_OP_BAD_STATE); }
     if (final_status == TASK_FAILED) {
-        # ⛔ CLONED. `reason` arrives as a jget view into the request buffer,
-        # which sandhi reuses for the next request; samay's setter stores the
-        # pointer it is given. (The 2.2.1 agent-name leak, the same class.)
+        # ⛔ CLONED. samay's setter stores the pointer it is given. The route
+        # hands over an owned, decoded copy since 2.3.2 (http_json_str), but
+        # this function does not rely on its caller: until 2.3.2 the reason was
+        # a view into the request buffer sandhi reuses, the 2.2.1 agent-name
+        # leak's class, and a view is what tests/sched.tcyr passes.
         if (reason != 0) { ScheduledTask_set_fail_reason(task, str_clone(reason)); }
     }
     return Ok(task);

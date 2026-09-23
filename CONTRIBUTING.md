@@ -53,6 +53,17 @@ the pin) and `cyrius deps` (git deps like sakshi). Run both after cloning.
    `fuzz/rng.cyr`, check properties from the documented contract, and exit with the number of the
    property that broke (`sys_exit(n)` — never a raw `syscall(60, …)`, which is x86-only)
 
+## Adding an HTTP Endpoint
+
+1. Route it in `src/router.cyr` with an explicit method check (`route_method`). A state change never
+   rides a GET.
+2. Read the body with `http_body_json` and the `http_json_str` / `_int` / `_has` / `_text` readers
+   (`src/http.cyr`), and answer `http_bad_body` when `http_body_json` refuses it. Do **not** use
+   bayan's flat `json_parse`. It keeps JSON escapes undecoded and misreads nested objects, which is
+   why daimon stopped using it at 2.3.2 (CHANGELOG 2.3.2).
+3. Escape every string you echo with `json_escape_str`.
+4. Add checks to `tests/smoke.sh`, which drives the linked binary over HTTP.
+
 ## Reporting Issues
 
 Open an issue on [GitHub](https://github.com/MacCracken/daimon/issues) with:

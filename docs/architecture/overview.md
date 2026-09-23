@@ -95,7 +95,8 @@ main.cyr   Preamble (syscall constants) + module includes + the `main` serve loo
 │
 ├── app.cyr          Global service state + composition root
 │   └── app_init           Initialize all subsystems
-├── http.cyr         HTTP plumbing
+├── http.cyr         HTTP plumbing; request bodies (2.3.2): http_body_json + http_json_str/_int/_has/_text —
+│                    the typed parser, strings decoded, one JSON object, no duplicate keys or U+0000
 │   ├── http_parse_*       Method, path, query params, body, Content-Length
 │   └── json_escape_str    Output encoding (VULN-002)
 ├── api.cyr          Service-level endpoints (health, metrics)

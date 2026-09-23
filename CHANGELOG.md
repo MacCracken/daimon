@@ -4,6 +4,107 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.3.2] - 2026-09-22
+
+**Request strings arrive as the client sent them.** Until now almost every handler read its body with
+bayan's flat parser. bayan's own contract says that parser keeps the raw source bytes, escapes
+undecoded, and tells callers who need decoded values to use its tree parser. daimon stored the
+raw bytes as if they were decoded. The same scan also misread nested objects. 2.3.2 moves every
+handler to the tree parser and checks each body once, at the boundary.
+
+**833 tests** (was 797) across 17 suites, **70 HTTP smoke checks** (was 60), **26 benchmarks** (was
+25) and **7 fuzz harnesses** (was 6), all green. The ten new smoke checks all pass here and all fail
+on 2.3.1. Five mutation runs, all caught. fmt / lint / vet clean; x86_64, aarch64 and agnos build.
+
+### Fixed — measured on 2.3.1, then on the fix
+
+| Body | 2.3.1 | 2.3.2 |
+|---|---|---|
+| `{"name":"say \"hi\" \\o/ \u00e9"}` | stored `say \"hi\" \\o/ \u00e9`, escapes intact | `say "hi" \o/ é` |
+| `{"meta":{"x":1,"name":"nested"},"name":"top"}` | name `nested` | `top` |
+| `{"meta":{"x":1},"name":"after"}` | name missing (`unnamed`) | `after` |
+| `POST /v1/mcp/call {"arguments":{"x":1,"name":"libro_export"},"name":"libro_verify"}` | ran **libro_export** | libro_verify |
+| `{"callback_url":"http:\/\/127.0.0.1:9\/"}` | 400, "invalid callback_url" | 201 |
+| a control byte in stored text | dropped on output | `\u0001` |
+
+- **Every string field is affected.** That covers agent, task, MCP tool, resource and prompt names,
+  descriptions and ids, RAG `text` and `query`, `callback_url`, `uri`, `node_id`, `agent_id` and a
+  task's `reason`. Before, a stored name was also what an agent received as `--agent-name`.
+- **The MCP line is a parser differential** (VULN-017, CWE-436). The flat scan ends an unquoted value at
+  its first `,` or `}`, so a nested object's keys became top-level fields. daimon then ran a different
+  tool from the one the forwarded body, or any JSON-aware proxy in front of it, names. The details are
+  in the 2.3.2 addendum to [docs/audit/2026-09-22-agent-lifecycle-audit.md](docs/audit/2026-09-22-agent-lifecycle-audit.md).
+- A decoded string is a fresh copy, never a view into the request buffer that sandhi reuses. That
+  closes the 2.2.x retention-leak class at its source.
+- `json_escape_str` writes control bytes other than `\n` `\r` `\t` as `\b`, `\f` or `\u00XX`. It
+  used to drop them, which went unnoticed only while inputs kept their escapes.
+
+### Changed — the request boundary (behaviour change)
+
+A body is now **one JSON object**, checked once by `http_body_json`. A body is refused with **400**
+when it:
+- is not JSON (for example form-encoded), has trailing content, or is not an object. 2.3.1 accepted
+  these and used defaults;
+- repeats a **top-level key**. 2.3.1 kept the first. Parsers disagree on which one wins, which is
+  the gap CVE-2017-12635 turned into CouchDB admin rights; Bishop Fox's JSON interoperability
+  research recommends a fatal error;
+- has **U+0000 in a top-level string**. Such a field is truncated wherever it becomes a C string
+  (registry keys, argv, audit entries). Nested values are not inspected.
+
+Field types:
+- A string field takes a JSON string or a number, read as its text. `"agent_id": 3` still reads
+  `"3"`, as it always did. true / false, objects and arrays are not strings.
+- An integer field takes a number (a fraction is truncated), a numeric string as before, or true /
+  false as 1 / 0. The flat reader read `"gpu_available": true` as 0.
+- RAG `metadata` keeps any JSON value: a string as itself, anything else as compact JSON. The flat
+  reader kept an object only up to its first comma.
+
+**Migration**: a client sending real JSON needs no change, and now gets back exactly what it sent. A
+client relying on non-JSON bodies or duplicate keys gets 400 with the reason in `error`.
+
+### Removed
+
+- `jget` / `jget_int` (`src/error.cyr`), the lookups over the flat parse. No handler uses them, and
+  leaving them would keep the wrong reader looking like the usual one. The readers are
+  `http_body_json` and `http_json_str` / `_int` / `_has` / `_text` in `src/http.cyr`. The prompt
+  handlers' own typed reader, `_mcp_v_str`, folded into `http_json_str`.
+
+### Tests
+
+- `tests/http.tcyr`, 37 new assertions, all built from the bodies the flat reader got wrong:
+  - decoding, including a surrogate pair;
+  - nesting;
+  - every refusal (non-JSON, non-object, trailing content, duplicate key, U+0000, an unknown escape,
+    a lone low surrogate);
+  - U+0000 left alone in nested values;
+  - raw control bytes still accepted;
+  - reuse of the request buffer;
+  - every reader.
+- `tests/daimon.tcyr`: `json_escape_str`'s output decodes, through bayan's independent decoder, back to
+  every control byte 1..31, a quote, a backslash, DEL and a UTF-8 character.
+- `fuzz/json_strings.fcyr`, new, 16,000 generated cases:
+  - encode → read round trips;
+  - random code points in every legal JSON form (literal, short escape, `\uXXXX` in either case,
+    surrogate pairs) → read;
+  - the U+0000 and duplicate-key refusals;
+  - nested keys never surfacing.
+
+### Performance
+
+Reading a body the new way costs **1.31 µs** (`http_body_read3`: parse, boundary checks, three decoded
+fields), against **0.46 µs** for the flat parse alone (`json_parse`, same body, kept as the baseline).
+That is under a microsecond more per request. The committed 2.3.1 bench binary and this one, run back
+to back (three runs each, medians), agree within −5.0% … +6.2% on the 23 shared benchmarks. The two
+largest moves, `trace_id_hex` (+3 ns) and `mcp_register_100_tools` (+5.3%), are on code this release
+did not touch, and earlier A/Bs saw `mcp_register_100_tools` swing between 58 and 70 µs from run to
+run.
+
+### Recorded (roadmap)
+
+- Edge nodes take their ids from the agent counter (`_next_agent_id`, `src/edge.cyr`), so agent and
+  edge ids interleave: after five agents, the first edge node is `"6"`. The ids stay unique. P3.
+- The remainder of 2.3.x: IPC.
+
 ## [2.3.1] - 2026-09-22
 
 **A scheduled task can now start and finish.** samay places tasks on nodes, but through the API every

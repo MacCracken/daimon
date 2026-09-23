@@ -21,6 +21,7 @@ include "lib/str.cyr"
 include "lib/io.cyr"
 include "lib/syscalls.cyr"
 include "lib/sandhi.cyr"
+include "lib/bayan.cyr"
 include "lib/assert.cyr"
 
 include "src/error.cyr"
@@ -80,5 +81,93 @@ assert_eq(_has_origin("Content-Type: text/plain\r\nOrigin: https://a.example\r\n
   "found after other headers");
 assert_eq(_has_origin("X-Origin: https://a.example\r\n"), 0, "X-Origin is a different header");
 assert_eq(_has_origin("Origins: https://a.example\r\n"), 0, "Origins is a different header");
+
+# --- 2.3.2: request bodies, read with the typed parser --------------------
+# Each case is a body the flat parser (json_parse + jget) got wrong — measured
+# on the 2.3.1 binary — or a boundary the new reader enforces.
+test_group("http_body");
+
+fn _b(cstr) { return http_body_json(str_from(cstr)); }
+
+# Escapes are decoded. Bytes built by hand so the expectation is exact:
+# `say "hi" \o/ ` then U+00E9 (0xC3 0xA9).
+var r1 = _b("{\"name\":\"say \\\"hi\\\" \\\\o/ \\u00e9\"}");
+assert(r1 != 0, "a body with escapes parses");
+var w1 = "say \"hi\" \\o/ ";
+var w1n = strlen(w1);
+var want1 = alloc(w1n + 2);
+memcpy(want1, w1, w1n);
+store8(want1 + w1n, 195);
+store8(want1 + w1n + 1, 169);
+assert_eq(str_eq(http_json_str(r1, "name"), str_new(want1, w1n + 2)), 1,
+  "\\\", \\\\ and \\u00e9 are decoded (the flat parser kept all three as typed)");
+var r2 = _b("{\"name\":\"\\ud83d\\ude00\"}");
+var want2 = alloc(4);
+store8(want2, 240); store8(want2 + 1, 159); store8(want2 + 2, 152); store8(want2 + 3, 128);
+assert_eq(str_eq(http_json_str(r2, "name"), str_new(want2, 4)), 1, "a surrogate pair decodes to one 4-byte character");
+var r3 = _b("{\"url\":\"http:\\/\\/127.0.0.1:9\\/\"}");
+assert_eq(str_eq(http_json_str(r3, "url"), str_from("http://127.0.0.1:9/")), 1,
+  "an escaped slash decodes (callback_url validation saw `http:\\/\\/` and refused it)");
+
+# Nesting is respected.
+var r4 = _b("{\"meta\":{\"x\":1,\"name\":\"nested\"},\"name\":\"top\"}");
+assert_eq(str_eq(http_json_str(r4, "name"), str_from("top")), 1,
+  "a nested key is not a top-level field (the flat parser read name = nested)");
+var r5 = _b("{\"meta\":{\"x\":1},\"name\":\"after\"}");
+assert_eq(str_eq(http_json_str(r5, "name"), str_from("after")), 1,
+  "a field after a nested object is found (the flat parser lost it)");
+
+# The decoded string is a copy, not a view into the request buffer.
+var kb = "{\"name\":\"kept\"}";
+var bodybuf = alloc(32);
+memcpy(bodybuf, kb, strlen(kb));
+var r6 = http_body_json(str_new(bodybuf, strlen(kb)));
+var kept = http_json_str(r6, "name");
+memset(bodybuf, 88, 32);                 # the next request reuses the buffer
+assert_eq(str_eq(kept, str_from("kept")), 1, "a decoded field survives the request buffer being reused");
+
+# What the reader refuses (each -> 400 at the route).
+assert_eq(_b("name=formish"), 0, "not JSON");
+assert_eq(_b("[1,2]"), 0, "not an object");
+assert_eq(_b("{\"name\":\"a\"} trailing"), 0, "trailing content");
+assert_eq(_b("{\"name\":\"first\",\"name\":\"second\"}"), 0,
+  "a duplicate top-level key (the CVE-2017-12635 differential)");
+assert_eq(_b("{\"name\":\"a\\u0000b\"}"), 0, "U+0000 in a top-level string");
+assert_eq(_b("{\"name\":\"bad \\x escape\"}"), 0, "an unknown escape");
+assert_eq(_b("{\"name\":\"\\udc00\"}"), 0, "a lone low surrogate");
+assert_eq(http_body_json(0), 0, "no body");
+assert(_b("{\"meta\":{\"k\":\"a\\u0000b\"},\"name\":\"n\"}") != 0,
+  "U+0000 in a NESTED string is left alone (daimon reads top-level fields only)");
+assert(_b("{\"a\":{\"k\":1},\"b\":{\"k\":2}}") != 0, "the same key in two nested objects is fine");
+# Raw control bytes inside a string: the typed parser accepts them, as the
+# flat one did — tests/smoke.sh's RAG check depends on it.
+var rb = "{\"t\":\"a b\"}";
+var rawbuf = alloc(16);
+memcpy(rawbuf, rb, strlen(rb));
+store8(rawbuf + 7, 1);                  # the space between a and b becomes 0x01
+assert(http_body_json(str_new(rawbuf, strlen(rb))) != 0, "a raw control byte inside a string is accepted");
+
+# Field readers.
+var r7 = _b("{\"s\":\"x\",\"n\":7,\"f\":7.9,\"ns\":\"42\",\"neg\":-5,\"t\":true,\"z\":null,\"o\":{\"k\":[1,\"2\"]}}");
+assert(r7 != 0, "the reader fixture parses");
+assert_eq(str_eq(http_json_str(r7, "n"), str_from("7")), 1,
+  "a number is read as its text (numeric ids, which the flat reader took as tokens)");
+assert_eq(str_eq(http_json_str(r7, "neg"), str_from("-5")), 1, "... negative too");
+assert_eq(http_json_str(r7, "t"), 0, "true is not a string");
+assert_eq(http_json_str(r7, "o"), 0, "an object is not a string");
+assert_eq(http_json_str(r7, "missing"), 0, "an absent string field is 0");
+assert_eq(http_json_int(r7, "n"), 7, "int: a number");
+assert_eq(http_json_int(r7, "f"), 7, "int: a fraction is truncated");
+assert_eq(http_json_int(r7, "ns"), 42, "int: a numeric string, as the API has always taken");
+assert_eq(http_json_int(r7, "neg"), 0 - 5, "int: negative");
+assert_eq(http_json_int(r7, "t"), 1, "int: true is 1 (jget_int read `true` as 0)");
+assert_eq(http_json_int(r7, "missing"), 0, "int: absent is 0");
+assert_eq(http_json_has(r7, "s"), 1, "has: present");
+assert_eq(http_json_has(r7, "z"), 0, "has: null counts as absent");
+assert_eq(http_json_has(r7, "missing"), 0, "has: absent");
+assert_eq(str_eq(http_json_text(r7, "s"), str_from("x")), 1, "text: a string as itself");
+assert_eq(str_eq(http_json_text(r7, "o"), str_from("{\"k\":[1,\"2\"]}")), 1, "text: an object as compact JSON");
+assert_eq(str_eq(http_json_text(r7, "n"), str_from("7")), 1, "text: a number as JSON");
+assert_eq(http_json_text(r7, "z"), 0, "text: null is 0");
 
 syscall(SYS_EXIT, assert_summary());

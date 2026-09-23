@@ -1,0 +1,283 @@
+# Fuzz: request strings — daimon's JSON encoder and the 2.3.2 body reader
+#
+# 2.3.2 moved every handler off bayan's FLAT parser (escapes kept raw, a nested
+# object's keys read as top-level fields) onto http_body_json + http_json_str,
+# and made json_escape_str escape every control byte instead of dropping it.
+# This harness checks both directions on generated input:
+#   1. encode -> read: any byte string without NUL, escaped by json_escape_str
+#      and sent as a field, reads back byte for byte;
+#   2. reference encode -> read: random code points, each written in a random
+#      legal JSON form (literal UTF-8, a short escape, \uXXXX in either hex
+#      case, a surrogate pair), read back as their UTF-8;
+#   3. U+0000 anywhere in a top-level string refuses the body;
+#   4. a duplicate top-level key refuses the body, distinct keys do not;
+#   5. a nested key never shadows, or stands in for, a top-level one.
+include "lib/alloc.cyr"
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/str.cyr"
+include "lib/vec.cyr"
+include "lib/io.cyr"
+include "lib/hashmap.cyr"
+include "lib/tagged.cyr"
+include "lib/bayan.cyr"
+include "lib/syscalls.cyr"
+include "lib/sandhi.cyr"
+
+include "src/error.cyr"
+include "src/http.cyr"
+include "fuzz/rng.cyr"
+
+alloc_init();
+
+# A random byte, weighted toward the ones JSON strings get wrong. Never 0.
+fn _pick_byte() {
+    var k = fz_below(10);
+    if (k == 0) { return 34; }                   # "
+    if (k == 1) { return 92; }                   # backslash
+    if (k == 2) { return 1 + fz_below(31); }     # control 1..31
+    if (k == 3) { return 127; }                  # DEL
+    if (k == 4) { return 128 + fz_below(128); }  # high bytes, not always valid UTF-8
+    if (k == 5) { return 47; }                   # /
+    return 32 + fz_below(95);                    # printable ASCII
+}
+
+fn _random_bytes(len) {
+    var buf = alloc(len + 1);
+    var j = 0;
+    while (j < len) {
+        store8(buf + j, _pick_byte());
+        j = j + 1;
+    }
+    return str_new(buf, len);
+}
+
+# {"<key>":"<escaped>"}
+fn _body_with(key, escaped) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"");
+    str_builder_add_cstr(sb, key);
+    str_builder_add_cstr(sb, "\":\"");
+    str_builder_add(sb, escaped);
+    str_builder_add_cstr(sb, "\"}");
+    return str_builder_build(sb);
+}
+
+fn _add_byte(sb, b) {
+    var one: u8[1];
+    store8(&one, b);
+    str_builder_add(sb, str_new(&one, 1));
+    return 0;
+}
+
+# cp as UTF-8 into sb.
+fn _add_utf8(sb, cp) {
+    if (cp < 128) { _add_byte(sb, cp); return 0; }
+    if (cp < 2048) {
+        _add_byte(sb, 192 | (cp >> 6));
+        _add_byte(sb, 128 | (cp & 63));
+        return 0;
+    }
+    if (cp < 65536) {
+        _add_byte(sb, 224 | (cp >> 12));
+        _add_byte(sb, 128 | ((cp >> 6) & 63));
+        _add_byte(sb, 128 | (cp & 63));
+        return 0;
+    }
+    _add_byte(sb, 240 | (cp >> 18));
+    _add_byte(sb, 128 | ((cp >> 12) & 63));
+    _add_byte(sb, 128 | ((cp >> 6) & 63));
+    _add_byte(sb, 128 | (cp & 63));
+    return 0;
+}
+
+# \uXXXX, the hex digits in a random case (the decoder must take both).
+fn _add_u4(sb, v) {
+    str_builder_add_cstr(sb, "\\u");
+    var upper = fz_below(2);
+    var sh = 12;
+    while (sh >= 0) {
+        var d = (v >> sh) & 15;
+        if (d < 10) { _add_byte(sb, 48 + d); }
+        elif (upper == 1) { _add_byte(sb, 55 + d); }
+        else { _add_byte(sb, 87 + d); }
+        sh = sh - 4;
+    }
+    return 0;
+}
+
+# A random code point in 1..0x10FFFF, never a surrogate.
+fn _pick_cp() {
+    var k = fz_below(4);
+    if (k == 0) { return 1 + fz_below(127); }
+    if (k == 1) { return 128 + fz_below(2048 - 128); }
+    if (k == 2) {
+        var c = 2048 + fz_below(65536 - 2048);
+        if (c >= 55296) { if (c <= 57343) { c = c - 2048; } }   # step out of D800..DFFF
+        return c;
+    }
+    return 65536 + fz_below(1114112 - 65536);
+}
+
+# The short escape for cp, or 0 if it has none.
+fn _short_escape(cp) {
+    if (cp == 34) { return "\\\""; }
+    if (cp == 92) { return "\\\\"; }
+    if (cp == 47) { return "\\/"; }
+    if (cp == 8) { return "\\b"; }
+    if (cp == 12) { return "\\f"; }
+    if (cp == 10) { return "\\n"; }
+    if (cp == 13) { return "\\r"; }
+    if (cp == 9) { return "\\t"; }
+    return 0;
+}
+
+# Write cp into the JSON source in a random legal form.
+fn _add_json_cp(sb, cp) {
+    var form = fz_below(3);
+    var must_escape = 0;
+    if (cp < 32) { must_escape = 1; }
+    if (cp == 34) { must_escape = 1; }
+    if (cp == 92) { must_escape = 1; }
+    if (form == 0) {
+        if (must_escape == 0) { _add_utf8(sb, cp); return 0; }
+    }
+    if (form == 1) {
+        var se = _short_escape(cp);
+        if (se != 0) { str_builder_add_cstr(sb, se); return 0; }
+    }
+    if (cp >= 65536) {
+        var v = cp - 65536;
+        _add_u4(sb, 55296 + (v >> 10));
+        _add_u4(sb, 56320 + (v & 1023));
+        return 0;
+    }
+    _add_u4(sb, cp);
+    return 0;
+}
+
+var total = 0;
+
+# --- 1. encode -> read ---------------------------------------------------------
+var N1 = 5000;
+var i = 0;
+while (i < N1) {
+    var s = _random_bytes(fz_below(40));
+    var root = http_body_json(_body_with("name", json_escape_str(s)));
+    if (root == 0) { sys_exit(1); }
+    var got = http_json_str(root, "name");
+    if (got == 0) { sys_exit(2); }
+    if (str_eq(got, s) != 1) { sys_exit(3); }
+    i = i + 1;
+}
+total = total + N1;
+
+# --- 2. reference encode -> read -----------------------------------------------
+var N2 = 5000;
+i = 0;
+while (i < N2) {
+    var src = str_builder_new();
+    var want = str_builder_new();
+    var n = fz_below(12);
+    var j = 0;
+    while (j < n) {
+        var cp = _pick_cp();
+        _add_json_cp(src, cp);
+        _add_utf8(want, cp);
+        j = j + 1;
+    }
+    var root2 = http_body_json(_body_with("v", str_builder_build(src)));
+    if (root2 == 0) { sys_exit(10); }
+    var got2 = http_json_str(root2, "v");
+    if (got2 == 0) { sys_exit(11); }
+    if (str_eq(got2, str_builder_build(want)) != 1) { sys_exit(12); }
+    i = i + 1;
+}
+total = total + N2;
+
+# --- 3. U+0000 in a top-level string refuses the body --------------------------
+var N3 = 2000;
+i = 0;
+while (i < N3) {
+    var pre = _random_bytes(fz_below(10));
+    var post = _random_bytes(fz_below(10));
+    var esc = str_builder_new();
+    str_builder_add(esc, json_escape_str(pre));
+    str_builder_add_cstr(esc, "\\u0000");
+    str_builder_add(esc, json_escape_str(post));
+    if (http_body_json(_body_with("name", str_builder_build(esc))) != 0) { sys_exit(20); }
+    # ...and json_escape_str never emits a raw NUL of its own for the NUL-free rest.
+    i = i + 1;
+}
+total = total + N3;
+
+# --- 4. duplicate top-level keys ------------------------------------------------
+var N4 = 2000;
+i = 0;
+while (i < N4) {
+    var nk = 1 + fz_below(5);
+    var seen = alloc(8 * 6);
+    memset(seen, 0, 48);
+    var dup = 0;
+    var sb4 = str_builder_new();
+    str_builder_add_cstr(sb4, "{");
+    var k = 0;
+    while (k < nk) {
+        var key = fz_below(6);
+        if (load64(seen + key * 8) == 1) { dup = 1; }
+        store64(seen + key * 8, 1);
+        if (k > 0) { str_builder_add_cstr(sb4, ","); }
+        str_builder_add_cstr(sb4, "\"k");
+        str_builder_add_int(sb4, key);
+        str_builder_add_cstr(sb4, "\":");
+        str_builder_add_int(sb4, k);
+        k = k + 1;
+    }
+    str_builder_add_cstr(sb4, "}");
+    var r4 = http_body_json(str_builder_build(sb4));
+    if (dup == 1) { if (r4 != 0) { sys_exit(30); } }
+    if (dup == 0) { if (r4 == 0) { sys_exit(31); } }
+    i = i + 1;
+}
+total = total + N4;
+
+# --- 5. nested keys never shadow top-level ones --------------------------------
+var N5 = 2000;
+i = 0;
+while (i < N5) {
+    var nested_first = fz_below(2);
+    var with_top = fz_below(2);
+    var depth = 1 + fz_below(3);
+    var nest = str_builder_new();
+    var d = 0;
+    while (d < depth) { str_builder_add_cstr(nest, "{\"x\":1,\"name\":\"NESTED\",\"o\":"); d = d + 1; }
+    str_builder_add_cstr(nest, "0");
+    d = 0;
+    while (d < depth) { str_builder_add_cstr(nest, "}"); d = d + 1; }
+    var nested = str_builder_build(nest);
+    var sb5 = str_builder_new();
+    str_builder_add_cstr(sb5, "{");
+    if (nested_first == 1) {
+        str_builder_add_cstr(sb5, "\"meta\":");
+        str_builder_add(sb5, nested);
+        if (with_top == 1) { str_builder_add_cstr(sb5, ",\"name\":\"TOP\""); }
+    } else {
+        if (with_top == 1) { str_builder_add_cstr(sb5, "\"name\":\"TOP\","); }
+        str_builder_add_cstr(sb5, "\"meta\":");
+        str_builder_add(sb5, nested);
+    }
+    str_builder_add_cstr(sb5, "}");
+    var r5 = http_body_json(str_builder_build(sb5));
+    if (r5 == 0) { sys_exit(40); }
+    var nm = http_json_str(r5, "name");
+    if (with_top == 1) {
+        if (nm == 0) { sys_exit(41); }
+        if (str_eq(nm, str_from("TOP")) != 1) { sys_exit(42); }
+    } else {
+        if (nm != 0) { sys_exit(43); }   # the nested name must not surface
+    }
+    i = i + 1;
+}
+total = total + N5;
+
+fz_done("json_strings", total);

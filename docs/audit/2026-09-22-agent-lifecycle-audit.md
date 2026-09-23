@@ -1,4 +1,4 @@
-# Security Audit — 2026-09-22: the agent lifecycle (2.3.0, with a 2.3.1 addendum)
+# Security Audit — 2026-09-22: the agent lifecycle (2.3.0, with 2.3.1 and 2.3.2 addenda)
 
 2.3.0 connects process control to the HTTP API: an unauthenticated client can now start, stop,
 pause, resume and delete agents. This audit covers that new surface and two older exposures that
@@ -197,6 +197,55 @@ output (`json_escape_str`), and cloned at the retention boundary, so a reused re
 rewrite it (`tests/sched.tcyr`). The new `GET /v1/scheduler/nodes/{id}/tasks` is readable the way
 every GET is, and so falls under VULN-012's open "no Host allowlist" item.
 
+### VULN-017: Request bodies were read by a flat, non-decoding parser — a parser differential (MEDIUM) — FIXED in 2.3.2
+
+**CWE**: [CWE-436](https://cwe.mitre.org/data/definitions/436.html) — Interpretation Conflict.
+**References**:
+- [CVE-2017-12635](https://docs.couchdb.org/en/stable/cve/2017-12635.html) — CouchDB's Erlang JSON
+  parser took the FIRST duplicate key and its JavaScript parser the LAST, so a user could grant
+  themselves `_admin`.
+- Bishop Fox, [An Exploration & Remediation of JSON Interoperability Vulnerabilities](https://bishopfox.com/blog/json-interoperability-vulnerabilities).
+  It recommends a fatal error on duplicate keys, and warns against truncating characters that
+  different parsers may treat differently.
+
+Until 2.3.2 almost every handler read its body with `json_parse` + `jget`, bayan's FLAT parser.
+bayan's own contract, above `bayan_json_parse`, says its values are the raw source bytes with
+escapes NOT decoded, and that a caller who needs decoded values should use the tagged-tree parser.
+Its scan also ends an unquoted value at the first `,` or `}`. **Observed**: this release's smoke
+section was run against the committed 2.3.1 code, and all ten checks failed:
+
+```
+{"name":"say \"hi\" \\o/ \u00e9"}                  -> stored `say \"hi\" \\o/ \u00e9`, escapes intact
+{"meta":{"x":1,"name":"nested"},"name":"top"}      -> name = nested
+{"meta":{"x":1},"name":"after"}                    -> name absent ("unnamed")
+POST /v1/mcp/call {"arguments":{"x":1,"name":"libro_export"},"name":"libro_verify"}
+                                                   -> ran libro_export
+{"callback_url":"http:\/\/127.0.0.1:9\/"}          -> 400: the SSRF guard saw `http:\/\/`
+name=formish · {"name":"a","name":"b"} · {"name":"a\u0000b"}   -> all 201
+a control byte in stored text                     -> dropped on output (json_escape_str)
+```
+
+**Impact**: the MCP line is the differential. daimon ran a different tool from the one the body's
+top-level `name` names, and the body it forwards, and any JSON-aware proxy or policy check in
+front of daimon, say the other. Nothing else in daimon was escalated by it, since the caller chooses
+both names. But it defeats any rule enforced upstream on the tool name. The escaped-slash URL was a
+false refusal, not a bypass: nothing decoded the stored raw URL later.
+
+**Fix**: `http_body_json` and the `http_json_str` / `_int` / `_has` / `_text` readers
+(`src/http.cyr`):
+- the typed parser, which decodes every escape and keeps nesting;
+- a body that is not one JSON object, that has a duplicate top-level key (the CVE-2017-12635
+  shape), or that has U+0000 in a top-level string, is refused with 400. U+0000 would be truncated
+  wherever the field becomes a C string: registry keys, argv, audit entries;
+- decoded strings are fresh copies, never views into the request buffer;
+- `json_escape_str` writes every other control byte as `\u00XX` instead of dropping it;
+- `jget` / `jget_int` are removed, so the flat read is no longer on hand.
+
+**Tests**: 34 new assertions in `tests/http.tcyr`. A new fuzz harness, `fuzz/json_strings.fcyr`
+(16,000 cases), checks encode → read and reference-encode → read round trips, the U+0000 and
+duplicate-key refusals, and that nested keys never surface. There are 10 smoke checks, which pass
+on 2.3.2 and all fail on 2.3.1. Five mutation runs were all caught.
+
 ## Defects fixed in the lifecycle code when it first ran
 
 None of this code had ever executed: it had no caller until 2.3.0. Each fix has a test that fails
@@ -241,3 +290,4 @@ were caught.
 - [CWE-403](https://cwe.mitre.org/data/definitions/403.html), [CWE-1327](https://cwe.mitre.org/data/definitions/1327.html), [CWE-346](https://cwe.mitre.org/data/definitions/346.html), [CWE-352](https://cwe.mitre.org/data/definitions/352.html), [CWE-400](https://cwe.mitre.org/data/definitions/400.html), [CWE-526](https://cwe.mitre.org/data/definitions/526.html), [CWE-770](https://cwe.mitre.org/data/definitions/770.html)
 - [QEMU `linux-user/syscall.c`](https://gitlab.com/qemu-project/qemu/-/blob/master/linux-user/syscall.c) — the `TARGET_NR_prlimit64` handler
 - [CVE-2026-48592 — Oban Web missing authorization](https://basefortify.eu/cve_reports/2026/05/cve-2026-48592.html); [CWE-862](https://cwe.mitre.org/data/definitions/862.html) (2.3.1 addendum)
+- [CVE-2017-12635 — CouchDB](https://docs.couchdb.org/en/stable/cve/2017-12635.html); [Bishop Fox — JSON interoperability vulnerabilities](https://bishopfox.com/blog/json-interoperability-vulnerabilities); [CWE-436](https://cwe.mitre.org/data/definitions/436.html) (2.3.2 addendum)

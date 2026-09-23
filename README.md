@@ -18,11 +18,12 @@ cyrius build src/main.cyr build/daimon # build
 ## Testing
 
 ```bash
-cyrius tests                        # every suite in tests/ — 797 assertions, 17 files
-cyrius fuzz                         # 6 property-based harnesses, ~160,000 generated cases
-cyrius bench tests/daimon.bcyr      # 23 benchmarks (+2 in tests/rag_ingest.bcyr)
+cyrius tests                        # every suite in tests/ — 833 assertions, 17 files
+cyrius fuzz                         # 7 property-based harnesses, 176,349 generated cases
+cyrius bench tests/daimon.bcyr      # 24 benchmarks (+2 in tests/rag_ingest.bcyr)
 sh tests/smoke.sh                   # the linked binary over HTTP: libro, tracing, regressions,
-                                    # the agent lifecycle, the bind address, task start/complete
+                                    # the agent lifecycle, the bind address, task start/complete,
+                                    # request-string decoding
 sh tests/test.sh                    # all of the above except the benchmarks
 ```
 

@@ -38,8 +38,9 @@ fn api_edge_stats(fd) {
 # POST /v1/edge/nodes — register edge node
 fn api_edge_register(fd, body) {
     if (body == 0) { http_bad_request(fd, str_from("missing body")); return 0; }
-    var pairs = json_parse(body);
-    var name = jget(pairs, "name");
+    var root = http_body_json(body);
+    if (root == 0) { http_bad_body(fd); return 0; }
+    var name = http_json_str(root, "name");
     if (name == 0) { http_error(fd, 422, str_from("name required")); return 0; }
     if (str_len(name) == 0) { http_error(fd, 422, str_from("name cannot be empty")); return 0; }
     var node = edge_node_new(name, str_from("x86_64"), 4, 4096);
@@ -121,9 +122,10 @@ fn api_edge_heartbeat(fd, id_cstr, body) {
     var active = 0;
     var completed = 0;
     if (body != 0) {
-        var pairs = json_parse(body);
-        active = jget_int(pairs, "active_tasks");
-        completed = jget_int(pairs, "tasks_completed");
+        var root = http_body_json(body);
+        if (root == 0) { http_bad_body(fd); return 0; }
+        active = http_json_int(root, "active_tasks");
+        completed = http_json_int(root, "tasks_completed");
     }
     # Counts are counts. A negative one was stored as-is and summed into
     # /v1/edge/stats, where one node could cancel out the rest of the fleet.

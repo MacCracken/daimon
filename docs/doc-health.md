@@ -6,7 +6,7 @@ type: state
 
 # Documentation Health — daimon
 
-> **Last refresh**: 2026-09-22 (2.3.1 — task start / complete: API guide, overview, README, quickstart, BENCHMARKS, roadmap, and an addendum to the lifecycle audit. Rows below that predate 2.3.1 are as last recorded.)
+> **Last refresh**: 2026-09-22 (2.3.2 — request-string decoding: API guide, CONTRIBUTING, overview, README, quickstart, BENCHMARKS, roadmap, and a second addendum to the lifecycle audit. Rows below that predate 2.3.2 are as last recorded.)
 > **Refresh cadence**: when docs are touched, update the affected row. Full re-audit at each minor cut.
 > **Scope**: this repo only (`daimon`) — root-level files plus the entire `docs/` tree.
 
@@ -104,6 +104,21 @@ Daimon is the AGNOS agent orchestrator — every consumer (hoosh, agnoshi, aethe
   `agent_ipc_send` and samay's `task_scheduler_complete_task`.
 - ✅ `CHANGELOG.md` / `VERSION` / `src/config.cyr` — 2.3.0 (`scripts/version-bump.sh`).
 
+**Doc work shipped in 2.3.2 (2026-09-22):**
+- ✅ `docs/guides/api.md` — a **Request bodies** section: one JSON object, strings decoded, the
+  refusals, and field types. The 2.3.1 known-issue note is removed, because the issue is fixed.
+- ✅ `CONTRIBUTING.md` — a new **Adding an HTTP Endpoint** section: read bodies with
+  `http_body_json` / `http_json_*`, never bayan's flat `json_parse`.
+- ✅ `docs/audit/2026-09-22-agent-lifecycle-audit.md` — the 2.3.2 addendum: VULN-017, the
+  flat-parser differential.
+- ✅ `docs/architecture/overview.md` — `http.cyr`'s request-body readers.
+- ✅ `README.md`, `docs/guides/quickstart.md` — 833 assertions, 24 + 2 benchmarks, 7 fuzz harnesses.
+- ✅ `BENCHMARKS.md` — the 2.3.2 section (the new read against the flat baseline, and the
+  2.3.1 / 2.3.2 A/B) and the coverage rows.
+- ✅ `docs/development/roadmap.md` — 2.3.2 done, IPC next, and a P3 for edge ids sharing the agent
+  counter.
+- ✅ `CHANGELOG.md` / `VERSION` / `src/config.cyr` — 2.3.2 (`scripts/version-bump.sh`).
+
 **Doc work shipped in 2.3.1 (2026-09-22):**
 - ✅ `docs/guides/api.md` — the task start / complete routes, a node's work list, the new task JSON
   and stats fields, and a task's life through the API. Also a **known-issue** note: request strings
@@ -126,8 +141,10 @@ counts and BENCHMARKS.md called untested modules "Complete". A doc can only be a
 that reads it: the rows below are what was last *recorded*, not a guarantee.
 
 **Stale set:** `CLAUDE.md`'s dependency rows still quote older pins (cyrius 6.6.4, samay 1.1.2,
-bote 3.3.9, libro 2.10.1, majra 2.7.2); `cyrius.cyml` is authoritative. Left for the maintainer, as
-CLAUDE.md is the instruction file.
+bote 3.3.9, libro 2.10.1, majra 2.7.2); `cyrius.cyml` is authoritative. Its `bayan` row also
+presents `json_parse` as how daimon reads JSON, which stopped being true at 2.3.2, and places
+`json_escape_str` in `src/main.cyr`, which is wrong: it is in `src/error.cyr`. Left for the
+maintainer, as CLAUDE.md is the instruction file.
 
 ---
 

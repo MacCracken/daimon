@@ -1,4 +1,4 @@
-# daimon.tcyr — cross-cutting checks: the error module, jget, samay, and the
+# daimon.tcyr — cross-cutting checks: the error module, samay, and the
 # stdlib contracts daimon relies on (hashmap, flat JSON).
 #
 # Run: cyrius test tests/daimon.tcyr
@@ -107,6 +107,30 @@ fn main() {
     }
     assert_eq(ctl_ok, 1, "json_escape_str leaves no raw control byte in its output");
 
+    # ⛔ 2.3.2 — the other control bytes are ESCAPED, not dropped: SOH used to
+    # vanish, which lost data once request strings started arriving decoded.
+    assert(str_contains(ctl, str_from("\\u0001")) == 1, "json_escape_str writes SOH as \\u0001");
+    # Round trip through bayan's decoder (an independent implementation): every
+    # control byte 1..31, a quote, a backslash, DEL and a 2-byte UTF-8 char.
+    var rt_n = 31 + 5;
+    var rt = alloc(rt_n);
+    var rti = 0;
+    while (rti < 31) { store8(rt + rti, rti + 1); rti = rti + 1; }
+    store8(rt + 31, 34);    # "
+    store8(rt + 32, 92);    # backslash
+    store8(rt + 33, 127);   # DEL
+    store8(rt + 34, 195);   # U+00E9, 2 bytes
+    store8(rt + 35, 169);
+    var orig = str_new(rt, rt_n);
+    var sb_rt = str_builder_new();
+    str_builder_add_cstr(sb_rt, "\"");
+    str_builder_add(sb_rt, json_escape_str(orig));
+    str_builder_add_cstr(sb_rt, "\"");
+    var back = bayan_json_v_parse(str_builder_build(sb_rt));
+    assert(back != 0, "json_escape_str output is a valid JSON string");
+    assert_eq(str_eq(bayan_json_v_str(back), orig), 1,
+      "decode(json_escape_str(s)) == s for every control byte, quote, backslash, DEL and UTF-8");
+
     # =============================================================
     # hashmap — the stdlib contract daimon's registries rely on
     # =============================================================
@@ -139,17 +163,9 @@ fn main() {
     assert(str_eq(jname, str_from("test")) == 1, "name is test");
     assert_eq(json_get_int(jpairs, str_from("port")), 8090, "port is 8090");
 
-    # =============================================================
-    # jget — cstr-keyed lookup (src/error.cyr)
-    # =============================================================
-    test_group("jget");
-    var jg_pairs = json_parse(str_from("{\"host\":\"localhost\",\"port\":\"9090\"}"));
-    var jg_host = jget(jg_pairs, "host");
-    assert(jg_host != 0, "jget host found");
-    assert(str_eq(jg_host, str_from("localhost")) == 1, "jget host value");
-    var jg_port = jget_int(jg_pairs, "port");
-    assert_eq(jg_port, 9090, "jget_int port");
-    assert_eq(jget(jg_pairs, "missing"), 0, "jget missing returns 0");
+    # (jget / jget_int were removed at 2.3.2 — see src/error.cyr. Their
+    #  replacements, http_body_json and http_json_*, are tested in
+    #  tests/http.tcyr against the bodies the flat lookups got wrong.)
 
     # =============================================================
     # samay — daimon's scheduler IS samay (2.0.0)
