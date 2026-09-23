@@ -56,6 +56,9 @@ curl -X POST http://localhost:8090/v1/agents/1/stop     # SIGTERM, up to 5 s, th
 
 See the [API guide](api.md#agents) for pause, resume, delete and the status codes.
 
+A started agent can send daimon messages on its fd 3 (`AGNOS_IPC_FD=3`): a 4-byte big-endian length,
+then a JSON object naming a `target`. See [agent-ipc.md](agent-ipc.md).
+
 ## Run Tests
 
 ```bash
@@ -74,8 +77,8 @@ cyrius bench tests/daimon.bcyr
 
 ```
 src/                  Source (30 modules, entry src/main.cyr)
-tests/*.tcyr          Test suites, one per module (833 assertions, 17 files)
-tests/daimon.bcyr     Benchmarks (24; tests/rag_ingest.bcyr has 2 more)
+tests/*.tcyr          Test suites, one per module (917 assertions, 17 files)
+tests/daimon.bcyr     Benchmarks (27; tests/rag_ingest.bcyr has 2 more)
 tests/smoke.sh        HTTP smoke checks against the built binary
 fuzz/                 Property-based fuzz harnesses (7), sharing fuzz/rng.cyr
 build/daimon          Binary (3.2 MB, static; ~1.6 MB of it NOPed unreachable code)

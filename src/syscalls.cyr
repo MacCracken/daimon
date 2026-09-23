@@ -48,6 +48,7 @@ var _DAIMON_SYS_PIPE2 = 59;         # asm-generic/unistd.h __NR_pipe2
 var _DAIMON_SYS_CLOSE_RANGE = 436;  # both headers agree; Linux 5.9+
 var _DAIMON_O_CLOEXEC = 524288;     # asm-generic/fcntl.h (1 << 19); x86_64's asm/fcntl.h includes it
 var _DAIMON_RLIMIT_NOFILE = 7;      # asm-generic/resource.h, both arches
+var _DAIMON_F_DUPFD_CLOEXEC = 1030; # linux/fcntl.h: F_LINUX_SPECIFIC_BASE (1024) + 6 (2.3.3)
 
 # =========================================================================
 # Portability shims — one call shape, per-target bodies

@@ -4,6 +4,142 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.3.3] - 2026-09-22
+
+**Agents can talk to daimon.** Every agent daimon starts now has a channel: one end of a socketpair,
+open in the agent as **fd 3** and announced as `AGNOS_IPC_FD=3`. The agent writes length-prefixed
+JSON frames and reads one reply byte for each. A service thread in daimon reads the channels, and
+the messages it accepts go onto daimon's message bus at the next HTTP request. This is the last
+2.3.x step of the lifecycle arc. Reading and sending messages over HTTP comes next.
+
+**917 tests** (was 833) across 17 suites, **84 HTTP smoke checks** (was 70), **29 benchmarks** (was
+26) and 7 fuzz harnesses, all green. Twelve mutation runs, all caught. fmt / lint / vet clean;
+x86_64, aarch64 and agnos build.
+
+⚠ **Once an agent has started, daimon's allocations are slower.** The channel service is daimon's
+first thread. From the moment any thread exists, the stdlib allocator takes its shared-heap lock on
+every call (`lib/alloc.cyr`: the lock-free path holds only while no thread has started, and the flag
+never resets). Measured on the daimon benchmarks, three runs each, medians, thread up versus not:
+`alloc(64)` 10 → 53 ns; `json_parse` 429 ns → 1.24 µs; `http_body_read3` 1.29 → 2.75 µs;
+`mcp_manifest_100_tools` 141 → 258 µs. Paths that do not allocate are unchanged. A daimon that never
+starts an agent never starts the thread and pays nothing. [ADR-005](docs/adr/005-agent-channels.md)
+records the trade and the roadmap the ways out.
+
+### Added — the agent channel
+
+- **The channel** (`src/agent.cyr`, `agent_start`):
+  - a close-on-exec socketpair per start;
+  - the child moves its end to fd 3, closes every other descriptor above stderr, and gets
+    `AGNOS_IPC_FD=3` added to daimon's environment (any `AGNOS_IPC_FD` daimon itself inherited is
+    replaced);
+  - daimon's end goes to the service thread, which owns it from then on;
+  - stop and reap close it, after reading what the agent had already written.
+- **The wire protocol** ([docs/guides/agent-ipc.md](docs/guides/agent-ipc.md)):
+  - a frame is a 4-byte big-endian length, then at most 65536 bytes of JSON (length 0 is a
+    keep-alive);
+  - the body is an object with a required `target` (an agent id, a name, or `"*"`), an optional
+    `type` (default `event`) and an optional `payload` of any JSON;
+  - the reply is one byte: 1 ACK, 2 NACK_QUEUE_FULL, 3 NACK_INVALID;
+  - **the source is always the channel's agent**, whatever the frame says.
+- **The service thread** (`src/ipc.cyr`):
+  - polls every channel and reassembles split and joined frames, with non-blocking reads;
+  - validates with the same rules as HTTP bodies (`json_object_ok`, moved to `src/error.cyr`);
+  - hands records to the main thread through a bounded queue.
+
+  It closes a channel on:
+  - a length over the limit;
+  - a frame not finished within 5 s;
+  - an agent that hangs up mid-frame.
+
+  Each of these is audited (`ipc.frame.oversize` / `.timeout` / `.short`, with the agent's id).
+- `ipc_drain` runs at the top of every HTTP request. It puts accepted messages on the bus (at most
+  1024 a request) and channel faults on the audit chain. With nothing pending it costs 56 ns
+  (`ipc_drain_empty`).
+- **Every registered agent has a bus queue**, from `POST /v1/agents` until `DELETE`.
+- `/v1/metrics`: `ipc_messages`, `ipc_refused`, `bus_dropped`.
+
+### Fixed
+
+- **daimon's exit left it running** once a thread existed. The epilogue called `sys_exit`, which is
+  exit(2) and ends only the calling thread (`lib/syscalls.cyr` says to use `sys_exit_group`). A
+  `serve` that returned after an agent had started would have left daimon up with its main thread
+  gone. The ipc suite showed it: it printed its summary and never exited. Now `sys_exit_group`.
+- **The bus was unbounded.** Subscriber queues now hold 100 messages (the Rust original's channel
+  size). Messages past that are dropped and counted, and `msg_bus_send_to` a full queue is an `Err`.
+- **Message ids used up agent ids**: `ipc_msg_new` drew from `_next_agent_id`. Messages have their
+  own counter now.
+- Found while building this release, before it shipped: a frame refused because the hand-off was
+  full had already built its record, leaking 224 bytes of never-freed heap per refused frame. The
+  room is now checked first, and a refused frame allocates nothing (tested).
+
+### Removed
+
+- **The socket-FILE endpoint**: `AgentIpc`, `agent_ipc_new` / `bind` / `accept_one` / `send` /
+  `cleanup`. Nothing called it, and it carried the three defects 2.2.3 found and parked for this
+  step, all gone with it:
+  - its `SO_PEERCRED` check failed open ([CWE-636](https://cwe.mitre.org/data/definitions/636.html));
+  - a message cut short was ACKed as whole ([CWE-130](https://cwe.mitre.org/data/definitions/130.html));
+  - a silent peer held the accept loop.
+
+  Every agent runs as daimon's own uid, so a uid check could not tell agents apart anyway. VULN-006
+  is superseded.
+
+### Security
+
+The 2.3.3 addendum to [docs/audit/2026-09-22-agent-lifecycle-audit.md](docs/audit/2026-09-22-agent-lifecycle-audit.md)
+checks the new surface against D-Bus's CVE-2014-3639 (incomplete connections) and CVE-2014-3638
+(one client's volume), and journald's CVE-2018-16865 (allocation driven by socket input). It adds:
+- **VULN-018** (MEDIUM, open): a delivered message costs 451 bytes of heap that is never freed. Its
+  mitigations and the remaining exposure are measured there.
+- **Frame parsing runs in the service thread's own arena**, reset per frame. The tree cost the
+  shared heap 1,496 bytes a frame; a handed-over frame now costs 224, and a refused one 0.
+- **One busy agent cannot starve the others**: at most 16 frames per channel per pass.
+
+### Performance
+
+- `bus_broadcast_100` (a broadcast to 100 subscribers): **11.18 → 3.37 µs**, because the broadcast
+  walks the subscriber map in place (`map_iter`) instead of building a key vector per message.
+  Measured three runs each in the same harness, built against 2.3.2 and 2.3.3.
+- The other 24 shared benchmarks, 2.3.2 against 2.3.3 (three interleaved runs each, medians), agree
+  within −2.8% … +1.1%, except for two:
+  - `http_body_read3` read +4.0%. A focused re-run, five runs each, gave 1.301 µs against 1.305 µs
+    (+0.3%);
+  - `mcp_find_tool_in_100` swung between 94 and 154 ns within each build.
+- New:
+  - `ipc_frame_roundtrip`: 11.6 µs, one message from the agent's write to its ACK, through the real
+    thread;
+  - `ipc_drain_empty`: 56 ns;
+  - `bus_broadcast_100`.
+- The allocation cost with the thread running is at the top of this entry.
+
+### Tests
+
+- `tests/ipc.tcyr`: the socket-file tests are replaced by channel tests through the real service
+  thread. They cover:
+  - ACK;
+  - each of 12 refusals, and a claimed source being ignored;
+  - keep-alive, joined and split frames, exactly 65536 bytes;
+  - oversize, short and timeout;
+  - a full hand-off, including its zero heap cost;
+  - drain and audit, remove-after-read and replace;
+  - the arena's heap bound;
+  - bounded queues.
+- `tests/agent.tcyr`: a started agent sees `AGNOS_IPC_FD=3` and a socket on fd 3, and fds 4–9 closed.
+  Its frame is ACKed and reaches daimon from its own id. daimon's end closes on stop and on reap even
+  while the agent's child still holds fd 3, with no descriptor leaked.
+- `tests/smoke.sh`: 14 checks over HTTP. 101 frames with 101 ACKs; the metrics; a deleted agent's
+  queue gone; an oversize length closing the channel and reaching the audit chain. The lifecycle
+  fixture now holds one socket (its channel), not none.
+- Every unit that includes `src/agent.cyr` now includes `src/ipc.cyr` and `lib/thread.cyr`. cyrius
+  makes an undefined call only a warning when nothing reaches it.
+
+### Recorded (roadmap)
+
+- Routes to read an agent's queue and to send to an agent; name registration on the bus.
+- The allocation lock: a channel process instead of a thread, or a serve-loop hook to run the
+  service on the main thread.
+- VULN-018: a per-agent frame rate.
+
 ## [2.3.2] - 2026-09-22
 
 **Request strings arrive as the client sent them.** Until now almost every handler read its body with

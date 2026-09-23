@@ -34,12 +34,14 @@ include "lib/math.cyr"
 include "lib/process.cyr"
 include "lib/sakshi.cyr"
 include "lib/libro.cyr"
+include "lib/thread.cyr"
 include "lib/assert.cyr"
 
 include "src/syscalls.cyr"
 include "src/error.cyr"
 include "src/audit.cyr"
 include "src/agent.cyr"
+include "src/ipc.cyr"      # agent.cyr opens and hands over agent channels (2.3.3)
 include "src/federation.cyr"
 include "src/fed_vector_store.cyr"
 

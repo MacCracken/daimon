@@ -168,8 +168,10 @@ START=$(curl -s --max-time 10 -X POST "$L/v1/agents/1/start")
 lc_check "start runs it (status 2)" "$(printf '%s' "$START" | field status)" "2"
 APID=$(printf '%s' "$START" | field pid)
 i=0; while [ $i -lt 50 ] && [ ! -e "$LC_DIR/agnos-agent-user-agent.ready.$APID" ]; do i=$((i + 1)); sleep 0.1; done
-lc_check "the agent holds no socket (daimon's listener + client conn not inherited)" \
-  "$(cat "$LC_DIR/agnos-agent-user-agent.sockets" 2>/dev/null)" "0"
+# One socket since 2.3.3: its channel, fd 3. Before, none (and before 2.3.0,
+# daimon's listener and the client connection that asked for the start).
+lc_check "the agent holds one socket, its channel (listener + client conn not inherited)" \
+  "$(cat "$LC_DIR/agnos-agent-user-agent.sockets" 2>/dev/null)" "1"
 lc_check "start again is 409"         "$(lcode -X POST "$L/v1/agents/1/start")"   "409"
 lc_check "GET .../start is 405"       "$(lcode "$L/v1/agents/1/start")"           "405"
 lc_check "pause (status 3)"           "$(curl -s --max-time 10 -X POST "$L/v1/agents/1/pause" | field status)"  "3"
@@ -353,5 +355,88 @@ js_has "a failure reason round-trips, escaped once" \
   '"fail_reason":"disk \"full\" at C:\\temp"'
 kill $JS_SRV 2>/dev/null || true
 if [ $JS_OK -ne 1 ]; then echo "  request-string smoke FAILED"; SMOKE_EXIT=1; fi
+
+echo ""
+echo "=== 2.3.3 agent channels ==="
+# A started agent writes frames on fd 3 and reads a reply byte per frame; daimon
+# puts what it accepts on the bus at its next request. The fixture sends 101
+# broadcasts (one more than a subscriber queue holds), one malformed frame, and
+# later one more broadcast and one oversize length, each step gated on a file
+# the smoke creates.
+IC_PORT=18087
+IC_OK=1
+IC_DIR=$(mktemp -d)
+cat > "$IC_DIR/agnos-agent-user-agent" <<'AGENT'
+#!/bin/sh
+trap 'exit 0' TERM
+echo "$AGNOS_IPC_FD" > "$0.env"
+i=0
+while [ $i -lt 101 ]; do printf '\000\000\000\016{"target":"*"}' >&3; i=$((i + 1)); done
+head -c 101 <&3 | od -v -An -tu1 | tr -s ' ' '\n' | grep -c '^1$' > "$0.acks"
+printf '\000\000\000\007{"x":1}' >&3
+head -c 1 <&3 | od -v -An -tu1 | tr -d ' ' > "$0.nack"
+: > "$0.done1"
+while [ ! -e "$0.go" ]; do sleep 0.05; done
+printf '\000\000\000\016{"target":"*"}' >&3
+head -c 1 <&3 > /dev/null
+: > "$0.done2"
+while [ ! -e "$0.go2" ]; do sleep 0.05; done
+printf '\000\001\000\001' >&3
+head -c 1 <&3 | od -v -An -tu1 | tr -d ' ' > "$0.over"
+head -c 1 <&3 | wc -c | tr -d ' ' > "$0.eof"
+: > "$0.done3"
+while :; do sleep 0.05; done
+AGENT
+chmod +x "$IC_DIR/agnos-agent-user-agent"
+IX="$IC_DIR/agnos-agent-user-agent"
+./build/daimon serve $IC_PORT --agents-dir "$IC_DIR" >/dev/null 2>&1 &
+IC_SRV=$!
+i=0
+while [ $i -lt 25 ]; do
+    if curl -s --max-time 1 "http://127.0.0.1:$IC_PORT/v1/health" >/dev/null 2>&1; then break; fi
+    i=$((i + 1)); sleep 0.1
+done
+C="http://127.0.0.1:$IC_PORT"
+ic_check() {
+    printf "  %s: " "$1"
+    if [ "$2" = "$3" ]; then echo "PASS"; else echo "FAIL (got '$2', want '$3')"; IC_OK=0; fi
+}
+ic_wait() { i=0; while [ $i -lt 50 ] && [ ! -e "$1" ]; do i=$((i + 1)); sleep 0.1; done; }
+metric() { curl -s --max-time 10 "$C/v1/metrics" | grep -o "\"$1\":[0-9]*" | cut -d: -f2; }
+
+curl -s -o /dev/null --max-time 10 -X POST "$C/v1/agents" -d '{"name":"talker","type":"User"}'
+curl -s -o /dev/null --max-time 10 -X POST "$C/v1/agents" -d '{"name":"listener","type":"System"}'
+curl -s -o /dev/null --max-time 10 -X POST "$C/v1/agents/1/start"
+ic_wait "$IX.done1"
+ic_check "the agent is told its channel: AGNOS_IPC_FD=3" "$(cat "$IX.env" 2>/dev/null)" "3"
+ic_check "101 frames, 101 ACKs"                "$(cat "$IX.acks" 2>/dev/null)" "101"
+ic_check "a malformed frame is NACK_INVALID (3)" "$(cat "$IX.nack" 2>/dev/null)" "3"
+ic_check "the next request puts all 101 on the bus" "$(metric ipc_messages)" "101"
+ic_check "the malformed one is counted as refused" "$(metric ipc_refused)" "1"
+# Both registered agents are subscribed, so each queue took 100 and dropped 1.
+ic_check "every registered agent's queue got them (1 dropped each)" "$(metric bus_dropped)" "2"
+ic_check "delete the agent that never ran" "$(lcode -X DELETE "$C/v1/agents/2")" "200"
+: > "$IX.go"
+ic_wait "$IX.done2"
+ic_check "one more broadcast is published" "$(metric ipc_messages)" "102"
+ic_check "a deleted agent's queue is gone (only the talker's drops)" "$(metric bus_dropped)" "3"
+: > "$IX.go2"
+ic_wait "$IX.done3"
+ic_check "an oversize length is NACK_INVALID (3)" "$(cat "$IX.over" 2>/dev/null)" "3"
+ic_check "... and the channel is closed (EOF)"   "$(cat "$IX.eof" 2>/dev/null)" "0"
+i=0; IC_AUDIT=""
+while [ $i -lt 20 ]; do
+    IC_AUDIT=$(curl -s --max-time 10 -X POST "$C/v1/mcp/call" -d '{"name":"libro_export","arguments":{}}')
+    if printf '%s' "$IC_AUDIT" | grep -q 'ipc.frame.oversize'; then break; fi
+    i=$((i + 1)); sleep 0.1
+done
+printf "  %s: " "the closed channel is on the audit chain (ipc.frame.oversize)"
+if printf '%s' "$IC_AUDIT" | grep -q 'ipc.frame.oversize'; then echo "PASS"; else echo "FAIL"; IC_OK=0; fi
+ic_check "... and counted as refused" "$(metric ipc_refused)" "2"
+ic_check "the agent still stops cleanly" \
+  "$(curl -s --max-time 10 -X POST "$C/v1/agents/1/stop" | field exit_code)" "0"
+kill $IC_SRV 2>/dev/null || true
+rm -rf "$IC_DIR"
+if [ $IC_OK -ne 1 ]; then echo "  channel smoke FAILED"; SMOKE_EXIT=1; fi
 
 exit $SMOKE_EXIT

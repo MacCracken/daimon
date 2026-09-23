@@ -87,11 +87,13 @@ main.cyr   Preamble (syscall constants) + module includes + the `main` serve loo
 │   └── edge_fleet_stats   Aggregation across fleet
 │
 ├── ipc.cyr            Inter-process communication
-│   ├── IpcMessage         Source, target, type, payload, timestamp
-│   ├── MessageBus         Named routing, broadcast, direct send
+│   ├── IpcMessage         Source, target, type, payload, timestamp (own id counter)
+│   ├── MessageBus         Named routing, broadcast, direct send; 100 messages per queue
 │   ├── RpcRegistry        Method registration + lookup
-│   ├── AgentIpc           Unix domain socket (bind, accept, send)
-│   └── SO_PEERCRED        UID verification on accept
+│   ├── agent channels     (2.3.3) a socketpair per started agent, the agent's end on its fd 3
+│   ├── service thread     polls the channels, reassembles + validates frames, replies at once;
+│   │                      parses in its own arena; hands records over a bounded queue (1024)
+│   └── ipc_drain          main thread, top of every request: records -> bus, faults -> audit chain
 │
 ├── app.cyr          Global service state + composition root
 │   └── app_init           Initialize all subsystems
@@ -143,19 +145,27 @@ Agent Process
   ├─ fork/exec with RLIMIT_AS + RLIMIT_CPU
   ├─ /proc/{pid}/status → VmRSS, threads, fds
   ├─ pidfd_open → race-free signal delivery
-  └─ Unix socket ←→ AgentIpc (length-prefixed JSON, ACK/NACK)
+  └─ fd 3 (AGNOS_IPC_FD) ←socketpair→ channel service thread
+       │   length-prefixed JSON; one reply byte per frame (ACK / NACK)
+       ▼
+     bounded hand-off (1024)
        │
-       └─► MessageBus → named routing / broadcast
-           RpcRegistry → method dispatch
+       ▼ ipc_drain, main thread, at each HTTP request
+     MessageBus → per-agent queues (id, name, "*" broadcast)
+     audit chain ← channel faults (ipc.frame.*)
 ```
+
+daimon is single-threaded until the first agent starts. From then on the channel service thread
+runs beside the server, and every allocation takes the stdlib's heap lock. See
+[ADR-005](../adr/005-agent-channels.md).
 
 ## Consumers
 
-Every AGNOS agent, hoosh, agnoshi, aethersafha, and any consumer app that talks to the HTTP API or connects via Unix domain sockets.
+Every AGNOS agent (over the HTTP API and, once started by daimon, its channel on fd 3), hoosh, agnoshi, aethersafha, and any consumer app that talks to the HTTP API.
 
 ## Key Design Decisions
 
-1. **Single compilation unit, multi-file source** — `src/main.cyr` `include`s 29 per-domain `src/*.cyr` modules (from the 1.2.8 monolith split, + `mcp_builtin.cyr` / `audit.cyr` at 1.3.0, `secmem.cyr` at 1.3.2, `trace.cyr` at 1.3.3; none over ~350 LOC). Cyrius flattens the includes into one global scope and compiles in one pass; no separate library crate. Contiguous module splits preserve original source order (byte-identical); the HTTP route handlers were regrouped by domain (pure functions, so order-independent), keeping behavior identical.
+1. **Single compilation unit, multi-file source** — `src/main.cyr` `include`s 29 per-domain `src/*.cyr` modules (from the 1.2.8 monolith split, + `mcp_builtin.cyr` / `audit.cyr` at 1.3.0, `secmem.cyr` at 1.3.2, `trace.cyr` at 1.3.3, `sched.cyr` at 2.3.1; the largest are `agent.cyr` at ~800 lines and `ipc.cyr` at ~700). Cyrius flattens the includes into one global scope and compiles in one pass; no separate library crate. Contiguous module splits preserve original source order (byte-identical); the HTTP route handlers were regrouped by domain (pure functions, so order-independent), keeping behavior identical.
 2. **Sync + async HTTP, both sandhi-backed** — `serve` (sync) drives sandhi's `sandhi_server_run_opts` accept loop; `serve --async` drives `sandhi_server_run_async` (epoll-cooperative, on `lib/async.cyr`; shipped 1.1.0, collapsed onto sandhi's loop at 1.2.6). Both apply a per-connection `SO_RCVTIMEO` and RFC 7230 request-smuggling rejection via sandhi. Single trust domain.
 3. **Bump allocator** — fast allocation, no individual free. Single trust domain (see VULN-007 security gate for multi-tenant).
 4. **Everything is i64** — Cyrius type system. Structs are manually laid out with `alloc()` + `store64()`/`load64()` at fixed offsets.

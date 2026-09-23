@@ -24,7 +24,7 @@ The following stdlib modules are available via `cyrius.cyml` deps. **Async IS av
 | Module | Purpose |
 |--------|---------|
 | `async` | **Cooperative async runtime — epoll event loop, spawn, sleep, await_readable, timeout** |
-| `thread` | Clone-based threads, mutex, MPSC channels |
+| `thread` | Clone-based threads, mutex, MPSC channels. **In use since 2.3.3**: the agent channel service thread (`src/ipc.cyr`), started at the first agent start. From then on every `alloc()` takes the heap lock (ADR-005). |
 | `net` | TCP sockets (connect, listen, accept, read, write) |
 | `sandhi` | **In use as of 1.1.4** (`lib/sandhi.cyr` is sandhi 1.9.17) — drives both serve modes in `src/server.cyr`: sync `sandhi_server_run_opts`, async `sandhi_server_run_async`, each bound to `server_bind_addr()` (config `listen_addr`, 127.0.0.1 unless `serve --listen`). The `http_*` shims in `src/http.cyr` are sandhi-backed. Daimon does NOT use sandhi's HTTP/2 / SSE / RPC modules at runtime — but their compile-time deps (`tls`, `mmap`, `dynlib`, `fdlopen`) ARE in `[deps].stdlib`, and `sigil` is an explicit `[deps.sigil]` git pin (see the `sigil` row below), because sandhi's bundle unconditionally references `TLS_EARLY_DATA_ACCEPTED` (0-RTT client-write path) and, since 6.3.43, `sha384_init_into` (defined in `sigil`, called by `tls_native_lowlevel`). DCE NOPs the unused runtime; `sandhi_rpc_mcp_call` is the 1.2.1 hook for unstubbing external MCP forwarding (see `api_mcp_call`). |
 | `tls`, `mmap`, `dynlib`, `fdlopen` | Pulled in transitively by sandhi's bundle. Daimon does not call any of these directly today — present for compile-time symbol resolution only. (`tls_native` is split into per-concern peers — `tls_native_conn/ctx/hs12/hs13/keysched/lowlevel` — all resolved transitively.) |
@@ -41,7 +41,7 @@ External (non-stdlib) deps used by daimon:
 |--------|--------|
 | `sakshi` (2.5.2) | Structured logging/tracing — git-pinned via `[deps.sakshi]` in `cyrius.cyml`; resolved into `lib/sakshi.cyr` (gitignored) by `cyrius deps`. The 2.4.x line carries the daimon-class slot-array fix (`ts[2]` timespec → `i64[N]`; requires pin ≥ 6.2.1), arch-portable syscalls (x86_64 + aarch64), opt-in `sakshi_clock_recalibrate()`, and the agnos x86-TSC-calibration guard. **2.4.4** adds 128-bit trace-id support (`sakshi_trace_set_128`/`_hi`/`_lo`) that daimon's tracing (`src/trace.cyr`) adopts for full W3C `traceparent` round-trip. The `msg_len`-required call surface is unchanged since 2.0.0. |
 | `bote` (3.3.13) | MCP core service. daimon hosts **13 builtin MCP tools** (`src/mcp_builtin.cyr`): bote's five `libro_*` audit tools (1.3.0), bote's `web_fetch` / `web_search` (1.4.0) and nein's six firewall tools (2.1.8). Vendored as the `dist/bote.cyr` bundle. daimon calls the handlers directly rather than bote's `dispatcher_dispatch`, keeping its own MCP registry and response shape. An external registration can never take a builtin's name (2.2.3). |
-| `libro` (2.10.3) | Hash-linked audit chain (chain / merkle / query / retention / proof) backing bote's libro tools. daimon owns one `chain_new()` chain in `src/audit.cyr` (genesis-seeded at `daimon_audit_init`); the `daimon_audit` / `daimon_audit_agent` helpers append daimon's own lifecycle + security events (agent spawn/stop, IPC auth-deny, rate-limit, MCP SSRF-reject, external MCP call) to it, and the libro_* MCP tools read the same chain. Vendored `dist/libro.cyr`; pulls the `ct` / `keccak` / `random` / `slice` / `thread_local` / `sync` stdlib modules. |
+| `libro` (2.10.3) | Hash-linked audit chain (chain / merkle / query / retention / proof) backing bote's libro tools. daimon owns one `chain_new()` chain in `src/audit.cyr` (genesis-seeded at `daimon_audit_init`); the `daimon_audit` / `daimon_audit_agent` helpers append daimon's own lifecycle + security events (agent spawn/stop, agent-channel faults `ipc.frame.*`, rate-limit, MCP SSRF-reject, external MCP call) to it, and the libro_* MCP tools read the same chain. Vendored `dist/libro.cyr`; pulls the `ct` / `keccak` / `random` / `slice` / `thread_local` / `sync` stdlib modules. |
 | `majra` (2.9.1) | Event-sink dep of bote's bundle (`events_majra.cyr`). Present for compile-time resolution of the full bote bundle; daimon does not use it at runtime today. **Owns `ERR_IPC = 4`** — historically daimon renamed its own IPC error `ERR_IPC_FAULT` (1.3.0) to dodge this collision; at 1.4.2 every daimon error constant was namespaced `DAIMON_ERR_*` (now `DAIMON_ERR_IPC_FAULT`), so no daimon constant can collide with a vendored `ERR_*` and the rename satisfies cyrlint's `lint_error_enum_namespace` rule (6.4.51). |
 | `samay` (1.1.3) | Task scheduler — the extraction of daimon's own `scheduler.cyr`/`cron.cyr`, which daimon 2.0.0 replaced with this library. `[deps.samay]` carries both a `path = "../samay"` (local dev checkout) and a `tag` (the release pin). samay has no scheduler-level "start": daimon's task start / complete live in `src/sched.cyr` (2.3.1). ⚠ `task_scheduler_complete_task` answers `Err(1)` both for an unknown id and for a refused transition, so look the task up first. |
 | `nein` (1.7.0) | Firewall MCP tools (2.1.8, `dist/nein-mcp.cyr`). It is declared after `bote` and `sigil` in `cyrius.cyml` because its bundle leaves their symbols for the host to supply. The mutating half (`nein_allow` / `nein_deny`) is **gated shut** until caller authentication (roadmap 2.5.x). |
@@ -119,7 +119,7 @@ Every AGNOS agent, every consumer app, hoosh, agnoshi, aethersafha.
 - **Fixed local arrays: use element-typed `var a: i64[N]` for slot arrays** (and `u8[N]` / `i32[N]` / `u32[N]` for sized byte/scalar buffers). Since cyrius 6.2.1, bare `var a[N]` is **N bytes in a function** (N i64 slots only at top level) — an address-taken `var a[N]` written via `store64(&a + i*8)` under-reserves and silently corrupts adjacent memory. This caused the 1.2.6 routing-404 bug; swept in 1.2.7. Before re-testing any "fixed" compiler footgun, **read the cyrius language CHANGELOG** — fixes there are often language changes, not silent codegen patches.
 - Original Rust implementations are in git history at tags `0.5.0` / `0.6.0` (e.g. `git show 0.6.0:src/agent.rs`). The Cyrius port starts at `0.7.0`.
 
-## Commands (verified at 2.3.2)
+## Commands (verified at 2.3.3)
 
 ```sh
 export CYRIUS_NO_WARN_SHADOW_LIB=1 CYRIUS_DCE=1   # what CI sets
@@ -134,6 +134,11 @@ cyrius lint <file>                               # CI fails on any `warn`
 ```
 
 `cyrius fmt <file>` without `--check` rewrites the file in place. `cyrius check` is only a syntax check.
+A suite prints its `N passed` line BEFORE it exits. Judge a run by its exit status and elapsed time,
+not by a grepped summary (2.3.3: a suite printed 102/102 and then hung). aarch64 suites:
+`cyrius build --aarch64 tests/<suite>.tcyr <out>` then `qemu-aarch64 <out>`. Under qemu, `agent.tcyr`
+fails six checks that also fail on 2.3.2 there: QEMU applies no RLIMIT_AS, and qemu-user runs a
+thread of its own.
 The QEMU AGNOS boot harness belongs to the agnos repo; its `agnsh-smoke` gate looks for agnsh's own
 banner, so it reports FAIL for any other binary.
 
@@ -166,6 +171,15 @@ banner, so it reports FAIL for any other binary.
   - agent and task control answer 403 to any request carrying `Origin` (`_route_refuse_browser`).
 
   Keep all three for new routes.
+- **Threads (2.3.3)**: once an agent has started, daimon runs the agent channel service thread.
+  - End a program or suite with `sys_exit_group` / `syscall(SYS_EXIT_GROUP, …)`. `sys_exit` is
+    exit(2) and ends only the calling thread, so the process stays up.
+  - The service thread touches nothing of the main thread's: not the bus, the registry, the audit
+    chain or sakshi. It hands records over, and `ipc_drain` applies them.
+  - The fork child (`_agent_child`) must not allocate or take any lock: another thread may hold one
+    at the fork.
+- **Every unit that includes `src/agent.cyr` must include `src/ipc.cyr` and `lib/thread.cyr`.** An
+  undefined function is only a *warning* when no call reaches it, and a build error when one does.
 - **AGNOS is the primary target.** Arch- and kernel-specific calls go through the shims in
   `src/syscalls.cyr` (`daimon_reap_code`, `daimon_signal`, …). Their agnos arms refuse process
   operations until 2.4.x. For agnos syscalls read `agnos/kernel/core/syscall.cyr`, not the cyrius

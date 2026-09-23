@@ -1,4 +1,4 @@
-# Security Audit — 2026-09-22: the agent lifecycle (2.3.0, with 2.3.1 and 2.3.2 addenda)
+# Security Audit — 2026-09-22: the agent lifecycle (2.3.0, with 2.3.1, 2.3.2 and 2.3.3 addenda)
 
 2.3.0 connects process control to the HTTP API: an unauthenticated client can now start, stop,
 pause, resume and delete agents. This audit covers that new surface and two older exposures that
@@ -15,6 +15,7 @@ external references listed at the end.
 | `DELETE /v1/agents/{id}` | registry removal | API clients |
 | the reap sweep | a non-blocking `waitpid` per agent, on every agent route | API clients |
 | the child between fork and exec | descriptors, signal dispositions, rlimits, environment | the agent process |
+| the agent's channel, fd 3 (2.3.3) | length-prefixed JSON frames, read by a service thread | the agent process |
 
 ---
 
@@ -246,6 +247,101 @@ false refusal, not a bypass: nothing decoded the stored raw URL later.
 duplicate-key refusals, and that nested keys never surface. There are 10 smoke checks, which pass
 on 2.3.2 and all fail on 2.3.1. Five mutation runs were all caught.
 
+### VULN-018: An agent's messages grow daimon's heap without bound (MEDIUM, denial of service) — OPEN, recorded (2.3.3)
+
+**CWE**: [CWE-770](https://cwe.mitre.org/data/definitions/770.html) — Allocation of Resources Without
+Limits or Throttling; [CWE-400](https://cwe.mitre.org/data/definitions/400.html) — Uncontrolled
+Resource Consumption.
+**Reference class**: [CVE-2018-16865](https://www.cve.org/CVERecord?id=CVE-2018-16865). In
+systemd-journald, "an allocation of memory without limits" when many entries are sent to the
+journal socket.
+
+daimon's heap is a bump allocator that never frees. **Measured** on 2.3.3 (a 100-byte frame with a
+nested payload, 90 frames):
+- **451 bytes** stay allocated per message delivered to the bus: 224 in the service thread (the
+  record and the target and payload copies) and 227 in `ipc_drain` (the bus message, its copies,
+  the queue push);
+- **0 bytes** per frame refused, including those refused because the hand-off was full.
+
+Messages are delivered only when an HTTP request drains the hand-off (at most 1024 per request),
+and one agent's channel ran ~86,000 round trips a second in the benchmark (`ipc_frame_roundtrip`,
+11.6 µs). An agent that also sends HTTP requests (loopback, unauthenticated) can therefore grow
+daimon's memory for as long as it likes, on the order of tens of MB a second. The same is true of
+HTTP requests alone, whose allocations are never freed either. This finding puts the old
+exposure in the hands of every started agent.
+
+**Mitigated by**:
+- the bounded queues (100 per agent) and hand-off (1024);
+- refused frames costing nothing (fixed during 2.3.3, below);
+- the parse running in a per-frame arena (the tree cost 1,496 bytes a frame on the shared heap).
+
+**Remediation**, recorded on the roadmap:
+- a per-agent frame rate (NACK past it), which bounds the rate but not the total;
+- a heap that can free, for the bus. That is the 3.0.0 arena-isolation arc.
+
+## 2.3.3 addendum — agent channels
+
+2.3.3 gives each started agent a **channel**. It is a socketpair: the agent's end is its fd 3
+(`AGNOS_IPC_FD=3`), and a service thread in daimon reads daimon's end. The design is recorded in
+[ADR-005](../adr/005-agent-channels.md) and the wire protocol in
+[docs/guides/agent-ipc.md](../guides/agent-ipc.md). The socket-FILE endpoint the port carried
+(`agent_ipc_new` / `bind` / `accept_one` / `send` / `cleanup`) is **removed**. Nothing called it.
+
+### The three parked defects, resolved by removal
+
+| Defect (found 2.2.3) | CWE | Now |
+|---|---|---|
+| the `SO_PEERCRED` check **failed open**: a failed `getsockopt` skipped the check | [CWE-636](https://cwe.mitre.org/data/definitions/636.html) Not Failing Securely | there is no peer to check. Only the agent's process received the other end of its pair. Agents all run as daimon's uid, so a uid check could never have told them apart |
+| a message cut short by its sender was queued and ACKed as whole | [CWE-130](https://cwe.mitre.org/data/definitions/130.html) Improper Handling of Length Parameter Inconsistency | a frame is handed over only when all `len` bytes have arrived. EOF mid-frame closes the channel and is audited (`ipc.frame.short`) |
+| `accept_one` read with no timeout, so a silent peer held the accept loop | [CWE-400](https://cwe.mitre.org/data/definitions/400.html) | reads never block. A begun frame has 5 s to finish, then the channel closes (`ipc.frame.timeout`) |
+
+### The new surface, against known IPC-daemon failures
+
+| Class | Reference | Control in 2.3.3 |
+|---|---|---|
+| incomplete messages pin a daemon's resources | [CVE-2014-3639](https://www.cve.org/CVERecord?id=CVE-2014-3639): dbus-daemon "does not properly close old connections … via a large number of incomplete connections" | one channel per agent, no accept. A begun frame times out after 5 s and closes its channel |
+| one client's volume starves the rest | [CVE-2014-3638](https://www.cve.org/CVERecord?id=CVE-2014-3638): D-Bus, "denial of service (CPU consumption) via a large number of method calls" | at most 16 frames per channel per service pass; the rest wait for the next pass |
+| socket input drives allocation | [CVE-2018-16865](https://www.cve.org/CVERecord?id=CVE-2018-16865) (journald) | frames capped at 64 KiB, allocated on the heap (never the stack). A refused frame allocates nothing. What remains is VULN-018 |
+| spoofed identity | — | the source is the channel's agent; a frame's claim of any other source is ignored (tested) |
+| parser differential | VULN-017 | frames pass the same `json_object_ok` as HTTP bodies: no duplicate top-level key, no U+0000 in a top-level string |
+
+### Found and fixed during 2.3.3, before release
+
+| Defect | Consequence, measured | Fix |
+|---|---|---|
+| daimon's epilogue called `sys_exit`, which is exit(2) and ends only the calling thread | once an agent had started, a `serve` that returned would leave daimon up with its main thread gone. The test suites showed it: the ipc suite printed its summary and then never exited | `sys_exit_group`, as `lib/syscalls.cyr` directs for a program epilogue |
+| a frame refused because the hand-off was full had already built its record | 224 bytes leaked per refused frame, so an agent flooding a full hand-off grew daimon without bound | the room is checked before anything is allocated |
+| a broadcast built a key vector per message (`map_keys`) | a never-freed allocation per broadcast, and a slower broadcast | `map_iter` over the subscribers: `bus_broadcast_100` 11.18 → 3.37 µs |
+
+### Thread safety
+
+The service thread touches:
+- its channel list, body buffers and parse arena (all its own);
+- two bounded thread channels (`lib/thread.cyr`, mutex-protected);
+- three counters, read and written atomically across threads;
+- `alloc()`, which takes its lock from the moment the thread starts.
+
+It never touches the bus, the agent registry, the audit chain or the logger; the main thread
+applies what it hands over. The parse is bayan's reentrant `bayan_json_v_parse_ctx_a`, into the
+thread's own arena. **Fork**: the main thread forks agents while the service thread may hold the
+allocator lock. The child path (`_agent_child`) uses only syscalls, stack buffers and string
+literals until `execve`, so it never takes a lock copied in a held state.
+
+### Verification
+
+- **Tests**:
+  - `tests/ipc.tcyr`: 111 assertions, through the real service thread. They cover ACK, every
+    refusal, keep-alive, split and joined frames, exactly 65536 bytes, oversize, short, timeout, a
+    full hand-off, drain, audit, remove-after-read, replace, and the arena's heap cost.
+  - `tests/agent.tcyr`: 138 assertions. An agent sees `AGNOS_IPC_FD=3` and a socket on fd 3, fds 4–9
+    are closed, its frame is ACKed, and daimon's end closes on stop and on reap even while the
+    agent's child still holds fd 3.
+- **12 mutation runs, all caught.**
+- **14 new HTTP smoke checks.**
+- **aarch64** (qemu-aarch64): `ipc.tcyr` 111/111. `agent.tcyr` shows the same six failures as 2.3.2
+  does under qemu: QEMU applies no RLIMIT_AS, and qemu-user adds a thread of its own.
+- **AGNOS**: builds. A start answers 501 before any channel is made.
+
 ## Defects fixed in the lifecycle code when it first ran
 
 None of this code had ever executed: it had no caller until 2.3.0. Each fix has a test that fails
@@ -265,7 +361,7 @@ were caught.
 
 ## Recorded on the roadmap, not fixed here
 
-- VULN-012's remainder and VULN-014, above.
+- VULN-012's remainder, VULN-014 and VULN-018, above.
 - An agent's own children are not signalled: stop signals the agent's process, not a process group.
 - Agents outlive a daimon crash: there is no parent-death signal, and the registry is in memory.
 - stdout and stderr are inherited, not captured. The supervisor's `OutputCapture` is not wired.
@@ -291,3 +387,4 @@ were caught.
 - [QEMU `linux-user/syscall.c`](https://gitlab.com/qemu-project/qemu/-/blob/master/linux-user/syscall.c) — the `TARGET_NR_prlimit64` handler
 - [CVE-2026-48592 — Oban Web missing authorization](https://basefortify.eu/cve_reports/2026/05/cve-2026-48592.html); [CWE-862](https://cwe.mitre.org/data/definitions/862.html) (2.3.1 addendum)
 - [CVE-2017-12635 — CouchDB](https://docs.couchdb.org/en/stable/cve/2017-12635.html); [Bishop Fox — JSON interoperability vulnerabilities](https://bishopfox.com/blog/json-interoperability-vulnerabilities); [CWE-436](https://cwe.mitre.org/data/definitions/436.html) (2.3.2 addendum)
+- [CVE-2014-3639](https://www.cve.org/CVERecord?id=CVE-2014-3639) and [CVE-2014-3638](https://www.cve.org/CVERecord?id=CVE-2014-3638) — D-Bus; [CVE-2018-16865](https://www.cve.org/CVERecord?id=CVE-2018-16865) — systemd-journald; [CWE-130](https://cwe.mitre.org/data/definitions/130.html), [CWE-636](https://cwe.mitre.org/data/definitions/636.html) (2.3.3 addendum)

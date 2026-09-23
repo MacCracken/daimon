@@ -4,7 +4,7 @@
 >
 > **Severity legend**: **P0** blocking (security / correctness — must-fix before ship) · **P1** high (must-have for the current arc) · **P2** medium (schedule when capacity opens) · **P3 / Low** nice-to-have, no urgency. Upstream-blocker items quote the upstream tracker's own severity.
 
-**Where daimon stands** — `2.3.2`, cyrius 6.6.6, nine dep pins current (samay
+**Where daimon stands** — `2.3.3`, cyrius 6.6.6, nine dep pins current (samay
 1.1.3). Builds on **three targets**: x86_64, aarch64 and AGNOS.
 - **Agents can be started, stopped, paused, resumed and deleted through the API** (2.3.0), under
   their rlimits, with exit status reported. On AGNOS a start answers 501 until 2.4.x.
@@ -13,8 +13,11 @@
 - **Request bodies are read with the typed JSON parser** (2.3.2): strings are decoded, nesting is
   respected, and a body that is not one JSON object, repeats a top-level key or carries U+0000 in a
   top-level string is refused.
-- **833 tests** in 17 suites, every one against its real `src/` module, plus 70 HTTP smoke checks,
-  26 benchmarks and 7 fuzz harnesses, all run by CI.
+- **Agents can send messages to daimon** (2.3.3) on a channel open as their fd 3. A service thread
+  reads it, and the messages go onto the bus
+  ([docs/guides/agent-ipc.md](../guides/agent-ipc.md)).
+- **917 tests** in 17 suites, every one against its real `src/` module, plus 84 HTTP smoke checks,
+  29 benchmarks and 7 fuzz harnesses, all run by CI.
 - The API binds 127.0.0.1 unless told otherwise (`--listen`), and agent and task control refuse
   browser-originated requests.
 - Zero open issue filings.
@@ -26,7 +29,7 @@ prerequisites, sequenced. Each line is a release train, not a single release.
 
 | arc | theme | why it must come after the one above |
 |---|---|---|
-| **2.3.x** | **Agent lifecycle** — start / stop / signal / reap through the API | The product gap. **2.3.0** shipped the process half (start, stop, pause, resume, delete, reaping); **2.3.1** task start/complete; **2.3.2** request-string decoding. IPC remains. |
+| **2.3.x** | **Agent lifecycle** — start / stop / signal / reap through the API | The product gap. **2.3.0** shipped the process half (start, stop, pause, resume, delete, reaping); **2.3.1** task start/complete; **2.3.2** request-string decoding; **2.3.3** agent channels. Message routes remain. |
 | **2.4.x** | **AGNOS spawn + IPC** — `sys_spawn_path`, `chan_op` capability channels, `sys_proclist` | Nothing to map until a route actually spawns. Unblocks the moment 2.3.x lands. |
 | **2.5.x** | **Agent identity + MCP authentication** | Prerequisite for un-gating nein's mutating firewall tools, and for any `claims`-based authorisation. Needs 2.3.x, because identity is per-agent. |
 | **3.0.0** | **Per-agent arena isolation** — VULN-007's open half; unlocks multi-tenant hosting, kavach sandboxing, untrusted federation, external MCP callbacks | Major because it changes the allocation model under every agent and flips the gates the P0 below guards. Needs identity (2.5.x) to know what a tenant *is*. |
@@ -60,11 +63,31 @@ cut re-evaluates the P0 below.
 **2.3.2 fixed request strings** (CHANGELOG 2.3.2, audit VULN-017): every handler reads its body
 with `http_body_json` and the `http_json_*` readers (the typed parser), and the flat `jget` is gone.
 
-**Next — IPC.** `agent_ipc_bind`, `agent_ipc_send` and `msg_bus_publish` still have no caller.
-Three defects were found when the socket code first ran (2.2.3) and deliberately left for this step:
-- the SO_PEERCRED check (VULN-006) **fails open**: if `getsockopt` fails, the peer is not checked;
-- a message cut short by its sender is queued and ACKed as if whole;
-- `agent_ipc_accept_one` reads with no timeout, so one silent peer holds the accept loop.
+**2.3.3 gave agents a channel** (CHANGELOG 2.3.3, [ADR-005](../adr/005-agent-channels.md), audit
+2.3.3 addendum). Each started agent gets a socketpair end as fd 3, and a service thread reads the
+channels. Accepted messages go onto the bus at each HTTP request. The socket-file endpoint and its
+three parked defects are gone.
+
+**Next — message routes.** Agents can send; nothing can read yet:
+- `GET /v1/agents/{id}/messages` to take an agent's queued messages, and a way for an HTTP client to
+  send to an agent. Both need the Origin guard, and neither may let one agent read another's queue
+  once identity exists (2.5.x);
+- **names on the bus**. Registration does not call `msg_bus_register_name`, so a name target reaches
+  no one. Decide first who owns a name: registration names are not unique, and last-writer-wins would
+  let any registration take over another agent's name;
+- decide whether a broadcast reaches its sender (it does today).
+
+**Channel follow-ups, recorded by 2.3.3:**
+- ⚠ **The allocation lock (P2, performance).** While the channel thread runs, every allocation
+  takes the stdlib's shared-heap lock: `alloc(64)` 10 → 53 ns, `json_parse` 429 ns → 1.24 µs,
+  `mcp_manifest_100_tools` 141 → 258 µs. The thread starts at the first agent start. Two ways out:
+  - a separate channel **process**: daimon stays single-threaded, and the process takes the agents'
+    ends by `SCM_RIGHTS`;
+  - running the service on daimon's own loop, which sandhi's serve loops give no hook for today.
+- **VULN-018 (P2): a delivered message costs 451 bytes of heap that is never freed.** A per-agent
+  frame rate (NACK past it) bounds the rate; only a heap that can free (3.0.0) bounds the total.
+- Delivery waits for HTTP traffic: with no requests, the hand-off fills (1024) and agents are told
+  NACK_QUEUE_FULL. A drain driven by the service itself would need the bus to be thread-safe.
 
 **Lifecycle follow-ups, recorded by the 2.3.0 audit:**
 - **A stop holds the server** (VULN-014, P2): up to ~6 s, in both serve modes. Measured: a request
@@ -80,7 +103,8 @@ Three defects were found when the socket code first ran (2.2.3) and deliberately
 - **aarch64 RLIMIT_AS is unverified on hardware.** qemu-aarch64 does not apply it: QEMU's user-mode
   `prlimit64` passes RLIMIT_AS / DATA / STACK through as a no-op.
 
-**Sequence**: IPC is the last 2.3.x step. One bite at a time, suite green at every step.
+**Sequence**: message routes, then the channel follow-ups. One bite at a time, suite green
+at every step.
 
 ## 2.4.x · P2 — AGNOS spawn + IPC mapping
 

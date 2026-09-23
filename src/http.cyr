@@ -102,18 +102,6 @@ fn http_parse_body(buf, len) {
 # allocation — so a decoded field is never a view into the request buffer
 # sandhi reuses (the 2.2.x retention-leak class, closed at the source).
 
-# 1 if the Str holds a NUL byte (a `\u0000` escape, or a raw NUL).
-fn _http_has_nul(s) {
-    var d = str_data(s);
-    var n = str_len(s);
-    var i = 0;
-    while (i < n) {
-        if (load8(d + i) == 0) { return 1; }
-        i = i + 1;
-    }
-    return 0;
-}
-
 # The body as a JSON object, or 0 when it is not an acceptable one:
 #   * not JSON, or JSON with trailing content;
 #   * not an object at the top;
@@ -126,25 +114,12 @@ fn _http_has_nul(s) {
 #     cut at the NUL and stop matching the value daimon checked.
 # Nested values are left alone: daimon reads only top-level fields, and forwards
 # nested ones (MCP `arguments`) without interpreting them.
+# (The checks are json_object_ok, src/error.cyr, shared with agent channel
+# frames since 2.3.3.)
 fn http_body_json(body) {
     if (body == 0) { return 0; }
     var root = bayan_json_v_parse(body);
-    if (bayan_json_v_is_obj(root) == 0) { return 0; }
-    var n = bayan_json_v_obj_len(root);
-    var i = 0;
-    while (i < n) {
-        var v = bayan_json_v_obj_val(root, i);
-        if (bayan_json_v_is_str(v) == 1) {
-            if (_http_has_nul(bayan_json_v_str(v)) == 1) { return 0; }
-        }
-        var k = bayan_json_v_obj_key(root, i);
-        var j = 0;
-        while (j < i) {
-            if (str_eq(bayan_json_v_obj_key(root, j), k) == 1) { return 0; }
-            j = j + 1;
-        }
-        i = i + 1;
-    }
+    if (json_object_ok(root) == 0) { return 0; }
     return root;
 }
 

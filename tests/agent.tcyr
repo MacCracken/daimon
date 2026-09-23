@@ -42,6 +42,7 @@ include "src/syscalls.cyr"
 include "src/error.cyr"
 include "src/audit.cyr"
 include "src/agent.cyr"
+include "src/ipc.cyr"      # agent.cyr opens and hands over agent channels (2.3.3)
 
 # A second thread that stays alive until the main thread has counted it —
 # released by a flag, not a fixed sleep, so no scheduling delay can make it
@@ -286,7 +287,7 @@ fn _t_sh(script, envp, mem, cpu) {
     store64(argv + 8, "-c");
     store64(argv + 16, script);
     store64(argv + 24, 0);
-    var r_t, r_v = agent_spawn_with_limits("/bin/sh", argv, envp, mem, cpu);
+    var r_t, r_v = agent_spawn_with_limits("/bin/sh", argv, envp, mem, cpu, 0 - 1);
     if (is_err_result(r_t) == 1) { return 0 - 100 - r_v; }
     return daimon_reap_within(r_v, 5000);
 }
@@ -333,7 +334,7 @@ assert_eq(_t_sh("kill -9 $$", 0, 0, 0), 137, "spawn: killed by SIGKILL reaps as 
 var nx_argv = alloc(16);
 store64(nx_argv, "/nonexistent/daimon-test-agent");
 store64(nx_argv + 8, 0);
-var nx_t, nx_v = agent_spawn_with_limits("/nonexistent/daimon-test-agent", nx_argv, 0, 0, 0);
+var nx_t, nx_v = agent_spawn_with_limits("/nonexistent/daimon-test-agent", nx_argv, 0, 0, 0, 0 - 1);
 assert_eq(is_err_result(nx_t), 1, "spawn: a missing executable is an Err");
 assert_eq(nx_v, AGENT_OP_NO_EXEC, "spawn: ... reported as AGENT_OP_NO_EXEC");
 var nx_st: i32[1];
@@ -387,7 +388,7 @@ store64(g_argv, "/bin/sh");
 store64(g_argv + 8, "-c");
 store64(g_argv + 16, "sleep 0.3");
 store64(g_argv + 24, 0);
-var g_t, g_pid = agent_spawn_with_limits("/bin/sh", g_argv, 0, 0, 0);
+var g_t, g_pid = agent_spawn_with_limits("/bin/sh", g_argv, 0, 0, 0, 0 - 1);
 assert_eq(is_ok(g_t), 1, "guard fixture started");
 assert_eq(daimon_reap_code(0), 0 - 1, "reap(0) is refused — it would reap ANY child in the group");
 assert_eq(daimon_reap_code(0 - 1), 0 - 1, "reap(-1) is refused — it would reap ANY child");
@@ -520,6 +521,7 @@ if (sys_getuid() != 0) {
     assert_eq(x_v, AGENT_OP_NO_LIMITS, "start: a limit that cannot be applied refuses the start (was: exit 126 later)");
     assert_eq(agent_status(lx), AGENT_FAILED, "start: the agent is FAILED, with no process");
     assert_eq(agent_pid(lx), 0, "start: no pid recorded");
+    if (is_ok(x_t) == 1) { agent_stop(lx, STOP_USER); }   # not refused: do not leave it running
 
     # The same for RLIMIT_AS: cap this process's hard address-space limit at
     # 64 GiB (or its current hard limit, if lower) and ask for 1 GiB more.
@@ -538,7 +540,160 @@ if (sys_getuid() != 0) {
     var m_t, m_v = agent_start(lm, as_cap + 1073741824, 0);
     assert_eq(m_v, AGENT_OP_NO_LIMITS, "start: an address-space limit that cannot be applied refuses the start");
     assert_eq(agent_pid(lm), 0, "start: no pid recorded (RLIMIT_AS)");
+    # Under qemu-aarch64 it is not refused (QEMU applies no RLIMIT_AS), and the
+    # started agent used to be left running after the suite. Stopped only after
+    # the checks above, so they still report it.
+    if (is_ok(m_t) == 1) { agent_stop(lm, STOP_USER); }
 }
+
+# --- 2.3.3: every started agent gets a channel on fd 3 ------------------------
+# The fixture reports what it sees from inside, sends one frame on fd 3 and
+# reads the reply, leaves a background child holding its fd 3 (as any agent's
+# subprocess would), then waits to be stopped. Because that child keeps the
+# channel open, daimon's end is closed only by daimon itself: after a stop or a
+# reap, nothing the agent left behind can go on speaking as the agent.
+test_group("agent_channel");
+var csb = str_builder_new();
+str_builder_add_cstr(csb, adir);
+str_builder_add_cstr(csb, "/chan");
+var cdir = str_data(str_builder_build(csb));
+xmkdir_p(cdir, 448);
+var chsb = str_builder_new();
+str_builder_add_cstr(chsb, "#!/bin/sh\ntrap 'exit 0' TERM\no=\"$0.out.$$\"\n{\necho \"env=$AGNOS_IPC_FD\"\n");
+str_builder_add_cstr(chsb, "case \"$(readlink /proc/$$/fd/3)\" in socket:*) echo sock=yes;; *) echo sock=no;; esac\n");
+str_builder_add_cstr(chsb, "for f in 4 5 6 7 8 9; do [ -e /proc/$$/fd/$f ] && echo \"leak=$f\"; done\n");
+str_builder_add_cstr(chsb, "} > \"$o.tmp\"\n");
+str_builder_add_cstr(chsb, "printf '\\000\\000\\000\\016{\"target\":\"*\"}' >&3\n");
+str_builder_add_cstr(chsb, "r=$(head -c 1 <&3 | od -v -An -tu1 | tr -d ' ')\necho \"reply=$r\" >> \"$o.tmp\"\n");
+str_builder_add_cstr(chsb, "sleep 30 >/dev/null 2>&1 &\necho \"bg=$!\" >> \"$o.tmp\"\n");
+str_builder_add_cstr(chsb, "mv \"$o.tmp\" \"$o\"\nwhile :; do sleep 0.05; done\n");
+var chan_exe = _t_script(cdir, "agnos-agent-user-agent", str_data(str_builder_build(chsb)));
+agent_set_agents_dir(cdir);
+
+# The fixture's report file for a started agent: <exe>.out.<pid>
+fn _t_out(exe, pid) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, exe);
+    str_builder_add_cstr(sb, ".out.");
+    str_builder_add_int(sb, pid);
+    return str_data(str_builder_build(sb));
+}
+
+# The number after "<key>=" on a line of the report, or 0.
+fn _t_report_int(buf, n, key) {
+    var kl = strlen(key);
+    var i = 0;
+    while (i + kl < n) {
+        if (i == 0 || load8(buf + i - 1) == 10) {
+            if (memeq(buf + i, key, kl) == 1) {
+                var v = 0;
+                var j = i + kl;
+                while (j < n && load8(buf + j) >= 48 && load8(buf + j) <= 57) {
+                    v = v * 10 + load8(buf + j) - 48;
+                    j = j + 1;
+                }
+                return v;
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _t_has_line(buf, n, line) {
+    var ll = strlen(line);
+    var i = 0;
+    while (i + ll <= n) {
+        if (i == 0 || load8(buf + i - 1) == 10) {
+            if (memeq(buf + i, line, ll) == 1) {
+                if (i + ll == n || load8(buf + i + ll) == 10) { return 1; }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Wait up to ~3 s for this process's descriptor count to be `want`.
+fn _t_wait_fds(want) {
+    var i = 0;
+    while (i < 300) {
+        if (count_fds(sys_getpid()) == want) { return 1; }
+        _t_nap_ms(10);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# The baseline, once the channels of the agents stopped above are closed: the
+# service applies removals on its next pass, so wait for the count to hold
+# still for 200 ms (bounded ~3 s).
+fn _t_settled_fds() {
+    var last = count_fds(sys_getpid());
+    var same = 0;
+    var i = 0;
+    while (i < 60) {
+        _t_nap_ms(50);
+        var now = count_fds(sys_getpid());
+        if (now == last) { same = same + 1; } else { same = 0; last = now; }
+        if (same >= 4) { return last; }
+        i = i + 1;
+    }
+    return last;
+}
+var fds0 = _t_settled_fds();
+var lc = agent_handle_new(agent_next_id(), str_from("channel"));
+var c_t, c_pid = agent_start(lc, 0, 0);
+assert_eq(is_ok(c_t), 1, "channel: the agent starts");
+var cout = _t_out(chan_exe, c_pid);
+assert_eq(_t_wait_file(cout), 1, "channel: the agent reported");
+var crep = alloc(512);
+var crn = file_read_all(cout, crep, 511);
+assert(crn > 0, "channel: the report is readable");
+assert_eq(_t_has_line(crep, crn, "env=3"), 1, "channel: AGNOS_IPC_FD=3 is in the agent's environment");
+assert_eq(_t_has_line(crep, crn, "sock=yes"), 1, "channel: fd 3 is a socket");
+var leaked = 0;
+var lci = 0;
+while (lci + 5 <= crn) {
+    if (memeq(crep + lci, "leak=", 5) == 1) { leaked = 1; }
+    lci = lci + 1;
+}
+assert_eq(leaked, 0, "channel: nothing else of daimon's reaches the agent (fds 4-9 closed)");
+assert_eq(_t_has_line(crep, crn, "reply=1"), 1, "channel: the agent's frame was ACKed");
+var bg1 = _t_report_int(crep, crn, "bg=");
+assert(bg1 > 0, "channel: the agent's background child is running");
+var crec = ipc_take();
+assert(crec != 0, "channel: the frame reached daimon");
+if (crec != 0) {
+    assert_eq(str_eq(ipc_rec_agent(crec), str_from_int(agent_id(lc))), 1,
+      "channel: its source is the agent daimon started (by id)");
+    assert_eq(str_eq(ipc_rec_target(crec), str_from("*")), 1, "channel: with the target it sent");
+}
+assert_eq(count_fds(sys_getpid()), fds0 + 1, "channel: daimon holds one descriptor for it (its own end)");
+agent_stop(lc, STOP_USER);
+assert_eq(agent_exit_code(lc), 0, "channel: the agent stops cleanly");
+assert_eq(_t_wait_fds(fds0), 1,
+  "channel: stopping the agent closes daimon's end, though its child still holds the other end");
+
+# A restart gets a fresh channel; an agent that exits on its own has it closed too.
+var c2_t, c2_pid = agent_start(lc, 0, 0);
+assert_eq(is_ok(c2_t), 1, "channel: restarted");
+assert_eq(_t_wait_file(_t_out(chan_exe, c2_pid)), 1, "channel: the restarted agent reported");
+var crn2 = file_read_all(_t_out(chan_exe, c2_pid), crep, 511);
+assert_eq(_t_has_line(crep, crn2, "reply=1"), 1, "channel: the restarted agent's frame was ACKed too");
+var bg2 = _t_report_int(crep, crn2, "bg=");
+ipc_take();
+sys_kill(c2_pid, 9);
+assert_eq(_t_reap_wait(lc), 1, "channel: the killed agent is reaped");
+assert_eq(_t_wait_fds(fds0), 1,
+  "channel: reaping an agent closes its channel, though its child still holds the other end");
+if (bg1 > 0) { sys_kill(bg1, 9); }
+if (bg2 > 0) { sys_kill(bg2, 9); }
+xunlink(_t_out(chan_exe, c_pid));
+xunlink(_t_out(chan_exe, c2_pid));
+xunlink(chan_exe);
+xrmdir(cdir);
+agent_set_agents_dir(adir);
 
 # Clean up the fixtures (ready markers carry pids; remove what we know).
 xunlink(_t_ready(user_exe, s_pid));
@@ -552,4 +707,6 @@ xrmdir(edir);
 xrmdir(adir);
 agent_set_agents_dir(0);
 
-syscall(SYS_EXIT, assert_summary());
+# exit_group, not exit: the agent channel service thread is running, and
+# exit(2) would end only this thread and leave the process alive (2.3.3).
+syscall(SYS_EXIT_GROUP, assert_summary());

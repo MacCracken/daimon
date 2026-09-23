@@ -139,6 +139,12 @@ fn rate_check_shared() {
 # request decode; sandhi accepts it for legit servers, we reject).
 # Sandhi closes cfd after we return — do NOT sock_close here.
 fn handle_request(ctx, cfd, buf, blen) {
+    # 2.3.3: first, what agents sent on their channels since the last request
+    # goes onto the bus (and channel faults onto the audit chain) — whoever is
+    # asking, rate-limited or not. The channel service thread hands it over;
+    # this thread owns the bus. An empty hand-off costs one uncontended lock.
+    ipc_drain(_msg_bus);
+
     if (rate_check(cfd) == 0) {
         var rl_msg = "{\"error\":\"too many requests\"}";
         daimon_audit(SEV_WARNING, "http", "http.ratelimit", "per-ip rate limit exceeded");

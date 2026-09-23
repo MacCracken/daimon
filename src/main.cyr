@@ -157,4 +157,7 @@ fn main() {
 }
 
 var r = main();
-sys_exit(r);
+# exit_group (2.3.3): once an agent has started, the channel service thread is
+# running, and sys_exit — exit(2) — ends only the calling thread. The process
+# would stay up with its main thread gone. lib/syscalls says the same.
+sys_exit_group(r);

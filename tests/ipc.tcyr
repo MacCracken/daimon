@@ -5,15 +5,15 @@
 # mirrored 10 of this module's 28 functions — the in-memory message bus and
 # RPC registry — and its mirror is DELETED in the same change.
 #
-# ⛔ CORRECTED at 2.2.3. This header used to say the socket half (agent_ipc_bind /
-# accept_one / send / cleanup) was exercised by tests/syscall_portability.tcyr.
-# That file round-trips the syscall WRAPPERS those functions call, never the
-# functions — and the functions did not work: agent_ipc_new crashed on its first
-# call and agent_ipc_bind made a directory where its socket belonged. Both are
-# now run here, end to end, across a fork (see the socket section at the end).
+# 2.3.3: the socket-FILE endpoint (agent_ipc_new / bind / accept_one / send /
+# cleanup) is gone, and its tests with it; nothing ever called it. Agents talk
+# to daimon over a CHANNEL (a socketpair; the agent's end is its fd 3), read by
+# a service thread. The channel section at the end drives that thread for real:
+# the test holds the agent's end and speaks the wire protocol on it.
 #
-# ipc.cyr depends on agent.cyr: ipc_msg_new draws message ids from agent.cyr's
-# `_next_agent_id` counter, so the include chain is agent.tcyr's.
+# ipc.cyr is included after agent.cyr because agent.cyr opens the channels; ipc
+# no longer draws on agent.cyr's `_next_agent_id` (message ids have their own
+# counter since 2.3.3, and a test below holds it to that).
 # =========================================================================
 
 include "lib/string.cyr"
@@ -32,6 +32,7 @@ include "lib/math.cyr"
 include "lib/process.cyr"
 include "lib/sakshi.cyr"
 include "lib/libro.cyr"
+include "lib/thread.cyr"
 include "lib/assert.cyr"
 
 include "src/syscalls.cyr"
@@ -161,94 +162,417 @@ msg_bus_publish(rbus, ipc_msg_new(str_from("sys"), str_new(rtb, 7), MSG_EVENT, s
 assert_eq(vec_len(map_get(load64(rbus), "agent-3")), 1,
   "a target that is a VIEW of a larger buffer still routes to its agent");
 
-# --- 2.2.3: the socket half, run for the first time ------------------------
-# S_IFSOCK via xstat + STAT_MODE (st_mode sits at a different offset per arch).
-fn _ipc_is_socket(path_cstr) {
-    var st: u8[144];
-    if (xstat(path_cstr, &st) != 0) { return 0; }
-    if ((load32(&st + STAT_MODE) & 0xF000) == 0xC000) { return 1; }
+# --- 2.3.3: bounded subscriber queues ---------------------------------------
+var qbus = msg_bus_new();
+msg_bus_subscribe(qbus, "9");
+var drop0 = msg_bus_dropped_count();
+var qi = 0;
+while (qi < IPC_BUS_QUEUE_MAX + 3) {
+    msg_bus_publish(qbus, ipc_msg_new(str_from("s"), str_from("9"), MSG_EVENT, str_from("q")));
+    qi = qi + 1;
+}
+assert_eq(vec_len(msg_bus_queue(qbus, "9")), IPC_BUS_QUEUE_MAX, "bus: a subscriber queue stops at IPC_BUS_QUEUE_MAX");
+assert_eq(msg_bus_dropped_count() - drop0, 3, "bus: the messages past it are dropped and counted");
+var qf_t, qf_v = msg_bus_send_to(qbus, "9", ipc_msg_new(str_from("s"), str_from("9"), MSG_EVENT, str_from("q")));
+assert_eq(is_err_result(qf_t), 1, "bus: send_to a full queue is Err");
+assert_eq(qf_v, DAIMON_ERR_IPC_FAULT, "bus: ... DAIMON_ERR_IPC_FAULT");
+assert_eq(msg_bus_queue(qbus, "nobody"), 0, "bus: no queue for an id that never subscribed");
+
+# Message ids have their own counter (they used to use up agent ids).
+var aid0 = _next_agent_id;
+ipc_msg_new(str_from("s"), str_from("t"), MSG_EVENT, str_from("p"));
+assert_eq(_next_agent_id, aid0, "a message does not consume an agent id");
+
+# --- 2.3.3: agent channels, through the real service thread -------------------
+# The test holds the AGENT's end of each channel and speaks the wire protocol
+# on it (docs/guides/agent-ipc.md); the service thread owns daimon's end.
+test_group("ipc_channel");
+
+# Small limits, set before the service starts: the hand-off's capacity is fixed
+# when it is created; the timeout is read on every pass.
+IPC_HANDOFF_CAP = 8;
+IPC_FRAME_TIMEOUT_MS = 300;
+
+# A channel for agent `id`; returns the agent's end.
+fn _t_chan(id) {
+    var fds: i32[2];
+    if (ipc_channel_open(&fds) != 0) { return 0 - 1; }
+    ipc_service_add(str_from(id), load32(&fds));
+    return load32(&fds + 4);
+}
+
+# `n` bytes of frame for a body of `blen` bytes: the 4-byte big-endian length,
+# then the body.
+fn _t_frame(body, blen) {
+    var buf = alloc(blen + 4);
+    store8(buf, (blen >> 24) & 255);
+    store8(buf + 1, (blen >> 16) & 255);
+    store8(buf + 2, (blen >> 8) & 255);
+    store8(buf + 3, blen & 255);
+    memcpy(buf + 4, body, blen);
+    return buf;
+}
+
+fn _t_send(fd, body) {
+    var n = strlen(body);
+    return sys_write(fd, _t_frame(body, n), n + 4);
+}
+
+# The next reply byte within `ms`: the code, 0 at EOF, or -1 if none came.
+fn _t_reply(fd, ms) {
+    var pfd: i64[1];
+    store32(&pfd, fd);
+    store16(&pfd + 4, 1);   # POLLIN
+    store16(&pfd + 6, 0);
+    if (syscall(7, &pfd, 1, ms) <= 0) { return 0 - 1; }
+    var b: u8[8];
+    if (sys_read(fd, &b, 1) <= 0) { return 0; }
+    return load8(&b);
+}
+
+# The next record handed over, waiting up to ~2 s (a fault's record follows
+# the close the test sees).
+fn _t_take() {
+    var i = 0;
+    while (i < 200) {
+        var r = ipc_take();
+        if (r != 0) { return r; }
+        sleep_ms(10);
+        i = i + 1;
+    }
     return 0;
 }
 
-var base_sb = str_builder_new();
-str_builder_add_cstr(base_sb, "build/test-ipc-");
-str_builder_add_int(base_sb, sys_getpid());
-var ipc_base = str_builder_build(base_sb);
-# path_join, NOT str_cat: str_cat does not NUL-terminate its result, and is_dir,
-# xmkdir_p and xrmdir read the path as a C string — so a str_cat'd path had
-# whatever byte followed it in the heap appended to it. That passed or failed
-# with the heap layout, i.e. with the length of the pid in the path: green on a
-# dev box, red on the CI runner (2.2.3; reproduced in an ubuntu:24.04 container).
-var sock_dir = path_join(ipc_base, str_from("sock"));   # does not exist yet
-
-var idb = alloc(16);
-memcpy(idb, "7", 1);
-var ipc = agent_ipc_new(str_new(idb, 1), sock_dir);    # crashed before 2.2.3
-memset(idb, 88, 16);
-assert(str_eq(agent_ipc_id(ipc), str_from("7")) == 1, "agent_ipc_new owns the agent id");
-var spath = agent_ipc_socket_path(ipc);
-assert(str_eq(spath, str_cat(sock_dir, str_from("/7.sock"))) == 1,
-  "agent_ipc_new builds <dir>/<id>.sock");
-
-var bind_t, bind_fd = agent_ipc_bind(ipc);
-assert_eq(is_ok(bind_t), 1, "agent_ipc_bind succeeds (it could not before 2.2.3)");
-assert_eq(is_dir(sock_dir), 1, "bind created the missing parent directory");
-assert_eq(is_dir(spath), 0, "the socket path is NOT a directory (the 2.2.3 bug made one)");
-assert_eq(_ipc_is_socket(str_data(spath)), 1, "the socket path IS a socket");
-
-# Round trip: agent_ipc_send blocks for an ACK, so it runs in a child while the
-# parent accepts. The child reports its own result through its exit status.
-var child = sys_fork();
-if (child == 0) {
-    var s_t, s_v = agent_ipc_send(spath, str_from("{\"hello\":1}"));
-    if (is_ok(s_t) == 1) { sys_exit(0); }
-    sys_exit(1);
+fn _t_str_is(s, cstr) {
+    if (s == 0) { return 0; }
+    return str_eq(s, str_from(cstr));
 }
-var acc_t, acc_n = agent_ipc_accept_one(bind_fd, ipc);
-assert_eq(is_ok(acc_t), 1, "agent_ipc_accept_one accepts the child's message");
-assert_eq(acc_n, 11, "accept reads the whole 11-byte body");
-assert_eq(vec_len(agent_ipc_queue(ipc)), 1, "the message is queued");
-var qmsg = 0;
-if (vec_len(agent_ipc_queue(ipc)) > 0) { qmsg = vec_get(agent_ipc_queue(ipc), 0); }
-assert(qmsg != 0, "a queued message exists to compare");
-if (qmsg != 0) {
-    assert(str_eq(qmsg, str_from("{\"hello\":1}")) == 1, "the queued message is the one sent");
+
+var a41 = _t_chan("41");
+assert(a41 >= 0, "channel: a socketpair opens");
+
+# A valid frame: ACK, and the record is already handed over when it arrives.
+_t_send(a41, "{\"target\":\"*\",\"type\":\"command\",\"payload\":{\"n\":1,\"s\":\"x\"}}");
+assert_eq(_t_reply(a41, 2000), ACK, "channel: a valid frame is ACKed");
+var r1 = ipc_take();
+assert(r1 != 0, "channel: the ACK follows the hand-over (the record is there)");
+if (r1 != 0) {
+    assert_eq(ipc_rec_kind(r1), IPC_REC_MESSAGE, "channel: a MESSAGE record");
+    assert_eq(_t_str_is(ipc_rec_agent(r1), "41"), 1, "channel: from the channel's agent");
+    assert_eq(_t_str_is(ipc_rec_target(r1), "*"), 1, "channel: target as sent");
+    assert_eq(ipc_rec_type(r1), MSG_COMMAND, "channel: type as sent");
+    assert_eq(_t_str_is(ipc_rec_payload(r1), "{\"n\":1,\"s\":\"x\"}"), 1, "channel: payload as compact JSON");
 }
-var cst: i32[1];
-store32(&cst, 255);
-sys_waitpid(child, &cst, 0);
-assert_eq((load32(&cst) >> 8) & 255, 0, "the sender got its ACK (child exited 0)");
 
-# The shape the old code ALWAYS failed on: the parent directory already exists.
-# path_dirname's view was not terminated at the directory, so mkdir received the
-# whole socket path and — its parent now existing — created a directory THERE.
-xmkdir_p(str_data(sock_dir), 493);                       # make sure it does
-var ipc2 = agent_ipc_new(str_from("9"), sock_dir);
-var b2_t, b2_fd = agent_ipc_bind(ipc2);
-var spath2 = agent_ipc_socket_path(ipc2);
-assert_eq(is_ok(b2_t), 1, "bind succeeds when the parent directory already exists");
-assert_eq(is_dir(spath2), 0, "and does not create a directory at the socket path");
-assert_eq(_ipc_is_socket(str_data(spath2)), 1, "the second socket path is a socket");
-agent_ipc_cleanup(ipc2);
-if (is_ok(b2_t) == 1) { sys_close(b2_fd); }
-xrmdir(str_data(spath2));   # only if a buggy build left a directory there
+# Identity is the channel: whatever a frame claims, the source is its agent.
+_t_send(a41, "{\"target\":\"7\",\"source\":\"99\",\"agent\":\"99\",\"agent_id\":99}");
+assert_eq(_t_reply(a41, 2000), ACK, "channel: a frame claiming another source is still a frame");
+var r2 = ipc_take();
+assert(r2 != 0, "channel: handed over");
+if (r2 != 0) {
+    assert_eq(_t_str_is(ipc_rec_agent(r2), "41"), 1,
+      "channel: a claimed source is ignored — it is the channel's agent");
+    assert_eq(ipc_rec_type(r2), MSG_EVENT, "channel: no type is an event");
+    assert_eq(_t_str_is(ipc_rec_payload(r2), "null"), 1, "channel: no payload is null");
+}
+# The arena is reset for each frame; what a record holds must not be in it.
+if (r1 != 0) {
+    assert_eq(_t_str_is(ipc_rec_target(r1), "*"), 1, "channel: a record's target outlives the next frame's parse");
+}
+_t_send(a41, "{\"target\":\"7\",\"type\":null,\"payload\":\"caf\\u00e9\"}");
+assert_eq(_t_reply(a41, 2000), ACK, "channel: type null is ACKed");
+var r3 = ipc_take();
+if (r3 != 0) {
+    assert_eq(ipc_rec_type(r3), MSG_EVENT, "channel: type null is an event");
+    # "café" as UTF-8, quoted: the \u00e9 is decoded, and re-encoded as bytes.
+    var cafe: u8[8];
+    memcpy(&cafe, "\"caf", 4);
+    store8(&cafe + 4, 195);
+    store8(&cafe + 5, 169);
+    store8(&cafe + 6, 34);
+    assert_eq(str_eq(ipc_rec_payload(r3), str_new(&cafe, 7)), 1,
+      "channel: a string payload is decoded, then re-encoded");
+}
 
-# A path sun_path cannot hold is refused, not truncated into a different socket.
-var long_sb = str_builder_new();
-str_builder_add(long_sb, ipc_base);
-str_builder_add_cstr(long_sb, "/");
-var li = 0;
-while (li < 110) { str_builder_add_cstr(long_sb, "d"); li = li + 1; }
-var long_ipc = agent_ipc_new(str_from("8"), str_builder_build(long_sb));
-var lb_t, lb_v = agent_ipc_bind(long_ipc);
-assert_eq(is_err_result(lb_t), 1, "bind refuses a socket path longer than sun_path holds");
-var ls_t, ls_v = agent_ipc_send(agent_ipc_socket_path(long_ipc), str_from("x"));
-assert_eq(is_err_result(ls_t), 1, "send refuses it too");
+# Refused bodies: NACK_INVALID, nothing handed over, the channel stays open.
+var bad = vec_new();
+vec_push(bad, "hello");
+vec_push(bad, "[1,2]");
+vec_push(bad, "{\"target\":\"a\"} x");
+vec_push(bad, "{\"x\":1}");
+vec_push(bad, "{\"target\":\"\"}");
+vec_push(bad, "{\"target\":5}");
+vec_push(bad, "{\"target\":null}");
+vec_push(bad, "{\"target\":\"a\",\"target\":\"b\"}");
+vec_push(bad, "{\"target\":\"a\\u0000b\"}");
+vec_push(bad, "{\"target\":\"a\",\"note\":\"\\u0000\"}");
+vec_push(bad, "{\"target\":\"a\",\"type\":\"bogus\"}");
+vec_push(bad, "{\"target\":\"a\",\"type\":5}");
+var ref0 = ipc_refused_count();
+var bi = 0;
+var bad_ok = 0;
+while (bi < vec_len(bad)) {
+    _t_send(a41, vec_get(bad, bi));
+    if (_t_reply(a41, 2000) == NACK_INVALID) {
+        if (ipc_take() == 0) { bad_ok = bad_ok + 1; }
+    }
+    bi = bi + 1;
+}
+assert_eq(bad_ok, vec_len(bad), "channel: each malformed body is NACK_INVALID and never handed over");
+assert_eq(ipc_refused_count() - ref0, vec_len(bad), "channel: each refusal is counted");
+_t_send(a41, "{\"target\":\"7\"}");
+assert_eq(_t_reply(a41, 2000), ACK, "channel: after refusals the channel still works");
+ipc_take();
 
-agent_ipc_cleanup(ipc);
-assert_eq(_ipc_is_socket(str_data(spath)), 0, "agent_ipc_cleanup removes the socket");
-if (is_ok(bind_t) == 1) { sys_close(bind_fd); }
-xrmdir(str_data(sock_dir));
-xrmdir(str_data(ipc_base));
+# The target's length: 256 bytes pass, 257 do not.
+fn _t_target_of(n) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"target\":\"");
+    var i = 0;
+    while (i < n) { str_builder_add_cstr(sb, "t"); i = i + 1; }
+    str_builder_add_cstr(sb, "\"}");
+    return str_data(str_builder_build(sb));
+}
+_t_send(a41, _t_target_of(IPC_TARGET_MAX));
+assert_eq(_t_reply(a41, 2000), ACK, "channel: a target of IPC_TARGET_MAX bytes is accepted");
+ipc_take();
+_t_send(a41, _t_target_of(IPC_TARGET_MAX + 1));
+assert_eq(_t_reply(a41, 2000), NACK_INVALID, "channel: one byte more is refused");
 
-syscall(SYS_EXIT, assert_summary());
+# A zero-length frame is a keep-alive: no reply at all.
+var ka: u8[4];
+memset(&ka, 0, 4);
+sys_write(a41, &ka, 4);
+assert_eq(_t_reply(a41, 200), 0 - 1, "channel: a keep-alive gets no reply");
+_t_send(a41, "{\"target\":\"7\"}");
+assert_eq(_t_reply(a41, 2000), ACK, "channel: the next frame after a keep-alive is answered normally");
+ipc_take();
+
+# Two frames in one write: two replies, two records.
+var f1 = "{\"target\":\"7\",\"payload\":1}";
+var f2 = "{\"target\":\"7\",\"payload\":2}";
+var two = alloc(64);
+memcpy(two, _t_frame(f1, strlen(f1)), strlen(f1) + 4);
+memcpy(two + strlen(f1) + 4, _t_frame(f2, strlen(f2)), strlen(f2) + 4);
+sys_write(a41, two, strlen(f1) + strlen(f2) + 8);
+assert_eq(_t_reply(a41, 2000), ACK, "channel: first of two frames in one write");
+assert_eq(_t_reply(a41, 2000), ACK, "channel: second of two frames in one write");
+var t1 = ipc_take();
+var t2 = ipc_take();
+assert(t1 != 0, "channel: both handed over (1)");
+assert(t2 != 0, "channel: both handed over (2)");
+if (t2 != 0) { assert_eq(_t_str_is(ipc_rec_payload(t2), "2"), 1, "channel: in order"); }
+
+# A frame in pieces: header split, body split, all within the timeout.
+var fr = "{\"target\":\"7\",\"payload\":\"pieces\"}";
+var frb = _t_frame(fr, strlen(fr));
+sys_write(a41, frb, 2);
+sleep_ms(30);
+sys_write(a41, frb + 2, 2);
+sleep_ms(30);
+sys_write(a41, frb + 4, 5);
+sleep_ms(30);
+sys_write(a41, frb + 9, strlen(fr) - 5);
+assert_eq(_t_reply(a41, 2000), ACK, "channel: a frame that arrives in pieces is reassembled");
+var tp = ipc_take();
+if (tp != 0) { assert_eq(_t_str_is(ipc_rec_payload(tp), "\"pieces\""), 1, "channel: ... intact"); }
+
+# Exactly MAX_MESSAGE_SIZE is allowed.
+var bigsb = str_builder_new();
+str_builder_add_cstr(bigsb, "{\"target\":\"*\",\"payload\":\"");
+var bx = 0;
+while (bx < MAX_MESSAGE_SIZE - 27) { str_builder_add_cstr(bigsb, "x"); bx = bx + 1; }
+str_builder_add_cstr(bigsb, "\"}");
+var big = str_builder_build(bigsb);
+assert_eq(str_len(big), MAX_MESSAGE_SIZE, "fixture: a body of exactly MAX_MESSAGE_SIZE");
+sys_write(a41, _t_frame(str_data(big), str_len(big)), str_len(big) + 4);
+assert_eq(_t_reply(a41, 2000), ACK, "channel: a frame of exactly MAX_MESSAGE_SIZE is accepted");
+var tb = ipc_take();
+if (tb != 0) { assert_eq(str_len(ipc_rec_payload(tb)), MAX_MESSAGE_SIZE - 25, "channel: ... whole"); }
+
+# Faults close the channel and are handed over as events.
+fn _t_event_is(r, ev, id) {
+    if (r == 0) { return 0; }
+    if (ipc_rec_kind(r) != IPC_REC_EVENT) { return 0; }
+    if (ipc_rec_event(r) != ev) { return 0; }
+    return _t_str_is(ipc_rec_agent(r), id);
+}
+
+var a42 = _t_chan("42");
+var over: u8[4];
+store8(&over, 0);
+store8(&over + 1, 1);
+store8(&over + 2, 0);
+store8(&over + 3, 1);           # 65537
+sys_write(a42, &over, 4);
+assert_eq(_t_reply(a42, 2000), NACK_INVALID, "oversize: a length over MAX_MESSAGE_SIZE is NACK_INVALID");
+assert_eq(_t_reply(a42, 2000), 0, "oversize: ... and the channel is closed");
+assert_eq(_t_event_is(_t_take(), IPC_EV_OVERSIZE, "42"), 1, "oversize: handed over as an OVERSIZE event");
+
+var a43 = _t_chan("43");
+var part: u8[14];
+memset(&part, 120, 14);
+store8(&part, 0);
+store8(&part + 1, 0);
+store8(&part + 2, 0);
+store8(&part + 3, 100);         # promises 100 bytes, sends 10
+sys_write(a43, &part, 14);
+sleep_ms(50);
+sys_close(a43);
+assert_eq(_t_event_is(_t_take(), IPC_EV_SHORT, "43"), 1, "short: a frame cut off by the agent is a SHORT event");
+assert_eq(ipc_take(), 0, "short: and nothing of it is delivered");
+
+var a44 = _t_chan("44");
+var t44 = clock_now_ms();
+sys_write(a44, &part, 14);
+assert_eq(_t_reply(a44, 3000), NACK_INVALID, "timeout: a frame that stalls is NACK_INVALID");
+var w44 = clock_now_ms() - t44;
+assert(w44 >= IPC_FRAME_TIMEOUT_MS, "timeout: ... not before IPC_FRAME_TIMEOUT_MS");
+assert(w44 < IPC_FRAME_TIMEOUT_MS + 1500, "timeout: ... and not long after");
+assert_eq(_t_reply(a44, 2000), 0, "timeout: the channel is closed");
+assert_eq(_t_event_is(_t_take(), IPC_EV_TIMEOUT, "44"), 1, "timeout: handed over as a TIMEOUT event");
+
+# A full hand-off: the agent is told, and nothing is lost that was ACKed.
+while (ipc_take() != 0) { }
+var a45 = _t_chan("45");
+var hf = 0;
+var hi = 0;
+while (hi < IPC_HANDOFF_CAP) {
+    _t_send(a45, "{\"target\":\"7\"}");
+    if (_t_reply(a45, 2000) == ACK) { hf = hf + 1; }
+    hi = hi + 1;
+}
+assert_eq(hf, IPC_HANDOFF_CAP, "hand-off: frames are ACKed until it is full");
+_t_send(a45, "{\"target\":\"7\"}");
+assert_eq(_t_reply(a45, 2000), NACK_QUEUE_FULL, "hand-off: then NACK_QUEUE_FULL");
+# ...and a refused frame costs the shared heap nothing: the room is checked
+# before the record is built. (It cost 224 bytes a frame before 2.3.3's fix.)
+var qff = "{\"target\":\"7\",\"payload\":{\"k\":[1,2,3]}}";
+var qfb = _t_frame(qff, strlen(qff));
+var qfn = strlen(qff) + 4;
+var qh0 = alloc_used();
+var qk = 0;
+var qfull = 0;
+while (qk < 50) {
+    sys_write(a45, qfb, qfn);
+    if (_t_reply(a45, 2000) == NACK_QUEUE_FULL) { qfull = qfull + 1; }
+    qk = qk + 1;
+}
+assert_eq(qfull, 50, "hand-off: every frame while it is full is NACK_QUEUE_FULL");
+assert(alloc_used() - qh0 < 50 * 8, "hand-off: and a refused frame allocates nothing on the shared heap");
+var dbus = msg_bus_new();
+msg_bus_subscribe(dbus, "7");
+msg_bus_subscribe(dbus, "8");
+var pub0 = ipc_published_count();
+assert_eq(ipc_drain(dbus), IPC_HANDOFF_CAP, "hand-off: ipc_drain takes every ACKed frame");
+assert_eq(ipc_published_count() - pub0, IPC_HANDOFF_CAP, "hand-off: ... and counts them");
+assert_eq(vec_len(msg_bus_queue(dbus, "7")), IPC_HANDOFF_CAP, "hand-off: all of them on the bus");
+_t_send(a45, "{\"target\":\"7\"}");
+assert_eq(_t_reply(a45, 2000), ACK, "hand-off: once drained, frames are accepted again");
+assert_eq(ipc_drain(dbus), 1, "hand-off: and drained in turn");
+
+# ipc_drain routes like any publish, with the channel's agent as the source.
+var a46 = _t_chan("46");
+_t_send(a46, "{\"target\":\"8\",\"payload\":{\"k\":\"v\"}}");
+assert_eq(_t_reply(a46, 2000), ACK, "drain: frame accepted");
+var q7 = vec_len(msg_bus_queue(dbus, "7"));
+assert_eq(ipc_drain(dbus), 1, "drain: the pending record");
+assert_eq(vec_len(msg_bus_queue(dbus, "7")), q7, "drain: a message for 8 does not reach 7");
+var q8 = msg_bus_queue(dbus, "8");
+assert_eq(vec_len(q8), 1, "drain: it reaches 8");
+if (vec_len(q8) == 1) {
+    var dm = vec_get(q8, 0);
+    assert_eq(_t_str_is(ipc_msg_source(dm), "46"), 1, "drain: the message's source is the channel's agent");
+    assert_eq(_t_str_is(ipc_msg_payload(dm), "{\"k\":\"v\"}"), 1, "drain: payload intact");
+}
+_t_send(a46, "{\"target\":\"*\"}");
+_t_reply(a46, 2000);
+ipc_drain(dbus);
+assert_eq(vec_len(msg_bus_queue(dbus, "8")), 2, "drain: a broadcast reaches 8");
+assert_eq(vec_len(msg_bus_queue(dbus, "7")), q7 + 1, "drain: ... and 7");
+
+# A fault's event is audited by the drain, with the agent's id.
+var alen = chain_len(daimon_audit_chain());
+var a47 = _t_chan("47");
+sys_write(a47, &over, 4);
+_t_reply(a47, 2000);
+var ev47 = 0;
+var ew = 0;
+while (ew < 200) {
+    ipc_drain(dbus);
+    if (chain_len(daimon_audit_chain()) > alen) { ew = 200; }
+    else { sleep_ms(10); }
+    ew = ew + 1;
+}
+assert_eq(chain_len(daimon_audit_chain()), alen + 1, "audit: the fault is one audit entry");
+var aent = vec_get(chain_entries(daimon_audit_chain()), chain_len(daimon_audit_chain()) - 1);
+assert_eq(_t_str_is(entry_action(aent), "ipc.frame.oversize"), 1, "audit: action ipc.frame.oversize");
+assert_eq(_t_str_is(entry_agent_id(aent), "47"), 1, "audit: the agent's id");
+
+# Remove closes the channel — after reading what the agent already wrote.
+_t_send(a46, "{\"target\":\"7\",\"payload\":\"last words\"}");
+ipc_service_remove(str_from("46"));
+assert_eq(_t_reply(a46, 2000), ACK, "remove: a frame written before the remove is still answered");
+assert_eq(_t_reply(a46, 2000), 0, "remove: then the channel is closed");
+var lw = _t_take();
+assert(lw != 0, "remove: and the frame is handed over");
+if (lw != 0) { assert_eq(_t_str_is(ipc_rec_payload(lw), "\"last words\""), 1, "remove: intact"); }
+
+# The same, deterministically: _ipc_apply on a channel the test owns (not the
+# service's), so no pass of the service can read the frame first.
+var uchans = vec_new();
+var uar = arena_allocator_growable(4096);
+var ufds: i32[2];
+assert_eq(ipc_channel_open(&ufds), 0, "apply: a pair for a channel the test owns");
+var uch = _ipc_chan_new(str_from("50"), load32(&ufds));
+vec_push(uchans, uch);
+_t_send(load32(&ufds + 4), "{\"target\":\"7\",\"payload\":\"final\"}");
+var ucmd = alloc(24);
+store64(ucmd, _IPC_CMD_REMOVE);
+store64(ucmd + 8, str_from("50"));
+store64(ucmd + 16, 0);
+_ipc_apply(uchans, ucmd, uar);
+assert_eq(load64(uch + 72), 0, "apply: REMOVE closes the channel");
+var ur = ipc_take();
+assert(ur != 0, "apply: the frame already written is read before the close");
+if (ur != 0) { assert_eq(_t_str_is(ipc_rec_payload(ur), "\"final\""), 1, "apply: ... and handed over whole"); }
+assert_eq(_t_reply(load32(&ufds + 4), 2000), ACK, "apply: the agent is answered");
+assert_eq(_t_reply(load32(&ufds + 4), 2000), 0, "apply: then sees the close");
+
+# Adding a channel for an agent that has one replaces it (a restart).
+var a48 = _t_chan("48");
+var a48b = _t_chan("48");
+assert_eq(_t_reply(a48, 2000), 0, "replace: the old channel is closed");
+_t_send(a48b, "{\"target\":\"7\"}");
+assert_eq(_t_reply(a48b, 2000), ACK, "replace: the new one works");
+ipc_take();
+
+# The parse runs in the service's own arena: what a frame costs the shared heap
+# is the record and the copies handed over, not the parse tree. 200 frames of a
+# 100-byte body with a nested payload.
+var hsb = str_builder_new();
+str_builder_add_cstr(hsb, "{\"target\":\"7\",\"type\":\"event\",");
+str_builder_add_cstr(hsb, "\"payload\":{\"a\":[1,2,3],\"b\":{\"c\":\"dddddddddddddddd\"},\"e\":true}}");
+var hbody = str_data(str_builder_build(hsb));
+var hframe = _t_frame(hbody, strlen(hbody));
+var hn = strlen(hbody) + 4;
+_t_send(a48b, hbody);
+_t_reply(a48b, 2000);
+ipc_take();                     # warm: the channel's body buffer and the arena
+var h0 = alloc_used();
+var hk = 0;
+while (hk < 200) {
+    sys_write(a48b, hframe, hn);
+    _t_reply(a48b, 2000);
+    ipc_take();
+    hk = hk + 1;
+}
+# Measured at 2.3.3: 224 bytes a frame (the record, the target and payload
+# copies). Parsed on the shared heap instead it was 1,496; with a body buffer
+# allocated per frame instead of reused, 320. The bound sits between.
+var hper = (alloc_used() - h0) / 200;
+assert(hper < 288, "arena: a frame costs the shared heap only what it hands over");
+
+# exit_group, not exit: the agent channel service thread is running, and
+# exit(2) would end only this thread and leave the process alive (2.3.3).
+syscall(SYS_EXIT_GROUP, assert_summary());

@@ -123,6 +123,9 @@ fn api_register_agent(fd, body) {
     map_set(_agents, str_data(id_str), h);
 
     supervisor_register(_supervisor, id_str);
+    # 2.3.3: a queue on the bus, so messages addressed to this agent's id (or
+    # to "*") wait for it — whether or not it is running when they are sent.
+    msg_bus_subscribe(_msg_bus, str_data(id_str));
 
     var sb = str_builder_new();
     str_builder_add_cstr(sb, "{\"id\":");
@@ -209,6 +212,7 @@ fn api_agent_delete(fd, id_cstr) {
     daimon_audit_agent(SEV_INFO, "agent", "agent.delete", "agent deleted", str_data(agent_name(h)));
     map_delete(_agents, id_cstr);
     supervisor_unregister(_supervisor, str_from(id_cstr));
+    msg_bus_unsubscribe(_msg_bus, id_cstr);   # its queue goes too (2.3.3)
     http_ok(fd, str_from("{\"ok\":true}"));
     return 0;
 }

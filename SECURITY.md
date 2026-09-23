@@ -36,7 +36,7 @@ This policy covers the daimon binary and its HTTP API. Security concerns include
 - **Authentication/authorization bypass**: Accessing agent operations without proper credentials
 - **Agent isolation**: Escaping sandbox or accessing other agents' data
 - **Input validation**: Malformed HTTP requests causing crashes or exploitation
-- **IPC security**: Unauthorized access to Unix domain sockets
+- **IPC security**: an agent's channel (its fd 3, since 2.3.3) — frames that crash, stall or flood the channel service, or that are attributed to another agent
 - **Denial of service**: Inputs that cause excessive computation or memory usage
 - **Request smuggling**: Ambiguous HTTP parsing behind reverse proxies
 - **Memory safety**: Buffer overflows, use-after-free, or information leaks via bump allocator

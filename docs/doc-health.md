@@ -6,7 +6,7 @@ type: state
 
 # Documentation Health — daimon
 
-> **Last refresh**: 2026-09-22 (2.3.2 — request-string decoding: API guide, CONTRIBUTING, overview, README, quickstart, BENCHMARKS, roadmap, and a second addendum to the lifecycle audit. Rows below that predate 2.3.2 are as last recorded.)
+> **Last refresh**: 2026-09-22 (2.3.3 — agent channels: a new guide (agent-ipc.md) and ADR-005, the API guide, overview, README, quickstart, BENCHMARKS, SECURITY, CLAUDE.md, roadmap, a third addendum to the lifecycle audit, and VULN-006 marked superseded in the 2026-04-13 audit. Rows below that predate 2.3.3 are as last recorded.)
 > **Refresh cadence**: when docs are touched, update the affected row. Full re-audit at each minor cut.
 > **Scope**: this repo only (`daimon`) — root-level files plus the entire `docs/` tree.
 
@@ -103,6 +103,35 @@ Daimon is the AGNOS agent orchestrator — every consumer (hoosh, agnoshi, aethe
   open. Its two function names were wrong (`ipc_send`, `complete_task`); they are now
   `agent_ipc_send` and samay's `task_scheduler_complete_task`.
 - ✅ `CHANGELOG.md` / `VERSION` / `src/config.cyr` — 2.3.0 (`scripts/version-bump.sh`).
+
+**Doc work shipped in 2.3.3 (2026-09-22):**
+- ✅ `docs/guides/agent-ipc.md` — **new**: the wire protocol an agent speaks on fd 3. It covers the
+  frame, the body, the replies, what closes a channel, where messages go, the metrics, sh and Python
+  examples, and the limits with their constants.
+- ✅ `docs/adr/005-agent-channels.md` — **new**. It records why a socketpair per agent, why a
+  service thread, and the bounds. Its consequences include the allocation-lock cost, measured.
+- ✅ `docs/audit/2026-09-22-agent-lifecycle-audit.md` — the 2.3.3 addendum:
+  - the three parked socket-file defects, resolved by removal;
+  - the new surface against D-Bus CVE-2014-3638 / -3639 and journald CVE-2018-16865;
+  - the three defects found and fixed before release;
+  - the thread-safety analysis;
+  - VULN-018 (heap growth per message, open).
+- ✅ `docs/audit/2026-04-13-security-audit.md` — VULN-006 marked superseded.
+- ✅ `docs/guides/api.md` — agents talk back on fd 3; the metrics example was missing fields and is
+  now the real output, with the three new counters.
+- ✅ `docs/architecture/overview.md` — the ipc module map and the agent data flow. The "none over
+  ~350 LOC" claim was already stale (agent.cyr ~800, api_mcp.cyr 472); it now names the largest.
+- ✅ `README.md`, `docs/guides/quickstart.md` — 917 assertions, 27 + 2 benchmarks, the IPC guide
+  linked. README's audit-event list named "IPC auth denials" from the removed socket code.
+- ✅ `BENCHMARKS.md` — the 2.3.3 section: the broadcast A/B, the two channel benchmarks and the
+  suite with the thread running. The ipc and coverage rows are updated.
+- ✅ `SECURITY.md` — the IPC scope line describes the channel, not socket files.
+- ✅ `CLAUDE.md` — the thread conventions (exit_group, what the service thread may touch, the fork
+  child), the include rule for `src/agent.cyr`, and judging a suite by its exit status. The `thread`
+  and `libro` rows are updated.
+- ✅ `docs/development/roadmap.md` — 2.3.3 done. Message routes are next, then the channel
+  follow-ups: the allocation lock, VULN-018 and delivery without HTTP traffic.
+- ✅ `CHANGELOG.md` / `VERSION` / `src/config.cyr` — 2.3.3 (`scripts/version-bump.sh`).
 
 **Doc work shipped in 2.3.2 (2026-09-22):**
 - ✅ `docs/guides/api.md` — a **Request bodies** section: one JSON object, strings decoded, the

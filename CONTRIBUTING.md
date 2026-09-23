@@ -48,6 +48,10 @@ the pin) and `cyrius deps` (git deps like sakshi). Run both after cloning.
    dependencies — never a copy of the functions under test. Until 2.2.3 `tests/daimon.tcyr`
    tested simplified local copies, and two security defects shipped green because the copies did
    not contain them; moving the last modules onto their real source found more (2.2.3 CHANGELOG).
+   A suite that includes `src/agent.cyr` must also include `src/ipc.cyr` and `lib/thread.cyr`
+   (agent starts open channels). A suite that may start an agent, and so the channel thread, must
+   end with `syscall(SYS_EXIT_GROUP, assert_summary())`. With `SYS_EXIT` only the main thread exits,
+   and the suite never finishes (2.3.3).
 3. Add benchmarks in `tests/daimon.bcyr` if performance-relevant — against the real functions too
 4. Add a fuzz harness in `fuzz/` for code that takes untrusted input: drive the real module with
    `fuzz/rng.cyr`, check properties from the documented contract, and exit with the number of the

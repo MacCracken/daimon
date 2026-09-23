@@ -38,6 +38,7 @@ include "lib/math.cyr"
 include "lib/process.cyr"
 include "lib/sakshi.cyr"
 include "lib/libro.cyr"
+include "lib/thread.cyr"
 
 include "src/syscalls.cyr"
 include "src/error.cyr"
@@ -48,6 +49,7 @@ include "src/audit.cyr"
 include "src/secmem.cyr"
 include "src/trace.cyr"
 include "src/agent.cyr"
+include "src/ipc.cyr"      # agent.cyr opens and hands over agent channels (2.3.3)
 include "src/supervisor.cyr"
 include "src/sched.cyr"
 include "src/vector_store.cyr"
@@ -249,7 +251,7 @@ var _bench_live_agent = 0;
 # descriptor / stdin / SIGPIPE / limit setup, exec of /bin/true, the parent's
 # wait for the exec report — plus the reap of the exited child.
 fn bench_agent_spawn_reap() {
-    var r_t, r_v = agent_spawn_with_limits("/bin/true", _bench_true_argv, 0, 0, 0);
+    var r_t, r_v = agent_spawn_with_limits("/bin/true", _bench_true_argv, 0, 0, 0, 0 - 1);
     if (is_ok(r_t) == 1) { daimon_reap_within(r_v, 5000); }
     return 0;
 }
@@ -286,6 +288,43 @@ fn bench_sched_start_complete() {
     ScheduledTask_set_status(_bench_task, TASK_SCHEDULED);
     node_capacity_reserve(_bench_node, ScheduledTask_resource_requirements(_bench_task));
     ScheduledTask_set_reserved_on(_bench_task, NodeCapacity_node_id(_bench_node));
+    return 0;
+}
+
+# 2.3.3 — agent channels.
+# One message through an agent's channel, as the agent sees it: its write, the
+# service thread's wakeup, read, parse (in the service's arena) and hand-off,
+# the ACK, the agent's read of it — plus the main thread's take.
+var _bench_ch_fd = 0;
+var _bench_ch_frame = 0;
+var _bench_ch_len = 0;
+fn bench_ipc_frame_roundtrip() {
+    sys_write(_bench_ch_fd, _bench_ch_frame, _bench_ch_len);
+    var b: u8[8];
+    sys_read(_bench_ch_fd, &b, 1);
+    ipc_take();
+    return 0;
+}
+
+# What every HTTP request now pays first: ipc_drain with nothing handed over.
+var _bench_bus = 0;
+fn bench_ipc_drain_empty() {
+    ipc_drain(_bench_bus);
+    return 0;
+}
+
+# A broadcast to 100 subscribers (then each queue emptied again, so every
+# iteration enqueues 100). map_iter since 2.3.3, where it was map_keys.
+var _bench_bcast_bus = 0;
+var _bench_bcast_queues = 0;
+var _bench_bcast_msg = 0;
+fn bench_bus_broadcast_100() {
+    msg_bus_publish(_bench_bcast_bus, _bench_bcast_msg);
+    var i = 0;
+    while (i < 100) {
+        vec_truncate(vec_get(_bench_bcast_queues, i), 0);
+        i = i + 1;
+    }
     return 0;
 }
 
@@ -463,7 +502,7 @@ fn main() {
     store64(sl_argv, "/bin/sleep");
     store64(sl_argv + 8, "600");
     store64(sl_argv + 16, 0);
-    var sl_t, sl_pid = agent_spawn_with_limits("/bin/sleep", sl_argv, 0, 0, 0);
+    var sl_t, sl_pid = agent_spawn_with_limits("/bin/sleep", sl_argv, 0, 0, 0, 0 - 1);
     _bench_live_agent = agent_handle_new(1000, str_from("live"));
     agent_set_pid(_bench_live_agent, sl_pid);
     agent_set_status(_bench_live_agent, AGENT_RUNNING);
@@ -500,9 +539,48 @@ fn main() {
     bench_run(b23, &bench_http_body_read3, 10000);
     vec_push(benches, b23);
 
+    # 2.3.3 — a channel through the real service thread, for a stand-in agent
+    # the benchmark plays itself.
+    var chf: i32[2];
+    ipc_channel_open(&chf);
+    ipc_service_add(str_from("bench-agent"), load32(&chf));
+    _bench_ch_fd = load32(&chf + 4);
+    var chbody = "{\"target\":\"*\",\"type\":\"event\",\"payload\":{\"n\":1}}";
+    _bench_ch_len = strlen(chbody) + 4;
+    _bench_ch_frame = alloc(_bench_ch_len);
+    store32(_bench_ch_frame, 0);
+    store8(_bench_ch_frame + 3, strlen(chbody));
+    memcpy(_bench_ch_frame + 4, chbody, strlen(chbody));
+    _bench_bus = msg_bus_new();
+
+    var b24 = bench_new("ipc_frame_roundtrip");
+    bench_run(b24, &bench_ipc_frame_roundtrip, 10000);
+    vec_push(benches, b24);
+
+    var b25 = bench_new("ipc_drain_empty");
+    bench_run(b25, &bench_ipc_drain_empty, 100000);
+    vec_push(benches, b25);
+
+    _bench_bcast_bus = msg_bus_new();
+    _bench_bcast_queues = vec_new();
+    var bi = 1;
+    while (bi <= 100) {
+        var bid = str_from_int(bi);
+        msg_bus_subscribe(_bench_bcast_bus, str_data(bid));
+        vec_push(_bench_bcast_queues, map_get(load64(_bench_bcast_bus), str_data(bid)));
+        bi = bi + 1;
+    }
+    _bench_bcast_msg = ipc_msg_new(str_from("bench"), str_from("*"), MSG_EVENT, str_from("p"));
+
+    var b26 = bench_new("bus_broadcast_100");
+    bench_run(b26, &bench_bus_broadcast_100, 10000);
+    vec_push(benches, b26);
+
     bench_report_all(benches);
     return 0;
 }
 
 var r = main();
-syscall(SYS_EXIT, r);
+# exit_group: the channel service thread is running (2.3.3), and exit(2) would
+# end only this thread.
+syscall(SYS_EXIT_GROUP, r);

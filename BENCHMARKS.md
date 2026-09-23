@@ -40,6 +40,43 @@ those numbers are not comparable.
 
 `tests/rag_ingest.bcyr` (real since 2.1.6): `rag_ingest_real_5k` 133.1µs, `rag_chunk_only_5k` 508ns.
 
+### 2.3.3 — agent channels
+
+Medians of three runs (`tests/daimon.bcyr`; the broadcast A/B from one harness built against both
+2.3.2 and 2.3.3):
+
+| Benchmark | 2.3.2 | 2.3.3 | iters |
+|---|---:|---:|---:|
+| bus_broadcast_100 — publish to `*` with 100 subscribers (each queue emptied again) | 11.18 µs | **3.37 µs** | 10000 |
+| ipc_frame_roundtrip — one message through an agent's channel: the agent's write, the service thread's read, parse and hand-off, the ACK, the agent's read of it, the main thread's take | — | 11.6 µs | 10000 |
+| ipc_drain_empty — what every HTTP request now does first, with nothing pending | — | 56 ns | 100000 |
+
+The broadcast walks the subscriber map in place (`map_iter`) instead of building a key vector for
+each message. The other 24 shared benchmarks agree within −2.8% … +1.1%, except for two. On
+`http_body_read3` (+4.0%), a focused re-run of five runs each gave 1.301 against 1.305 µs.
+`mcp_find_tool_in_100` swung between 94 and 154 ns within each build.
+
+⚠ **With the channel thread running**, every allocation takes the stdlib's heap lock. The thread
+starts at the first agent start (ADR-005). Here is the same suite with the thread started first,
+three runs each, medians:
+
+| Benchmark | no thread | thread running | ratio |
+|---|---:|---:|---:|
+| alloc(64) (scratch harness) | 10 ns | 53 ns | 5.3× |
+| config_default | 87 ns | 294 ns | 3.38× |
+| json_parse | 429 ns | 1.24 µs | 2.88× |
+| rag_chunk_5k_chars | 4.31 µs | 11.87 µs | 2.75× |
+| http_body_read3 | 1.29 µs | 2.75 µs | 2.14× |
+| mcp_extract_input_schema | 4.55 µs | 8.67 µs | 1.90× |
+| mcp_register_100_tools | 59.2 µs | 112.0 µs | 1.89× |
+| mcp_manifest_100_tools | 140.9 µs | 257.6 µs | 1.83× |
+| hashmap_1000_insert_lookup | 483.4 µs | 737.2 µs | 1.52× |
+| scheduler_100_tasks | 322.5 µs | 403.6 µs | 1.25× |
+| vector_insert_100x128d / vector_search_1k_64d | 173.0 / 389.0 µs | 191.7 / 426.7 µs | 1.11× / 1.10× |
+| agent_spawn_reap, agent_reap_*, sched_start_complete, circuit_breaker_cycle, secure_zero_4k, edge_heartbeat_100, bus_broadcast_100 | — | — | 0.98–1.01× |
+
+The paths at the bottom allocate little or nothing. The roadmap records the ways to remove the cost.
+
 ### 2.3.2 — request bodies
 
 | Benchmark | avg | min | iters |
@@ -238,7 +275,7 @@ Scheduler scheduling (1.5x), supervisor registration (2.5x), MCP registration (1
 | scheduler | Complete | Complete (2.3.1) | samay since 2.0.0. Tasks can start and complete through the API since 2.3.1 (`src/sched.cyr`); before that every task stopped at Scheduled |
 | federation | Complete | Complete | Cluster, election, scoring, placement, vector store |
 | edge | Complete | Complete | Register, heartbeat, health, decommission, stats |
-| ipc | Complete | Partial | Message bus + RPC registry tested; the Unix-socket half first ran at 2.2.3 (`agent_ipc_new` crashed, `agent_ipc_bind` made a directory at the socket path). No route wires it yet (the last step of roadmap 2.3.x) |
+| ipc | Complete | Partial (2.3.3) | Agents send on a channel (a socketpair, their fd 3) read by a service thread; accepted messages reach the bus (2.3.3). The socket-file endpoint was removed. No route reads or sends messages yet |
 | api | Complete | Complete | 41 method + path routes (the Rust original had no agent or task control; 2.3.0 added 5, 2.3.1 added 3) |
 | logging | Complete | Complete | sakshi integration |
 | firewall | Complete | Integrated (2.1.8) | nein's MCP tools; the mutating half is gated shut until caller authentication (roadmap 2.5.x) |
@@ -249,8 +286,8 @@ Scheduler scheduling (1.5x), supervisor registration (2.5x), MCP registration (1
 | | Rust | Cyrius |
 |---|---|---|
 | Unit tests | 305 | — (inline in test groups) |
-| Integration tests | 28 | 833 assertions / 17 suites, each against its real `src/` module (2.3.2) |
-| Benchmarks | 19 | 26, against the real code (2.3.2) |
+| Integration tests | 28 | 917 assertions / 17 suites, each against its real `src/` module (2.3.3) |
+| Benchmarks | 19 | 29, against the real code (2.3.3) |
 | Fuzz harnesses | 0 | 7, property-based, run in CI (2.3.2) |
-| HTTP smoke | — | tests/smoke.sh, 70 checks, run in CI (2.3.2) |
-| Security audit | — | 17 findings (2026-04-13: 10; 2026-09-22 lifecycle: 7) — see docs/audit/ |
+| HTTP smoke | — | tests/smoke.sh, 84 checks, run in CI (2.3.3) |
+| Security audit | — | 18 findings (2026-04-13: 10; 2026-09-22 lifecycle: 8) — see docs/audit/ |

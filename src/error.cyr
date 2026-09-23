@@ -64,6 +64,38 @@ fn error_to_status(err) {
 #  http_body_json + http_json_str / _int / _text (src/http.cyr); keeping the old
 #  pair around would leave the wrong way looking like the usual one.)
 
+# The acceptance rule for a JSON object daimon reads fields from: an HTTP body
+# (http_body_json) or an agent's channel frame (src/ipc.cyr). 1 if `root` is an
+# object with no duplicate top-level key and no U+0000 in a top-level string,
+# else 0. Why each rule: see http_body_json. Pure — safe from the channel
+# service thread.
+fn json_object_ok(root) {
+    if (bayan_json_v_is_obj(root) == 0) { return 0; }
+    var n = bayan_json_v_obj_len(root);
+    var i = 0;
+    while (i < n) {
+        var v = bayan_json_v_obj_val(root, i);
+        if (bayan_json_v_is_str(v) == 1) {
+            var s = bayan_json_v_str(v);
+            var d = str_data(s);
+            var sl = str_len(s);
+            var c = 0;
+            while (c < sl) {
+                if (load8(d + c) == 0) { return 0; }
+                c = c + 1;
+            }
+        }
+        var k = bayan_json_v_obj_key(root, i);
+        var j = 0;
+        while (j < i) {
+            if (str_eq(bayan_json_v_obj_key(root, j), k) == 1) { return 0; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
 fn _json_hex_digit(d) {
     if (d < 10) { return 48 + d; }
     return 87 + d;   # 'a' - 10

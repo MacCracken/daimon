@@ -119,6 +119,10 @@ Audit of daimon v0.7.0 (Cyrius port) against known CVE patterns and vulnerabilit
 
 **Severity**: MEDIUM — relies solely on filesystem permissions for access control.
 
+**Status (2.3.3)**: superseded. The socket-file endpoint is gone. Each agent now gets a socketpair
+at spawn (its fd 3), so there is no socket anyone else can connect to. See ADR-005 and the 2.3.3
+addendum to [2026-09-22-agent-lifecycle-audit.md](2026-09-22-agent-lifecycle-audit.md).
+
 **Remediation**:
 1. After `accept()`, call `getsockopt(fd, SOL_SOCKET, SO_PEERCRED, ...)` to get peer UID
 2. Verify peer UID matches expected agent UID or the daimon service UID
@@ -201,7 +205,7 @@ Audit of daimon v0.7.0 (Cyrius port) against known CVE patterns and vulnerabilit
 | VULN-003 | LOW | Mitigated | JSON parsing depth — flat parser, no recursion |
 | VULN-004 | MEDIUM | **Fixed** | PID reuse race — `pidfd_open()`/`pidfd_send_signal()` with `kill()` fallback |
 | VULN-005 | LOW | **Fixed** | File TOCTOU — agent memory dirs now 0700, not 0755 |
-| VULN-006 | MEDIUM | **Fixed** | IPC auth — `SO_PEERCRED` UID verification on Unix socket accept |
+| VULN-006 | MEDIUM | **Superseded (2.3.3)** | IPC auth — `SO_PEERCRED` UID verification on Unix socket accept. The check was found to fail open (2.2.3); the socket-file endpoint was removed at 2.3.3 for per-agent channels, whose peer is the agent by construction (2026-09-22 audit, 2.3.3 addendum) |
 | VULN-007 | LOW | Accepted risk | Memory reuse — single trust domain |
 | VULN-008 | MEDIUM | **Fixed** | Request size — MAX_REQUEST_SIZE=65536, Content-Length body reads, 413 response |
 | VULN-009 | LOW | **Fixed** | Rate limiting — per-IP 120 req/min sliding window, 429 Too Many Requests |

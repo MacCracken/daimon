@@ -2,7 +2,7 @@
 
 **Daimon** (Greek: δαίμων — guiding spirit) — AGNOS agent orchestrator.
 
-The core runtime for the AGNOS ecosystem: agent lifecycle, HTTP API (port 8090), process supervision, IPC over Unix sockets, task scheduling, multi-node federation, edge fleet management, memory/vector/RAG stores, MCP tool dispatch (with a built-in libro audit trail), and screen capture. Written in [Cyrius](https://github.com/MacCracken/cyrius), ported from Rust.
+The core runtime for the AGNOS ecosystem: agent lifecycle, HTTP API (port 8090), process supervision, agent IPC (a channel per agent, open as its fd 3), task scheduling, multi-node federation, edge fleet management, memory/vector/RAG stores, MCP tool dispatch (with a built-in libro audit trail), and screen capture. Written in [Cyrius](https://github.com/MacCracken/cyrius), ported from Rust.
 
 ## Building
 
@@ -18,12 +18,12 @@ cyrius build src/main.cyr build/daimon # build
 ## Testing
 
 ```bash
-cyrius tests                        # every suite in tests/ — 833 assertions, 17 files
+cyrius tests                        # every suite in tests/ — 917 assertions, 17 files
 cyrius fuzz                         # 7 property-based harnesses, 176,349 generated cases
-cyrius bench tests/daimon.bcyr      # 24 benchmarks (+2 in tests/rag_ingest.bcyr)
+cyrius bench tests/daimon.bcyr      # 27 benchmarks (+2 in tests/rag_ingest.bcyr)
 sh tests/smoke.sh                   # the linked binary over HTTP: libro, tracing, regressions,
                                     # the agent lifecycle, the bind address, task start/complete,
-                                    # request-string decoding
+                                    # request-string decoding, agent channels
 sh tests/test.sh                    # all of the above except the benchmarks
 ```
 
@@ -32,11 +32,11 @@ copy of daimon's code (that was the 2.2.x test-integrity arc; see the CHANGELOG 
 
 ## MCP audit tools
 
-daimon hosts five built-in MCP tools over a hash-linked [libro](https://github.com/MacCracken/libro) audit chain — `libro_query`, `libro_verify`, `libro_export`, `libro_proof`, `libro_retention` — fed by daimon's own lifecycle and security events (agent spawn/stop, IPC auth denials, rate-limit and SSRF-guard rejections, external MCP calls). List them at `GET /v1/mcp/tools`; invoke via `POST /v1/mcp/call`.
+daimon hosts five built-in MCP tools over a hash-linked [libro](https://github.com/MacCracken/libro) audit chain — `libro_query`, `libro_verify`, `libro_export`, `libro_proof`, `libro_retention` — fed by daimon's own lifecycle and security events (agent spawn/stop, agent channels closed on a bad frame, rate-limit and SSRF-guard rejections, external MCP calls). List them at `GET /v1/mcp/tools`; invoke via `POST /v1/mcp/call`.
 
 ## Documentation
 
-- [Quickstart](docs/guides/quickstart.md) · [API reference](docs/guides/api.md) · [Architecture](docs/architecture/overview.md) · [Roadmap](docs/development/roadmap.md)
+- [Quickstart](docs/guides/quickstart.md) · [API reference](docs/guides/api.md) · [Agent IPC](docs/guides/agent-ipc.md) · [Architecture](docs/architecture/overview.md) · [Roadmap](docs/development/roadmap.md)
 - [CHANGELOG](CHANGELOG.md) · [Security policy](SECURITY.md) · [Contributing](CONTRIBUTING.md)
 
 ## Status

@@ -45,6 +45,15 @@ fn api_metrics(fd) {
     str_builder_add_int(sb, edge_fleet_node_count(_edge_fleet));
     str_builder_add_cstr(sb, ",\"federation_nodes\":");
     str_builder_add_int(sb, fed_mgr_node_count(_fed_mgr));
+    # 2.3.3 agent channels: frames put on the bus, frames refused (a NACK, or
+    # a fault that closed the channel), and bus messages dropped at a full
+    # subscriber queue.
+    str_builder_add_cstr(sb, ",\"ipc_messages\":");
+    str_builder_add_int(sb, ipc_published_count());
+    str_builder_add_cstr(sb, ",\"ipc_refused\":");
+    str_builder_add_int(sb, ipc_refused_count());
+    str_builder_add_cstr(sb, ",\"bus_dropped\":");
+    str_builder_add_int(sb, msg_bus_dropped_count());
     str_builder_add_cstr(sb, "}");
     http_ok(fd, str_builder_build(sb));
 }

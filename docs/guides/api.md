@@ -98,9 +98,9 @@ killed it (137 = SIGKILL).
 replace the search with `serve --agents-dir DIR`, where the runner is `DIR/agnos-agent-runner`. The
 child:
 - has stdin from `/dev/null`;
-- inherits no descriptor above stderr;
+- inherits no descriptor above stderr except **fd 3, its channel to daimon** (2.3.3);
 - starts with SIGPIPE at its default;
-- gets daimon's environment;
+- gets daimon's environment, plus `AGNOS_IPC_FD=3`;
 - runs under its supervisor quota as rlimits: 1 GiB address space and 3600 s CPU by default. A
   limit that cannot be applied refuses the start with a 500.
 
@@ -108,6 +108,11 @@ child:
 request carrying an `Origin` header. A web page can send a cross-origin `text/plain` POST with no
 CORS preflight, and could otherwise drive agents from a browser (2.3.0 audit, VULN-012). curl,
 agents and other native clients send no `Origin`.
+
+**Agents talk back on fd 3** (2.3.3). A started agent writes length-prefixed JSON frames to its
+channel and gets a one-byte reply for each. daimon puts accepted messages on its message bus, where
+each registered agent has a queue. The wire format, the limits and what closes a channel are in
+[agent-ipc.md](agent-ipc.md). The channel's traffic shows in `/v1/metrics`.
 
 ## MCP Tools
 
@@ -248,8 +253,16 @@ agents), and executor identity waits for authentication (roadmap 2.5.x).
 
 ```
 GET /v1/metrics
-→ {"agents":1,"mcp_tools":2,"vector_entries":5,"edge_nodes":3,"federation_nodes":0}
+→ {"agents":1,"mcp_tools":13,"mcp_resources":0,"mcp_prompts":0,"vector_entries":5,"edge_nodes":3,
+   "federation_nodes":0,"ipc_messages":42,"ipc_refused":1,"bus_dropped":0}
 ```
+
+Since 2.3.3:
+- `ipc_messages` counts agent messages put on the bus;
+- `ipc_refused` counts frames answered NACK, plus channels closed on a fault;
+- `bus_dropped` counts messages dropped at a full queue (100 per agent).
+
+See [agent-ipc.md](agent-ipc.md).
 
 ## Error Responses
 
