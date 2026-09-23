@@ -174,7 +174,12 @@ var base_sb = str_builder_new();
 str_builder_add_cstr(base_sb, "build/test-ipc-");
 str_builder_add_int(base_sb, sys_getpid());
 var ipc_base = str_builder_build(base_sb);
-var sock_dir = str_cat(ipc_base, str_from("/sock"));   # does not exist yet
+# path_join, NOT str_cat: str_cat does not NUL-terminate its result, and is_dir,
+# xmkdir_p and xrmdir read the path as a C string — so a str_cat'd path had
+# whatever byte followed it in the heap appended to it. That passed or failed
+# with the heap layout, i.e. with the length of the pid in the path: green on a
+# dev box, red on the CI runner (2.2.3; reproduced in an ubuntu:24.04 container).
+var sock_dir = path_join(ipc_base, str_from("sock"));   # does not exist yet
 
 var idb = alloc(16);
 memcpy(idb, "7", 1);

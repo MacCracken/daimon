@@ -88,8 +88,10 @@ _adopt("X-Trace-Id: 00000000deadbeef\r\n");
 assert_eq(sakshi_trace_id_hi(), 0, "X-Trace-Id (16 hex): high half is 0");
 assert_eq(sakshi_trace_id_lo(), 0xdeadbeef, "X-Trace-Id (16 hex): low half adopted");
 
+# str_cstr, not str_data: _adopt appends a C string, and str_cat does not
+# NUL-terminate — str_data(both) would carry heap bytes into the headers.
 var both = str_cat(str_from(TP), str_from("X-Trace-Id: 11112222333344445555666677778888\r\n"));
-_adopt(str_data(both));
+_adopt(str_cstr(both));
 assert_eq(sakshi_trace_id_lo(), CD, "traceparent wins over X-Trace-Id");
 
 _adopt("");
@@ -116,7 +118,7 @@ assert(sakshi_trace_id_lo() != 0, "an all-zero X-Trace-Id is replaced by a fresh
 # A valid traceparent still wins after an invalid one is ignored in the same request.
 var mixed = str_cat(str_from("traceparent: 00-abc-5566778899aabbcc-01-padding-past-35\r\n"),
   str_from("X-Trace-Id: 00000000deadbeef\r\n"));
-_adopt(str_data(mixed));
+_adopt(str_cstr(mixed));
 assert_eq(sakshi_trace_id_lo(), 0xdeadbeef, "an invalid traceparent falls through to X-Trace-Id");
 
 # --- spans and the switch: first coverage -----------------------------------

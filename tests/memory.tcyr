@@ -106,7 +106,10 @@ var base_sb = str_builder_new();
 str_builder_add_cstr(base_sb, "build/test-mem-");
 str_builder_add_int(base_sb, sys_getpid());
 var base = str_builder_build(base_sb);
-var store_dir = str_cat(base, str_from("/store"));   # neither level exists yet
+# path_join, not str_cat, for every path this file hands to a syscall wrapper:
+# str_cat does not NUL-terminate, and file_exists / xrmdir read a C string (see
+# the note in tests/ipc.tcyr — the same slip failed CI there).
+var store_dir = path_join(base, str_from("store"));   # neither level exists yet
 var ms = memory_store_new(store_dir);
 var A = str_from("agent-1");
 
@@ -137,7 +140,7 @@ assert_eq(is_some(gl_t), 1, "and read back");
 var st_t, st_v = memory_store_set(ms, str_from("../escaped"), str_from("k"), str_from("1"));
 assert_eq(is_err_result(st_t), 1, "set refuses a traversing agent id");
 assert_eq(st_v, DAIMON_ERR_INVALID_PARAM, "with INVALID_PARAM");
-var esc = str_cat(base, str_from("/escaped/k.json"));
+var esc = path_join(base, str_from("escaped/k.json"));
 assert_eq(file_exists(str_data(esc)), 0, "and nothing was written outside the store");
 var gt_t, gt_v = memory_store_get(ms, str_from("../escaped"), str_from("k"));
 assert_eq(is_none(gt_t), 1, "get refuses a traversing agent id");
@@ -223,7 +226,7 @@ assert_eq(is_err_result(sf_t), 1, "set reports a store it cannot create");
 assert_eq(sf_v, DAIMON_ERR_STORAGE, "as STORAGE");
 
 # Scratch cleanup.
-var adir = str_cat(store_dir, str_from("/agent-1"));
+var adir = path_join(store_dir, str_from("agent-1"));
 xrmdir(str_data(adir));
 xrmdir(str_data(store_dir));
 xrmdir(str_data(base));
