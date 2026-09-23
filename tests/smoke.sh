@@ -166,6 +166,7 @@ lcode() { curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$@"; }
 lc_check "register a User agent is 201" "$(lcode -X POST "$L/v1/agents" -d '{"name":"smoke-user","type":"User"}')" "201"
 START=$(curl -s --max-time 10 -X POST "$L/v1/agents/1/start")
 lc_check "start runs it (status 2)" "$(printf '%s' "$START" | field status)" "2"
+lc_check "... under its limits (limits_enforced, 2.4.0)" "$(printf '%s' "$START" | field limits_enforced)" "true"
 APID=$(printf '%s' "$START" | field pid)
 i=0; while [ $i -lt 50 ] && [ ! -e "$LC_DIR/agnos-agent-user-agent.ready.$APID" ]; do i=$((i + 1)); sleep 0.1; done
 # One socket since 2.3.3: its channel, fd 3. Before, none (and before 2.3.0,

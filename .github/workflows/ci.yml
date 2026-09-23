@@ -80,7 +80,7 @@ jobs:
         # stdout by design. Same shape kavach uses.
         run: |
           drift=0
-          for f in src/*.cyr tests/*.tcyr tests/*.bcyr fuzz/*.fcyr fuzz/*.cyr; do
+          for f in src/*.cyr tests/*.tcyr tests/*.bcyr tests/agnos/*.cyr fuzz/*.fcyr fuzz/*.cyr; do
             [ -f "$f" ] || continue
             if ! cyrius fmt "$f" --check > /dev/null 2>&1; then
               echo "needs fmt: $f"
@@ -97,7 +97,7 @@ jobs:
         # src/ + tests/ + bench/ + fuzz/ (harnesses and the shared fuzz/rng.cyr).
         run: |
           fail=0
-          for f in src/*.cyr tests/*.tcyr tests/*.bcyr fuzz/*.fcyr fuzz/*.cyr; do
+          for f in src/*.cyr tests/*.tcyr tests/*.bcyr tests/agnos/*.cyr fuzz/*.fcyr fuzz/*.cyr; do
             [ -f "$f" ] || continue
             out=$(cyrius lint "$f" 2>&1)
             echo "$out"
@@ -186,17 +186,22 @@ jobs:
         # gate, not best-effort like the aarch64 lane. It first built at 2.1.7;
         # before that the build had never succeeded.
         #
-        # The seven `undefined function` warnings this emits (sys_execve,
-        # sys_socket, sys_bind, sys_listen, sys_accept4, sys_connect,
-        # sys_pidfd_open) are EXPECTED and are not agnos-specific: daimon's
-        # spawn/IPC surface has zero callers on every target, so DCE NOPs it on
-        # Linux too. The build must still link — cycc refuses to emit a binary
-        # with a REACHABLE undefined function, which is the real check here.
+        # One `undefined function` warning is expected (sys_dup2, in the Linux
+        # agent child, which agnos never reaches). The build must still link —
+        # cycc refuses to emit a binary with a REACHABLE undefined function,
+        # which is the real check here.
+        #
+        # 2.4.0: the AGNOS guest test's programs must build too. tests/agnos/run.sh
+        # boots them under QEMU against an agnos kernel, which CI does not have.
         run: |
           cyrius build --agnos src/main.cyr build/daimon-agnos
           xxd -l 4 build/daimon-agnos | grep -q "7f45 4c46" || {
             echo "::error::daimon-agnos is not an ELF"; exit 1; }
           echo "daimon-agnos: $(wc -c < build/daimon-agnos) bytes"
+          for p in tests/agnos/*.cyr; do
+            cyrius build --agnos "$p" "build/agnos-$(basename "$p" .cyr)" > /dev/null 2>&1 || {
+              echo "::error::$p does not build for agnos"; exit 1; }
+          done
 
       - name: Syscall portability under qemu-aarch64
         # 2.1.6. The x86_64 suite cannot catch an aarch64 syscall-number defect:

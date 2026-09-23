@@ -462,11 +462,13 @@ assert_eq(streq(agent_find_executable(AGENT_TYPE_USER), user_exe), 1, "a type re
 assert_eq(streq(agent_find_executable(AGENT_TYPE_SERVICE), svc_exe), 1, "... per type");
 
 var la = agent_handle_new(agent_next_id(), str_from("life"));
+assert_eq(agent_limits_enforced(la), 0, "limits: an agent never started reports none (2.4.0)");
 var s_t, s_pid = agent_start(la, 1073741824, 3600);
 assert_eq(is_ok(s_t), 1, "start: a PENDING agent starts");
 assert_eq(agent_status(la), AGENT_RUNNING, "start: RUNNING");
 assert_eq(agent_pid(la), s_pid, "start: the pid is recorded");
 assert(agent_started_at(la) > 0, "start: started_at is stamped");
+assert_eq(agent_limits_enforced(la), 1, "start: its process runs under its limits (Linux; not agnos yet)");
 assert_eq(_t_wait_file(_t_ready(user_exe, s_pid)), 1, "start: the agent is running its program");
 var re_t, re_v = agent_start(la, 0, 0);
 assert_eq(re_v, AGENT_OP_BAD_STATE, "start: a RUNNING agent cannot be started again");

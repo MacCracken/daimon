@@ -60,6 +60,12 @@ fn _api_agent_json(sb, h) {
     str_builder_add_cstr(sb, ",\"exit_code\":");
     if (agent_exit_code(h) < 0) { str_builder_add_cstr(sb, "null"); }
     else { str_builder_add_int(sb, agent_exit_code(h)); }
+    # 2.4.0: while it has a process, whether that process runs under its quota's
+    # limits. false only on agnos, which has none yet.
+    if (agent_pid(h) > 0) {
+        if (agent_limits_enforced(h) == 1) { str_builder_add_cstr(sb, ",\"limits_enforced\":true"); }
+        else { str_builder_add_cstr(sb, ",\"limits_enforced\":false"); }
+    }
     str_builder_add_cstr(sb, "}");
     return 0;
 }
@@ -78,7 +84,10 @@ fn _api_agent_op_error(fd, code) {
     } elif (code == AGENT_OP_NO_EXECUTABLE) {
         http_error(fd, 422, str_from("no executable is installed for this agent type"));
     } elif (code == AGENT_OP_UNSUPPORTED) {
-        http_error(fd, 501, str_from("agent processes are not supported on this target yet"));
+        http_error(fd, 501, str_from("this operation is not supported on this target yet"));
+    } elif (code == AGENT_OP_ARGS) {
+        http_error(fd, 422,
+          str_from("this agent cannot start on agnos: its name has a space, or its command line is over 127 bytes"));
     } elif (code == AGENT_OP_NO_LIMITS) {
         http_error(fd, 500, str_from("agent resource limits could not be applied; not started"));
     } elif (code == AGENT_OP_NO_EXEC) {
@@ -206,7 +215,7 @@ fn api_agent_stop(fd, id_cstr) {
     }
     if (server_defer(&_api_agent_stop_answer, h) == 1) { return 0; }
     # Not served by the event loop: wait here.
-    while (agent_stop_step(h, clock_now_ms()) == 0) { sleep_ms(1); }
+    while (agent_stop_step(h, clock_now_ms()) == 0) { daimon_yield_ms(1); }
     _api_agent_ok(fd, h);
     return 0;
 }

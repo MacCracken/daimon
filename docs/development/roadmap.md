@@ -4,10 +4,14 @@
 >
 > **Severity legend**: **P0** blocking (security / correctness — must-fix before ship) · **P1** high (must-have for the current arc) · **P2** medium (schedule when capacity opens) · **P3 / Low** nice-to-have, no urgency. Upstream-blocker items quote the upstream tracker's own severity.
 
-**Where daimon stands** — `2.3.4`, cyrius 6.6.6, nine dep pins current (samay
-1.1.3). Builds on **three targets**: x86_64, aarch64 and AGNOS.
+**Where daimon stands** — `2.4.0`, cyrius 6.6.6, nine dep pins current (samay 1.1.3, ai-hwaccel
+2.3.24). Builds on **three targets**: x86_64, aarch64 and AGNOS.
 - **Agents can be started, stopped, paused, resumed and deleted through the API** (2.3.0), under
-  their rlimits, with exit status reported. On AGNOS a start answers 501 until 2.4.x.
+  their rlimits, with exit status reported.
+- **On AGNOS too** (2.4.0, [ADR-007](../adr/007-daimon-on-agnos.md)): agents are started, stopped,
+  collected, heard on their channel and measured with the kernel's own primitives. daimon runs its
+  own loop there. `tests/agnos/run.sh` checks this on agnos 1.57.5 under QEMU. What agnos cannot do
+  yet (limits, ending a process, a loopback-only listener, …) is filed with agnos; see 2.4.x.
 - **Scheduled tasks can be started and completed** (2.3.1), and an executor can list its node's
   work.
 - **Request bodies are read with the typed JSON parser** (2.3.2): strings are decoded, nesting is
@@ -19,11 +23,12 @@
   one epoll set. A slow client holds only its own connection, a stop waits for its agent and not
   for the server, and agents are collected as they exit. Agents lead their own process groups and
   die with daimon.
-- **1033 tests** in 17 suites, every one against its real `src/` module, plus 130 HTTP smoke checks,
-  29 benchmarks and 7 fuzz harnesses, all run by CI.
+- **1038 tests** in 17 suites, every one against its real `src/` module, plus 131 HTTP smoke checks,
+  29 benchmarks and 7 fuzz harnesses, all run by CI; and the AGNOS guest test's 64 checks, run by
+  hand (CI has no agnos kernel; it builds the guest programs).
 - The API binds 127.0.0.1 unless told otherwise (`--listen`). While it does, a request must name a
   loopback host, and no route accepts a write from another site's page.
-- Zero open issue filings.
+- Zero open issue filings of daimon's own. Nine agnos filings are open upstream (2.4.x).
 
 ## The arc to 3.0.0
 
@@ -33,7 +38,7 @@ prerequisites, sequenced. Each line is a release train, not a single release.
 | arc | theme | why it must come after the one above |
 |---|---|---|
 | **2.3.x** | **Agent lifecycle** — start / stop / signal / reap through the API | The product gap. **2.3.0** shipped the process half (start, stop, pause, resume, delete, reaping); **2.3.1** task start/complete; **2.3.2** request-string decoding; **2.3.3** agent channels; **2.3.4** message routes, daimon's own event loop, and the lifecycle follow-ups. What remains is below. |
-| **2.4.x** | **AGNOS spawn + IPC** — `sys_spawn_path`, `chan_op` capability channels, `sys_proclist` | Nothing to map until a route actually spawns. Unblocks the moment 2.3.x lands. |
+| **2.4.x** | **AGNOS spawn + IPC** — `sys_spawn_path`, `chan_op` capability channels, `sys_proclist` | Nothing to map until a route actually spawns. **2.4.0** shipped the mapping (spawn, signal, reap, channels, the polled loop, proclist). What remains waits on agnos filings; see below. |
 | **2.5.x** | **Agent identity + MCP authentication** | Prerequisite for un-gating nein's mutating firewall tools, and for any `claims`-based authorisation. Needs 2.3.x, because identity is per-agent. |
 | **3.0.0** | **Per-agent arena isolation** — VULN-007's open half; unlocks multi-tenant hosting, kavach sandboxing, untrusted federation, external MCP callbacks | Major because it changes the allocation model under every agent and flips the gates the P0 below guards. Needs identity (2.5.x) to know what a tenant *is*. |
 
@@ -50,33 +55,44 @@ Shipped in 2.3.0 – 2.3.4: the CHANGELOG entries, ADR-004 – ADR-006 and the a
 
 **Still open in 2.3.x:**
 - **Agents that leave their process group (P3).** A child that calls `setsid` is out of reach of a
-  stop. A cgroup per agent would hold it, but that is Linux-specific; decide with 2.4.x.
+  stop. A cgroup per agent would hold it on Linux. agnos has no process groups at all; reaching an
+  agent's descendants is part of the 2026-09-23 filing on ending a process.
 - **One local client can take all 128 connection slots (P3)**, each for up to 30 s. All loopback
   clients share 127.0.0.1, so a per-IP cap would be global; a per-connection rate would bound it.
 - **aarch64 RLIMIT_AS is unverified on hardware.** qemu-aarch64 does not apply it: QEMU's user-mode
   `prlimit64` passes RLIMIT_AS / DATA / STACK through as a no-op.
 
-**Sequence**: 2.4.x next. One bite at a time, suite green at every step.
+**Sequence**: the 2.4.x items below as their agnos filings land, and 2.5.x. One bite at a time,
+suite green at every step.
 
 ## 2.4.x · P2 — AGNOS spawn + IPC mapping
 
-**Unblocked by 2.3.0**: a route now spawns a process. On AGNOS, `POST /v1/agents/{id}/start`
-answers 501, because `agent_spawn_with_limits`, `daimon_signal` and `daimon_reap_code` have AGNOS
-arms that refuse. Those arms are the mapping targets: spawn, signal and reap. `daimon_reap_code`'s arm
-already passes agnos's #4 through.
+Shipped in 2.4.0: the CHANGELOG entry, [ADR-007](../adr/007-daimon-on-agnos.md) and
+[docs/audit/2026-09-23-agnos-platform-audit.md](../audit/2026-09-23-agnos-platform-audit.md).
 
-Reference for when it does — every row read from `agnos/kernel/core/syscall.cyr`:
+**Waiting on agnos** — nine filings in the agnos repo, `docs/development/issues/2026-09-23-*.md`.
+When each closes, daimon's interim changes:
 
-| subsystem | agnos primitive | constraint |
+| agnos filing | daimon's interim today | when it closes |
 |---|---|---|
-| exec | `sys_spawn_path` (#43) — one call; **does** tokenize argv from the command line | no fork/exec split |
-| IPC | `chan_op` (#97) — `CH_MINT` returns an unnamed **pair**, `CH_ENDOW` places one end into the next spawned child. The kernel notes this *"deletes the entire unlink-before-bind race class AF_UNIX carries"* — a stronger model than the Linux path, not a workaround | **`CH_SEND` caps a payload at 64 bytes** vs daimon's `MAX_MESSAGE_SIZE` 65536, so bulk bodies need `sys_shm_create/write/read/free` with the channel carrying the control word |
-| agent rlimits | — | ⛔ **agnos has no rlimit syscall at all** (`grep -ci rlimit` over the kernel: 0). VULN-010 has no direct equivalent. Whether that becomes a kernel ask, a scheduler-side quota, or a documented non-guarantee is **a question for the agnos side** — raise it there rather than assume it in either direction. |
-| supervisor | `sys_proclist` (#99) — 64-byte records: pid · state · ppid · name[32] · `+56` split as **cpu ticks (low u32) / rss pages (high u32)** | agnos has no `/proc`; those are the same two numbers `read_vm_rss` / `read_cpu_time_ms` parse today |
+| `inbound-tcp-syn-dropped-by-isr-drain` (P1 for daimon) | the API is reachable only from the box itself | nothing to change; re-measure accept from the host |
+| `socket-ids-have-no-owner` (P1) | documented exposure (audit AG-1) | nothing to change; close AG-1 |
+| `parent-cannot-end-stop-or-continue-a-child` | a stop asks; pause/resume answer 501 | SIGKILL ends the stop; map pause/resume; reach descendants |
+| `no-per-process-resource-limits` | agents run without limits, audited | arm the limits at spawn; `limits_enforced:true`; refuse a start whose limits fail |
+| `tcp-server-cannot-be-loopback-only` | listen on the NIC's address, warn and audit | listen on 127.0.0.1 by default, as on Linux; per-client rate limiting |
+| `child-inherits-every-fd-and-spawn-arms-leak` | `--agent-output capture` refused | capture stdout and stderr on agnos |
+| `spawn-path-args-cannot-contain-spaces` | 422 for a name with a space | pass the argv as separate arguments |
+| `sleep-ms-holds-the-cpu` | `daimon_yield_ms` (pause) | nothing to change |
+| `sock-recv-never-reports-eof-after-peer-fin` | the guest client reads to `Content-Length` | nothing to change in daimon |
 
-⚠ Read `agnos/kernel/core/syscall.cyr` for any of this, **not** `lib/syscalls_x86_64_agnos.cyr`. The
-cyrius peer's own header records that a doc→peer→doc citation loop once let a wrong number verify
-itself, and states the kernel is canonical; it mirrors an older kernel.
+**daimon's own, on agnos:**
+- **The guest test is not in CI (P3).** CI has no agnos kernel. A released agnos kernel image
+  CI could download would let `tests/agnos/run.sh` run on every push; until then it runs by hand,
+  and CI only builds the guest programs.
+- **Capacity is agnos's, not `max_agents`'s.** The kernel has 16 process slots and 16 channels
+  (32 endpoints) for the whole machine, and daimon's fd table 32 slots. A start past any of them
+  fails cleanly (`AGENT_OP_NO_PROCESS`, 500). Whether `max_agents` should default lower on agnos is
+  open.
 
 ## 2.5.x · P1 — Agent identity and MCP caller authentication
 
@@ -96,7 +112,9 @@ argument, the seam an identity would arrive through, is a reserved `0` in the 3.
   still write (VULN-012's remainder).
 
 **Still open**: anything on the host can still do everything, and so can any client on the network
-once `--listen` opens it. Each of those layers stops browsers; this item is the fix.
+once `--listen` opens it. On agnos, until the connection-owner filing closes, any process on the
+box can also act on daimon's connections directly (audit AG-1). Each of those layers stops browsers;
+this item is the fix.
 
 nein's firewall admin tools (`nein_allow` / `nein_deny`) are registered and **gated shut** as of
 2.1.8 for exactly this reason. Three things unblock together when this lands: un-gating the firewall admin tools

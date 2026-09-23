@@ -24,7 +24,13 @@ cyrius fuzz                          # Run the fuzz harnesses
 cyrius bench tests/daimon.bcyr       # Run benchmarks
 sh tests/test.sh                     # Tests + fuzz + HTTP smoke (tests/smoke.sh)
 ./scripts/bench-history.sh           # Append benchmark baseline
+sh tests/agnos/run.sh                # AGNOS guest test (needs a built agnos kernel and gnoboot)
 ```
+
+A change to an agnos arm (`#ifdef CYRIUS_TARGET_AGNOS`) is tested on agnos:
+`tests/agnos/run.sh` boots the kernel under QEMU and runs `tests/agnos/guest.cyr` and the real
+daimon, driven over HTTP by `tests/agnos/http_client.cyr`. On agnos, wait with `daimon_yield_ms`,
+never `sleep_ms`, which holds the CPU (ADR-007).
 
 `lib/` is gitignored — it is repopulated by `cyrius lib sync` (stdlib subset from
 the pin) and `cyrius deps` (git deps like sakshi). Run both after cloning.

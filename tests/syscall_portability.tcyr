@@ -211,6 +211,16 @@ assert_eq(daimon_reap_wait(0 - 12345), 0 - 1,
   "daimon_reap_wait returns -1 immediately for a non-child");
 assert(DAIMON_REAP_BUDGET_MS > 0, "the reap budget is bounded and non-zero");
 
+# --- daimon_yield_ms (2.4.0): a wait that leaves the CPU to others ------
+# On agnos it is a pause#14 loop (sleep_ms#41 would hold the CPU); on Linux
+# nanosleep. Either way at least the time asked for passes, and it returns.
+var y0 = clock_now_ms();
+daimon_yield_ms(30);
+var yel = clock_now_ms() - y0;
+assert(yel >= 30, "daimon_yield_ms(30) lets at least 30 ms pass");
+assert(yel < 1000, "... and returns");
+assert_eq(daimon_yield_ms(0), 0, "daimon_yield_ms(0) returns at once");
+
 # --- no daimon-owned name may be spelled SYS_* --------------------------
 # The defect class is a daimon global SHADOWING an arch-aware stdlib one.
 # The `_DAIMON_SYS_` prefix is what makes that impossible; assert the

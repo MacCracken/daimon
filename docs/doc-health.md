@@ -6,7 +6,7 @@ type: state
 
 # Documentation Health — daimon
 
-> **Last refresh**: 2026-09-22 (2.3.4 — daimon's own event loop: ADR-006 new, ADR-005 §2 superseded, the IPC and API guides, overview, README, quickstart, BENCHMARKS, SECURITY, CONTRIBUTING, CLAUDE.md, roadmap, and a fourth addendum to the lifecycle audit. The tier tables below were brought current at 2.3.4; the at-a-glance bucket table is the 2026-07-03 inventory.)
+> **Last refresh**: 2026-09-23 (2.4.0 — daimon on AGNOS: ADR-007 and the AGNOS platform audit new; the API, IPC and quickstart guides, overview, README, BENCHMARKS, SECURITY, CONTRIBUTING, CLAUDE.md and roadmap updated; nine agnos filings recorded under the upstream trackers.)
 > **Refresh cadence**: when docs are touched, update the affected row. Full re-audit at each minor cut.
 > **Scope**: this repo only (`daimon`) — root-level files plus the entire `docs/` tree.
 
@@ -103,6 +103,27 @@ Daimon is the AGNOS agent orchestrator — every consumer (hoosh, agnoshi, aethe
   open. Its two function names were wrong (`ipc_send`, `complete_task`); they are now
   `agent_ipc_send` and samay's `task_scheduler_complete_task`.
 - ✅ `CHANGELOG.md` / `VERSION` / `src/config.cyr` — 2.3.0 (`scripts/version-bump.sh`).
+
+**Doc work shipped in 2.4.0 (2026-09-23):**
+- ✅ `docs/adr/007-daimon-on-agnos.md` — **new**: the kernel's primitives behind daimon's seams, the
+  polled loop, one wire format for channels, and the rule that an agnos gap is filed with agnos,
+  with daimon's interim for each in one table.
+- ✅ `docs/audit/2026-09-23-agnos-platform-audit.md` — **new**: AG-1 to AG-10. Each has its kernel
+  citation, its measurement, its agnos filing, and daimon's interim.
+- ✅ `docs/guides/api.md` — an "On AGNOS" section: start, limits, stop, capture, listener. The 501 row
+  and the start line are corrected (no longer "501 on AGNOS until 2.4.x"). `limits_enforced` is in
+  the start example.
+- ✅ `docs/guides/agent-ipc.md` — an "On AGNOS" section: the fd, 64-byte records, the 4092-byte frame.
+- ✅ `docs/architecture/overview.md` — the agnos arms. The data flow still drew 2.3.3's channel
+  thread and hand-off; it is now the loop's.
+- ✅ `docs/development/roadmap.md` — the status header; 2.4.0 shipped; what waits on each agnos
+  filing and what daimon changes when it closes.
+- ✅ `README.md`, `docs/guides/quickstart.md`, `CONTRIBUTING.md` — the agnos guest test; 1038.
+- ✅ `SECURITY.md` — supported 2.4.x; AGNOS scope.
+- ✅ `BENCHMARKS.md` — the 2.4.0 section (Linux A/B; no AGNOS performance claim); coverage rows.
+- ✅ `CLAUDE.md` — "Commands (verified at 2.4.0)" with the guest test; the AGNOS conventions (never
+  `sleep_ms`, the foreground slot, file gaps with agnos); the ai-hwaccel row (2.3.24, no `path`).
+- ✅ `CHANGELOG.md` / `VERSION` / `src/config.cyr` — 2.4.0 (`scripts/version-bump.sh`).
 
 **Doc work shipped in 2.3.4 (2026-09-22):**
 - ✅ `docs/adr/006-own-event-loop.md` — **new**. Why daimon runs its own loop (one thread, one epoll
@@ -219,14 +240,14 @@ Each change was checked against `cyrius.cyml`, the source or the tool's own help
 
 | File | Last touched | Status | Notes |
 |---|---|---|---|
-| `README.md` | 2026-09-22 | ✅ Fresh | 2.3.4: 1033 assertions in 17 suites; what the smoke script covers; `help` lists every flag. |
-| `CHANGELOG.md` | 2026-09-22 | ✅ Fresh | Source of truth for shipped work. 2.3.4 entry: the event loop, the fixes it closed, performance with numbers. |
-| `CLAUDE.md` | 2026-09-22 | ✅ Fresh | Durable rules. 2.3.4: event-loop conventions, the `thread` row, "Commands (verified at 2.3.4)". |
-| `CONTRIBUTING.md` | 2026-09-22 | ✅ Fresh | 2.3.4: six endpoint rules (methods, bodies, escaping, Host / Origin, not blocking the loop, smoke checks); the 6.6.6 pin and the real gate. |
-| `SECURITY.md` | 2026-09-22 | ✅ Fresh | Supported versions `2.3.x`. 2.3.4: IPC and browser-reach scope. |
+| `README.md` | 2026-09-23 | ✅ Fresh | 2.4.0: 1038 assertions; the agnos guest test; an "On AGNOS" paragraph. |
+| `CHANGELOG.md` | 2026-09-23 | ✅ Fresh | Source of truth for shipped work. 2.4.0 entry: daimon on AGNOS, the nine agnos filings, performance with numbers. |
+| `CLAUDE.md` | 2026-09-23 | ✅ Fresh | Durable rules. 2.4.0: AGNOS conventions (never sleep_ms, the foreground slot, file gaps with agnos), the guest test command, ai-hwaccel 2.3.24. |
+| `CONTRIBUTING.md` | 2026-09-23 | ✅ Fresh | 2.4.0: the agnos guest test and testing agnos arms; the six endpoint rules; the 6.6.6 pin and the real gate. |
+| `SECURITY.md` | 2026-09-23 | ✅ Fresh | Supported versions `2.4.x`. 2.4.0: AGNOS scope and the platform audit. |
 | `CODE_OF_CONDUCT.md` | (initial) | 🔵 Evergreen | Standard. |
-| `BENCHMARKS.md` | 2026-09-22 | ✅ Fresh | A section per 2.3.x release with its A/B; 2.3.4: allocation lock, HTTP 200 / 429 paths, poll vs epoll. Frozen v1.0.1 port comparison kept. |
-| `VERSION` | 2026-09-22 | ✅ Fresh | `2.3.4`, written with `src/config.cyr` by `scripts/version-bump.sh`; `tests/version_sync.tcyr` checks they agree. |
+| `BENCHMARKS.md` | 2026-09-23 | ✅ Fresh | A section per release with its A/B; 2.4.0: Linux A/B, no AGNOS performance claim. Frozen v1.0.1 port comparison kept. |
+| `VERSION` | 2026-09-23 | ✅ Fresh | `2.4.0`, written with `src/config.cyr` by `scripts/version-bump.sh`; `tests/version_sync.tcyr` checks they agree. |
 | `LICENSE` | (initial) | 🔵 Evergreen | GPL-3.0-only. |
 
 ---
@@ -235,7 +256,7 @@ Each change was checked against `cyrius.cyml`, the source or the tool's own help
 
 | File | Last touched | Status | Notes |
 |---|---|---|---|
-| `overview.md` | 2026-09-22 | ✅ Fresh | 2.3.4: the event loop (design decision 2), message layout, captured output, 44 routes. |
+| `overview.md` | 2026-09-23 | ✅ Fresh | 2.4.0: the agnos arms; the data flow no longer draws 2.3.3's channel thread. |
 
 ---
 
@@ -243,7 +264,7 @@ Each change was checked against `cyrius.cyml`, the source or the tool's own help
 
 | File | Last touched | Status | Notes |
 |---|---|---|---|
-| `roadmap.md` | 2026-09-22 | ✅ Fresh | Open work only (since 1.3.1). 2.3.4 removed; the 2.3.x items left open carry their reason, then 2.4.x (AGNOS) and 2.5.x (authentication). |
+| `roadmap.md` | 2026-09-23 | ✅ Fresh | Open work only. 2.4.0 removed; the agnos filings and what daimon changes when each closes; 2.5.x. |
 
 **Missing today (file in 1.2.x cleanup):**
 - `development/state.md` — agnosys convention for the live volatile state file (pin / build sizes / test count / consumer table / recent releases / slot ledger). Daimon's roadmap.md partially covers this; consider splitting in 1.2.x if scope grows.
@@ -256,6 +277,15 @@ Each change was checked against `cyrius.cyml`, the source or the tool's own help
 | Tracker | Severity | Filed | Status | Notes |
 |---|---|---|---|---|
 | [cyrius § daimon-async-aarch64-sys-epoll-wait](https://github.com/MacCracken/cyrius/blob/main/docs/development/issues/2026-05-10-daimon-async-aarch64-sys-epoll-wait.md) | **P2** | 2026-05-10 | ✅ **RESOLVED upstream — verified 2.1.7** | `lib/async.cyr` no longer references `SYS_EPOLL_WAIT` at all; the aarch64 peer defines `SYS_EPOLL_PWAIT = 1022` (a private alias, since native 22 is taken by x86 `pipe`). Confirmed end-to-end: daimon's `--aarch64` cross-build succeeds and the binary serves under `qemu-aarch64`. CI's warn-on-detect allowlist for this symbol now matches nothing — kept for older pins. |
+| agnos `2026-09-23-inbound-tcp-syn-dropped-by-isr-drain.md` | **High** (daimon's view) | 2026-09-23 | 🟠 Open upstream | A SYN drained in interrupt context is dropped: servers accept 0–9 of 12. daimon's API is reachable only from the box. |
+| agnos `2026-09-23-socket-ids-have-no-owner.md` | **High** | 2026-09-23 | 🟠 Open upstream | Any process can read, write or close any TCP connection (audit AG-1). |
+| agnos `2026-09-23-parent-cannot-end-stop-or-continue-a-child.md` | Medium | 2026-09-23 | 🟠 Open upstream | No default signal actions: a stop only asks; pause/resume 501. |
+| agnos `2026-09-23-no-per-process-resource-limits.md` | Medium | 2026-09-23 | 🟠 Open upstream | Agents run without limits (operator ruling), audited. |
+| agnos `2026-09-23-tcp-server-cannot-be-loopback-only.md` | Medium | 2026-09-23 | 🟠 Open upstream | No listen address; 127.0.0.1 TCP dropped; no peer address. |
+| agnos `2026-09-23-child-inherits-every-fd-and-spawn-arms-leak.md` | Medium | 2026-09-23 | 🟠 Open upstream | No close-on-exec; one redirect; CH_ENDOW armed after a failed spawn. Capture refused on agnos. |
+| agnos `2026-09-23-sleep-ms-holds-the-cpu.md` | Low | 2026-09-23 | 🟠 Open upstream | daimon waits with `daimon_yield_ms`. |
+| agnos `2026-09-23-sock-recv-never-reports-eof-after-peer-fin.md` | Low | 2026-09-23 | 🟠 Open upstream | CLOSE_WAIT reads as "nothing yet". |
+| agnos `2026-09-23-spawn-path-args-cannot-contain-spaces.md` | Low | 2026-09-23 | 🟠 Open upstream | 422 for a name with a space. |
 | [sandhi § daimon-server-max-conns](https://github.com/MacCracken/sandhi/blob/main/docs/development/issues/archive/2026-05-10-daimon-server-max-conns.md) | **Low** | 2026-05-10 | ✅ **RESOLVED both sides — corrected 2.1.7** | ⛔ This row read "Open upstream / no daimon-side action", which was wrong on both halves. Sandhi shipped the epoll-cooperative `max_conns` enforcement in **`sandhi_server_run_async` at 1.4.9** (hardened 1.4.10) and ARCHIVED its filing; daimon collapsed `serve_async` onto that call at **1.2.6** (`src/server.cyr:224-244`). Nothing is open on either side. The `"reserved for 0.8.0+"` text still in `lib/sandhi.cyr` is a stale doc comment on the **sync** options struct (`sandhi_server_run_opts`), not the async path daimon uses. |
 
 ---
@@ -270,6 +300,7 @@ Each change was checked against `cyrius.cyml`, the source or the tool's own help
 | `004-agent-process-control.md` | 2026-09-22 | ✅ Accepted | 2.3.0. Process control on an unauthenticated API: executable by type, loopback bind, browser control refused, bounded stop. |
 | `005-agent-channels.md` | 2026-09-22 | ✅ Accepted, §2 superseded | 2.3.3. A socketpair per agent on fd 3; §2 (the service thread) superseded by ADR-006 at 2.3.4. |
 | `006-own-event-loop.md` | 2026-09-22 | ✅ Accepted | 2.3.4. daimon's own epoll loop over sandhi's HTTP; the serving model since 2.3.4. |
+| `007-daimon-on-agnos.md` | 2026-09-23 | ✅ Accepted | 2.4.0. The agnos kernel's primitives behind daimon's seams; the polled loop; gaps filed with agnos. |
 
 **ADR posture**: low decision-velocity. Only architecturally significant calls earn an ADR — minor decisions ride CHANGELOG + design comments. 1.1.4 sandhi adoption was a candidate but rode the CHANGELOG entry; the migration audit at `docs/audit/2026-04-27-sandhi-migration.md` carries the deep rationale. Re-evaluate at v2.0.0 cut.
 
@@ -284,6 +315,7 @@ Date-stamped, frozen by design. Each P(-1) hardening pass per CLAUDE.md cadence 
 | `2026-04-13-security-audit.md` | 2026-04-13 | 📦 Frozen | 0.7.0 P(-1) security audit. 10 findings, 9 fixed at 0.7.0, VULN-007 gated. |
 | `2026-04-27-sandhi-migration.md` | 2026-04-27 | 📦 Frozen | 1.1.4 sandhi adoption — VULN-001 strengthened, VULN-008 trade-off documented (sandhi's 30s SO_RCVTIMEO replaces no-timeout), 1.1.5 sandhi follow-ups (now 1.2.1 / 1.2.2). |
 | `2026-09-22-agent-lifecycle-audit.md` | 2026-09-22 | ✅ Open (addenda per 2.3.x release) | VULN-011 – VULN-018. 2.3.4 addendum: VULN-012 remainder, VULN-014 and VULN-018 fixed; VULN-015 an operator option; VULN-016 waits for 2.5.x identity. |
+| `2026-09-23-agnos-platform-audit.md` | 2026-09-23 | ✅ Open | AG-1 – AG-10: the agnos kernel's gaps as they reach daimon, each filed with agnos, with daimon's interim. |
 
 Next audit slot: the CLAUDE.md cadence sets the trigger (security-touching work, or a CVE pattern in daimon's surfaces: its event loop and sandhi's HTTP framing, bayan's JSON parser, the agent channels, /proc scrape paths, the bump allocator).
 
@@ -293,9 +325,9 @@ Next audit slot: the CLAUDE.md cadence sets the trigger (security-touching work,
 
 | File | Last touched | Status | Notes |
 |---|---|---|---|
-| `api.md` | 2026-09-22 | ✅ Fresh | 2.3.4: who may call, the event loop, stops, messages, output, env, edge capabilities, metrics, errors. |
-| `quickstart.md` | 2026-09-22 | ✅ Fresh | 2.3.4: 1033 assertions; taking an agent's messages; captured output. |
-| `agent-ipc.md` | 2026-09-22 | ✅ Fresh | 2.3.3, new: the fd-3 wire protocol. 2.3.4: reply 4, names, the HTTP message routes, byte limit. |
+| `api.md` | 2026-09-23 | ✅ Fresh | 2.4.0: "On AGNOS" (start, limits, stop, capture, listener); limits_enforced. 2.3.4: who may call, the loop, stops, messages, output. |
+| `quickstart.md` | 2026-09-23 | ✅ Fresh | 2.4.0: 1038 assertions; tests/agnos. |
+| `agent-ipc.md` | 2026-09-23 | ✅ Fresh | 2.3.3, new: the fd-3 wire protocol. 2.3.4: reply 4, names, the HTTP message routes. 2.4.0: the AGNOS channel. |
 
 ---
 

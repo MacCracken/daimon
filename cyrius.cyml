@@ -56,10 +56,14 @@ git = "https://github.com/MacCracken/sakshi.git"
 tag = "2.5.2"
 modules = ["dist/sakshi.cyr"]
 
+# ai-hwaccel — samay's hardware-acceleration dependency; daimon calls nothing
+# in it. No `path`: a dep with both `path` and `tag` resolves from the local
+# checkout and the tag is inert (cbt/deps.cyr, CVE-21 note), and every build
+# re-resolves deps, so a sibling checkout mid-change leaked into daimon's lock
+# (2.3.4). Resolved from the tag, the lock also records its commit.
 [deps.ai-hwaccel]
 git = "https://github.com/MacCracken/ai-hwaccel.git"
-path = "../ai-hwaccel"
-tag = "2.3.23"
+tag = "2.3.24"
 modules = ["dist/ai-hwaccel.cyr"]
 
 # samay — task scheduler. daimon 2.0.0 REPLACES its own duplicated

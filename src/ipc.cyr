@@ -436,8 +436,15 @@ fn rpc_list_methods(rr) {
 # A frame is parsed in _ipc_arena, rewound for every frame, so the parse tree
 # never reaches the shared heap; the message the bus keeps is its own copy.
 #
-# AGNOS: no channels until 2.4.x maps chan_op. Agents cannot start there yet
-# (agent_start answers AGENT_OP_UNSUPPORTED), so nothing below is reached.
+# AGNOS (2.4.0): the channel is chan_op#97's. The kernel mints the pair
+# (CH_MINT) and places the agent's end in the next spawned child (CH_ENDOW), which
+# finds it through AGNOS_IPC_FD like a Linux agent. The wire format is the same
+# byte stream, carried in records of at most 64 bytes (CH_SEND / CH_RECV): the
+# agent splits its frames into records, and _ipc_recv joins them back. An inbox
+# holds 64 records and drops its OLDEST when full, so a frame there is at most
+# IPC_FRAME_MAX bytes, and an agent waits for each reply before its next frame.
+# Nothing can wait on a channel with epoll there, so the loop polls
+# (ipc_poll_once).
 
 # Wire reply codes.
 var ACK = 1;               # queued for its target (a broadcast: for every subscriber with room)
@@ -445,7 +452,17 @@ var NACK_QUEUE_FULL = 2;   # the target's queue, or the bus, is full; nothing wa
 var NACK_INVALID = 3;      # not a valid frame
 var NACK_NO_TARGET = 4;    # no agent has that id or name; nothing was kept (2.3.4)
 
-# (The agent's end is fd AGENT_IPC_FD = 3 inside the agent: src/agent.cyr.)
+# (The agent's end is fd AGENT_IPC_FD = 3 inside the agent: src/agent.cyr. On
+# agnos it is whichever fd CH_ENDOW chose, announced the same way.)
+
+# The longest frame body a channel carries. On agnos a frame must fit an inbox
+# (64 records of 64 bytes, less the 4-byte length): records past it would drop
+# the frame's first bytes before daimon had read them.
+#ifdef CYRIUS_TARGET_AGNOS
+var IPC_FRAME_MAX = 4092;
+#else
+var IPC_FRAME_MAX = 65536;         # MAX_MESSAGE_SIZE
+#endif
 var IPC_FRAME_TIMEOUT_MS = 5000;   # a started frame must finish within this (SERVE_IDLE_MS)
 var IPC_TARGET_MAX = 256;          # the longest target a frame may name
 var IPC_FRAMES_PER_PASS = 16;      # frames one channel may complete per pass of the loop
@@ -512,25 +529,39 @@ fn _ipc_chan_list() {
     return _ipc_chans;
 }
 
-#ifndef CYRIUS_TARGET_AGNOS
+# epoll_ctl's ADD and DEL (include/uapi/linux/eventpoll.h), named here so the
+# code agnos shares compiles there: _ipc_epoll ignores them on agnos.
+var _IPC_EPOLL_ADD = 1;
+var _IPC_EPOLL_DEL = 2;
 
 # A connected pair for a new agent's channel, into `fds` (an i32[2]): [0] stays
 # with daimon, [1] becomes the agent's fd 3. Both are close-on-exec, so neither
 # can leak into another agent. 0 on success, negative on failure.
+# agnos: CH_MINT writes the two fds as 8-byte words.
 fn ipc_channel_open(fds) {
+    #ifdef CYRIUS_TARGET_AGNOS
+    var pair: i64[2];
+    if (sys_chan_mint(&pair) != 0) { return 0 - 1; }
+    store32(fds, load64(&pair));
+    store32(fds + 4, load64(&pair + 8));
+    return 0;
+    #else
     return sys_socketpair(1, 1 | _IPC_SOCK_CLOEXEC, 0, fds);   # AF_UNIX, SOCK_STREAM
+    #endif
 }
 
 # --- channel records -----------------------------------------------------------
 #   +0 agent_id Str   +8 fd   +16 header bytes read   +24 header (4 bytes)
 #   +32 body buffer   +40 its capacity   +48 this frame's length (0 = reading
 #   the header)   +56 body bytes read   +64 frame start (ms, 0 = idle)   +72 open
+#   agnos (2.4.0): +80 the record in hand (64 bytes)  +88 its length  +96 bytes
+#   of it consumed
 # The body buffer is kept and reused: it grows, by doubling, to the largest frame
 # the agent has sent (at most MAX_MESSAGE_SIZE), so a steady agent allocates
 # nothing per frame for it.
 fn _ipc_chan_new(agent_id, fd) {
-    var ch = alloc(80);
-    memset(ch, 0, 80);
+    var ch = alloc(104);
+    memset(ch, 0, 104);
     store64(ch, agent_id);
     store64(ch + 8, fd);
     store64(ch + 72, 1);
@@ -542,6 +573,9 @@ fn _ipc_chan_new(agent_id, fd) {
 # x86_64 (data at +4) and naturally aligned elsewhere (data at +8):
 # include/uapi/linux/eventpoll.h, EPOLL_PACKED.
 fn _ipc_epoll(op, ch) {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 0;   # polled: nothing to register
+    #else
     if (_ipc_epfd == 0) { return 0; }
     var ev: i64[2];
     store64(&ev, 0);
@@ -554,12 +588,17 @@ fn _ipc_epoll(op, ch) {
     #endif
     sys_epoll_ctl(_ipc_epfd, op, load64(ch + 8), &ev);
     return 0;
+    #endif
 }
 
 fn _ipc_close(ch) {
     if (load64(ch + 72) == 1) {
-        _ipc_epoll(EPOLL_CTL_DEL, ch);
+        #ifdef CYRIUS_TARGET_AGNOS
+        sys_chan_close(load64(ch + 8));   # the agent's end reads PEERGONE from here on
+        #else
+        _ipc_epoll(_IPC_EPOLL_DEL, ch);
         sys_close(load64(ch + 8));
+        #endif
         store64(ch + 72, 0);
     }
     return 0;
@@ -570,7 +609,11 @@ fn _ipc_close(ch) {
 fn _ipc_reply(ch, code) {
     var b: u8[1];
     store8(&b, code);
+    #ifdef CYRIUS_TARGET_AGNOS
+    sys_chan_send(load64(ch + 8), &b, 1);   # one record; CH_SEND never waits
+    #else
     sys_sendto(load64(ch + 8), &b, 1, _IPC_MSG_DONTWAIT | _IPC_MSG_NOSIGNAL, 0, 0);
+    #endif
     return 0;
 }
 
@@ -628,11 +671,38 @@ fn _ipc_frame(ch, body, len) {
     return 0;
 }
 
-# A non-blocking read, retried if a signal interrupts it.
-fn _ipc_recv(fd, buf, len) {
+# Up to `len` bytes of the channel's stream, without waiting: >0 bytes, 0 at
+# the end of the stream, -EAGAIN when nothing has arrived. Linux: recv, retried
+# if a signal interrupts it. agnos: CH_RECV hands over a whole record (at most
+# 64 bytes) or none, so the record in hand is kept on the channel and served
+# from; PEERGONE, once its inbox is drained, is the end of the stream.
+fn _ipc_recv(ch, buf, len) {
+    #ifdef CYRIUS_TARGET_AGNOS
+    var rec = load64(ch + 80);
+    if (rec == 0) {
+        rec = alloc(64);
+        store64(ch + 80, rec);
+    }
+    var have = load64(ch + 88) - load64(ch + 96);
+    if (have <= 0) {
+        var r = sys_chan_recv(load64(ch + 8), rec, 64);
+        if (r == 0 - CH_E_WOULDBLOCK) { return 0 - _IPC_EAGAIN; }
+        if (r <= 0) { return 0; }
+        store64(ch + 88, r);
+        store64(ch + 96, 0);
+        have = r;
+    }
+    var n = have;
+    if (n > len) { n = len; }
+    memcpy(buf, rec + load64(ch + 96), n);
+    store64(ch + 96, load64(ch + 96) + n);
+    return n;
+    #else
+    var fd = load64(ch + 8);
     var n = sys_recvfrom(fd, buf, len, _IPC_MSG_DONTWAIT, 0, 0);
     while (n == 0 - _IPC_EINTR) { n = sys_recvfrom(fd, buf, len, _IPC_MSG_DONTWAIT, 0, 0); }
     return n;
+    #endif
 }
 
 # Room in the channel's body buffer for a frame of `len` bytes.
@@ -652,14 +722,13 @@ fn _ipc_body_room(ch, len) {
 # busy agent cannot hold the loop while the others wait. What is left is still
 # readable, and poll reports it again on the next pass.
 fn _ipc_service_channel(ch, budget) {
-    var fd = load64(ch + 8);
     var done = 0;
     while (load64(ch + 72) == 1) {
         if (done >= budget) { return 0; }
         var blen = load64(ch + 48);
         if (blen == 0) {
             var got = load64(ch + 16);
-            var n = _ipc_recv(fd, ch + 24 + got, 4 - got);
+            var n = _ipc_recv(ch, ch + 24 + got, 4 - got);
             if (n == 0 - _IPC_EAGAIN) { return 0; }
             if (n <= 0) {
                 # EOF (or an error) on a frame boundary is the agent leaving;
@@ -677,7 +746,7 @@ fn _ipc_service_channel(ch, budget) {
                 if (len == 0) {
                     store64(ch + 64, 0);   # keep-alive: no reply
                     done = done + 1;
-                } elif (len > MAX_MESSAGE_SIZE) {
+                } elif (len > IPC_FRAME_MAX) {
                     _ipc_reply(ch, NACK_INVALID);
                     _ipc_fault(ch, IPC_EV_OVERSIZE);
                     return 0;
@@ -689,7 +758,7 @@ fn _ipc_service_channel(ch, budget) {
             }
         } else {
             var bgot = load64(ch + 56);
-            var m = _ipc_recv(fd, load64(ch + 32) + bgot, blen - bgot);
+            var m = _ipc_recv(ch, load64(ch + 32) + bgot, blen - bgot);
             if (m == 0 - _IPC_EAGAIN) { return 0; }
             if (m <= 0) {
                 _ipc_fault(ch, IPC_EV_SHORT);   # cut short: never delivered
@@ -746,7 +815,7 @@ fn ipc_service_add(agent_id_str, fd) {
     _ipc_close_agent(agent_id_str);
     var ch = _ipc_chan_new(str_clone(agent_id_str), fd);
     vec_push(_ipc_chan_list(), ch);
-    _ipc_epoll(EPOLL_CTL_ADD, ch);
+    _ipc_epoll(_IPC_EPOLL_ADD, ch);
     return 1;
 }
 
@@ -787,7 +856,7 @@ fn ipc_use_epoll(epfd) {
     var i = 0;
     while (i < vec_len(chans)) {
         var ch = vec_get(chans, i);
-        if (load64(ch + 72) == 1) { _ipc_epoll(EPOLL_CTL_ADD, ch); }
+        if (load64(ch + 72) == 1) { _ipc_epoll(_IPC_EPOLL_ADD, ch); }
         i = i + 1;
     }
     return 0;
@@ -796,7 +865,9 @@ fn ipc_use_epoll(epfd) {
 # For the event loop: the descriptor behind epoll data `tok` is readable — a
 # channel record, or (low bit set) an agent's output record.
 fn ipc_on_ready(tok) {
+    #ifndef CYRIUS_TARGET_AGNOS
     if ((tok & 1) == 1) { return _ipc_output_read(tok - 1); }
+    #endif
     if (load64(tok + 72) == 1) { _ipc_service_channel(tok, IPC_FRAMES_PER_PASS); }
     return 0;
 }
@@ -816,8 +887,21 @@ fn ipc_tick(now) {
 
 # One pass over the channels alone, waiting up to `ms` for one to be readable,
 # with poll(2). Tests and benchmarks drive channels with it; the event loop
-# uses its epoll set instead.
+# uses its epoll set instead. agnos: nothing can wait on a channel, so this
+# serves every open channel without waiting (`ms` is unused), and the event
+# loop calls it on every pass.
 fn ipc_poll_once(ms) {
+    #ifdef CYRIUS_TARGET_AGNOS
+    var achans = _ipc_chan_list();
+    var ai = 0;
+    while (ai < vec_len(achans)) {
+        var ach = vec_get(achans, ai);
+        if (load64(ach + 72) == 1) { _ipc_service_channel(ach, IPC_FRAMES_PER_PASS); }
+        ai = ai + 1;
+    }
+    ipc_tick(clock_now_ms());
+    return vec_len(achans);
+    #else
     _ipc_sweep();
     var chans = _ipc_chan_list();
     var n = vec_len(chans);
@@ -849,8 +933,10 @@ fn ipc_poll_once(ms) {
     }
     ipc_tick(clock_now_ms());
     return n;
+    #endif
 }
 
+#ifndef CYRIUS_TARGET_AGNOS
 # --- captured output (2.3.4, `serve --agent-output capture`) ---------------------
 #
 # One record per agent whose output daimon has captured, kept after the agent's
@@ -988,17 +1074,10 @@ fn ipc_output_forget(agent_id_cstr) {
 
 #else
 
-fn ipc_channel_open(fds) { return 0 - 1; }
-fn ipc_service_add(agent_id_str, fd) { return 0; }
-fn ipc_service_remove(agent_id_str) { return 0; }
-fn ipc_channel_count() { return 0; }
+# agnos: output is not captured yet (serve refuses --agent-output capture there).
 fn ipc_output_add(agent_id_str, fd) { return 0; }
 fn ipc_output_total(agent_id_cstr) { return 0 - 1; }
 fn ipc_output_text(agent_id_cstr) { return 0; }
 fn ipc_output_forget(agent_id_cstr) { return 0; }
-fn ipc_use_epoll(epfd) { return 0; }
-fn ipc_on_ready(ch) { return 0; }
-fn ipc_tick(now) { return 0; }
-fn ipc_poll_once(ms) { return 0; }
 
 #endif

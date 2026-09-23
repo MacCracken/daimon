@@ -1,0 +1,59 @@
+# daimon's AGNOS guest test (tests/agnos/run.sh): /bin/agnsh, which kybernet
+# (PID 1) execs. It runs the agent test (/bin/guest) to its end, then the real
+# daimon (/bin/daimon serve) and the HTTP client that drives it (/bin/client),
+# each started with spawn_path#43, and waits with pause#14, never sleep_ms#41,
+# which would hold the CPU from the processes it waits for.
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/syscalls.cyr"
+include "lib/chrono.cyr"
+
+fn _l_put(s) {
+    syscall(SYS_WRITE, 1, s, strlen(s));
+    return 0;
+}
+
+fn _l_wait_ms(ms) {
+    var t0 = clock_now_ms();
+    while (clock_now_ms() - t0 < ms) { sys_pause(); }
+    return 0;
+}
+
+# The exit code of child `pid`, or -2 if it is still running after `ms`.
+fn _l_wait_exit(pid, ms) {
+    var t0 = clock_now_ms();
+    while (clock_now_ms() - t0 < ms) {
+        var r = sys_waitpid(pid);
+        if (r != 0 - 2) { return r; }
+        sys_pause();
+    }
+    return 0 - 2;
+}
+
+fn _l_run(line) {
+    var pid = sys_spawn_path(line, strlen(line));
+    _l_put("LAUNCHER started ");
+    _l_put(line);
+    _l_put(" as pid ");
+    fmt_int(pid);
+    _l_put("\n");
+    return pid;
+}
+
+_l_put("LAUNCHER start\n");
+var g = _l_run("/bin/guest");
+if (g >= 0) {
+    _l_put("LAUNCHER guest exited ");
+    fmt_int(_l_wait_exit(g, 120000));
+    _l_put("\n");
+}
+var d = _l_run("/bin/daimon serve 8090 --agents-dir /agents");
+_l_wait_ms(1500);
+var c = _l_run("/bin/client");
+if (c >= 0) {
+    _l_put("LAUNCHER client exited ");
+    fmt_int(_l_wait_exit(c, 120000));
+    _l_put("\n");
+}
+_l_put("LAUNCHER DONE\n");
+while (1 == 1) { sys_pause(); }

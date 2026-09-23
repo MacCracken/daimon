@@ -4,6 +4,123 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.4.0] - 2026-09-23
+
+**daimon runs its agents on AGNOS.** On agnos, starting, stopping and collecting an agent, its channel
+to daimon, daimon's own event loop and the supervisor's readings now use the kernel's own primitives:
+`spawn_path`, `kill`, `waitpid`, `chan_op`, `proclist`. A new guest test boots agnos 1.57.5 under
+QEMU. It drives `src/agent.cyr` directly (44 checks) and the real daimon binary over HTTP (20
+checks). What agnos cannot do yet has been filed with agnos, nine filings, rather than designed
+around. daimon's interim behaviour there is documented and audited
+([docs/audit/2026-09-23-agnos-platform-audit.md](docs/audit/2026-09-23-agnos-platform-audit.md)).
+
+**1038 tests** (was 1033) across 17 suites, **131 HTTP smoke checks** (was 130), 29 benchmarks and 7
+fuzz harnesses, all green on Linux. The agnos guest test (`sh tests/agnos/run.sh`) passes all 64 of
+its checks. It runs by hand, since CI has no agnos kernel; CI builds its programs. fmt / lint / vet
+clean; x86_64, aarch64 and agnos build.
+
+### Added (agnos)
+
+- **Agent processes.**
+  - `spawn_path`#43 starts them: the argv is `<exe> --agent-id <id> --agent-name <name>`, and the
+    environment is daimon's own, filtered by `--agent-env`, within the kernel's limits of 16 entries
+    and 1024 bytes.
+  - `waitpid`#4 collects them, and `kill`#16 sends SIGTERM to stop them.
+  - An agent that reads its signalfd stops. One that ignores SIGTERM stays *Stopping*, because agnos
+    cannot end a process yet (filed).
+- **Agent channels** over `chan_op`#97. `CH_MINT` makes the pair. `CH_ENDOW` moves the agent's end
+  into the child, and its fd is announced as `AGNOS_IPC_FD`. `CH_SEND` / `CH_RECV` carry the traffic.
+  The frames are Linux's byte stream, carried in 64-byte records. There, a frame is at most 4092
+  bytes: an inbox holds 64 records and drops its oldest when full.
+- **daimon's own event loop on agnos**, polled: accept#57 and recv#49 never block, and nothing can
+  wait on a socket with epoll. It yields with `pause`#14 between passes. Deferred stops, agents
+  collected as they exit, and per-connection deadlines all work as on Linux. It replaces sandhi's
+  sync loop there. That loop retries accept's `EAGAIN` at once, so it never gives up the CPU itself,
+  and the agents daimon starts need it.
+- **Supervisor readings** from `proclist`#99: resident memory (4 KiB pages) and CPU time (100 Hz
+  ticks). `agent_is_alive` reads the process table: `kill`#16 checks ownership, not whether the
+  process is alive.
+- `limits_enforced` in an agent's JSON while it has a process. It is `true` on Linux, where a start
+  whose limits fail is refused, and `false` on agnos, where each start is also audited
+  (`agent.limits.unenforced`).
+- `daimon_yield_ms`: a wait that leaves the CPU to others.
+- `tests/agnos/`: the guest test, its launcher, an HTTP client and three fixture agents. `run.sh`
+  boots the prebuilt agnos kernel (`AGNOS_KERNEL`, default `../agnos/build/agnos`) under QEMU and
+  reads the verdict from the serial console.
+
+### Changed
+
+- On agnos:
+  - pause and resume answer 501 (SIGSTOP/SIGCONT stop nothing there yet);
+  - an agent whose name has a space, or whose command line is over 127 bytes, answers 422
+    (`spawn_path` splits on spaces);
+  - `serve --agent-output capture` exits 1. A child inherits daimon's whole fd table, so every agent
+    would hold every other agent's output pipe;
+  - the listener is on the NIC's address, because `sock_listen`#56 takes no address. daimon warns and
+    audits (`http.listen.not_loopback`).
+- The 501 message reads "this operation is not supported on this target yet".
+- **ai-hwaccel is pinned to 2.3.24 from its tag, with no `path`.** With a `path`, the tag is inert
+  (cyrius resolves from the local checkout), and every build re-resolves, so a sibling checkout
+  mid-change leaked into the lock at 2.3.4. The lock now records the tag's commit (`a2cb2aa`).
+- CI formats, lints and builds `tests/agnos/`.
+
+### Fixed
+
+- agnos: the cyrius peer's `sys_access` is a stub that always fails, so no agent executable was ever
+  found there. `_agent_runnable` uses stat#33.
+- agnos: daimon's own blocking waits held the CPU. These were `agent_stop`'s loop and
+  `daimon_reap_within`, and `sleep_ms`#41 disables preemption for the whole sleep. The agent being
+  stopped never ran, so the stop gave up. Measured in the guest: that stop now completes, exit code 0.
+
+### Filed with agnos
+
+In the agnos repo, `docs/development/issues/2026-09-23-*.md`:
+1. **Inbound TCP**: a SYN drained in interrupt context is dropped. A server there accepted 0 to 9 of
+   12 connections, depending on how it waits.
+2. A parent cannot end, stop or continue its child: signals are pending bits.
+3. No per-process resource limits.
+4. `spawn_path` cannot pass an argument that contains a space.
+5. `sleep_ms`#41 holds the CPU.
+6. `sock_recv`#49 never reports the end of a stream the peer has closed.
+7. A TCP server cannot be loopback-only. TCP to 127.0.0.1 is dropped, and accept gives no peer
+   address.
+8. **TCP connection ids have no owner**: any process can read, write or close any connection. On
+   agnos, an agent can interfere with daimon's API.
+9. A child inherits every fd its parent holds; `exec_redirect` arms one fd; a failed `spawn_path`
+   leaves `CH_ENDOW` armed.
+
+### Performance
+
+- 2.3.4 against 2.4.0, six interleaved runs, medians. Everything is within ±3% except two benchmarks
+  in code 2.4.0 did not change (`src/mcp.cyr`, `src/edge.cyr`):
+  - `mcp_manifest_100_tools` +3.1%;
+  - `edge_stats_500` +4.1%.
+- The agent and IPC benchmarks stay within ±2% (`agent_spawn_reap` −2.1%, `ipc_frame_roundtrip`
+  +0.1%, `bus_broadcast_take_100` −1.1%), with the agent handle grown to 120 bytes and the channel
+  record to 104.
+
+### Tests
+
+- `tests/agnos/guest.cyr` (44, in the guest):
+  - start;
+  - reap;
+  - stop by SIGTERM, and the blocking stop;
+  - the channel: a two-record frame is published with the agent as its source;
+  - the proclist readings;
+  - the 422 refusals and the pause refusal;
+  - an agent that ignores SIGTERM;
+  - no executable.
+- `tests/agnos/http_client.cyr` (20, in the guest, against the real daimon over TCP to the guest's own
+  address):
+  - health, register, start (`limits_enforced:false`);
+  - taking the agent's channel message;
+  - pause 501;
+  - the deferred stop;
+  - a crash collected as FAILED;
+  - the 422.
+- `tests/agent.tcyr` (175): `limits_enforced`. `tests/syscall_portability.tcyr` (42):
+  `daimon_yield_ms`. `tests/smoke.sh` (131): `limits_enforced` over HTTP.
+
 ## [2.3.4] - 2026-09-22
 
 **daimon runs its own event loop, and the 2.3.x follow-ups are fixed rather than deferred.** Through

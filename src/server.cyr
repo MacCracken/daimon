@@ -281,7 +281,11 @@ var SERVE_IDLE_MS = 5000;
 
 # Connections open at once. At the cap the listener is not polled; new
 # connections wait in the kernel's backlog.
+#ifdef CYRIUS_TARGET_AGNOS
+var SERVE_MAX_CONNS = 5;    # agnos's kernel has 8 TCP slots in all: the listener, these, and daimon's outbound calls
+#else
 var SERVE_MAX_CONNS = 128;
+#endif
 
 # =========================================================================
 # daimon's event loop (2.3.4)
@@ -315,10 +319,11 @@ var SERVE_MAX_CONNS = 128;
 # A handler may answer later (server_defer): a stop waits for its agent, not
 # the server's other clients.
 #
-# AGNOS keeps sandhi's loop: it has no agent processes or channels until 2.4.x,
-# and its sockets are driven differently (lib/net.cyr).
-
-#ifndef CYRIUS_TARGET_AGNOS
+# agnos runs the same loop since 2.4.0, polled rather than woken by epoll
+# (server_loop's agnos arm): its accept and recv never block, and a socket there
+# cannot join an epoll set. Until 2.3.4 agnos served from sandhi's sync loop,
+# which retries accept's EAGAIN at once and so never gives up the CPU itself;
+# the agents daimon starts there need it (pause#14 below).
 
 var SERVE_TICK_MS = 100;           # the longest the loop sleeps
 var SERVE_TICK_BUSY_MS = 10;       # ... while a deferred answer is waiting
@@ -366,6 +371,10 @@ var _srv_events = 0;
 # epoll data for the server's own descriptors: 1 is the listener, 2 + i is
 # connection slot i. Anything else is an agent channel record (a heap pointer,
 # never this small): src/ipc.cyr.
+# epoll_ctl's ADD and DEL (include/uapi/linux/eventpoll.h), named here so the
+# functions agnos shares compile there: _srv_epoll ignores them on agnos.
+var _SRV_EPOLL_ADD = 1;
+var _SRV_EPOLL_DEL = 2;
 var _SRV_TOKEN_LISTEN = 1;
 var _SRV_TOKEN_SLOT0 = 2;
 var _SRV_TOKEN_PIPE0 = 130;   # _SRV_TOKEN_SLOT0 + SERVE_MAX_CONNS: slot i's detached pipe
@@ -376,6 +385,9 @@ fn _srv_slot(i) { return _srv_slots + i * SRV_SLOT_SIZE; }
 # with data `token`. `struct epoll_event` is packed on x86_64 (data at +4) and
 # naturally aligned elsewhere (data at +8): include/uapi/linux/eventpoll.h.
 fn _srv_epoll(op, fd, token) {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 0;   # polled: nothing to register
+    #else
     var ev: i64[2];
     store64(&ev, 0);
     store64(&ev + 8, 0);
@@ -386,13 +398,14 @@ fn _srv_epoll(op, fd, token) {
     store64(&ev + 4, token);
     #endif
     return sys_epoll_ctl(_srv_epfd, op, fd, &ev);
+    #endif
 }
 
 fn _srv_slot_index(slot) { return (slot - _srv_slots) / SRV_SLOT_SIZE; }
 
 fn _srv_unregister(slot) {
     if (load64(slot + 80) == 1) {
-        _srv_epoll(EPOLL_CTL_DEL, load64(slot + 8), _SRV_TOKEN_SLOT0 + _srv_slot_index(slot));
+        _srv_epoll(_SRV_EPOLL_DEL, load64(slot + 8), _SRV_TOKEN_SLOT0 + _srv_slot_index(slot));
         store64(slot + 80, 0);
     }
     return 0;
@@ -401,9 +414,11 @@ fn _srv_unregister(slot) {
 fn _srv_close(slot) {
     _srv_unregister(slot);
     if (load64(slot) == SRV_DEFERRED) { _srv_deferred = _srv_deferred - 1; }
+    #ifndef CYRIUS_TARGET_AGNOS
     if (load64(slot) == SRV_DETACHED) {
         if (load64(slot + 96) >= 0) { _srv_detach_end(slot, 1); }
     }
+    #endif
     sys_close(load64(slot + 8));
     store64(slot, SRV_FREE);
     return 0;
@@ -421,11 +436,15 @@ fn _srv_free_slot() {
 # SO_SNDTIMEO: a response write that makes no progress for SERVE_IDLE_MS
 # fails rather than holding the loop.
 fn _srv_send_timeout(fd) {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 0;   # no SO_SNDTIMEO: sock_send#48 gives up after ~8 s without an ACK
+    #else
     var tv: i64[2];
     store64(&tv, SERVE_IDLE_MS / 1000);
     store64(&tv + 8, (SERVE_IDLE_MS % 1000) * 1000);
     sys_setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, 16);
     return 0;
+    #endif
 }
 
 fn _srv_open(i, cfd, now) {
@@ -453,7 +472,7 @@ fn _srv_open(i, cfd, now) {
     _srv_read(slot, now);
     var st = load64(slot);
     if (st == SRV_READING || st == SRV_DRAINING) {
-        _srv_epoll(EPOLL_CTL_ADD, cfd, _SRV_TOKEN_SLOT0 + i);
+        _srv_epoll(_SRV_EPOLL_ADD, cfd, _SRV_TOKEN_SLOT0 + i);
         store64(slot + 80, 1);
     }
     return 0;
@@ -497,11 +516,24 @@ fn _srv_dispatch(slot, n) {
     return 0;
 }
 
-# A non-blocking read, retried if a signal interrupts it.
+# A non-blocking read, retried if a signal interrupts it: >0 bytes, 0 at the end
+# of the stream, -EAGAIN when nothing has arrived.
 fn _srv_recv(fd, buf, len) {
+    #ifdef CYRIUS_TARGET_AGNOS
+    # sock_recv#49 on the connection behind lib/net's tagged fd; its answers are
+    # the other way round (0 = nothing yet, -1 = closed). sys_read on a tagged
+    # fd would block, polling for up to 30 s (the peer's _agnos_sock_recv_block).
+    var c = _agnos_fd_conn(fd);
+    if (c < 0) { return 0; }
+    var r = syscall(SYS_SOCK_RECV, c, buf, len);
+    if (r > 0) { return r; }
+    if (r == 0) { return 0 - _SRV_EAGAIN; }
+    return 0;
+    #else
     var n = sys_recvfrom(fd, buf, len, _SRV_MSG_DONTWAIT, 0, 0);
     while (n == 0 - _SRV_EINTR) { n = sys_recvfrom(fd, buf, len, _SRV_MSG_DONTWAIT, 0, 0); }
     return n;
+    #endif
 }
 
 # Read what a connection has sent; dispatch it once it is a whole request.
@@ -562,6 +594,17 @@ fn _srv_drain(slot) {
 # never ends the loop: the listener backs off, 1 ms doubling to 250 ms, while
 # the open connections and the channels are still served.
 fn _srv_accept(lfd, now) {
+    #ifdef CYRIUS_TARGET_AGNOS
+    # lib/net's accept: accept#57, never blocking, wrapped as a tagged fd. Its
+    # errors are "nothing pending" or a full fd table (it closes the connection
+    # then): the loop polls again on its next pass either way.
+    while (_srv_free_slot() >= 0) {
+        var a_t, a_fd = sock_accept(lfd);
+        if (is_err_result(a_t) == 1) { return 1; }
+        _srv_open(_srv_free_slot(), a_fd, now);
+    }
+    return 1;
+    #else
     while (_srv_free_slot() >= 0) {
         var cfd = sys_accept4(lfd, 0, 0, _SRV_SOCK_CLOEXEC);
         if (cfd >= 0) {
@@ -589,6 +632,7 @@ fn _srv_accept(lfd, now) {
         }
     }
     return 1;
+    #endif
 }
 
 # Deadlines: a request that stalls or trickles, a drain that has run its
@@ -612,10 +656,12 @@ fn _srv_tick(now) {
         } elif (st == SRV_DETACHED) {
             # The pipe is relayed as it becomes readable (the loop); the tick
             # only enforces the deadline.
+            #ifndef CYRIUS_TARGET_AGNOS
             if (now > load64(slot + 48)) {
                 _srv_relay(slot, 1);
                 _srv_close(slot);
             }
+            #endif
         }
         i = i + 1;
     }
@@ -626,6 +672,9 @@ fn _srv_tick(now) {
 # backing off; otherwise a pending connection would wake the loop on every
 # pass (epoll is level-triggered).
 fn _srv_arm_listener(now) {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 0;   # polled: nothing to arm
+    #else
     var want = 1;
     if (_srv_free_slot() < 0) { want = 0; }
     if (_srv_accept_resume > now) { want = 0; }
@@ -634,6 +683,7 @@ fn _srv_arm_listener(now) {
     else { _srv_epoll(EPOLL_CTL_DEL, _srv_lfd, _SRV_TOKEN_LISTEN); }
     _srv_listening = want;
     return 0;
+    #endif
 }
 
 # The data word of event `i` in _srv_events (x86_64 packs the struct: 12 bytes,
@@ -647,6 +697,24 @@ fn _srv_event_data(i) {
 }
 
 fn _srv_listen(addr, port) {
+    #ifdef CYRIUS_TARGET_AGNOS
+    # lib/net's listener: sock_listen#56 takes the port only, so the kernel
+    # listens on the NIC's address whatever `addr` says (filed with agnos,
+    # 2026-09-23; serve warns).
+    var s_t, s_fd = tcp_socket();
+    if (is_err_result(s_t) == 1) { return 0 - 1; }
+    var b_t, b_v = sock_bind(s_fd, addr, port);
+    if (is_err_result(b_t) == 1) {
+        sock_close(s_fd);
+        return 0 - 1;
+    }
+    var l_t, l_v = sock_listen(s_fd, SERVE_BACKLOG);
+    if (is_err_result(l_t) == 1) {
+        sock_close(s_fd);
+        return 0 - 1;
+    }
+    return s_fd;
+    #else
     var fd = sys_socket(AF_INET, SOCK_STREAM | _SRV_SOCK_NONBLOCK | _SRV_SOCK_CLOEXEC, 0);
     if (fd < 0) { return 0 - 1; }
     var one: i32[1];
@@ -661,10 +729,48 @@ fn _srv_listen(addr, port) {
         return 0 - 1;
     }
     return fd;
+    #endif
 }
 
 # Serve on addr:port until the listener fails. Returns 1 then (or when it
 # cannot bind), as sandhi's loops did; it does not return otherwise.
+#ifdef CYRIUS_TARGET_AGNOS
+# agnos (2.4.0): polled. Each pass accepts what is pending, reads every
+# connection still arriving and runs the tick's upkeep, then yields with
+# pause#14: to the agents above all. (Not sleep_ms#41, which holds the CPU for
+# the whole sleep; filed with agnos, 2026-09-23.) A pass therefore waits at most
+# one scheduler tick, 10 ms, when nothing else is ready.
+fn server_loop(addr, port) {
+    _srv_lfd = _srv_listen(addr, port);
+    if (_srv_lfd < 0) { return 1; }
+    _srv_slots = alloc(SERVE_MAX_CONNS * SRV_SLOT_SIZE);
+    memset(_srv_slots, 0, SERVE_MAX_CONNS * SRV_SLOT_SIZE);
+    _srv_reject = arena_allocator(4096);
+    var last_upkeep = 0;
+    while (1 == 1) {
+        var now = clock_now_ms();
+        _srv_accept(_srv_lfd, now);
+        var i = 0;
+        while (i < SERVE_MAX_CONNS) {
+            var slot = _srv_slot(i);
+            if (load64(slot) == SRV_READING) { _srv_read(slot, now); }
+            elif (load64(slot) == SRV_DRAINING) { _srv_drain(slot); }
+            i = i + 1;
+        }
+        var tick = SERVE_TICK_MS;
+        if (_srv_deferred > 0) { tick = SERVE_TICK_BUSY_MS; }
+        ipc_poll_once(0);   # agnos: every open channel, every pass (nothing can wait on one)
+        if (now - last_upkeep >= tick) {
+            agents_tick(now);
+            _srv_tick(now);
+            ipc_tick(now);
+            last_upkeep = now;
+        }
+        sys_pause();
+    }
+    return 0;
+}
+#else
 fn server_loop(addr, port) {
     _srv_lfd = _srv_listen(addr, port);
     if (_srv_lfd < 0) { return 1; }
@@ -723,6 +829,8 @@ fn server_loop(addr, port) {
     return 0;
 }
 
+#endif
+
 # For a handler: answer this request later. The loop keeps the connection open
 # and calls fp(cfd, arg, timed_out) each tick until it returns 1 (it has
 # answered; the loop then closes the connection). After SERVE_DEFER_MAX_MS it
@@ -743,6 +851,7 @@ fn server_defer(fp, arg) {
     return 1;
 }
 
+#ifndef CYRIUS_TARGET_AGNOS
 # --- Detached work ---------------------------------------------------------
 #
 # Some handlers wait on another server: an MCP call forwarded to a registered
@@ -914,8 +1023,7 @@ fn server_detach(work, arg) {
 
 #else
 
-fn server_defer(fp, arg) { return 0; }
-
+# agnos: no fork for daimon's use, so a handler's work runs inline.
 fn server_detach(work, arg) { return 0; }
 
 #endif
@@ -925,10 +1033,16 @@ fn server_detach(work, arg) { return 0; }
 # completion just as the sync one did; the flag is still accepted.
 fn serve(port) {
     #ifdef CYRIUS_TARGET_AGNOS
-    server_banner(port, "sync");
-    var opts = sandhi_server_options_new();
-    sandhi_server_options_idle_ms(opts, SERVE_IDLE_MS);
-    return sandhi_server_run_opts(server_bind_addr(), port, &handle_request, 0, opts);
+    server_banner(port, "event loop");
+    # agnos's sock_listen#56 has no address: the listener takes the NIC's, and
+    # the API is reachable from the network even with the default 127.0.0.1
+    # (filed with agnos, 2026-09-23). The Host check still applies.
+    if (server_loopback_only() == 1) {
+        sakshi_warn("agnos listens on the NIC's address, not loopback: the API is reachable from the network", 87);
+        daimon_audit(SEV_WARNING, "http", "http.listen.not_loopback",
+          "agnos cannot bind the listener to loopback; it is on the NIC's address");
+    }
+    return server_loop(server_bind_addr(), port);
     #else
     server_banner(port, "event loop");
     # Room for every agent's channel plus the connections (agent_nofile_raise;

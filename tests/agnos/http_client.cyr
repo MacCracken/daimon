@@ -1,0 +1,148 @@
+# daimon's AGNOS guest test (tests/agnos/run.sh): an HTTP client that drives the
+# real daimon binary inside the guest, over TCP to the guest's own address.
+# Connections to that address go through the kernel's loopback queue, drained
+# in syscall context, so they are not subject to the SYN that interrupt context
+# drops (filed with agnos, 2026-09-23). Ends by printing
+#     CLIENT DONE <failures>
+include "lib/string.cyr"
+include "lib/alloc.cyr"
+include "lib/str.cyr"
+include "lib/fmt.cyr"
+include "lib/syscalls.cyr"
+include "lib/chrono.cyr"
+
+var _c_fail = 0;
+var _c_total = 0;
+var _c_resp = 0;   # the last response, NUL-terminated
+var _c_resp_n = 0;
+
+fn _c_put(s) {
+    syscall(SYS_WRITE, 1, s, strlen(s));
+    return 0;
+}
+
+fn _c_check(cond, name) {
+    _c_total = _c_total + 1;
+    if (cond == 1) { return 0; }
+    _c_fail = _c_fail + 1;
+    _c_put("CLIENT FAIL: ");
+    _c_put(name);
+    _c_put("\n    response: ");
+    if (_c_resp_n > 0) { _c_put(_c_resp); }
+    _c_put("\n");
+    return 0;
+}
+
+# 1 if the last response contains `needle`.
+fn _c_has(needle) {
+    var nl = strlen(needle);
+    var i = 0;
+    while (i + nl <= _c_resp_n) {
+        if (memeq(_c_resp + i, needle, nl) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Bytes of a whole response in the buffer so far, from its headers'
+# Content-Length, or -1 while the headers are incomplete. The client reads to
+# this rather than to the server's close: agnos's sock_recv#49 never reports the
+# end of a stream the peer has closed (CLOSE_WAIT reads as "nothing yet"; filed
+# with agnos, 2026-09-23).
+fn _c_whole() {
+    var i = 0;
+    while (i + 4 <= _c_resp_n) {
+        if (memeq(_c_resp + i, "\r\n\r\n", 4) == 1) {
+            var hdr_end = i + 4;
+            var cl = 0;
+            var j = 0;
+            while (j + 16 <= i) {
+                if (memeq(_c_resp + j, "Content-Length: ", 16) == 1) {
+                    var k = j + 16;
+                    while (load8(_c_resp + k) >= 48 && load8(_c_resp + k) <= 57) {
+                        cl = cl * 10 + load8(_c_resp + k) - 48;
+                        k = k + 1;
+                    }
+                }
+                j = j + 1;
+            }
+            return hdr_end + cl;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+# One request on a fresh connection. Returns the status code, or -1.
+fn _c_req(method, path, body) {
+    _c_resp_n = 0;
+    store8(_c_resp, 0);
+    var conn = syscall(SYS_SOCK_CONNECT, sys_net_ip(), 8090, 0);
+    if (conn < 0) { return 0 - 1; }
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, method);
+    str_builder_add_cstr(sb, " ");
+    str_builder_add_cstr(sb, path);
+    str_builder_add_cstr(sb, " HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: ");
+    str_builder_add_int(sb, strlen(body));
+    str_builder_add_cstr(sb, "\r\n\r\n");
+    str_builder_add_cstr(sb, body);
+    var r = str_builder_build(sb);
+    syscall(SYS_SOCK_SEND, conn, str_data(r), str_len(r));
+    var t0 = clock_now_ms();
+    while (clock_now_ms() - t0 < 15000) {
+        var n = syscall(SYS_SOCK_RECV, conn, _c_resp + _c_resp_n, 8190 - _c_resp_n);
+        if (n > 0) {
+            _c_resp_n = _c_resp_n + n;
+            store8(_c_resp + _c_resp_n, 0);
+            var whole = _c_whole();
+            if (whole >= 0 && _c_resp_n >= whole) { t0 = 0 - 100000; }
+        } elif (n < 0) {
+            t0 = 0 - 100000;   # the server closed: the answer is whole
+        } else {
+            sys_pause();
+        }
+        if (t0 < 0) { break; }
+    }
+    syscall(SYS_SOCK_CLOSE, conn);
+    if (_c_resp_n < 12) { return 0 - 1; }
+    return (load8(_c_resp + 9) - 48) * 100 + (load8(_c_resp + 10) - 48) * 10 + (load8(_c_resp + 11) - 48);
+}
+
+alloc_init();
+_c_resp = alloc(8192);
+_c_put("CLIENT start\n");
+
+_c_check(_c_req("GET", "/v1/health", "") == 200, "health answers 200");
+_c_check(_c_req("POST", "/v1/agents", "{\"name\":\"w1\"}") == 201, "an agent registers");
+_c_check(_c_req("POST", "/v1/agents/1/start", "") == 200, "it starts (spawn_path on agnos)");
+_c_check(_c_has("\"status\":2") == 1, "... RUNNING");
+_c_check(_c_has("\"limits_enforced\":false") == 1, "... and says its limits are not enforced");
+var tm = clock_now_ms();
+while (clock_now_ms() - tm < 500) { sys_pause(); }
+_c_check(_c_req("POST", "/v1/agents/1/messages/take", "") == 200, "its queue is taken");
+_c_check(_c_has("hello from an agnos agent") == 1, "... holding the frame it sent on its channel");
+_c_check(_c_has("\"source\":\"1\"") == 1, "... from the agent itself");
+_c_check(_c_req("POST", "/v1/agents/1/pause", "") == 501, "pause answers 501 on agnos");
+_c_check(_c_req("POST", "/v1/agents/1/stop", "") == 200, "stop answers (deferred, the loop steps it)");
+_c_check(_c_has("\"status\":5") == 1, "... STOPPED");
+_c_check(_c_has("\"exit_code\":0") == 1, "... with the agent's own exit code");
+_c_check(_c_req("POST", "/v1/agents", "{\"name\":\"crash\",\"type\":\"System\"}") == 201, "a system agent registers");
+_c_check(_c_req("POST", "/v1/agents/2/start", "") == 200, "... starts");
+var tw = clock_now_ms();
+while (clock_now_ms() - tw < 1500) { sys_pause(); }
+_c_check(_c_req("GET", "/v1/agents/2", "") == 200, "... is read back");
+_c_check(_c_has("\"status\":6") == 1, "... FAILED once it exits");
+_c_check(_c_has("\"exit_code\":3") == 1, "... with exit code 3");
+_c_check(_c_req("POST", "/v1/agents", "{\"name\":\"two words\"}") == 201, "a name with a space registers");
+_c_check(_c_req("POST", "/v1/agents/3/start", "") == 422, "... but cannot start on agnos (422)");
+_c_check(_c_req("GET", "/v1/health", "") == 200, "health still answers");
+
+_c_put("CLIENT ");
+fmt_int(_c_total - _c_fail);
+_c_put(" passed, ");
+fmt_int(_c_fail);
+_c_put(" failed\nCLIENT DONE ");
+fmt_int(_c_fail);
+_c_put("\n");
+sys_exit(_c_fail);

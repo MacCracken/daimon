@@ -50,7 +50,7 @@ fn config_set_max_agents(c, n) { store64(c + 24, n); }
 # ⚠ KEEP IN SYNC WITH THE `VERSION` FILE. `scripts/version-bump.sh` rewrites both
 # in one step, and `tests/version_sync.tcyr` FAILS if they ever disagree — so the
 # duplication is enforced, not merely documented.
-var DAIMON_VERSION = "2.3.4";
+var DAIMON_VERSION = "2.4.0";
 
 fn daimon_version() {
     return DAIMON_VERSION;

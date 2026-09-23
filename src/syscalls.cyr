@@ -170,11 +170,14 @@ fn daimon_reap_code(pid) {
 # trail VULN-004 records.)
 # ⛔ pid <= 0 is refused: kill(0, sig) signals daimon's whole process group,
 # daimon included, and kill(-1, sig) every process daimon may signal.
-# agnos: no agent process exists there until 2.4.x maps sys_spawn_path.
+# agnos (2.4.0): kill#16, allowed for daimon's own children. It records the
+# signal as PENDING and nothing more: an agent sees it by reading a signalfd,
+# and no signal ends, stops or continues a process there yet (filed with agnos,
+# 2026-09-23). So a stop can only ask.
 fn daimon_signal(pid, sig) {
     if (pid <= 0) { return 0 - 1; }
     #ifdef CYRIUS_TARGET_AGNOS
-    return 0 - 1;
+    return sys_kill(pid, sig);
     #else
     var pidfd = sys_pidfd_open(pid, 0);
     if (pidfd >= 0) {
@@ -195,6 +198,8 @@ fn daimon_signal(pid, sig) {
 #
 # The group's id cannot be reused while daimon holds the leader unreaped (the
 # kernel keeps a pgid's number alive), and daimon signals only before reaping.
+# agnos has no process groups (asked for with the 2026-09-23 filing): the agent
+# alone.
 fn daimon_signal_tree(pid, sig) {
     if (pid <= 0) { return 0 - 1; }
     var r = daimon_signal(pid, sig);
@@ -230,22 +235,37 @@ fn daimon_reap_wait(pid) {
 # (Counting sleeps instead of reading the clock ran a 5 s grace to 5.36 s —
 # measured — because each 1 ms sleep costs more than 1 ms.)
 fn daimon_reap_within(pid, ms) {
-    # `sys_nanosleep(req, rem)` is the one sleep primitive BOTH the Linux and
-    # agnos peers define (agnos also has sys_sleep_ms, Linux does not), so it is
-    # what keeps this loop free of an #ifdef. timespec = {i64 tv_sec, i64 tv_nsec};
-    # element-typed `i64[2]` per CLAUDE.md — a bare `var ts[2]` is TWO BYTES in a
-    # function since cyrius 6.2.1 and would corrupt the frame when written via &ts.
-    var ts: i64[2];
-    store64(&ts, 0);
-    store64(&ts + 8, 1000000);      # 1 ms
     var deadline = clock_now_ms() + ms;
     var r = daimon_reap_code(pid);
     while (r == 0 - 2) {
         if (clock_now_ms() >= deadline) { return r; }
-        sys_nanosleep(&ts, 0);
+        daimon_yield_ms(1);
         r = daimon_reap_code(pid);
     }
     return r;
+}
+
+# Let about `ms` milliseconds pass without keeping other processes off the CPU
+# (2.4.0). Linux: nanosleep. agnos: its sleep_ms#41 (which the peer's
+# sys_nanosleep and chrono's sleep_ms both call) disables preemption for the
+# whole sleep, so nothing else runs meanwhile — measured in the agnos guest
+# test: the agents a stop was waiting for did not run until it gave up. pause#14
+# yields to a ready process first, and otherwise halts until the next tick.
+# (Filed with agnos, 2026-09-23.)
+fn daimon_yield_ms(ms) {
+    if (ms <= 0) { return 0; }
+    #ifdef CYRIUS_TARGET_AGNOS
+    var t0 = clock_now_ms();
+    while (clock_now_ms() - t0 < ms) { sys_pause(); }
+    return 0;
+    #else
+    # timespec {i64 tv_sec, i64 tv_nsec}: element-typed `i64[2]` per CLAUDE.md.
+    var ts: i64[2];
+    store64(&ts, ms / 1000);
+    store64(&ts + 8, (ms % 1000) * 1000000);
+    sys_nanosleep(&ts, 0);
+    return 0;
+    #endif
 }
 
 # Peer IPv4 address of a connected socket, as a 32-bit integer.

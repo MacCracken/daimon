@@ -1,0 +1,193 @@
+# =========================================================================
+# daimon's AGNOS guest test (2.4.0). Runs INSIDE agnos: tests/agnos/run.sh
+# boots the kernel under QEMU, and the launcher (/bin/agnsh) runs this program
+# as /bin/guest with the fixture agents under /agents. It drives the real
+# src/agent.cyr on the real kernel. It ends by printing
+#     GUEST DONE <failures>
+# which run.sh reads from the serial console, and exits with that count.
+#
+# What it pins: start (spawn_path#43), reap (waitpid#4), stop (kill#16 SIGTERM
+# to an agent that honours it), the refusals agnos needs (a name with a space,
+# a command line over 127 bytes, pause), and what agnos cannot do yet: end an
+# agent that ignores SIGTERM.
+# =========================================================================
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/io.cyr"
+include "lib/fs.cyr"
+include "lib/hashmap.cyr"
+include "lib/tagged.cyr"
+include "lib/bayan.cyr"
+include "lib/chrono.cyr"
+include "lib/syscalls.cyr"
+include "lib/args.cyr"
+include "lib/math.cyr"
+include "lib/process.cyr"
+include "lib/sakshi.cyr"
+include "lib/libro.cyr"
+include "lib/assert.cyr"
+
+include "src/syscalls.cyr"
+include "src/error.cyr"
+include "src/audit.cyr"
+include "src/agent.cyr"
+include "src/ipc.cyr"
+
+fn _g_say(s) {
+    syscall(SYS_WRITE, 1, s, strlen(s));
+    return 0;
+}
+
+# Let `ms` pass WITHOUT holding the CPU. sleep_ms#41 disables preemption for the
+# whole sleep, so the agents this test waits for would not run meanwhile;
+# pause#14 yields to a ready process first.
+fn _g_wait(ms) {
+    var t0 = clock_now_ms();
+    while (clock_now_ms() - t0 < ms) {
+        ipc_poll_once(0);   # serve the agents' channels, as daimon's loop does
+        sys_pause();
+    }
+    return 0;
+}
+
+# Step a stop until it is over, or `ms` pass. Returns agent_stop_step's last answer.
+fn _g_stop(h, ms) {
+    var t0 = clock_now_ms();
+    var done = 0;
+    while (done == 0) {
+        done = agent_stop_step(h, clock_now_ms());
+        if (done == 0) {
+            if (clock_now_ms() - t0 > ms) { return 0; }
+            _g_wait(10);
+        }
+    }
+    return done;
+}
+
+# Reap until the agent's process is collected, or `ms` pass. Returns 1 if reaped.
+fn _g_reap(h, ms) {
+    var t0 = clock_now_ms();
+    while (clock_now_ms() - t0 <= ms) {
+        if (agent_reap(h) == 1) { return 1; }
+        _g_wait(10);
+    }
+    return 0;
+}
+
+alloc_init();
+daimon_audit_init();
+_g_say("GUEST start\n");
+var bus = msg_bus_new();
+ipc_attach_bus(bus);
+msg_bus_subscribe(bus, "1");
+agent_set_agents_dir("/agents");
+AGENT_STOP_GRACE_MS = 400;
+DAIMON_REAP_BUDGET_MS = 400;
+
+# --- a user agent: started, running, stopped by SIGTERM -----------------------
+var h1 = agent_handle_new(1, str_from("worker"));
+var r1_t, r1_v = agent_start(h1, 0, 0);
+assert_eq(is_ok(r1_t), 1, "agnos: a user agent starts (spawn_path#43)");
+assert(r1_v > 0, "agnos: ... and has a pid");
+assert_eq(agent_status(h1), AGENT_RUNNING, "agnos: ... RUNNING");
+assert_eq(agent_limits_enforced(h1), 0, "agnos: ... without its limits (agnos has none yet)");
+_g_wait(300);
+assert_eq(ipc_channel_count(), 1, "agnos: its channel is open (CH_MINT, CH_ENDOW)");
+assert(ipc_published_count() >= 1, "agnos: the frame it sent on its channel reached the bus");
+var q1 = msg_bus_queue(bus, "1");
+assert(vec_len(q1) >= 1, "agnos: ... into the subscriber's queue");
+if (vec_len(q1) >= 1) {
+    var m1 = vec_get(q1, 0);
+    assert_eq(str_eq_cstr(ipc_msg_source(m1), "1"), 1, "agnos: ... from the agent, by channel");
+    assert_eq(str_contains(ipc_msg_payload(m1), str_from("hello from an agnos agent")), 1,
+      "agnos: ... with its payload (two records joined)");
+}
+assert(read_vm_rss(agent_pid(h1)) > 0, "agnos: its resident memory is read from proclist#99");
+assert(read_cpu_time_ms(agent_pid(h1)) >= 0, "agnos: ... and its CPU time");
+assert_eq(agent_is_alive(h1), 1, "agnos: it is alive (a proclist#99 record)");
+assert_eq(read_vm_rss(4242), 0, "agnos: a pid with no process reads as 0");
+assert_eq(agent_reap(h1), 0, "agnos: a running agent is not reaped (waitpid#4 answers -2)");
+assert_eq(agent_status(h1), AGENT_RUNNING, "agnos: ... and stays RUNNING");
+assert_eq(agent_stop_begin(h1, "test"), 0, "agnos: a stop begins (SIGTERM, kill#16)");
+assert_eq(agent_status(h1), AGENT_STOPPING, "agnos: ... STOPPING meanwhile");
+assert_eq(_g_stop(h1, 5000), 1, "agnos: ... and ends");
+assert_eq(agent_status(h1), AGENT_STOPPED, "agnos: ... STOPPED");
+assert_eq(agent_exit_code(h1), 0, "agnos: ... with the agent's own exit code (it read its signalfd)");
+assert_eq(agent_pid(h1), 0, "agnos: ... and its pid cleared");
+assert_eq(agent_is_alive(h1), 0, "agnos: ... and it is no longer alive");
+
+# --- a system agent exits 3 on its own ----------------------------------------
+var h2 = agent_handle_new(2, str_from("crasher"));
+agent_set_type(h2, AGENT_TYPE_SYSTEM);
+var r2_t, r2_v = agent_start(h2, 0, 0);
+assert_eq(is_ok(r2_t), 1, "agnos: a system agent starts");
+assert_eq(_g_reap(h2, 3000), 1, "agnos: an agent that exits is reaped");
+assert_eq(agent_status(h2), AGENT_FAILED, "agnos: ... FAILED (exit 3)");
+assert_eq(agent_exit_code(h2), 3, "agnos: ... with exit code 3");
+
+# --- command lines agnos cannot pass ------------------------------------------
+var h3 = agent_handle_new(3, str_from("two words"));
+var r3_t, r3_v = agent_start(h3, 0, 0);
+assert_eq(is_err_result(r3_t), 1, "agnos: a name with a space is refused (the kernel splits on spaces)");
+assert_eq(r3_v, AGENT_OP_ARGS, "agnos: ... as AGENT_OP_ARGS");
+assert_eq(agent_status(h3), AGENT_PENDING, "agnos: ... and the agent stays PENDING");
+var lsb = str_builder_new();
+var li = 0;
+while (li < 100) {
+    str_builder_add_cstr(lsb, "n");
+    li = li + 1;
+}
+var h4 = agent_handle_new(4, str_builder_build(lsb));
+var r4_t, r4_v = agent_start(h4, 0, 0);
+assert_eq(r4_v, AGENT_OP_ARGS, "agnos: a command line over 127 bytes is refused");
+
+# --- pause is refused; the agent is then stopped ------------------------------
+var h5 = agent_handle_new(5, str_from("pausable"));
+var r5_t, r5_v = agent_start(h5, 0, 0);
+assert_eq(is_ok(r5_t), 1, "agnos: another user agent starts");
+var p5_t, p5_v = agent_pause(h5);
+assert_eq(p5_v, AGENT_OP_UNSUPPORTED, "agnos: pause is refused (SIGSTOP stops nothing there yet)");
+assert_eq(agent_status(h5), AGENT_RUNNING, "agnos: ... and the agent keeps RUNNING");
+agent_stop_begin(h5, "test");
+assert_eq(_g_stop(h5, 5000), 1, "agnos: ... then stops");
+assert_eq(agent_status(h5), AGENT_STOPPED, "agnos: ... STOPPED");
+
+# --- daimon's own blocking stop waits without holding the CPU -------------------
+# agent_stop (a stop not served by the event loop) waited with sleep_ms, which on
+# agnos holds the CPU for the whole sleep: the agent never ran to see SIGTERM.
+# It waits with daimon_yield_ms now.
+var h8 = agent_handle_new(8, str_from("blocking"));
+var r8_t, r8_v = agent_start(h8, 0, 0);
+assert_eq(is_ok(r8_t), 1, "agnos: a user agent starts for agent_stop");
+_g_wait(200);
+agent_stop(h8, "test");
+assert_eq(agent_status(h8), AGENT_STOPPED, "agnos: agent_stop ends it (daimon_yield_ms lets the agent run)");
+assert_eq(agent_exit_code(h8), 0, "agnos: ... with the agent's own exit code");
+
+# --- an agent that ignores SIGTERM: agnos cannot end it yet ---------------------
+var h6 = agent_handle_new(6, str_from("stubborn"));
+agent_set_type(h6, AGENT_TYPE_SERVICE);
+var r6_t, r6_v = agent_start(h6, 0, 0);
+assert_eq(is_ok(r6_t), 1, "agnos: a service agent starts");
+_g_wait(200);
+agent_stop_begin(h6, "test");
+assert_eq(_g_stop(h6, 5000), 1, "agnos: a stop of an agent that ignores SIGTERM gives up");
+assert_eq(agent_status(h6), AGENT_STOPPING, "agnos: ... leaving it STOPPING (no signal ends a process yet)");
+assert(agent_pid(h6) > 0, "agnos: ... with its pid kept, for a later reap");
+assert_eq(daimon_reap_code(agent_pid(h6)), 0 - 2, "agnos: ... and it is still running");
+
+# --- no executable for a type -------------------------------------------------
+agent_set_agents_dir("/none");
+var h7 = agent_handle_new(7, str_from("orphan"));
+var r7_t, r7_v = agent_start(h7, 0, 0);
+assert_eq(r7_v, AGENT_OP_NO_EXECUTABLE, "agnos: no executable for the type is refused");
+
+var failed = assert_summary();
+_g_say("GUEST DONE ");
+fmt_int(failed);
+_g_say("\n");
+sys_exit(failed);

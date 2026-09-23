@@ -86,8 +86,8 @@ GET /v1/agents/1
 
 # Start — runs the agent's process (2.3.0)
 POST /v1/agents/1/start
-→ {"id":1,"name":"my-agent","type":"User","status":2,"pid":4242,"exit_code":null}
-→ 409 not Pending/Stopped/Failed · 422 no executable for its type · 501 on AGNOS (until 2.4.x)
+→ {"id":1,"name":"my-agent","type":"User","status":2,"pid":4242,"exit_code":null,"limits_enforced":true}
+→ 409 not Pending/Stopped/Failed · 422 no executable for its type (on AGNOS also: a name with a space)
 
 # Stop — SIGTERM, up to 5 s to exit, then SIGKILL; always 200, once the agent is gone
 POST /v1/agents/1/stop
@@ -142,6 +142,22 @@ reached again.
 - `serve --agent-output capture` collects each agent's stdout and stderr: the last 32 KiB, served
   at `GET /v1/agents/{id}/output`. Invalid UTF-8 is shown as U+FFFD. The default, `inherit`, leaves
   them daimon's own.
+
+**On AGNOS** (2.4.0, [ADR-007](../adr/007-daimon-on-agnos.md)) the same routes use the agnos
+kernel's primitives. Some things differ until agnos closes the gaps filed with it
+(`docs/development/issues/2026-09-23-*.md` in the agnos repo):
+- **Start**: `spawn_path` runs `<exe> --agent-id <id> --agent-name <name>` as one line split on
+  spaces, at most 127 bytes. So a name with a space, or a longer line, answers **422**. The
+  environment is daimon's (filtered by `--agent-env`), at most 16 entries and 1024 bytes, plus
+  `AGNOS_IPC_FD` naming the channel's fd, which the kernel chooses.
+- **No limits**: agnos has none, so the agent runs without its quota. Its JSON says
+  `"limits_enforced":false`, and each start is audited `agent.limits.unenforced`.
+- **Stop asks**: SIGTERM, which the agent sees on a signalfd. An agent that ignores it stays at status
+  4 (Stopping), because no signal ends a process on agnos yet. Pause and resume answer **501**.
+- **No captured output**: `serve --agent-output capture` exits 1, because an agnos child inherits
+  daimon's whole fd table.
+- **The listener** is on the NIC's address: agnos cannot bind 127.0.0.1. daimon warns and audits
+  `http.listen.not_loopback`. Local clients reach it at the box's own address, not 127.0.0.1.
 
 **Browsers may not control agents.** start / stop / pause / resume / DELETE answer **403** to any
 request carrying an `Origin` header. A web page can send a cross-origin `text/plain` POST with no
@@ -331,7 +347,7 @@ See [agent-ipc.md](agent-ipc.md).
 | 422 | Unprocessable Entity — validation failure |
 | 429 | Too Many Requests — rate limit (120/min per IP), or an agent's message queue is full |
 | 500 | Internal Server Error — e.g. an agent's rlimits could not be applied, or its executable could not be run |
-| 501 | Not Implemented — chunked Transfer-Encoding; agent processes on AGNOS (until 2.4.x) |
+| 501 | Not Implemented — chunked Transfer-Encoding; pause and resume on AGNOS |
 | 502 | Bad Gateway — an MCP endpoint could not be reached or answered wrongly |
 | 504 | Gateway Timeout — an MCP call, `web_fetch` or `web_search` did not finish within 60 s |
 

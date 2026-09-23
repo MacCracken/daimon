@@ -36,8 +36,9 @@ enum AgentOpError {
     AGENT_OP_NO_PROCESS = 3;      # pipe2 or fork failed
     AGENT_OP_NO_LIMITS = 4;       # an rlimit could not be applied (VULN-010)
     AGENT_OP_NO_EXEC = 5;         # execve failed
-    AGENT_OP_UNSUPPORTED = 6;     # this target cannot run agents yet (agnos: 2.4.x)
+    AGENT_OP_UNSUPPORTED = 6;     # this target cannot do this yet (agnos: pause / resume)
     AGENT_OP_SIGNAL = 7;          # the signal could not be delivered
+    AGENT_OP_ARGS = 8;            # the command line cannot be passed (agnos: a space, or > 127 bytes)
 }
 
 # AgentHandle: {id, name, status, created_at, started_at, pid,
@@ -46,7 +47,7 @@ enum AgentOpError {
 # 12 fields x 8 bytes = 96 bytes (type + exit_code added at 2.3.0)
 
 fn agent_handle_new(id, name) {
-    var h = alloc(112);
+    var h = alloc(120);
     store64(h, id);                # id (integer counter)
     # ⛔ str_clone THE NAME — copy at the RETENTION boundary. 2.2.1.
     #
@@ -79,6 +80,7 @@ fn agent_handle_new(id, name) {
     store64(h + 88, 0 - 1);        # exit_code: -1 until the process has exited
     store64(h + 96, 0);            # a stop's SIGKILL deadline, ms (0 = no stop under way; 2.3.4)
     store64(h + 104, 0);           # when that stop sent SIGKILL, ms (0 = not yet)
+    store64(h + 112, 0);           # 1 if its process runs under its limits (2.4.0; agnos cannot)
     return h;
 }
 
@@ -97,12 +99,17 @@ fn agent_type(h) { return load64(h + 80); }
 # The exit code of the agent's last process (128 + signal if a signal killed
 # it), or -1 if it has not exited — or exited somewhere daimon could not see.
 fn agent_exit_code(h) { return load64(h + 88); }
+# 1 if the agent's process runs under its quota's limits: always on Linux (a
+# start whose rlimits fail is refused), never on agnos, which has no limits yet
+# (2.4.0; filed with agnos 2026-09-23).
+fn agent_limits_enforced(h) { return load64(h + 112); }
 
 fn agent_set_status(h, s) { store64(h + 16, s); }
 fn agent_set_pid(h, pid) { store64(h + 40, pid); }
 fn agent_set_started_at(h, t) { store64(h + 32, t); }
 fn agent_set_type(h, t) { store64(h + 80, t); }
 fn agent_set_exit_code(h, c) { store64(h + 88, c); }
+fn agent_set_limits_enforced(h, v) { store64(h + 112, v); }
 
 # agnostik's serialised name for a type.
 fn agent_type_name(t) {
@@ -135,8 +142,32 @@ fn agent_next_id() {
 
 # /proc helpers — read resource usage for a PID
 
+#ifdef CYRIUS_TARGET_AGNOS
+# agnos (2.4.0) has no /proc. proclist#99 reports each live process as a
+# 64-byte record: +0 pid, and +56 a word holding its CPU ticks (low 32 bits,
+# 100 Hz) and its resident 4 KiB pages (high 32 bits). The table has 16 slots.
+var _agent_pl: u8[1024];
+var _AGENT_PL_ABSENT = 0 - 1;
+
+# The +56 word of `pid`'s record, or -1 when no live process has that pid.
+fn _agent_proc_word(pid) {
+    var n = sys_proclist(&_agent_pl, 16);
+    var i = 0;
+    while (i < n) {
+        if (load64(&_agent_pl + i * 64) == pid) { return load64(&_agent_pl + i * 64 + 56); }
+        i = i + 1;
+    }
+    return _AGENT_PL_ABSENT;
+}
+#endif
+
 fn read_vm_rss(pid) {
     if (pid == 0) { return 0; }
+    #ifdef CYRIUS_TARGET_AGNOS
+    var w = _agent_proc_word(pid);
+    if (w < 0) { return 0; }
+    return (w >> 32) * 4096;
+    #endif
     var path_sb = str_builder_new();
     str_builder_add_cstr(path_sb, "/proc/");
     str_builder_add_int(path_sb, pid);
@@ -197,6 +228,11 @@ fn read_vm_rss(pid) {
 # Read CPU time (utime+stime) from /proc/{pid}/stat in milliseconds
 fn read_cpu_time_ms(pid) {
     if (pid == 0) { return 0; }
+    #ifdef CYRIUS_TARGET_AGNOS
+    var cw = _agent_proc_word(pid);
+    if (cw < 0) { return 0; }
+    return (cw & 4294967295) * 10;   # 100 Hz ticks
+    #endif
     var path_sb = str_builder_new();
     str_builder_add_cstr(path_sb, "/proc/");
     str_builder_add_int(path_sb, pid);
@@ -280,6 +316,9 @@ fn normalize_vec(v, dim) {
 # given str_data — and 0 for /tmp given str_data too.
 fn count_fds(pid) {
     if (pid == 0) { return 0; }
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 0;   # agnos offers no way to count another process's descriptors
+    #endif
     var path_sb = str_builder_new();
     str_builder_add_cstr(path_sb, "/proc/");
     str_builder_add_int(path_sb, pid);
@@ -292,6 +331,9 @@ fn count_fds(pid) {
 
 fn count_threads(pid) {
     if (pid == 0) { return 1; }
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 1;   # an agnos process is one thread
+    #endif
     var path_sb = str_builder_new();
     str_builder_add_cstr(path_sb, "/proc/");
     str_builder_add_int(path_sb, pid);
@@ -317,6 +359,11 @@ fn agent_update_resources(h) {
 fn agent_is_alive(h) {
     var pid = agent_pid(h);
     if (pid == 0) { return 0; }
+    #ifdef CYRIUS_TARGET_AGNOS
+    # kill#16 checks bounds and ownership, not whether the process lives.
+    if (_agent_proc_word(pid) < 0) { return 0; }
+    return 1;
+    #endif
     var r = sys_kill(pid, 0);
     if (r == 0) { return 1; }
     return 0;
@@ -754,6 +801,20 @@ fn _agent_type_slug(t) {
     return "user";
 }
 
+# 1 if `path` names a file daimon can run. agnos (2.4.0) has no access() (the
+# cyrius peer's sys_access is a stub that always fails, so no executable was ever
+# found there) and no execute permission: a file that stat#33 finds is runnable.
+fn _agent_runnable(path) {
+    #ifdef CYRIUS_TARGET_AGNOS
+    var st: u8[48];
+    if (sys_stat(path, strlen(path), &st) == 0) { return 1; }
+    return 0;
+    #else
+    if (sys_access(path, 1) == 0) { return 1; }   # X_OK
+    return 0;
+    #endif
+}
+
 # <dir>/<file> if it exists and is executable, else 0.
 fn _agent_exe_in(dir, file) {
     var sb = str_builder_new();
@@ -761,7 +822,7 @@ fn _agent_exe_in(dir, file) {
     str_builder_add_cstr(sb, "/");
     str_builder_add_cstr(sb, file);
     var p = str_data(str_builder_build(sb));   # builder output is NUL-terminated
-    if (sys_access(p, 1) == 0) { return p; }   # X_OK
+    if (_agent_runnable(p) == 1) { return p; }
     return 0;
 }
 
@@ -782,7 +843,7 @@ fn agent_find_executable(t) {
     if (p != 0) { return p; }
     p = _agent_exe_in("/opt/agnos/agents", file);
     if (p != 0) { return p; }
-    if (sys_access("/usr/bin/agnos-agent-runner", 1) == 0) { return "/usr/bin/agnos-agent-runner"; }
+    if (_agent_runnable("/usr/bin/agnos-agent-runner") == 1) { return "/usr/bin/agnos-agent-runner"; }
     return 0;
 }
 
@@ -802,7 +863,7 @@ fn agent_start(h, mem_limit, cpu_secs) {
         }
     }
     #ifdef CYRIUS_TARGET_AGNOS
-    return Err(AGENT_OP_UNSUPPORTED);
+    return _agent_start_agnos(h);
     #else
     var exe = agent_find_executable(agent_type(h));
     if (exe == 0) { return Err(AGENT_OP_NO_EXECUTABLE); }
@@ -857,6 +918,7 @@ fn agent_start(h, mem_limit, cpu_secs) {
     agent_set_exit_code(h, 0 - 1);
     agent_set_started_at(h, clock_epoch_secs());
     agent_set_status(h, AGENT_RUNNING);
+    agent_set_limits_enforced(h, 1);   # the child applied them, or it would not have exec'd
     daimon_audit_agent(SEV_INFO, "agent", "agent.spawn", "agent process started", str_data(agent_name(h)));
     # daimon's end joins the channels the event loop polls (src/ipc.cyr), which
     # own it from here on, replacing any channel left from an earlier run; the
@@ -866,6 +928,171 @@ fn agent_start(h, mem_limit, cpu_secs) {
     return Ok(r_v);
     #endif
 }
+
+#ifdef CYRIUS_TARGET_AGNOS
+# --- Starting an agent on agnos (2.4.0) ---
+#
+# spawn_path#43 loads the executable and returns the child's pid at once, or -1
+# when it cannot be loaded: the counterpart of the Linux exec report. waitpid#4
+# collects the exit code as on Linux (daimon_reap_code). What agnos cannot do
+# yet is filed with it (the agnos repo, docs/development/issues/2026-09-23-*):
+#   - resource limits: the agent runs without its quota, and each start records
+#     that (agent_limits_enforced 0, audit agent.limits.unenforced);
+#   - argv: one line split on spaces, at most 127 bytes, so an agent whose name
+#     contains a space, or a longer line, is refused (AGENT_OP_ARGS);
+#   - ending a process: a stop asks with SIGTERM and waits (agent_stop_step).
+# The agent's channel is chan_op's (src/ipc.cyr): the pair is minted, the
+# agent's end is endowed to the child (CH_ENDOW moves it; the kernel chooses
+# the fd, announced as AGNOS_IPC_FD), and daimon's end is served by the loop.
+var AGENT_AGNOS_LINE_MAX = 127;     # spawn_path#43 refuses a longer line
+var AGENT_AGNOS_ENV_MAX = 1024;     # an env blob over this, or with more
+var AGENT_AGNOS_ENV_ENTRIES = 16;   # entries, gets the kernel's default env instead
+
+fn _agent_has_space(p, n) {
+    var i = 0;
+    while (i < n) {
+        if (load8(p + i) == 32) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# "<exe> --agent-id <id> --agent-name <name>" as spawn_path takes it, or 0 when
+# it cannot be passed.
+fn _agent_cmdline_agnos(exe, id, name) {
+    var nl = str_len(name);
+    if (nl == 0) { return 0; }
+    if (_agent_has_space(str_data(name), nl) == 1) { return 0; }
+    if (_agent_has_space(exe, strlen(exe)) == 1) { return 0; }
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, exe);
+    str_builder_add_cstr(sb, " --agent-id ");
+    str_builder_add_int(sb, id);
+    str_builder_add_cstr(sb, " --agent-name ");
+    str_builder_add(sb, name);
+    var line = str_builder_build(sb);
+    if (str_len(line) > AGENT_AGNOS_LINE_MAX) { return 0; }
+    return line;
+}
+
+# daimon's environment as spawn_path's env blob ("K=V\0K=V\0"), filtered by
+# `serve --agent-env` as the Linux envp is, then `extra` ("K=V", or 0). The
+# kernel answers a blob past its limits by giving the child its DEFAULT
+# environment, so entries that would not fit are left out here instead, and
+# logged. agnos keeps no /proc: the environment is read from daimon's own init
+# stack, as lib/args_agnos.cyr's getenv does. Returns a Str, empty if there is
+# nothing to pass.
+fn _agent_env_blob_agnos(extra) {
+    var sb = str_builder_new();
+    var room = AGENT_AGNOS_ENV_ENTRIES;
+    var budget = AGENT_AGNOS_ENV_MAX;
+    if (extra != 0) {
+        room = room - 1;
+        budget = budget - strlen(extra) - 1;
+    }
+    var entries = 0;
+    var used = 0;
+    var left_out = 0;
+    var base = _agnos_argv_base();
+    if (base != 0) {
+        var envv = base + 8 + (load64(base) + 1) * 8;   # &envp[0], after argv's NULL
+        var j = 0;
+        while (j < 256) {
+            var e = load64(envv + j * 8);
+            if (e == 0) { break; }
+            j = j + 1;
+            var keep = 1;
+            if (strlen(e) >= 13) { if (memeq(e, "AGNOS_IPC_FD=", 13) == 1) { keep = 0; } }
+            if (_agent_env_mode == AGENT_ENV_MINIMAL) {
+                if (_agent_env_keep(e) == 0) { keep = 0; }
+            }
+            if (keep == 1) {
+                var n = strlen(e);
+                if (entries >= room) {
+                    left_out = left_out + 1;
+                } elif (used + n + 1 > budget) {
+                    left_out = left_out + 1;
+                } else {
+                    str_builder_add_cstr(sb, e);
+                    str_builder_add_byte(sb, 0);
+                    used = used + n + 1;
+                    entries = entries + 1;
+                }
+            }
+        }
+    }
+    if (extra != 0) {
+        str_builder_add_cstr(sb, extra);
+        str_builder_add_byte(sb, 0);
+    }
+    if (left_out > 0) {
+        sakshi_warn("agent environment trimmed to agnos's 16 entries / 1024 bytes", 61);
+    }
+    return str_builder_build(sb);
+}
+
+fn _agent_start_agnos(h) {
+    var exe = agent_find_executable(agent_type(h));
+    if (exe == 0) { return Err(AGENT_OP_NO_EXECUTABLE); }
+    var line = _agent_cmdline_agnos(exe, agent_id(h), agent_name(h));
+    if (line == 0) { return Err(AGENT_OP_ARGS); }
+    var chfds: i32[2];
+    if (ipc_channel_open(&chfds) != 0) { return Err(AGENT_OP_NO_PROCESS); }   # CH_E_FULL: 16 channels in all
+    var own_end = load32(&chfds);
+    var agent_end = load32(&chfds + 4);
+    var child_fd = sys_chan_endow(agent_end);
+    if (child_fd < 0) {
+        sys_chan_close(agent_end);
+        sys_chan_close(own_end);
+        return Err(AGENT_OP_NO_PROCESS);
+    }
+    var isb = str_builder_new();
+    str_builder_add_cstr(isb, "AGNOS_IPC_FD=");
+    str_builder_add_int(isb, child_fd);
+    var env = _agent_env_blob_agnos(str_data(str_builder_build(isb)));
+    var env_p = 0;
+    var env_n = 0;
+    if (str_len(env) > 0) {
+        env_p = str_data(env);
+        env_n = str_len(env);
+    }
+    agent_set_status(h, AGENT_STARTING);
+    sakshi_info("starting agent", 14);
+    var pid = sys_spawn_path_env(str_data(line), str_len(line), env_p, env_n);
+    if (pid < 0) {
+        # A failed spawn leaves the endowment armed for whatever spawns next;
+        # with both ends closed, its placement is refused (filed with agnos).
+        sys_chan_close(agent_end);
+        sys_chan_close(own_end);
+        agent_set_status(h, AGENT_FAILED);
+        daimon_audit_agent(SEV_WARNING, "agent", "agent.spawn.fail", "agent process failed to start",
+          str_data(agent_name(h)));
+        return Err(AGENT_OP_NO_EXEC);
+    }
+    agent_set_pid(h, pid);
+    agent_set_exit_code(h, 0 - 1);
+    agent_set_started_at(h, clock_epoch_secs());
+    agent_set_status(h, AGENT_RUNNING);
+    agent_set_limits_enforced(h, 0);
+    daimon_audit_agent(SEV_INFO, "agent", "agent.spawn", "agent process started", str_data(agent_name(h)));
+    daimon_audit_agent(SEV_WARNING, "agent", "agent.limits.unenforced",
+      "agent runs without its memory and CPU limits: agnos has none yet", str_data(agent_name(h)));
+    # The agent's end moved to the child, so CH_CLOSE on it fails (daimon no
+    # longer owns it) and a plain close frees daimon's inert copy. If it
+    # succeeds, the kernel refused the placement and the agent has no channel.
+    if (sys_chan_close(agent_end) == 0) {
+        sakshi_warn("agent started without its channel: agnos refused the endowment", 62);
+        daimon_audit_agent(SEV_WARNING, "ipc", "ipc.endow.refused",
+          "agent started without its channel: agnos refused the endowment", str_data(agent_name(h)));
+    } else {
+        sys_close(agent_end);
+    }
+    var id_sb = str_builder_new();
+    str_builder_add_int(id_sb, agent_id(h));
+    ipc_service_add(str_builder_build(id_sb), own_end);
+    return Ok(pid);
+}
+#endif
 
 # How long a stopping agent gets between SIGTERM and SIGKILL. The Rust original
 # gave 10 s, but it stopped agents on an async runtime; daimon's server answers
@@ -961,13 +1188,16 @@ fn agent_stop_step(h, now) {
 # caller that may block (tests; a request not served by the event loop).
 fn agent_stop(h, reason) {
     if (agent_stop_begin(h, reason) == 1) { return Ok(0); }
-    while (agent_stop_step(h, clock_now_ms()) == 0) { sleep_ms(1); }
+    while (agent_stop_step(h, clock_now_ms()) == 0) { daimon_yield_ms(1); }
     return Ok(0);
 }
 
 # Pause (SIGSTOP) a RUNNING agent.
 fn agent_pause(h) {
     if (agent_status(h) != AGENT_RUNNING) { return Err(AGENT_OP_BAD_STATE); }
+    #ifdef CYRIUS_TARGET_AGNOS
+    return Err(AGENT_OP_UNSUPPORTED);   # SIGSTOP stops nothing there yet (filed with agnos 2026-09-23)
+    #endif
     if (daimon_signal_tree(agent_pid(h), 19) != 0) { return Err(AGENT_OP_SIGNAL); }   # SIGSTOP
     agent_set_status(h, AGENT_PAUSED);
     return Ok(0);
@@ -976,6 +1206,9 @@ fn agent_pause(h) {
 # Resume (SIGCONT) a PAUSED agent.
 fn agent_resume(h) {
     if (agent_status(h) != AGENT_PAUSED) { return Err(AGENT_OP_BAD_STATE); }
+    #ifdef CYRIUS_TARGET_AGNOS
+    return Err(AGENT_OP_UNSUPPORTED);
+    #endif
     if (daimon_signal_tree(agent_pid(h), 18) != 0) { return Err(AGENT_OP_SIGNAL); }   # SIGCONT
     agent_set_status(h, AGENT_RUNNING);
     return Ok(0);

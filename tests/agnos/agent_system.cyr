@@ -1,0 +1,7 @@
+# daimon's AGNOS guest test (tests/agnos/run.sh): the system-type fixture agent.
+# Exits 3 at once: an agent that fails on its own.
+include "lib/string.cyr"
+include "lib/syscalls.cyr"
+
+syscall(SYS_WRITE, 1, "AGENT system exiting 3\n", 23);
+sys_exit(3);

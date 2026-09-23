@@ -1,0 +1,86 @@
+# daimon's AGNOS guest test (tests/agnos/run.sh): the user-type fixture agent.
+# Prints its argv and environment to the console, sends daimon one frame on its
+# channel (AGNOS_IPC_FD, a chan_op endpoint) and prints the reply, then waits
+# for SIGTERM on a signalfd and exits 0: the graceful stop daimon asks for.
+include "lib/string.cyr"
+include "lib/alloc.cyr"
+include "lib/str.cyr"
+include "lib/fmt.cyr"
+include "lib/io.cyr"
+include "lib/syscalls.cyr"
+include "lib/args.cyr"
+
+fn _a_put(s) {
+    syscall(SYS_WRITE, 1, s, strlen(s));
+    return 0;
+}
+
+alloc_init();
+_a_put("AGENT user argv:");
+var i = 0;
+while (i < argc()) {
+    _a_put(" ");
+    _a_put(argv(i));
+    i = i + 1;
+}
+_a_put("\n");
+# The environment, from the init stack (argc, argv, NULL, then envp).
+var base = _agnos_argv_base();
+var envv = base + 8 + (load64(base) + 1) * 8;
+var j = 0;
+while (load64(envv + j * 8) != 0) {
+    _a_put("AGENT user env: ");
+    _a_put(load64(envv + j * 8));
+    _a_put("\n");
+    j = j + 1;
+}
+# One frame, the Linux wire format: a 4-byte big-endian length, then the JSON
+# body. At about 90 bytes it spans two 64-byte records, which daimon joins.
+var cfd = 0 - 1;
+var fdv = getenv("AGNOS_IPC_FD");
+if (fdv != 0) {
+    cfd = 0;
+    var ci = 0;
+    while (load8(fdv + ci) >= 48 && load8(fdv + ci) <= 57) {
+        cfd = cfd * 10 + load8(fdv + ci) - 48;
+        ci = ci + 1;
+    }
+    var body = "{\"target\":\"*\",\"type\":\"event\",\"payload\":{\"greeting\":\"hello from an agnos agent\",\"n\":1}}";
+    var blen = strlen(body);
+    var frame = alloc(blen + 4);
+    store8(frame, 0);
+    store8(frame + 1, 0);
+    store8(frame + 2, (blen >> 8) & 255);
+    store8(frame + 3, blen & 255);
+    memcpy(frame + 4, body, blen);
+    var off = 0;
+    while (off < blen + 4) {
+        var n = blen + 4 - off;
+        if (n > 64) { n = 64; }
+        sys_chan_send(cfd, frame + off, n);
+        off = off + n;
+    }
+}
+# Then one loop, as an agent should have: the reply on its channel and SIGTERM
+# on its signalfd, whichever comes, without waiting on either.
+var mask: i64[1];
+store64(&mask, 1 << 15);   # SIGTERM
+var sfd = sys_signalfd(0 - 1, &mask, 0);
+var got: u8[8];
+var reply: u8[8];
+while (1 == 1) {
+    if (cfd >= 0) {
+        if (sys_chan_recv(cfd, &reply, 8) == 1) {
+            _a_put("AGENT user channel reply ");
+            fmt_int(load8(&reply));
+            _a_put("\n");
+        }
+    }
+    if (sys_read(sfd, &got, 4) == 4) {
+        if (load32(&got) == 15) {
+            _a_put("AGENT user got SIGTERM\n");
+            sys_exit(0);
+        }
+    }
+    sys_pause();   # not sleep_ms#41, which holds the CPU for the whole sleep
+}

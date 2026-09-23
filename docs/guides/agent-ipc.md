@@ -1,4 +1,4 @@
-# Agent IPC — the agent's channel (2.3.3; 2.3.4)
+# Agent IPC — the agent's channel (2.3.3; 2.3.4; AGNOS 2.4.0)
 
 Every agent daimon starts gets a **channel** to daimon: one end of a Unix socketpair, open in the
 agent as **file descriptor 3**. daimon announces it in the agent's environment as
@@ -9,8 +9,8 @@ agent's program starts, and only that agent's process received it, so daimon kno
 The source of every message is the agent daimon started on that channel, whatever the message
 says.
 
-On AGNOS, agents cannot be started yet (a start answers 501 until 2.4.x maps `chan_op`, the kernel's
-capability channels, which work the same way).
+On AGNOS (2.4.0) the channel is the kernel's own: a `chan_op` pair, one end moved into the agent at
+spawn. The frames and replies are the same. See [On AGNOS](#on-agnos) for the three differences.
 
 ## The wire format
 
@@ -145,11 +145,30 @@ os.write(fd, struct.pack(">I", len(body)) + body)
 reply = os.read(fd, 1)[0]    # 1 ACK, 2 NACK_QUEUE_FULL, 3 NACK_INVALID, 4 NACK_NO_TARGET
 ```
 
+## On AGNOS
+
+The channel is a `chan_op`#97 pair. daimon mints it (`CH_MINT`) and moves one end into the agent as it
+spawns (`CH_ENDOW`). **Three things differ from Linux:**
+
+1. **The fd is not 3.** The kernel chooses it. Read `AGNOS_IPC_FD` from the environment; an agent
+   written that way works on both.
+2. **Bytes travel in records of at most 64 bytes.** Write a frame with `CH_SEND` in chunks of up to
+   64 bytes, and read the reply with `CH_RECV`. daimon joins the records back into the same stream.
+   An agent that uses plain `write` / `read` on the fd works too: the kernel routes them to the
+   channel.
+3. **A frame is at most 4092 bytes**, and an agent should wait for each reply before its next frame.
+   An inbox holds 64 records (4096 bytes) and drops its **oldest** when full, so a longer burst
+   would lose its first bytes before daimon read them. A declared length over 4092 is answered 3 and
+   closes the channel, as an oversize frame does on Linux.
+
+A reply is one record of one byte. When daimon closes the channel (the agent is reaped), the agent's
+next `CH_RECV` answers `CH_E_PEERGONE`.
+
 ## Limits
 
 | limit | value | constant (`src/ipc.cyr`) |
 |---|---|---|
-| frame body | 65536 bytes | `MAX_MESSAGE_SIZE` |
+| frame body | 65536 bytes (AGNOS: 4092) | `IPC_FRAME_MAX` |
 | target | 256 bytes | `IPC_TARGET_MAX` |
 | time to finish a begun frame | 5000 ms | `IPC_FRAME_TIMEOUT_MS` |
 | frames one channel may complete per pass of the loop | 16 | `IPC_FRAMES_PER_PASS` |

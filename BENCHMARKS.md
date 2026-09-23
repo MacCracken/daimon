@@ -40,6 +40,27 @@ those numbers are not comparable.
 
 `tests/rag_ingest.bcyr` (real since 2.1.6): `rag_ingest_real_5k` 133.1µs, `rag_chunk_only_5k` 508ns.
 
+### 2.4.0 — daimon on AGNOS
+
+**No performance claim for AGNOS yet.** 2.4.0 makes daimon's agent lifecycle, channels and loop
+correct there (the guest test, 64 checks). Measuring them under QEMU would measure QEMU, and the
+kernel's inbound accept is filed as broken.
+
+**The Linux side is unchanged.** 2.3.4 against 2.4.0, `tests/daimon.bcyr`, six interleaved runs,
+medians. Everything is within ±3% except two benchmarks in code 2.4.0 did not change (`src/mcp.cyr`
+and `src/edge.cyr` are untouched): code layout, not code.
+
+| Benchmark | 2.3.4 | 2.4.0 | change |
+|---|---:|---:|---:|
+| agent_spawn_reap | 1.457 ms | 1.427 ms | −2.1% |
+| ipc_frame_roundtrip | 11.63 µs | 11.64 µs | +0.1% |
+| bus_broadcast_take_100 | 13.85 µs | 13.69 µs | −1.1% |
+| mcp_manifest_100_tools (untouched) | 141.18 µs | 145.60 µs | +3.1% |
+| edge_stats_500 (untouched) | 59.16 µs | 61.57 µs | +4.1% |
+
+The agent handle grew from 112 to 120 bytes (`limits_enforced`), and the channel record from 80 to
+104 (the record buffer agnos needs).
+
 ### 2.3.4 — daimon's own event loop
 
 **The allocation lock is gone.** 2.3.3's channel thread made every allocation take the stdlib's
@@ -355,8 +376,8 @@ Scheduler scheduling (1.5x), supervisor registration (2.5x), MCP registration (1
 | | Rust | Cyrius |
 |---|---|---|
 | Unit tests | 305 | — (inline in test groups) |
-| Integration tests | 28 | 1033 assertions / 17 suites, each against its real `src/` module (2.3.4) |
+| Integration tests | 28 | 1038 assertions / 17 suites, each against its real `src/` module (2.4.0); AGNOS guest test 64 checks (tests/agnos/run.sh, by hand) |
 | Benchmarks | 19 | 29, against the real code (2.3.4) |
 | Fuzz harnesses | 0 | 7, property-based, run in CI (2.3.2) |
-| HTTP smoke | — | tests/smoke.sh, 130 checks, run in CI (2.3.4) |
-| Security audit | — | 18 findings (2026-04-13: 10; 2026-09-22 lifecycle: 8), 11 fixed or superseded since 2.3.0 — see docs/audit/ |
+| HTTP smoke | — | tests/smoke.sh, 131 checks, run in CI (2.4.0) |
+| Security audit | — | 28 findings (2026-04-13: 10; 2026-09-22 lifecycle: 8; 2026-09-23 AGNOS platform: 10, filed with agnos) — see docs/audit/ |

@@ -45,7 +45,7 @@ External (non-stdlib) deps used by daimon:
 | `majra` (2.9.1) | Event-sink dep of bote's bundle (`events_majra.cyr`). Present for compile-time resolution of the full bote bundle; daimon does not use it at runtime today. **Owns `ERR_IPC = 4`** — historically daimon renamed its own IPC error `ERR_IPC_FAULT` (1.3.0) to dodge this collision; at 1.4.2 every daimon error constant was namespaced `DAIMON_ERR_*` (now `DAIMON_ERR_IPC_FAULT`), so no daimon constant can collide with a vendored `ERR_*` and the rename satisfies cyrlint's `lint_error_enum_namespace` rule (6.4.51). |
 | `samay` (1.1.3) | Task scheduler — the extraction of daimon's own `scheduler.cyr`/`cron.cyr`, which daimon 2.0.0 replaced with this library. `[deps.samay]` carries both a `path = "../samay"` (local dev checkout) and a `tag` (the release pin). samay has no scheduler-level "start": daimon's task start / complete live in `src/sched.cyr` (2.3.1). ⚠ `task_scheduler_complete_task` answers `Err(1)` both for an unknown id and for a refused transition, so look the task up first. |
 | `nein` (1.7.0) | Firewall MCP tools (2.1.8, `dist/nein-mcp.cyr`). It is declared after `bote` and `sigil` in `cyrius.cyml` because its bundle leaves their symbols for the host to supply. The mutating half (`nein_allow` / `nein_deny`) is **gated shut** until caller authentication (roadmap 2.5.x). |
-| `ai-hwaccel` (2.3.23) | samay's hardware-acceleration dependency (samay's own `[deps.ai-hwaccel]`), declared here since 2.0.0 so the full `dist/samay.cyr` bundle resolves at compile time. daimon calls nothing in it directly. Same `path` + `tag` shape as samay. |
+| `ai-hwaccel` (2.3.24) | samay's hardware-acceleration dependency (samay's own `[deps.ai-hwaccel]`), declared here since 2.0.0 so the full `dist/samay.cyr` bundle resolves at compile time. daimon calls nothing in it directly. Resolved from its tag with no `path` (2.4.0): with a `path`, the tag is inert and every build re-copies the sibling checkout, which leaked one mid-change into the lock at 2.3.4. |
 
 **ADR-002 is invalid** — `lib/async.cyr` provides epoll-based cooperative async:
 ```cyrius
@@ -119,7 +119,7 @@ Every AGNOS agent, every consumer app, hoosh, agnoshi, aethersafha.
 - **Fixed local arrays: use element-typed `var a: i64[N]` for slot arrays** (and `u8[N]` / `i32[N]` / `u32[N]` for sized byte/scalar buffers). Since cyrius 6.2.1, bare `var a[N]` is **N bytes in a function** (N i64 slots only at top level) — an address-taken `var a[N]` written via `store64(&a + i*8)` under-reserves and silently corrupts adjacent memory. This caused the 1.2.6 routing-404 bug; swept in 1.2.7. Before re-testing any "fixed" compiler footgun, **read the cyrius language CHANGELOG** — fixes there are often language changes, not silent codegen patches.
 - Original Rust implementations are in git history at tags `0.5.0` / `0.6.0` (e.g. `git show 0.6.0:src/agent.rs`). The Cyrius port starts at `0.7.0`.
 
-## Commands (verified at 2.3.4)
+## Commands (verified at 2.4.0)
 
 ```sh
 export CYRIUS_NO_WARN_SHADOW_LIB=1 CYRIUS_DCE=1   # what CI sets
@@ -127,10 +127,11 @@ cyrius build src/main.cyr build/daimon           # also: --agnos build/daimon-ag
 cyrius test tests/<suite>.tcyr                   # one suite (17 suites, each includes its real src/ module)
 sh tests/test.sh                                 # every suite + tests/smoke.sh (the linked binary over HTTP) + cyrius fuzz
 cyrius vet src/main.cyr
-cyrius fmt <file> --check                        # CI runs this on src/*.cyr tests/*.tcyr tests/*.bcyr fuzz/*
+cyrius fmt <file> --check                        # CI runs this on src/*.cyr tests/*.tcyr tests/*.bcyr tests/agnos/*.cyr fuzz/*
 cyrius lint <file>                               # CI fails on any `warn`
 ./scripts/bench-history.sh                       # tests/daimon.bcyr; `cyrius bench tests/rag_ingest.bcyr` for the other two
 ./scripts/version-bump.sh <version>              # VERSION + src/config.cyr, only when the user names the version
+sh tests/agnos/run.sh                            # AGNOS guest test: boots ../agnos/build/agnos under QEMU (by hand; not in CI)
 ```
 
 `cyrius fmt <file>` without `--check` rewrites the file in place. `cyrius check` is only a syntax check.
@@ -139,8 +140,11 @@ not by a grepped summary (2.3.3: a suite printed 102/102 and then hung). aarch64
 `cyrius build --aarch64 tests/<suite>.tcyr <out>` then `qemu-aarch64 <out>`. Under qemu, `agent.tcyr`
 fails six checks that also fail on 2.3.2 there: QEMU applies no RLIMIT_AS, and qemu-user runs a
 thread of its own.
-The QEMU AGNOS boot harness belongs to the agnos repo; its `agnsh-smoke` gate looks for agnsh's own
-banner, so it reports FAIL for any other binary.
+`tests/agnos/run.sh` (2.4.0) builds `tests/agnos/*.cyr` and daimon for agnos, boots the PREBUILT
+kernel (`AGNOS_KERNEL`, `GNOBOOT_EFI`; read, never written) under QEMU with its own image in
+`build/agnos-guest/`, and reads `GUEST DONE` / `CLIENT DONE` from the serial log. Do not run the agnos
+repo's own harnesses from daimon: they write into `../agnos/build`, and a sibling checkout may be
+another session's work in progress.
 
 ## Conventions that bite (read before writing code)
 
@@ -180,6 +184,7 @@ banner, so it reports FAIL for any other binary.
 - **The event loop (2.3.4, ADR-006)**: daimon is ONE thread running `server_loop` (`src/server.cyr`)
   over one epoll set: the listener, connections being read, agent channels and output pipes
   (`src/ipc.cyr` registers those). Upkeep runs on its tick (`agents_tick`: reap, advance stops).
+  On agnos the same loop is polled (2.4.0, ADR-007).
   - **Do not start a thread.** It arms the stdlib's heap lock for every allocation, for good.
   - A handler runs on the loop, so **a handler that blocks holds everything**: channels, other
     clients, stops. Never wait in place. Wait for a process by deferring the answer
@@ -194,9 +199,19 @@ banner, so it reports FAIL for any other binary.
 - **cyrius has no adjacent-literal concatenation** (`"a" "b"` is a syntax error), and `cyrius fmt
   --check` / `cyrius lint` do not compile: build or run the suite after every edit.
 - **AGNOS is the primary target.** Arch- and kernel-specific calls go through the shims in
-  `src/syscalls.cyr` (`daimon_reap_code`, `daimon_signal`, …). Their agnos arms refuse process
-  operations until 2.4.x. For agnos syscalls read `agnos/kernel/core/syscall.cyr`, not the cyrius
-  peer `lib/syscalls_x86_64_agnos.cyr`, which mirrors an older kernel.
+  `src/syscalls.cyr` (`daimon_reap_code`, `daimon_signal`, `daimon_yield_ms`, …) and the agnos arms
+  in `src/agent.cyr`, `src/ipc.cyr` and `src/server.cyr` (2.4.0, ADR-007): `spawn_path`#43, `kill`#16,
+  `waitpid`#4, `chan_op`#97, `proclist`#99. For agnos syscalls read `agnos/kernel/core/syscall.cyr`,
+  not the cyrius peer `lib/syscalls_x86_64_agnos.cyr`, which mirrors an older kernel.
+  - **Never `sleep_ms` / `sys_nanosleep` on agnos**: both are `sleep_ms`#41, which disables
+    preemption for the whole sleep, so the agents daimon waits for do not run. Wait with
+    `daimon_yield_ms` (`pause`#14 until the deadline).
+  - **The `/bin/agnsh` slot is a foreground `execwait` child** (kybernet runs it to completion):
+    something tested there does not behave as daimon in service would. `tests/agnos/` puts a launcher
+    in that slot and runs everything under test as background processes.
+  - **A gap in agnos is filed with agnos, not designed around as permanent**: a dated issue in the
+    agnos repo's `docs/development/issues/`, in its format (cited lines, measurements, the ask, what
+    daimon does meanwhile). daimon's interim is explicit, documented and audited (ADR-007's table).
 
 ## DO NOT
 
