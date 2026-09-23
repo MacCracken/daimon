@@ -40,6 +40,75 @@ those numbers are not comparable.
 
 `tests/rag_ingest.bcyr` (real since 2.1.6): `rag_ingest_real_5k` 133.1µs, `rag_chunk_only_5k` 508ns.
 
+### 2.3.4 — daimon's own event loop
+
+**The allocation lock is gone.** 2.3.3's channel thread made every allocation take the stdlib's
+heap lock once an agent had started. 2.3.4 starts no thread. The suite run with 100 channels open
+(medians of three), against 2.3.3 with its thread running:
+
+| Benchmark | 2.3.3, thread running | 2.3.4, 100 channels open |
+|---|---:|---:|
+| config_default | 294 ns | 87 ns |
+| json_parse | 1.24 µs | 440 ns |
+| rag_chunk_5k_chars | 11.87 µs | 4.39 µs |
+| http_body_read3 | 2.75 µs | 1.25 µs |
+| mcp_manifest_100_tools | 257.6 µs | 141.3 µs |
+| hashmap_1000_insert_lookup | 737.2 µs | 497.0 µs |
+
+**HTTP, sequential requests over fresh connections** (3000 × `GET /v1/health`, one client, three
+interleaved runs, medians). Answered 200: each block of 100 requests comes from its own loopback
+address (127.0.0.2 to .31), under the per-address limit of 120 a minute.
+
+| | µs / request |
+|---|---:|
+| 2.3.3 (sandhi's sync loop) | 111.9 |
+| 2.3.4 | 113.3 (+1.3%; higher in each of the three pairs) |
+
+The loop was first compared with all 3000 requests from one address, which the rate limiter
+answers 429 after the 120th. Each refusal also appends an audit entry. On that path the first
+version of the loop measured 142.6 µs against 2.3.3's 133.7 (+6.7%). Reading on accept (a local
+client has usually sent its whole request) removed an epoll round trip: 133.8 against 134.6.
+
+A request beside a client that stalls mid-headers answered in 6 ms, where 2.3.3's loop blocked for up
+to 5 s. During a 5 s stop of an agent that ignores SIGTERM, `/v1/health` took 0.001 s; in 2.3.3 it
+took 4.8 s.
+
+**Calls that wait on another server run in a child** (`server_detach`). A 2 s MCP endpoint, with
+`/v1/health` sent 0.3 s into the call:
+
+| path | health, 2.3.3 | health, 2.3.4 | the call, 2.3.3 | the call, 2.3.4 |
+|---|---:|---:|---:|---:|
+| `tools/call` (external) | 1.700 s | 0.0004 s | 2.001 s | 2.002 s |
+| `resources/read` | 1.700 s | 0.0004 s | 2.001 s | 2.002 s |
+| `web_fetch` | 1.699 s | 0.0005 s | 2.001 s | 2.002 s |
+
+The cost is a fork per call. 300 sequential `tools/call` to an endpoint that answers at once, three
+runs each, medians: 470.3 µs per call on 2.3.3, 616.8 µs detached (+146.5 µs). A first version
+relayed the child's answer on the 10 ms tick and added 10 ms to every call; the pipe is now in the
+epoll set.
+
+**The loop uses epoll.** A poll-based version cost, per pass, what was open:
+
+| open channels | 10 | 100 | 1000 |
+|---|---:|---:|---:|
+| µs per poll pass (`ipc_poll_once`, which tests still use) | 2.6 | 9.3 | 92.7 |
+
+**Suite A/B**, 2.3.3 against 2.3.4 (`tests/daimon.bcyr`, three interleaved runs, medians). The shared
+benchmarks agree within ±3%, except:
+- `edge_register_100`: 930.0 → **282.2 µs**. The duplicate-name check is a lookup, not a scan
+  over a key vector allocated per registration.
+- `edge_stats_500`: 58.6 → 63.6 µs (+8.4%). It now also totals the nodes' capacities.
+- `agent_reap_live`: 522 → 496 ns (−5%), on code 2.3.4 did not touch.
+
+| New or changed benchmark | 2.3.4 |
+|---|---:|
+| ipc_frame_roundtrip — write, one pass of the channels, read the ACK (2.3.3, through the thread: 11.6 µs) | 12.1 µs |
+| ipc_poll_100_idle — a poll pass over 100 quiet channels | 9.5 µs |
+| bus_broadcast_take_100 — a broadcast published to 100 queues, then taken from each (the last take frees it) | 14.0 µs |
+
+`ipc_poll_100_idle` replaces `ipc_drain_empty` (the hand-off it timed is gone), and
+`bus_broadcast_take_100` replaces `bus_broadcast_100` (publish only). The count stays 27 + 2.
+
 ### 2.3.3 — agent channels
 
 Medians of three runs (`tests/daimon.bcyr`; the broadcast A/B from one harness built against both
@@ -275,7 +344,7 @@ Scheduler scheduling (1.5x), supervisor registration (2.5x), MCP registration (1
 | scheduler | Complete | Complete (2.3.1) | samay since 2.0.0. Tasks can start and complete through the API since 2.3.1 (`src/sched.cyr`); before that every task stopped at Scheduled |
 | federation | Complete | Complete | Cluster, election, scoring, placement, vector store |
 | edge | Complete | Complete | Register, heartbeat, health, decommission, stats |
-| ipc | Complete | Partial (2.3.3) | Agents send on a channel (a socketpair, their fd 3) read by a service thread; accepted messages reach the bus (2.3.3). The socket-file endpoint was removed. No route reads or sends messages yet |
+| ipc | Complete | Complete (2.3.4) | Agents send on a channel (a socketpair, their fd 3), read by daimon's event loop; HTTP clients send and take messages; messages are freed, names first-wins (2.3.4). The socket-file endpoint was removed at 2.3.3 |
 | api | Complete | Complete | 41 method + path routes (the Rust original had no agent or task control; 2.3.0 added 5, 2.3.1 added 3) |
 | logging | Complete | Complete | sakshi integration |
 | firewall | Complete | Integrated (2.1.8) | nein's MCP tools; the mutating half is gated shut until caller authentication (roadmap 2.5.x) |
@@ -286,8 +355,8 @@ Scheduler scheduling (1.5x), supervisor registration (2.5x), MCP registration (1
 | | Rust | Cyrius |
 |---|---|---|
 | Unit tests | 305 | — (inline in test groups) |
-| Integration tests | 28 | 917 assertions / 17 suites, each against its real `src/` module (2.3.3) |
-| Benchmarks | 19 | 29, against the real code (2.3.3) |
+| Integration tests | 28 | 1033 assertions / 17 suites, each against its real `src/` module (2.3.4) |
+| Benchmarks | 19 | 29, against the real code (2.3.4) |
 | Fuzz harnesses | 0 | 7, property-based, run in CI (2.3.2) |
-| HTTP smoke | — | tests/smoke.sh, 84 checks, run in CI (2.3.3) |
-| Security audit | — | 18 findings (2026-04-13: 10; 2026-09-22 lifecycle: 8) — see docs/audit/ |
+| HTTP smoke | — | tests/smoke.sh, 130 checks, run in CI (2.3.4) |
+| Security audit | — | 18 findings (2026-04-13: 10; 2026-09-22 lifecycle: 8), 11 fixed or superseded since 2.3.0 — see docs/audit/ |

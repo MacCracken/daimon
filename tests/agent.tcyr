@@ -287,7 +287,7 @@ fn _t_sh(script, envp, mem, cpu) {
     store64(argv + 8, "-c");
     store64(argv + 16, script);
     store64(argv + 24, 0);
-    var r_t, r_v = agent_spawn_with_limits("/bin/sh", argv, envp, mem, cpu, 0 - 1);
+    var r_t, r_v = agent_spawn_with_limits("/bin/sh", argv, envp, mem, cpu, 0 - 1, 0 - 1);
     if (is_err_result(r_t) == 1) { return 0 - 100 - r_v; }
     return daimon_reap_within(r_v, 5000);
 }
@@ -334,7 +334,7 @@ assert_eq(_t_sh("kill -9 $$", 0, 0, 0), 137, "spawn: killed by SIGKILL reaps as 
 var nx_argv = alloc(16);
 store64(nx_argv, "/nonexistent/daimon-test-agent");
 store64(nx_argv + 8, 0);
-var nx_t, nx_v = agent_spawn_with_limits("/nonexistent/daimon-test-agent", nx_argv, 0, 0, 0, 0 - 1);
+var nx_t, nx_v = agent_spawn_with_limits("/nonexistent/daimon-test-agent", nx_argv, 0, 0, 0, 0 - 1, 0 - 1);
 assert_eq(is_err_result(nx_t), 1, "spawn: a missing executable is an Err");
 assert_eq(nx_v, AGENT_OP_NO_EXEC, "spawn: ... reported as AGENT_OP_NO_EXEC");
 var nx_st: i32[1];
@@ -381,6 +381,53 @@ if (getenv("PATH") != 0) {
     assert_eq(_t_sh("[ -n \"$PATH\" ]", ev, 0, 0), 0, "spawn: with agent_environ the child inherits PATH");
 }
 
+# --- 2.3.4: the minimal agent environment (VULN-015) ---------------------------
+# This process's environment carries a would-be secret; a minimal environment
+# keeps it from the agent, inherit (the default) passes it on.
+var secret_env = alloc(64);
+memcpy(secret_env, "DAIMON_TEST_SECRET=hunter2", 26);
+store8(secret_env + 26, 0);
+var envs = agent_environ();
+var en = 0;
+while (load64(envs + en * 8) != 0) { en = en + 1; }
+var envx = alloc((en + 2) * 8);
+memcpy(envx, envs, en * 8);
+store64(envx + en * 8, secret_env);
+store64(envx + (en + 1) * 8, 0);
+_agent_envp = envx;               # as if daimon had been started with it
+agent_set_env_mode(AGENT_ENV_INHERIT);
+var env_in = "[ \"$DAIMON_TEST_SECRET\" = hunter2 ] && [ \"$AGNOS_IPC_FD\" = 3 ]";
+assert_eq(_t_sh(env_in, agent_environ_ipc(), 0, 0), 0,
+  "env: inherit passes daimon's whole environment, plus AGNOS_IPC_FD");
+agent_set_env_mode(AGENT_ENV_MINIMAL);
+var env_min = "[ -z \"$DAIMON_TEST_SECRET\" ] && [ -n \"$PATH\" ] && [ \"$AGNOS_IPC_FD\" = 3 ]";
+assert_eq(_t_sh(env_min, agent_environ_ipc(), 0, 0), 0,
+  "env: minimal keeps PATH and AGNOS_IPC_FD, and drops the rest");
+agent_set_env_mode(AGENT_ENV_INHERIT);
+_agent_envp = envs;
+
+# --- 2.3.4: daimon raises its descriptor limit; agents get the original --------
+# Lower this process's soft RLIMIT_NOFILE to 512 (a systemd service starts at
+# 1024), raise it the way `serve` does, and look at what an agent is given.
+var nf0: i64[2];
+syscall(_DAIMON_SYS_PRLIMIT64, 0, _DAIMON_RLIMIT_NOFILE, 0, &nf0);
+var nf_max = load64(&nf0 + 8);
+if (nf_max < 0 || nf_max >= 4096) {
+    var nf_low: i64[2];
+    store64(&nf_low, 512);
+    store64(&nf_low + 8, nf_max);
+    assert_eq(syscall(_DAIMON_SYS_PRLIMIT64, 0, _DAIMON_RLIMIT_NOFILE, &nf_low, 0), 0,
+      "nofile: soft limit lowered to 512");
+    assert_eq(agent_nofile_raise(4096), 4096, "nofile: daimon raises its soft limit to what it asks for");
+    var nf_now: i64[2];
+    syscall(_DAIMON_SYS_PRLIMIT64, 0, _DAIMON_RLIMIT_NOFILE, 0, &nf_now);
+    assert_eq(load64(&nf_now), 4096, "nofile: ... and it is in force");
+    assert_eq(agent_nofile_raise(1024), 4096, "nofile: asking for less changes nothing");
+    assert_eq(_t_sh("[ \"$(ulimit -Sn)\" = 512 ]", 0, 0, 0), 0,
+      "nofile: an agent gets the limit daimon started with, not the raised one");
+    syscall(_DAIMON_SYS_PRLIMIT64, 0, _DAIMON_RLIMIT_NOFILE, &nf0, 0);   # as this process found it
+}
+
 # --- the reap / signal guards ------------------------------------------------
 test_group("agent_guards");
 var g_argv = alloc(32);
@@ -388,7 +435,7 @@ store64(g_argv, "/bin/sh");
 store64(g_argv + 8, "-c");
 store64(g_argv + 16, "sleep 0.3");
 store64(g_argv + 24, 0);
-var g_t, g_pid = agent_spawn_with_limits("/bin/sh", g_argv, 0, 0, 0, 0 - 1);
+var g_t, g_pid = agent_spawn_with_limits("/bin/sh", g_argv, 0, 0, 0, 0 - 1, 0 - 1);
 assert_eq(is_ok(g_t), 1, "guard fixture started");
 assert_eq(daimon_reap_code(0), 0 - 1, "reap(0) is refused — it would reap ANY child in the group");
 assert_eq(daimon_reap_code(0 - 1), 0 - 1, "reap(-1) is refused — it would reap ANY child");
@@ -546,13 +593,197 @@ if (sys_getuid() != 0) {
     if (is_ok(m_t) == 1) { agent_stop(lm, STOP_USER); }
 }
 
+# --- 2.3.4: a stop that does not wait, children, and death with daimon ---------
+test_group("agent_stop_async");
+var gsb = str_builder_new();
+str_builder_add_cstr(gsb, adir);
+str_builder_add_cstr(gsb, "/group");
+var gdir = str_data(str_builder_build(gsb));
+xmkdir_p(gdir, 448);
+# The child's output goes to /dev/null: a child left running by a regression
+# must not hold this suite's output pipe open (the harness would wait out its
+# 300 s instead of reporting the failure).
+var grpsb = str_builder_new();
+str_builder_add_cstr(grpsb, "#!/bin/sh\ntrap 'exit 0' TERM\nsleep 300 >/dev/null 2>&1 &\n");
+str_builder_add_cstr(grpsb, "echo $! > \"$0.kid.$$\"\n: > \"$0.ready.$$\"\nwhile :; do sleep 0.05; done\n");
+var grp_exe = _t_script(gdir, "agnos-agent-user-agent", str_data(str_builder_build(grpsb)));
+agent_set_agents_dir(gdir);
+
+# 1 once `pid` is gone or a zombie (someone else's to reap).
+fn _t_dead(pid) {
+    var st = _t_proc_state(pid);
+    if (st == 0) { return 1; }
+    if (st == 90) { return 1; }   # 'Z'
+    return 0;
+}
+
+fn _t_wait_dead(pid) {
+    var i = 0;
+    while (i < 300) {
+        if (_t_dead(pid) == 1) { return 1; }
+        _t_nap_ms(10);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _t_kid(exe, pid) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, exe);
+    str_builder_add_cstr(sb, ".kid.");
+    str_builder_add_int(sb, pid);
+    return str_data(str_builder_build(sb));
+}
+
+fn _t_read_int(path) {
+    var buf = alloc(64);
+    var n = file_read_all(path, buf, 63);
+    var v = 0;
+    var i = 0;
+    while (i < n) {
+        var c = load8(buf + i);
+        if (c >= 48) { if (c <= 57) { v = v * 10 + c - 48; } }
+        i = i + 1;
+    }
+    return v;
+}
+
+var la2 = agent_handle_new(agent_next_id(), str_from("async-stop"));
+var a2_t, a2_pid = agent_start(la2, 0, 0);
+assert_eq(is_ok(a2_t), 1, "async stop: started");
+assert_eq(_t_wait_file(_t_ready(grp_exe, a2_pid)), 1, "async stop: running");
+var kid = _t_read_int(_t_kid(grp_exe, a2_pid));
+assert(kid > 0, "async stop: the agent started a child of its own");
+var ab0 = clock_now_ms();
+assert_eq(agent_stop_begin(la2, STOP_USER), 0, "async stop: begin returns with the stop under way");
+assert(clock_now_ms() - ab0 < 100, "async stop: ... at once, without waiting for the agent");
+assert_eq(agent_status(la2), AGENT_STOPPING, "async stop: STOPPING meanwhile");
+assert_eq(agent_stop_pending(la2), 1, "async stop: pending");
+assert_eq(agent_stop_begin(la2, STOP_USER), 0, "async stop: a second begin changes nothing");
+var steps = 0;
+while (agent_stop_step(la2, clock_now_ms()) == 0) {
+    _t_nap_ms(5);
+    steps = steps + 1;
+    if (steps > 600) { agent_stop(la2, STOP_USER); }
+}
+assert_eq(agent_status(la2), AGENT_STOPPED, "async stop: steps to STOPPED");
+assert_eq(agent_exit_code(la2), 0, "async stop: exited through its SIGTERM handler");
+assert_eq(agent_pid(la2), 0, "async stop: pid cleared");
+assert_eq(agent_stop_pending(la2), 0, "async stop: nothing pending");
+assert_eq(_t_wait_dead(kid), 1, "a stop reaches the agent's own children (its process group)");
+assert_eq(agent_stop_begin(la2, STOP_USER), 1, "async stop: stopping a stopped agent is done at once");
+
+# Pause and resume reach the children too.
+var la3 = agent_handle_new(agent_next_id(), str_from("group-pause"));
+var a3_t, a3_pid = agent_start(la3, 0, 0);
+assert_eq(_t_wait_file(_t_ready(grp_exe, a3_pid)), 1, "group pause: running");
+var kid3 = _t_read_int(_t_kid(grp_exe, a3_pid));
+agent_pause(la3);
+assert_eq(_t_wait_state(kid3, 84, 1), 1, "pause stops the agent's child too (state T)");
+agent_resume(la3);
+assert_eq(_t_wait_state(kid3, 84, 0), 1, "resume continues it");
+agent_stop(la3, STOP_USER);
+assert_eq(_t_wait_dead(kid3), 1, "and the stop ends it");
+
+# An agent dies with daimon (PR_SET_PDEATHSIG). A child of this test plays
+# daimon: it starts an agent, and exits without stopping it.
+var pdf = _t_path(gdir, "pdeath.pid");
+var pd_parent = sys_fork();
+if (pd_parent == 0) {
+    var pargv2 = alloc(40);
+    store64(pargv2, "/bin/sh");
+    store64(pargv2 + 8, "-c");
+    store64(pargv2 + 16, "echo $$ > \"$1\"; while :; do sleep 0.05; done");
+    store64(pargv2 + 24, "agent");
+    store64(pargv2 + 32, pdf);
+    store64(pargv2 + 40, 0);
+    agent_spawn_with_limits("/bin/sh", pargv2, 0, 0, 0, 0 - 1, 0 - 1);
+    var pw = 0;
+    while (pw < 300) {
+        if (file_exists(pdf) == 1) { pw = 300; }
+        _t_nap_ms(10);
+        pw = pw + 1;
+    }
+    sys_exit_group(0);   # "daimon" dies, leaving its agent
+}
+var pd_st: i32[1];
+sys_waitpid(pd_parent, &pd_st, 0);
+assert_eq(_t_wait_file(pdf), 1, "death: the agent reported its pid");
+var orphan = _t_read_int(pdf);
+assert(orphan > 0, "death: an agent pid");
+assert_eq(_t_wait_dead(orphan), 1, "an agent dies with the daimon that started it (was: it outlived daimon)");
+if (_t_dead(orphan) == 0) { sys_kill(orphan, 9); }
+xunlink(pdf);
+xunlink(_t_kid(grp_exe, a2_pid));
+xunlink(_t_kid(grp_exe, a3_pid));
+xunlink(_t_ready(grp_exe, a2_pid));
+xunlink(_t_ready(grp_exe, a3_pid));
+xunlink(grp_exe);
+xrmdir(gdir);
+agent_set_agents_dir(adir);
+
+# --- 2.3.4: captured output -------------------------------------------------------
+test_group("agent_output");
+var osb = str_builder_new();
+str_builder_add_cstr(osb, adir);
+str_builder_add_cstr(osb, "/out");
+var odir = str_data(str_builder_build(osb));
+xmkdir_p(odir, 448);
+var outsb = str_builder_new();
+str_builder_add_cstr(outsb, "#!/bin/sh\ntrap 'exit 0' TERM\necho to-stdout\necho to-stderr >&2\n");
+str_builder_add_cstr(outsb, ": > \"$0.ready.$$\"\nwhile :; do sleep 0.05; done\n");
+var out_exe = _t_script(odir, "agnos-agent-user-agent", str_data(str_builder_build(outsb)));
+agent_set_agents_dir(odir);
+agent_set_output_mode(AGENT_OUTPUT_CAPTURE);
+var lo = agent_handle_new(agent_next_id(), str_from("talky"));
+var lo_t, lo_pid = agent_start(lo, 0, 0);
+assert_eq(is_ok(lo_t), 1, "output: started with its output captured");
+assert_eq(_t_wait_file(_t_ready(out_exe, lo_pid)), 1, "output: running");
+var loid = str_cstr(str_from_int(agent_id(lo)));
+var ow = 0;
+while (ow < 100) {
+    ipc_poll_once(10);
+    if (ipc_output_total(loid) >= 20) { ow = 100; }
+    ow = ow + 1;
+}
+var ltext = ipc_output_text(loid);
+assert(ltext != 0, "output: there is captured text");
+if (ltext != 0) {
+    assert(str_contains(ltext, str_from("to-stdout")) == 1, "output: stdout is captured");
+    assert(str_contains(ltext, str_from("to-stderr")) == 1, "output: stderr is captured");
+}
+agent_stop(lo, STOP_USER);
+assert_eq(agent_exit_code(lo), 0, "output: the agent still stops cleanly");
+agent_set_output_mode(AGENT_OUTPUT_INHERIT);
+ipc_output_forget(loid);
+xunlink(_t_ready(out_exe, lo_pid));
+xunlink(out_exe);
+xrmdir(odir);
+agent_set_agents_dir(adir);
+
 # --- 2.3.3: every started agent gets a channel on fd 3 ------------------------
 # The fixture reports what it sees from inside, sends one frame on fd 3 and
-# reads the reply, leaves a background child holding its fd 3 (as any agent's
-# subprocess would), then waits to be stopped. Because that child keeps the
+# reads the reply, leaves a background child holding its fd 3 — in a session of
+# its own, so a stop's group signal (2.3.4) does not reach it — then waits to be
+# stopped. Because that child keeps the
 # channel open, daimon's end is closed only by daimon itself: after a stop or a
 # reap, nothing the agent left behind can go on speaking as the agent.
 test_group("agent_channel");
+var cbus = msg_bus_new();
+msg_bus_subscribe(cbus, "999");   # any subscriber: the fixture broadcasts
+ipc_attach_bus(cbus);
+
+# Wait up to ~3 s for `path`, running daimon's side of the channels meanwhile
+# (the pass daimon's event loop makes; the fixture blocks on its reply).
+fn _t_wait_file_ipc(path) {
+    var i = 0;
+    while (i < 300) {
+        if (file_exists(path) == 1) { return 1; }
+        ipc_poll_once(10);
+        i = i + 1;
+    }
+    return 0;
+}
 var csb = str_builder_new();
 str_builder_add_cstr(csb, adir);
 str_builder_add_cstr(csb, "/chan");
@@ -565,7 +796,7 @@ str_builder_add_cstr(chsb, "for f in 4 5 6 7 8 9; do [ -e /proc/$$/fd/$f ] && ec
 str_builder_add_cstr(chsb, "} > \"$o.tmp\"\n");
 str_builder_add_cstr(chsb, "printf '\\000\\000\\000\\016{\"target\":\"*\"}' >&3\n");
 str_builder_add_cstr(chsb, "r=$(head -c 1 <&3 | od -v -An -tu1 | tr -d ' ')\necho \"reply=$r\" >> \"$o.tmp\"\n");
-str_builder_add_cstr(chsb, "sleep 30 >/dev/null 2>&1 &\necho \"bg=$!\" >> \"$o.tmp\"\n");
+str_builder_add_cstr(chsb, "setsid sleep 30 >/dev/null 2>&1 &\necho \"bg=$!\" >> \"$o.tmp\"\n");
 str_builder_add_cstr(chsb, "mv \"$o.tmp\" \"$o\"\nwhile :; do sleep 0.05; done\n");
 var chan_exe = _t_script(cdir, "agnos-agent-user-agent", str_data(str_builder_build(chsb)));
 agent_set_agents_dir(cdir);
@@ -646,7 +877,7 @@ var lc = agent_handle_new(agent_next_id(), str_from("channel"));
 var c_t, c_pid = agent_start(lc, 0, 0);
 assert_eq(is_ok(c_t), 1, "channel: the agent starts");
 var cout = _t_out(chan_exe, c_pid);
-assert_eq(_t_wait_file(cout), 1, "channel: the agent reported");
+assert_eq(_t_wait_file_ipc(cout), 1, "channel: the agent reported");
 var crep = alloc(512);
 var crn = file_read_all(cout, crep, 511);
 assert(crn > 0, "channel: the report is readable");
@@ -662,12 +893,13 @@ assert_eq(leaked, 0, "channel: nothing else of daimon's reaches the agent (fds 4
 assert_eq(_t_has_line(crep, crn, "reply=1"), 1, "channel: the agent's frame was ACKed");
 var bg1 = _t_report_int(crep, crn, "bg=");
 assert(bg1 > 0, "channel: the agent's background child is running");
-var crec = ipc_take();
-assert(crec != 0, "channel: the frame reached daimon");
-if (crec != 0) {
-    assert_eq(str_eq(ipc_rec_agent(crec), str_from_int(agent_id(lc))), 1,
+var cq = msg_bus_queue(cbus, "999");
+assert_eq(vec_len(cq), 1, "channel: the frame reached daimon's bus");
+if (vec_len(cq) == 1) {
+    var crec = vec_get(cq, 0);
+    assert_eq(str_eq(ipc_msg_source(crec), str_from_int(agent_id(lc))), 1,
       "channel: its source is the agent daimon started (by id)");
-    assert_eq(str_eq(ipc_rec_target(crec), str_from("*")), 1, "channel: with the target it sent");
+    assert_eq(str_eq(ipc_msg_target(crec), str_from("*")), 1, "channel: with the target it sent");
 }
 assert_eq(count_fds(sys_getpid()), fds0 + 1, "channel: daimon holds one descriptor for it (its own end)");
 agent_stop(lc, STOP_USER);
@@ -678,11 +910,11 @@ assert_eq(_t_wait_fds(fds0), 1,
 # A restart gets a fresh channel; an agent that exits on its own has it closed too.
 var c2_t, c2_pid = agent_start(lc, 0, 0);
 assert_eq(is_ok(c2_t), 1, "channel: restarted");
-assert_eq(_t_wait_file(_t_out(chan_exe, c2_pid)), 1, "channel: the restarted agent reported");
+assert_eq(_t_wait_file_ipc(_t_out(chan_exe, c2_pid)), 1, "channel: the restarted agent reported");
 var crn2 = file_read_all(_t_out(chan_exe, c2_pid), crep, 511);
 assert_eq(_t_has_line(crep, crn2, "reply=1"), 1, "channel: the restarted agent's frame was ACKed too");
 var bg2 = _t_report_int(crep, crn2, "bg=");
-ipc_take();
+assert_eq(vec_len(msg_bus_queue(cbus, "999")), 2, "channel: the restarted agent's frame reached the bus");
 sys_kill(c2_pid, 9);
 assert_eq(_t_reap_wait(lc), 1, "channel: the killed agent is reaped");
 assert_eq(_t_wait_fds(fds0), 1,
@@ -707,6 +939,6 @@ xrmdir(edir);
 xrmdir(adir);
 agent_set_agents_dir(0);
 
-# exit_group, not exit: the agent channel service thread is running, and
-# exit(2) would end only this thread and leave the process alive (2.3.3).
+# exit_group: the program epilogue lib/syscalls prescribes (exit(2) ends only
+# the calling thread).
 syscall(SYS_EXIT_GROUP, assert_summary());

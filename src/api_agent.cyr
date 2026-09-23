@@ -26,6 +26,24 @@ fn _api_agents_reap() {
     return 0;
 }
 
+# The event loop's upkeep, every SERVE_TICK_MS (src/server.cyr). An agent that
+# exits is collected now — its exit status recorded, its channel closed —
+# rather than at the next agent request; and every stop under way is advanced
+# (SIGKILL at its deadline; agent_stop_step).
+var _agents_tick_now = 0;
+
+fn _agents_tick_entry(key, h) {
+    agent_reap(h);
+    if (agent_stop_pending(h) == 1) { agent_stop_step(h, _agents_tick_now); }
+    return 0;
+}
+
+fn agents_tick(now) {
+    _agents_tick_now = now;
+    map_iter(_agents, &_agents_tick_entry);
+    return 0;
+}
+
 # One agent as JSON. `status` stays the integer it has always been; `type` and
 # `exit_code` are 2.3.0 additions (exit_code is null until a process exits).
 fn _api_agent_json(sb, h) {
@@ -126,6 +144,8 @@ fn api_register_agent(fd, body) {
     # 2.3.3: a queue on the bus, so messages addressed to this agent's id (or
     # to "*") wait for it — whether or not it is running when they are sent.
     msg_bus_subscribe(_msg_bus, str_data(id_str));
+    # 2.3.4: and its name, if no agent has it yet (first registration wins).
+    msg_bus_register_name(_msg_bus, str_cstr(name), str_data(id_str));
 
     var sb = str_builder_new();
     str_builder_add_cstr(sb, "{\"id\":");
@@ -167,14 +187,38 @@ fn api_agent_start(fd, id_cstr) {
     return 0;
 }
 
-# POST /v1/agents/{id}/stop — SIGTERM, a grace period, then SIGKILL.
+# POST /v1/agents/{id}/stop — SIGTERM, a grace period, then SIGKILL; answered
+# once the agent has stopped, with its exit code, as it always was.
+#
+# ⛔ VULN-014 (2.3.4). The answer used to be computed in place: the stop waited
+# up to ~6 s for the agent, and daimon's single-threaded server answered
+# nobody else meanwhile (a request sent during a 5 s stop waited 4.8 s). Now
+# the stop is begun here and the answer deferred (server_defer): the event
+# loop advances the stop (agents_tick) and answers this client when it is
+# over, serving everyone else in between.
 fn api_agent_stop(fd, id_cstr) {
     _api_agents_reap();
     var h = map_get(_agents, id_cstr);
     if (h == 0) { http_error(fd, 404, str_from("agent not found")); return 0; }
-    agent_stop(h, STOP_USER);
+    if (agent_stop_begin(h, STOP_USER) == 1) {
+        _api_agent_ok(fd, h);
+        return 0;
+    }
+    if (server_defer(&_api_agent_stop_answer, h) == 1) { return 0; }
+    # Not served by the event loop: wait here.
+    while (agent_stop_step(h, clock_now_ms()) == 0) { sleep_ms(1); }
     _api_agent_ok(fd, h);
     return 0;
+}
+
+# The deferred answer to a stop: given once the stop is over (or the loop's
+# deadline for deferred answers passes, with the agent as it then stands).
+fn _api_agent_stop_answer(fd, h, timed_out) {
+    if (agent_stop_pending(h) == 1) {
+        if (timed_out == 0) { return 0; }
+    }
+    _api_agent_ok(fd, h);
+    return 1;
 }
 
 # POST /v1/agents/{id}/pause
@@ -210,9 +254,150 @@ fn api_agent_delete(fd, id_cstr) {
         return 0;
     }
     daimon_audit_agent(SEV_INFO, "agent", "agent.delete", "agent deleted", str_data(agent_name(h)));
+    msg_bus_unregister_name(_msg_bus, str_cstr(agent_name(h)), id_cstr);
+    ipc_output_forget(id_cstr);   # its captured output, if any (2.3.4)
     map_delete(_agents, id_cstr);
     supervisor_unregister(_supervisor, str_from(id_cstr));
-    msg_bus_unsubscribe(_msg_bus, id_cstr);   # its queue goes too (2.3.3)
+    msg_bus_unsubscribe(_msg_bus, id_cstr);   # its queue goes too, and what was in it
     http_ok(fd, str_from("{\"ok\":true}"));
+    return 0;
+}
+
+# --- messages (2.3.4) ------------------------------------------------------------
+#
+# Every registered agent has a queue on the bus (IPC_BUS_QUEUE_MAX messages).
+# Agents fill queues from their channels; these two routes let an HTTP client
+# put a message on one and take what is on one. Both refuse browsers, like the
+# rest of agent control. There is no authentication until 2.5.x, so anyone who
+# can reach the API can read any agent's queue (docs/guides/agent-ipc.md).
+
+# One queued message as JSON. The payload is JSON text already (a channel
+# frame's or a request's value, re-encoded compactly), so it is inlined.
+fn _api_msg_json(sb, m) {
+    str_builder_add_cstr(sb, "{\"id\":");
+    str_builder_add_int(sb, ipc_msg_id(m));
+    str_builder_add_cstr(sb, ",\"source\":\"");
+    str_builder_add(sb, json_escape_str(ipc_msg_source(m)));
+    str_builder_add_cstr(sb, "\",\"target\":\"");
+    str_builder_add(sb, json_escape_str(ipc_msg_target(m)));
+    str_builder_add_cstr(sb, "\",\"type\":\"");
+    str_builder_add_cstr(sb, ipc_msg_type_name(ipc_msg_type(m)));
+    str_builder_add_cstr(sb, "\",\"payload\":");
+    str_builder_add(sb, ipc_msg_payload(m));
+    str_builder_add_cstr(sb, ",\"timestamp\":");
+    str_builder_add_int(sb, ipc_msg_timestamp(m));
+    str_builder_add_cstr(sb, "}");
+    return 0;
+}
+
+# POST /v1/agents/{id}/messages — put a message on an agent's queue. Body (all
+# optional): {"type": "event" | "request" | "response" | "heartbeat" |
+# "command", "payload": any JSON}. The source is "api": an HTTP client has no
+# identity to give yet (2.5.x), and a body that names a source is not believed.
+fn api_agent_message_send(fd, id_cstr, body) {
+    var h = map_get(_agents, id_cstr);
+    if (h == 0) { http_error(fd, 404, str_from("agent not found")); return 0; }
+    var mtype = MSG_EVENT;
+    var payload = 0;
+    if (body != 0) {
+        var root = http_body_json(body);
+        if (root == 0) { http_bad_body(fd); return 0; }
+        if (http_json_has(root, "type") == 1) {
+            var tv = http_json_str(root, "type");
+            mtype = 0 - 1;
+            if (tv != 0) { mtype = ipc_msg_type_parse(tv); }
+            if (mtype < 0) {
+                http_bad_request(fd, str_from("type must be event, request, response, heartbeat or command"));
+                return 0;
+            }
+        }
+        var pv = bayan_json_v_obj_get(root, "payload");
+        if (pv != 0) { payload = bayan_json_v_build(pv); }
+    }
+    if (payload == 0) { payload = str_from("null"); }
+    var m = ipc_msg_new(str_from("api"), str_from(id_cstr), mtype, payload);
+    var mid = ipc_msg_id(m);   # read now: a message the bus refuses is freed
+    var r_t, r_v = msg_bus_send_to(_msg_bus, id_cstr, m);
+    if (is_err_result(r_t) == 1) {
+        if (r_v == DAIMON_ERR_AGENT_NOT_FOUND) { http_error(fd, 404, str_from("the agent has no message queue")); }
+        else { http_error(fd, 429, str_from("the agent's message queue is full")); }
+        return 0;
+    }
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"id\":");
+    str_builder_add_int(sb, mid);
+    str_builder_add_cstr(sb, "}");
+    var resp = str_builder_build(sb);
+    http_send_response(fd, 201, str_data(resp), str_len(resp));
+    return 0;
+}
+
+# POST /v1/agents/{id}/messages/take — the agent's queued messages, oldest
+# first, taken off its queue. Body (optional): {"max": n}, 1 or more; at most a
+# whole queue. The answer carries how many are left.
+fn api_agent_message_take(fd, id_cstr, body) {
+    var h = map_get(_agents, id_cstr);
+    if (h == 0) { http_error(fd, 404, str_from("agent not found")); return 0; }
+    var max = IPC_BUS_QUEUE_MAX;
+    if (body != 0) {
+        var root = http_body_json(body);
+        if (root == 0) { http_bad_body(fd); return 0; }
+        if (http_json_has(root, "max") == 1) {
+            var want = http_json_int(root, "max");
+            if (want < 1) { http_bad_request(fd, str_from("max must be at least 1")); return 0; }
+            if (want < max) { max = want; }
+        }
+    }
+    var q = msg_bus_queue(_msg_bus, id_cstr);
+    var len = 0;
+    if (q != 0) { len = vec_len(q); }
+    var n = len;
+    if (n > max) { n = max; }
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"messages\":[");
+    var i = 0;
+    while (i < n) {
+        if (i > 0) { str_builder_add_cstr(sb, ","); }
+        _api_msg_json(sb, vec_get(q, i));
+        i = i + 1;
+    }
+    str_builder_add_cstr(sb, "],\"count\":");
+    str_builder_add_int(sb, n);
+    str_builder_add_cstr(sb, ",\"remaining\":");
+    str_builder_add_int(sb, len - n);
+    str_builder_add_cstr(sb, "}");
+    var resp = str_builder_build(sb);
+    msg_bus_drop_front(_msg_bus, id_cstr, n);   # after the answer is built: this frees them
+    http_ok(fd, resp);
+    return 0;
+}
+
+# GET /v1/agents/{id}/output — what the agent wrote to stdout and stderr since
+# its latest start, when daimon captures output (`serve --agent-output
+# capture`, 2.3.4): the most recent AGENT_OUTPUT_RING bytes, as text (invalid
+# UTF-8 shown as U+FFFD). `bytes` is everything it wrote; `kept` what is here.
+fn api_agent_output(fd, id_cstr) {
+    var h = map_get(_agents, id_cstr);
+    if (h == 0) { http_error(fd, 404, str_from("agent not found")); return 0; }
+    if (agent_output_mode() != AGENT_OUTPUT_CAPTURE) {
+        http_error(fd, 409, str_from("agent output is not captured; start daimon with --agent-output capture"));
+        return 0;
+    }
+    var total = ipc_output_total(id_cstr);
+    var text = ipc_output_text(id_cstr);
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"output\":\"");
+    var kept = 0;
+    if (text != 0) {
+        kept = str_len(text);
+        str_builder_add(sb, json_escape_text(str_data(text), kept));
+    }
+    str_builder_add_cstr(sb, "\",\"bytes\":");
+    if (total < 0) { total = 0; }
+    str_builder_add_int(sb, total);
+    str_builder_add_cstr(sb, ",\"kept\":");
+    str_builder_add_int(sb, kept);
+    str_builder_add_cstr(sb, "}");
+    http_ok(fd, str_builder_build(sb));
     return 0;
 }

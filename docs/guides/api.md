@@ -7,6 +7,22 @@ authentication, so do that only behind a firewall.
 
 All responses are JSON. All POST bodies are JSON. Connection is closed after each response.
 
+**Who may call it** (2.3.4, VULN-012):
+- While daimon listens on loopback (the default), a request must name a loopback host (`Host:
+  127.0.0.1`, `localhost` or `[::1]`, any port); any other name gets **403**. This is what defeats
+  DNS rebinding, where a web page's requests reach 127.0.0.1 under the attacker's hostname. With
+  `--listen` beyond loopback the check is off: the operator chose the names daimon answers to.
+- A request that changes state (POST, PUT, DELETE) and carries an `Origin` from another site gets
+  **403** on every route. Such a request is what a web page sends with no CORS preflight (a
+  `text/plain` POST). A page served from a loopback host (`http://127.0.0.1:…`, `http://localhost:…`)
+  may still write. Agent and task control refuse any `Origin`, as since 2.3.0. Clients that are not
+  browsers send no `Origin`.
+
+**One client does not hold the server** (2.3.4): daimon runs its own event loop and reads requests
+without blocking, so a slow client holds only its own connection:
+- a connection that sends nothing for 5 s, or has no whole request after 30 s, is closed;
+- at most 128 connections are open at once, and more wait in the kernel's queue.
+
 ## Request bodies
 
 Since 2.3.2 a body is **one JSON object**, read with a full JSON parser. It gets **400** when it:
@@ -73,7 +89,7 @@ POST /v1/agents/1/start
 → {"id":1,"name":"my-agent","type":"User","status":2,"pid":4242,"exit_code":null}
 → 409 not Pending/Stopped/Failed · 422 no executable for its type · 501 on AGNOS (until 2.4.x)
 
-# Stop — SIGTERM, up to 5 s to exit, then SIGKILL; always 200
+# Stop — SIGTERM, up to 5 s to exit, then SIGKILL; always 200, once the agent is gone
 POST /v1/agents/1/stop
 → {"id":1,"name":"my-agent","type":"User","status":5,"pid":0,"exit_code":0}
 
@@ -84,10 +100,18 @@ POST /v1/agents/1/resume     → status 2 · 409 unless Paused
 # Delete — refused while the agent has a process
 DELETE /v1/agents/1
 → {"ok":true} · 409 while it has a process
+
+# Messages (2.3.4) — queue one for the agent; take (and remove) what is queued
+POST /v1/agents/1/messages            {"type":"command","payload":{...}}   → 201 {"id":13}
+POST /v1/agents/1/messages/take       {"max":10}                           → {"messages":[...],"count":1,"remaining":0}
+
+# Captured output (2.3.4; serve --agent-output capture) — stdout and stderr since its latest start
+GET /v1/agents/1/output
+→ {"output":"hello\n","bytes":6,"kept":6} · 409 when output is not captured
 ```
 
 Agent status values: 0=Pending, 1=Starting, 2=Running, 3=Paused, 4=Stopping, 5=Stopped, 6=Failed.
-A process that exits on its own is collected on the next agent request. Exit 0 leaves the agent
+A process that exits on its own is collected within 100 ms (daimon's upkeep tick, 2.3.4). Exit 0 leaves the agent
 Stopped; a non-zero exit, or death by a signal, leaves it Failed. A Failed agent can be started
 again. `exit_code` is null until a process has exited, and 128 + the signal number if a signal
 killed it (137 = SIGKILL).
@@ -103,6 +127,21 @@ child:
 - gets daimon's environment, plus `AGNOS_IPC_FD=3`;
 - runs under its supervisor quota as rlimits: 1 GiB address space and 3600 s CPU by default. A
   limit that cannot be applied refuses the start with a 500.
+
+**A stop does not hold the server** (2.3.4, VULN-014). Its answer comes when the agent is gone, up
+to about 6 s for an agent that ignores SIGTERM. Other requests, and agents' channels, are served
+meanwhile. A GET in between shows the agent at status 4 (Stopping). A stop, pause or resume reaches
+the processes the agent started too: each agent leads its own process group. An agent is killed if
+daimon itself dies (`PR_SET_PDEATHSIG`); daimon's registry is in memory, so it could never be
+reached again.
+
+**Environment and output** (2.3.4):
+- `serve --agent-env minimal` gives agents only PATH, HOME, USER, LOGNAME, SHELL, TERM, TMPDIR, TZ,
+  LANG, LANGUAGE, LC_*, XDG_RUNTIME_DIR and AGNOS_*, instead of daimon's whole environment (the
+  default, `inherit`; VULN-015).
+- `serve --agent-output capture` collects each agent's stdout and stderr: the last 32 KiB, served
+  at `GET /v1/agents/{id}/output`. Invalid UTF-8 is shown as U+FFFD. The default, `inherit`, leaves
+  them daimon's own.
 
 **Browsers may not control agents.** start / stop / pause / resume / DELETE answer **403** to any
 request carrying an `Origin` header. A web page can send a cross-origin `text/plain` POST with no
@@ -132,6 +171,9 @@ POST /v1/mcp/tools
 POST /v1/mcp/call
 {"name":"scan"}
 → {"content":[...],"isError":false}
+# A call to an external tool (like resources/read, prompts/get, web_fetch and
+# web_search) runs in a child process, so daimon keeps serving meanwhile. One
+# that has not finished within 60 s is answered 504 (2.3.4).
 
 # Deregister
 DELETE /v1/mcp/tools/scan
@@ -163,10 +205,10 @@ POST /v1/rag/query
 ## Edge Fleet
 
 ```
-# Register node
+# Register node — capabilities optional (2.3.4); defaults x86_64 / 4 / 4096 / 32768 / false
 POST /v1/edge/nodes
-{"name":"edge-1"}
-→ 201 {"id":"1"}
+{"name":"edge-1","arch":"aarch64","cpu_cores":4,"memory_mb":8192,"disk_mb":65536,"has_gpu":true}
+→ 201 {"id":"1"} · 400 name taken · 422 an invalid capability
 
 # List nodes (optional ?status=online|suspect|offline|updating|decommissioned)
 GET /v1/edge/nodes
@@ -174,7 +216,8 @@ GET /v1/edge/nodes
 
 # Get node
 GET /v1/edge/nodes/1
-→ {"id":"1","name":"edge-1","status":"Online","active_tasks":0}
+→ {"id":"1","name":"edge-1","status":"Online","active_tasks":0,"arch":"aarch64","cpu_cores":4,
+   "memory_mb":8192,"disk_mb":65536,"has_gpu":true}
 
 # Heartbeat
 POST /v1/edge/nodes/1/heartbeat
@@ -187,8 +230,14 @@ POST /v1/edge/nodes/1/decommission
 
 # Fleet stats
 GET /v1/edge/stats
-→ {"total":1,"online":1,"suspect":0,"offline":0,"active_tasks":0,"tasks_completed":0}
+→ {"total":1,"online":1,"suspect":0,"offline":0,"updating":0,"decommissioned":0,"active_tasks":0,
+   "tasks_completed":0,"cpu_cores":4,"memory_mb":8192,"gpu_nodes":1}
 ```
+
+Edge node ids have their own sequence since 2.3.4. Before, they came from the agent counter, so
+after five agents the first node was `"6"`. `cpu_cores`, `memory_mb` and `gpu_nodes` in the stats
+total the nodes that can take work (not offline, not decommissioned). `arch` is 1–32 characters of
+`a-z`, `0-9` and `_`. `cpu_cores` is 1–65536, and `memory_mb` and `disk_mb` are whole numbers.
 
 ## Scheduler
 
@@ -260,7 +309,12 @@ GET /v1/metrics
 Since 2.3.3:
 - `ipc_messages` counts agent messages put on the bus;
 - `ipc_refused` counts frames answered NACK, plus channels closed on a fault;
-- `bus_dropped` counts messages dropped at a full queue (100 per agent).
+- `bus_dropped` counts messages not queued because a queue (100 per agent) or the bus (64 MiB) was
+  full.
+
+Since 2.3.4:
+- `ipc_channels` is the number of open agent channels;
+- `bus_bytes` is the bytes of messages the bus holds (freed as they are taken).
 
 See [agent-ipc.md](agent-ipc.md).
 
@@ -269,15 +323,17 @@ See [agent-ipc.md](agent-ipc.md).
 | Status | Meaning |
 |---|---|
 | 400 | Bad Request — missing/invalid field, or a body that is not one JSON object (see Request bodies) |
-| 403 | Forbidden — agent or task control from a browser (a request carrying `Origin`) |
+| 403 | Forbidden — a host name other than loopback's while daimon listens on loopback; a state change from another site; agent or task control from any browser |
 | 404 | Not Found — unknown route or ID |
 | 405 | Method Not Allowed — a route exists, not for this method |
-| 409 | Conflict — the agent's status does not allow the action, a name is taken, or the agent limit is reached |
+| 409 | Conflict — the agent's status does not allow the action, a name is taken, the agent limit is reached, or output is not captured |
 | 413 | Payload Too Large — body > 64 KB |
 | 422 | Unprocessable Entity — validation failure |
-| 429 | Too Many Requests — rate limit (120/min per IP) |
+| 429 | Too Many Requests — rate limit (120/min per IP), or an agent's message queue is full |
 | 500 | Internal Server Error — e.g. an agent's rlimits could not be applied, or its executable could not be run |
 | 501 | Not Implemented — chunked Transfer-Encoding; agent processes on AGNOS (until 2.4.x) |
+| 502 | Bad Gateway — an MCP endpoint could not be reached or answered wrongly |
+| 504 | Gateway Timeout — an MCP call, `web_fetch` or `web_search` did not finish within 60 s |
 
 All errors return `{"error":"message","code":NNN}`.
 
@@ -288,8 +344,8 @@ All errors return `{"error":"message","code":NNN}`.
 ## Security
 
 - There is **no authentication** (roadmap 2.5.x). The defaults limit who can reach the API. It binds
-  127.0.0.1, and agent control refuses browser-originated requests. Other mutating routes still
-  accept a cross-origin `text/plain` POST.
+  127.0.0.1, answers only to loopback host names while it does, and refuses state changes from
+  other sites on every route. Agent and task control refuse any browser-originated request.
 - All user-controlled strings in responses are JSON-escaped.
 - Content-Length is validated; Transfer-Encoding is rejected.
 - Maximum request size: 64 KB.

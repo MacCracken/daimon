@@ -29,10 +29,14 @@ fn _screen_own(s) {
     return str_clone(s);
 }
 
+# Recording ids have their own counter (2.3.4); they were drawn from agent.cyr's
+# _next_agent_id, so every recording used up an agent id.
+var _next_recording_id = 1;
+
 fn recording_session_new(agent_id) {
     var s = alloc(40);
-    store64(s, str_from_int(_next_agent_id)); # reuse counter for unique IDs
-    _next_agent_id = _next_agent_id + 1;
+    store64(s, str_from_int(_next_recording_id));
+    _next_recording_id = _next_recording_id + 1;
     store64(s + 8, REC_ACTIVE);
     store64(s + 16, 0);            # frame_count
     store64(s + 24, clock_epoch_secs());

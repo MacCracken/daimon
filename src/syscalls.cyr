@@ -50,6 +50,19 @@ var _DAIMON_O_CLOEXEC = 524288;     # asm-generic/fcntl.h (1 << 19); x86_64's as
 var _DAIMON_RLIMIT_NOFILE = 7;      # asm-generic/resource.h, both arches
 var _DAIMON_F_DUPFD_CLOEXEC = 1030; # linux/fcntl.h: F_LINUX_SPECIFIC_BASE (1024) + 6 (2.3.3)
 
+# 2.3.4 — an agent leads its own process group, and dies with daimon
+# (src/agent.cyr _agent_child). The stdlib has no setpgid. Verified the same
+# way as above, and on both arches by tracing a build under qemu-{x86_64,aarch64}
+# -strace: the kernel sees setpgid(0,0) (aarch64's 154 has no x86-compat
+# renumbering in the backend).
+#ifdef CYRIUS_ARCH_X86
+var _DAIMON_SYS_SETPGID = 109;      # asm/unistd_64.h __NR_setpgid
+#endif
+#ifdef CYRIUS_ARCH_AARCH64
+var _DAIMON_SYS_SETPGID = 154;      # asm-generic/unistd.h __NR_setpgid
+#endif
+var _DAIMON_PR_SET_PDEATHSIG = 1;   # linux/prctl.h
+
 # =========================================================================
 # Portability shims — one call shape, per-target bodies
 # =========================================================================
@@ -171,6 +184,24 @@ fn daimon_signal(pid, sig) {
     }
     return sys_kill(pid, sig);
     #endif
+}
+
+# Signal an agent and everything in its process group (2.3.4). The agent is its
+# group's leader (src/agent.cyr _agent_child), so kill(-pid) also reaches the
+# processes it started, which a stop used to leave running. The leader itself
+# is signalled first, by pidfd as above (race-free); the group signal is
+# best-effort — a group whose leader alone is left answers ESRCH.
+# Returns the leader's result.
+#
+# The group's id cannot be reused while daimon holds the leader unreaped (the
+# kernel keeps a pgid's number alive), and daimon signals only before reaping.
+fn daimon_signal_tree(pid, sig) {
+    if (pid <= 0) { return 0 - 1; }
+    var r = daimon_signal(pid, sig);
+    #ifndef CYRIUS_TARGET_AGNOS
+    sys_kill(0 - pid, sig);
+    #endif
+    return r;
 }
 
 # Wait for a child to exit, bounded. Returns 1 if reaped, 0 if it outlived the

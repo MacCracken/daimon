@@ -13,17 +13,20 @@ cyrius lib sync                        # vendor stdlib subset from the pin (lib/
 cyrius deps                            # resolve git deps (sakshi, bote, libro, majra) into lib/
 cyrius build src/main.cyr build/daimon # build
 ./build/daimon serve                   # start server on 127.0.0.1:8090 (--listen ADDR to change)
+./build/daimon help                    # every flag (--agents-dir, --agent-env, --agent-output, ...)
 ```
 
 ## Testing
 
 ```bash
-cyrius tests                        # every suite in tests/ — 917 assertions, 17 files
+cyrius tests                        # every suite in tests/ — 1033 assertions, 17 files
 cyrius fuzz                         # 7 property-based harnesses, 176,349 generated cases
 cyrius bench tests/daimon.bcyr      # 27 benchmarks (+2 in tests/rag_ingest.bcyr)
 sh tests/smoke.sh                   # the linked binary over HTTP: libro, tracing, regressions,
                                     # the agent lifecycle, the bind address, task start/complete,
-                                    # request-string decoding, agent channels
+                                    # request-string decoding, agent channels and messages,
+                                    # the event loop, hosts and origins, captured output,
+                                    # detached MCP calls
 sh tests/test.sh                    # all of the above except the benchmarks
 ```
 

@@ -357,12 +357,16 @@ kill $JS_SRV 2>/dev/null || true
 if [ $JS_OK -ne 1 ]; then echo "  request-string smoke FAILED"; SMOKE_EXIT=1; fi
 
 echo ""
-echo "=== 2.3.3 agent channels ==="
-# A started agent writes frames on fd 3 and reads a reply byte per frame; daimon
-# puts what it accepts on the bus at its next request. The fixture sends 101
-# broadcasts (one more than a subscriber queue holds), one malformed frame, and
-# later one more broadcast and one oversize length, each step gated on a file
-# the smoke creates.
+echo "=== 2.3.3 / 2.3.4 agent channels and messages ==="
+# A started agent writes frames on fd 3 and reads a reply byte per frame; the
+# message goes onto daimon's bus at once (2.3.4: daimon's own event loop), and
+# the reply says what became of it. The fixture:
+#   * sends a frame to the NAME "listener" (another registered agent);
+#   * sends 101 broadcasts: every queue holds 100, so the last one has nowhere
+#     to go;
+#   * sends a malformed frame and one to a target nobody has;
+# then, each gated on a file the smoke creates, one more broadcast and an
+# oversize length.
 IC_PORT=18087
 IC_OK=1
 IC_DIR=$(mktemp -d)
@@ -370,15 +374,19 @@ cat > "$IC_DIR/agnos-agent-user-agent" <<'AGENT'
 #!/bin/sh
 trap 'exit 0' TERM
 echo "$AGNOS_IPC_FD" > "$0.env"
+printf '\000\000\000\025{"target":"listener"}' >&3
+head -c 1 <&3 | od -v -An -tu1 | tr -d ' ' > "$0.named"
 i=0
 while [ $i -lt 101 ]; do printf '\000\000\000\016{"target":"*"}' >&3; i=$((i + 1)); done
-head -c 101 <&3 | od -v -An -tu1 | tr -s ' ' '\n' | grep -c '^1$' > "$0.acks"
+head -c 101 <&3 | od -v -An -tu1 | tr -s ' ' '\n' | grep -v '^$' > "$0.replies"
 printf '\000\000\000\007{"x":1}' >&3
 head -c 1 <&3 | od -v -An -tu1 | tr -d ' ' > "$0.nack"
+printf '\000\000\000\023{"target":"nobody"}' >&3
+head -c 1 <&3 | od -v -An -tu1 | tr -d ' ' > "$0.notarget"
 : > "$0.done1"
 while [ ! -e "$0.go" ]; do sleep 0.05; done
 printf '\000\000\000\016{"target":"*"}' >&3
-head -c 1 <&3 > /dev/null
+head -c 1 <&3 | od -v -An -tu1 | tr -d ' ' > "$0.after"
 : > "$0.done2"
 while [ ! -e "$0.go2" ]; do sleep 0.05; done
 printf '\000\001\000\001' >&3
@@ -403,40 +411,261 @@ ic_check() {
 }
 ic_wait() { i=0; while [ $i -lt 50 ] && [ ! -e "$1" ]; do i=$((i + 1)); sleep 0.1; done; }
 metric() { curl -s --max-time 10 "$C/v1/metrics" | grep -o "\"$1\":[0-9]*" | cut -d: -f2; }
+jcount() { grep -o "\"count\":[0-9]*" | cut -d: -f2; }
 
 curl -s -o /dev/null --max-time 10 -X POST "$C/v1/agents" -d '{"name":"talker","type":"User"}'
+curl -s -o /dev/null --max-time 10 -X POST "$C/v1/agents" -d '{"name":"listener","type":"System"}'
 curl -s -o /dev/null --max-time 10 -X POST "$C/v1/agents" -d '{"name":"listener","type":"System"}'
 curl -s -o /dev/null --max-time 10 -X POST "$C/v1/agents/1/start"
 ic_wait "$IX.done1"
 ic_check "the agent is told its channel: AGNOS_IPC_FD=3" "$(cat "$IX.env" 2>/dev/null)" "3"
-ic_check "101 frames, 101 ACKs"                "$(cat "$IX.acks" 2>/dev/null)" "101"
+ic_check "a frame to a registered NAME is ACKed (1)" "$(cat "$IX.named" 2>/dev/null)" "1"
+ic_check "100 broadcasts fit every queue: 100 ACKs" "$(grep -c '^1$' "$IX.replies" 2>/dev/null)" "100"
+ic_check "the 101st has nowhere to go: NACK_QUEUE_FULL (2)" "$(tail -1 "$IX.replies" 2>/dev/null)" "2"
 ic_check "a malformed frame is NACK_INVALID (3)" "$(cat "$IX.nack" 2>/dev/null)" "3"
-ic_check "the next request puts all 101 on the bus" "$(metric ipc_messages)" "101"
-ic_check "the malformed one is counted as refused" "$(metric ipc_refused)" "1"
-# Both registered agents are subscribed, so each queue took 100 and dropped 1.
-ic_check "every registered agent's queue got them (1 dropped each)" "$(metric bus_dropped)" "2"
-ic_check "delete the agent that never ran" "$(lcode -X DELETE "$C/v1/agents/2")" "200"
+ic_check "a target nobody has is NACK_NO_TARGET (4)" "$(cat "$IX.notarget" 2>/dev/null)" "4"
+ic_check "published at once, no request needed: 101 on the bus" "$(metric ipc_messages)" "101"
+ic_check "refused: the full one, the malformed one, the unknown target" "$(metric ipc_refused)" "3"
+# Three queues (the talker, the listener, and the second "listener" — an agent
+# like any other, just without the name): the 100th broadcast finds the
+# listener's full (it also holds the named frame), the 101st finds all three full.
+ic_check "dropped at full queues: 1 + 3" "$(metric bus_dropped)" "4"
+ic_check "one open channel" "$(metric ipc_channels)" "1"
+TAKE2=$(curl -s --max-time 10 -X POST "$C/v1/agents/2/messages/take" -d '{"max":1}')
+printf "  %s: " "the name routes to the FIRST agent that registered it (2, not 3)"
+if printf '%s' "$TAKE2" | grep -q '"target":"listener"' && printf '%s' "$TAKE2" | grep -q '"source":"1"'; then echo "PASS"; else echo "FAIL ($TAKE2)"; IC_OK=0; fi
+ic_check "take reports what is left (99 broadcasts)" "$(printf '%s' "$TAKE2" | grep -o '"remaining":[0-9]*' | cut -d: -f2)" "99"
+TAKE3=$(curl -s --max-time 10 -X POST "$C/v1/agents/3/messages/take")
+ic_check "the later registrant of the name got the broadcasts (100)" "$(printf '%s' "$TAKE3" | jcount)" "100"
+ic_check "... and not the frame sent to the name" "$(printf '%s' "$TAKE3" | grep -c '"target":"listener"')" "0"
+ic_check "take is POST only (GET is 405)" "$(lcode "$C/v1/agents/1/messages/take")" "405"
+ic_check "a browser may not take messages (403)" \
+  "$(lcode -X POST -H 'Origin: https://attacker.example' "$C/v1/agents/1/messages/take")" "403"
+ic_check "delete the listener" "$(lcode -X DELETE "$C/v1/agents/2")" "200"
+ic_check "the talker's own queue has its 100 broadcasts" \
+  "$(curl -s --max-time 10 -X POST "$C/v1/agents/1/messages/take" | jcount)" "100"
+ic_check "with every queue emptied, the bus holds 0 bytes (freed, VULN-018)" "$(metric bus_bytes)" "0"
 : > "$IX.go"
 ic_wait "$IX.done2"
-ic_check "one more broadcast is published" "$(metric ipc_messages)" "102"
-ic_check "a deleted agent's queue is gone (only the talker's drops)" "$(metric bus_dropped)" "3"
+ic_check "room again: the next broadcast is ACKed" "$(cat "$IX.after" 2>/dev/null)" "1"
+ic_check "an HTTP client can send to an agent (201)" \
+  "$(lcode -X POST "$C/v1/agents/1/messages" -d '{"type":"command","payload":{"k":"v"}}')" "201"
+TAKE1=$(curl -s --max-time 10 -X POST "$C/v1/agents/1/messages/take")
+ic_check "both are on its queue" "$(printf '%s' "$TAKE1" | jcount)" "2"
+printf "  %s: " "an HTTP message's source is \"api\" and its payload is intact"
+if printf '%s' "$TAKE1" | grep -q '"source":"api","target":"1","type":"command","payload":{"k":"v"}'; then echo "PASS"; else echo "FAIL ($TAKE1)"; IC_OK=0; fi
+ic_check "sending to an agent that does not exist is 404" "$(lcode -X POST "$C/v1/agents/99/messages" -d '{}')" "404"
 : > "$IX.go2"
 ic_wait "$IX.done3"
 ic_check "an oversize length is NACK_INVALID (3)" "$(cat "$IX.over" 2>/dev/null)" "3"
 ic_check "... and the channel is closed (EOF)"   "$(cat "$IX.eof" 2>/dev/null)" "0"
-i=0; IC_AUDIT=""
-while [ $i -lt 20 ]; do
-    IC_AUDIT=$(curl -s --max-time 10 -X POST "$C/v1/mcp/call" -d '{"name":"libro_export","arguments":{}}')
-    if printf '%s' "$IC_AUDIT" | grep -q 'ipc.frame.oversize'; then break; fi
-    i=$((i + 1)); sleep 0.1
-done
+IC_AUDIT=$(curl -s --max-time 10 -X POST "$C/v1/mcp/call" -d '{"name":"libro_export","arguments":{}}')
 printf "  %s: " "the closed channel is on the audit chain (ipc.frame.oversize)"
 if printf '%s' "$IC_AUDIT" | grep -q 'ipc.frame.oversize'; then echo "PASS"; else echo "FAIL"; IC_OK=0; fi
-ic_check "... and counted as refused" "$(metric ipc_refused)" "2"
+ic_check "... and counted as refused" "$(metric ipc_refused)" "4"
+ic_check "no open channel is left" "$(metric ipc_channels)" "0"
 ic_check "the agent still stops cleanly" \
   "$(curl -s --max-time 10 -X POST "$C/v1/agents/1/stop" | field exit_code)" "0"
 kill $IC_SRV 2>/dev/null || true
 rm -rf "$IC_DIR"
 if [ $IC_OK -ne 1 ]; then echo "  channel smoke FAILED"; SMOKE_EXIT=1; fi
+
+echo ""
+echo "=== 2.3.4 the event loop ==="
+# daimon runs its own loop since 2.3.4: a slow client holds only its own
+# connection, and a stop waits for its agent, not for the server (VULN-014).
+EL_PORT=18088
+EL_OK=1
+EL_DIR=$(mktemp -d)
+cat > "$EL_DIR/agnos-agent-service-agent" <<'AGENT'
+#!/bin/sh
+trap '' TERM
+: > "$0.ready"
+while :; do sleep 0.05; done
+AGENT
+chmod +x "$EL_DIR/agnos-agent-service-agent"
+./build/daimon serve $EL_PORT --agents-dir "$EL_DIR" >/dev/null 2>&1 &
+EL_SRV=$!
+i=0
+while [ $i -lt 25 ]; do
+    if curl -s --max-time 1 "http://127.0.0.1:$EL_PORT/v1/health" >/dev/null 2>&1; then break; fi
+    i=$((i + 1)); sleep 0.1
+done
+E="http://127.0.0.1:$EL_PORT"
+el_check() {
+    printf "  %s: " "$1"
+    if [ "$2" = "$3" ]; then echo "PASS"; else echo "FAIL (got '$2', want '$3')"; EL_OK=0; fi
+}
+# A request answered within a second reads 1.
+fast() { curl -s -o /dev/null -w '%{time_total}' --max-time 5 "$E/v1/health" | awk '{ print ($1 < 1.0) ? 1 : 0 }'; }
+# A client uploading one byte a second.
+head -c 40 /dev/zero | tr '\0' 'a' > "$EL_DIR/body"
+curl -s -o /dev/null --max-time 10 --limit-rate 1 -X POST "$E/v1/agents" --data-binary @"$EL_DIR/body" &
+SLOW=$!
+sleep 1
+el_check "a request is answered at once while another client trickles its body" "$(fast)" "1"
+kill $SLOW 2>/dev/null || true
+curl -s -o /dev/null --max-time 10 -X POST "$E/v1/agents" -d '{"name":"stubborn","type":"Service"}'
+curl -s -o /dev/null --max-time 10 -X POST "$E/v1/agents/1/start"
+i=0; while [ $i -lt 50 ] && [ ! -e "$EL_DIR/agnos-agent-service-agent.ready" ]; do i=$((i + 1)); sleep 0.1; done
+# The agent ignores SIGTERM, so its stop takes the whole 5 s grace.
+curl -s --max-time 20 -X POST "$E/v1/agents/1/stop" > "$EL_DIR/stop.out" &
+STOPPER=$!
+sleep 1
+el_check "during a 5 s stop, another request is answered at once (VULN-014)" "$(fast)" "1"
+el_check "... and sees the agent STOPPING (4)" "$(curl -s --max-time 5 "$E/v1/agents/1" | field status)" "4"
+wait $STOPPER
+el_check "the stop is answered once the agent is gone: SIGKILL (137)" "$(field exit_code < "$EL_DIR/stop.out")" "137"
+el_check "... STOPPED (5)" "$(field status < "$EL_DIR/stop.out")" "5"
+kill $EL_SRV 2>/dev/null || true
+rm -rf "$EL_DIR"
+if [ $EL_OK -ne 1 ]; then echo "  event loop smoke FAILED"; SMOKE_EXIT=1; fi
+
+echo ""
+echo "=== 2.3.4 hosts, origins, edge capabilities ==="
+HO_PORT=18089
+HO_OK=1
+./build/daimon serve $HO_PORT >/dev/null 2>&1 &
+HO_SRV=$!
+i=0
+while [ $i -lt 25 ]; do
+    if curl -s --max-time 1 "http://127.0.0.1:$HO_PORT/v1/health" >/dev/null 2>&1; then break; fi
+    i=$((i + 1)); sleep 0.1
+done
+H="http://127.0.0.1:$HO_PORT"
+ho_check() {
+    printf "  %s: " "$1"
+    if [ "$2" = "$3" ]; then echo "PASS"; else echo "FAIL (got '$2', want '$3')"; HO_OK=0; fi
+}
+hcode() { curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$@"; }
+# DNS rebinding (VULN-012): the page's requests carry the attacker's name.
+ho_check "a request for another host name is refused (DNS rebinding)" \
+  "$(hcode -H 'Host: attacker.example:'$HO_PORT "$H/v1/health")" "403"
+ho_check "localhost is daimon's own name" "$(hcode -H 'Host: localhost:'$HO_PORT "$H/v1/health")" "200"
+# Cross-site writes on every route, not only agent control.
+ho_check "a cross-site text/plain POST to /v1/mcp/tools is refused" \
+  "$(hcode -X POST -H 'Content-Type: text/plain' -H 'Origin: https://attacker.example' "$H/v1/mcp/tools" \
+      -d '{"name":"x","description":"d","callback_url":"http://127.0.0.1:9/"}')" "403"
+ho_check "a page on daimon's own loopback host may write" \
+  "$(hcode -X POST -H 'Origin: http://127.0.0.1:'$HO_PORT "$H/v1/mcp/tools" \
+      -d '{"name":"x","description":"d","callback_url":"http://127.0.0.1:9/"}')" "201"
+ho_check "a cross-site GET is still answered (it changes nothing; CORS keeps its answer from the page)" \
+  "$(hcode -H 'Origin: https://attacker.example' "$H/v1/health")" "200"
+# Edge nodes register their capabilities, numbered on their own.
+curl -s -o /dev/null --max-time 10 -X POST "$H/v1/agents" -d '{"name":"a1"}'
+curl -s -o /dev/null --max-time 10 -X POST "$H/v1/agents" -d '{"name":"a2"}'
+EID=$(curl -s --max-time 10 -X POST "$H/v1/edge/nodes" \
+  -d '{"name":"pi-1","arch":"aarch64","cpu_cores":4,"memory_mb":8192,"has_gpu":true}' | grep -o '"id":"[^"]*"' | cut -d'"' -f4)
+ho_check "edge ids have their own counter (the first node is 1, after two agents)" "$EID" "1"
+EN=$(curl -s --max-time 10 "$H/v1/edge/nodes/$EID")
+printf "  %s: " "a node keeps the capabilities it registered"
+if printf '%s' "$EN" | grep -q '"arch":"aarch64","cpu_cores":4,"memory_mb":8192,"disk_mb":32768,"has_gpu":true'; then echo "PASS"; else echo "FAIL ($EN)"; HO_OK=0; fi
+ho_check "the fleet's stats count them" "$(curl -s --max-time 10 "$H/v1/edge/stats" | grep -o '"cpu_cores":[0-9]*' | cut -d: -f2)" "4"
+ho_check "an invalid arch is 422" "$(hcode -X POST "$H/v1/edge/nodes" -d '{"name":"bad","arch":"X86!"}')" "422"
+ho_check "cpu_cores must be a positive integer (422)" "$(hcode -X POST "$H/v1/edge/nodes" -d '{"name":"bad2","cpu_cores":0}')" "422"
+ho_check "a duplicate edge name is still refused" "$(hcode -X POST "$H/v1/edge/nodes" -d '{"name":"pi-1"}')" "400"
+ho_check "without --agent-output capture, the output route says so (409)" "$(hcode "$H/v1/agents/1/output")" "409"
+kill $HO_SRV 2>/dev/null || true
+./build/daimon serve 18090 --listen 0.0.0.0 >/dev/null 2>&1 &
+HO2=$!
+i=0; while [ $i -lt 25 ]; do curl -s --max-time 1 "http://127.0.0.1:18090/v1/health" >/dev/null 2>&1 && break; i=$((i + 1)); sleep 0.1; done
+ho_check "with --listen 0.0.0.0 the operator chose its names: any Host is served" \
+  "$(hcode -H 'Host: daimon.lan:18090' "http://127.0.0.1:18090/v1/health")" "200"
+kill $HO2 2>/dev/null || true
+./build/daimon serve 18091 --agent-env bogus >/dev/null 2>&1
+ho_check "an unknown --agent-env exits 1" "$?" "1"
+# Captured output (2.3.4, serve --agent-output capture).
+OC_DIR=$(mktemp -d)
+printf '#!/bin/sh\ntrap "exit 0" TERM\necho "out line"\necho "err line" >&2\n: > "$0.ready"\nwhile :; do sleep 0.05; done\n' > "$OC_DIR/agnos-agent-user-agent"
+chmod +x "$OC_DIR/agnos-agent-user-agent"
+./build/daimon serve 18092 --agents-dir "$OC_DIR" --agent-output capture >/dev/null 2>&1 &
+OC_SRV=$!
+i=0; while [ $i -lt 25 ]; do curl -s --max-time 1 "http://127.0.0.1:18092/v1/health" >/dev/null 2>&1 && break; i=$((i + 1)); sleep 0.1; done
+curl -s -o /dev/null --max-time 10 -X POST "http://127.0.0.1:18092/v1/agents" -d '{"name":"talky"}'
+curl -s -o /dev/null --max-time 10 -X POST "http://127.0.0.1:18092/v1/agents/1/start"
+i=0; while [ $i -lt 50 ] && [ ! -e "$OC_DIR/agnos-agent-user-agent.ready" ]; do i=$((i + 1)); sleep 0.1; done
+sleep 0.3
+OUTJ=$(curl -s --max-time 10 "http://127.0.0.1:18092/v1/agents/1/output")
+printf "  %s: " "with --agent-output capture, an agent's stdout and stderr are served"
+if printf '%s' "$OUTJ" | grep -q 'out line' && printf '%s' "$OUTJ" | grep -q 'err line'; then echo "PASS"; else echo "FAIL ($OUTJ)"; HO_OK=0; fi
+curl -s -o /dev/null --max-time 10 -X POST "http://127.0.0.1:18092/v1/agents/1/stop"
+kill $OC_SRV 2>/dev/null || true
+rm -rf "$OC_DIR"
+if [ $HO_OK -ne 1 ]; then echo "  host/origin/edge smoke FAILED"; SMOKE_EXIT=1; fi
+
+echo ""
+echo "=== detached calls smoke (2.3.4) ==="
+# A call that waits on another server (a forwarded MCP call, web_fetch) runs in
+# a child process; the loop relays its answer. Before, it held the server: a
+# health check sent during a 2 s call waited 1.7 s.
+DT_OK=1
+dt_check() {
+    printf "  %s: " "$1"
+    if [ "$2" = "$3" ]; then echo "PASS"; else echo "FAIL (got '$2', expected '$3')"; DT_OK=0; fi
+}
+if command -v python3 >/dev/null 2>&1; then
+    DT_DIR=$(mktemp -d)
+    # An MCP endpoint that answers after 2 s: POST a JSON-RPC result naming the
+    # method it was asked, GET a page.
+    cat > "$DT_DIR/slow_mcp.py" <<'PY'
+import json, sys, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_POST(self):
+        req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
+        time.sleep(2)
+        body = json.dumps({"jsonrpc": "2.0", "id": req.get("id"), "result": {"content": [
+            {"type": "text", "text": "slow ok: " + str(req.get("method"))}], "isError": False}}).encode()
+        self.send_response(200); self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    def do_GET(self):
+        time.sleep(2)
+        body = b"<html><body><p>slow page</p></body></html>"
+        self.send_response(200); self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+PY
+    python3 "$DT_DIR/slow_mcp.py" 18094 >/dev/null 2>&1 &
+    DT_UP=$!
+    ./build/daimon serve 18093 >/dev/null 2>&1 &
+    DT_SRV=$!
+    DT=http://127.0.0.1:18093
+    i=0; while [ $i -lt 25 ]; do curl -s --max-time 1 "$DT/v1/health" >/dev/null 2>&1 && break; i=$((i + 1)); sleep 0.1; done
+    curl -s -o /dev/null --max-time 10 -X POST "$DT/v1/mcp/tools" \
+        -d '{"name":"slow_tool","description":"d","callback_url":"http://127.0.0.1:18094/"}'
+    curl -s -o /dev/null --max-time 10 -X POST "$DT/v1/mcp/resources" \
+        -d '{"uri":"test://slow","name":"slow","callback_url":"http://127.0.0.1:18094/"}'
+    for what in tool resource web; do
+        case $what in
+            tool) path=/v1/mcp/call; body='{"name":"slow_tool","arguments":{}}'; want='slow ok: tools/call' ;;
+            resource) path=/v1/mcp/resources/read; body='{"uri":"test://slow"}'; want='slow ok: resources/read' ;;
+            web) path=/v1/mcp/call; body='{"name":"web_fetch","arguments":{"url":"http://127.0.0.1:18094/page"}}'; want='slow page' ;;
+        esac
+        curl -s --max-time 20 -o "$DT_DIR/$what.out" -w '%{http_code}' -X POST "$DT$path" -d "$body" > "$DT_DIR/$what.code" &
+        DT_CALL=$!
+        sleep 0.3
+        HT=$(curl -s -o /dev/null --max-time 10 -w '%{time_total}' "$DT/v1/health")
+        dt_check "$what: health during a 2 s call answers within 0.5 s" \
+            "$(awk -v t="$HT" 'BEGIN { if (t < 0.5) print "yes"; else print "no, " t " s" }')" "yes"
+        wait $DT_CALL
+        dt_check "$what: the call is answered (200)" "$(cat "$DT_DIR/$what.code")" "200"
+        dt_check "$what: ... with the endpoint's answer" "$(grep -c "$want" "$DT_DIR/$what.out")" "1"
+    done
+    sleep 0.3
+    # The children are reaped: none of daimon's is left, zombie or not. (The
+    # parent pid is field 2 after the ")" that ends the command name.)
+    DT_KIDS=0
+    for d in /proc/[0-9]*; do
+        pp=$(sed 's/.*) //' "$d/stat" 2>/dev/null | awk '{print $2}')
+        if [ "$pp" = "$DT_SRV" ]; then DT_KIDS=$((DT_KIDS + 1)); fi
+    done
+    dt_check "every call's child is reaped" "$DT_KIDS" "0"
+    kill $DT_SRV $DT_UP 2>/dev/null || true
+    rm -rf "$DT_DIR"
+else
+    echo "  SKIP: python3 is not installed (the slow MCP endpoint needs it)"
+fi
+if [ $DT_OK -ne 1 ]; then echo "  detached-call smoke FAILED"; SMOKE_EXIT=1; fi
 
 exit $SMOKE_EXIT

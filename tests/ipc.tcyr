@@ -32,7 +32,6 @@ include "lib/math.cyr"
 include "lib/process.cyr"
 include "lib/sakshi.cyr"
 include "lib/libro.cyr"
-include "lib/thread.cyr"
 include "lib/assert.cyr"
 
 include "src/syscalls.cyr"
@@ -51,7 +50,8 @@ assert(str_eq(ipc_msg_target(m), str_from("b")) == 1, "msg target round-trips");
 assert_eq(ipc_msg_type(m), 3, "msg type round-trips");
 assert(str_eq(ipc_msg_payload(m), str_from("hi")) == 1, "msg payload round-trips");
 var m2 = ipc_msg_new(str_from("a"), str_from("b"), 3, str_from("x"));
-assert(str_eq(load64(m), load64(m2)) == 0, "message ids are unique");
+assert(ipc_msg_id(m) != ipc_msg_id(m2), "message ids are unique");
+assert_eq(ipc_msg_id(m2), ipc_msg_id(m) + 1, "... and increase");
 
 # --- message bus ---------------------------------------------------------
 var mb = msg_bus_new();
@@ -183,15 +183,177 @@ var aid0 = _next_agent_id;
 ipc_msg_new(str_from("s"), str_from("t"), MSG_EVENT, str_from("p"));
 assert_eq(_next_agent_id, aid0, "a message does not consume an agent id");
 
-# --- 2.3.3: agent channels, through the real service thread -------------------
-# The test holds the AGENT's end of each channel and speaks the wire protocol
-# on it (docs/guides/agent-ipc.md); the service thread owns daimon's end.
+# --- 2.3.4: message memory is freed (VULN-018) --------------------------------------
+# A message is one freelist block, held by every queue it is on and freed when
+# the last lets go. msg_bus_bytes counts what the bus holds.
+test_group("ipc_bus_memory");
+var fbus = msg_bus_new();
+msg_bus_subscribe(fbus, "10");
+msg_bus_subscribe(fbus, "11");
+msg_bus_subscribe(fbus, "12");
+var b0 = msg_bus_bytes();
+var one = ipc_msg_new(str_from("s"), str_from("10"), MSG_EVENT, str_from("\"payload\""));
+var one_size = ipc_msg_size(one);
+var p1_t, p1_v = msg_bus_publish(fbus, one);
+assert_eq(is_ok(p1_t), 1, "memory: a directed message is published");
+assert_eq(p1_v, 1, "memory: ... onto one queue");
+assert_eq(msg_bus_bytes() - b0, one_size, "memory: the bus counts its bytes");
+assert_eq(msg_bus_drop_front(fbus, "10", 5), 1, "memory: taking it lets go of it");
+assert_eq(msg_bus_bytes(), b0, "memory: ... and its bytes are freed");
+# ... back to the freelist, which hands the same block to the next message.
+var reuse = ipc_msg_new(str_from("s"), str_from("10"), MSG_EVENT, str_from("\"payload\""));
+assert_eq(reuse, one, "memory: the freed block is reused by the next message");
+ipc_msg_discard(reuse);
+
+# A broadcast is one message on three queues, counted once, freed by the last.
+var bc = ipc_msg_new(str_from("s"), str_from("*"), MSG_EVENT, str_from("1"));
+var bc_size = ipc_msg_size(bc);
+var bc_t, bc_v = msg_bus_publish(fbus, bc);
+assert_eq(bc_v, 3, "memory: a broadcast reaches all three queues");
+assert_eq(msg_bus_bytes() - b0, bc_size, "memory: ... and is counted once");
+msg_bus_drop_front(fbus, "10", 1);
+msg_bus_drop_front(fbus, "11", 1);
+assert_eq(msg_bus_bytes() - b0, bc_size, "memory: still held while one queue has it");
+assert_eq(str_eq(ipc_msg_payload(vec_get(msg_bus_queue(fbus, "12"), 0)), str_from("1")), 1,
+  "memory: ... and still readable there");
+msg_bus_drop_front(fbus, "12", 1);
+assert_eq(msg_bus_bytes(), b0, "memory: the last queue to let go frees it");
+
+# Deleting a subscriber lets go of what its queue held.
+msg_bus_publish(fbus, ipc_msg_new(str_from("s"), str_from("11"), MSG_EVENT, str_from("2")));
+msg_bus_publish(fbus, ipc_msg_new(str_from("s"), str_from("11"), MSG_EVENT, str_from("3")));
+assert(msg_bus_bytes() > b0, "memory: two messages held");
+msg_bus_unsubscribe(fbus, "11");
+assert_eq(msg_bus_bytes(), b0, "memory: unsubscribing frees its queue's messages");
+assert_eq(msg_bus_queue(fbus, "11"), 0, "memory: and the queue is gone");
+
+# Unknown targets and full queues keep nothing.
+var nt_t, nt_v = msg_bus_publish(fbus, ipc_msg_new(str_from("s"), str_from("nobody"), MSG_EVENT, str_from("4")));
+assert_eq(is_err_result(nt_t), 1, "bus: an unknown target is an error");
+assert_eq(nt_v, DAIMON_ERR_AGENT_NOT_FOUND, "bus: ... AGENT_NOT_FOUND (not a broadcast to everyone)");
+assert_eq(msg_bus_bytes(), b0, "memory: and the message is freed");
+
+# The byte cap: past it nothing is queued, and that is counted.
+var cap0 = IPC_BUS_BYTES_MAX;
+IPC_BUS_BYTES_MAX = msg_bus_bytes() + 400;
+var bigp = str_builder_new();
+var bpi = 0;
+while (bpi < 300) { str_builder_add_cstr(bigp, "a"); bpi = bpi + 1; }
+var bigs = str_builder_build(bigp);
+var d0 = msg_bus_dropped_count();
+var c1_t, c1_v = msg_bus_publish(fbus, ipc_msg_new(str_from("s"), str_from("12"), MSG_EVENT, bigs));
+assert_eq(is_ok(c1_t), 1, "cap: a message within the cap is queued");
+var c2_t, c2_v = msg_bus_publish(fbus, ipc_msg_new(str_from("s"), str_from("12"), MSG_EVENT, bigs));
+assert_eq(is_err_result(c2_t), 1, "cap: one past it is refused");
+assert_eq(c2_v, DAIMON_ERR_IPC_FAULT, "cap: ... as full");
+assert_eq(msg_bus_dropped_count() - d0, 1, "cap: and counted as dropped");
+assert(msg_bus_bytes() <= IPC_BUS_BYTES_MAX, "cap: the bus never holds more than the cap");
+msg_bus_drop_front(fbus, "12", 10);
+IPC_BUS_BYTES_MAX = cap0;
+assert_eq(msg_bus_bytes(), b0, "cap: freed again");
+
+# A broadcast whose every queue is full is refused; one to nobody is not.
+var ebus = msg_bus_new();
+var e_t, e_v = msg_bus_publish(ebus, ipc_msg_new(str_from("s"), str_from("*"), MSG_EVENT, str_from("5")));
+assert_eq(is_ok(e_t), 1, "bus: a broadcast with no subscribers is accepted");
+assert_eq(e_v, 0, "bus: ... reaching nobody");
+msg_bus_subscribe(ebus, "20");
+var fq = 0;
+while (fq < IPC_BUS_QUEUE_MAX) {
+    msg_bus_publish(ebus, ipc_msg_new(str_from("s"), str_from("20"), MSG_EVENT, str_from("6")));
+    fq = fq + 1;
+}
+var f_t, f_v = msg_bus_publish(ebus, ipc_msg_new(str_from("s"), str_from("BroadCast"), MSG_EVENT, str_from("7")));
+assert_eq(is_err_result(f_t), 1, "bus: a broadcast every queue is too full for is refused");
+assert_eq(f_v, DAIMON_ERR_IPC_FAULT, "bus: ... as full (\"broadcast\" in any case is a broadcast)");
+msg_bus_unsubscribe(ebus, "20");
+assert_eq(msg_bus_bytes(), b0, "memory: all of it freed");
+
+# --- 2.3.4: captured output rings ------------------------------------------------
+test_group("ipc_output");
+var opf: i32[2];
+assert_eq(syscall(_DAIMON_SYS_PIPE2, &opf, _DAIMON_O_CLOEXEC), 0, "output: a pipe");
+var out_wr = load32(&opf + 4);
+ipc_output_add(str_from("60"), load32(&opf));
+assert_eq(ipc_output_total("60"), 0, "output: an empty ring to start");
+var chunk = alloc(4000);
+var ck = 0;
+while (ck < 10) {                  # 40000 bytes: more than the ring holds
+    memset(chunk, 65 + ck, 4000);  # "AAAA...", "BBBB...", ...
+    sys_write(out_wr, chunk, 4000);
+    ipc_poll_once(0);
+    ck = ck + 1;
+}
+ipc_poll_once(0);
+assert_eq(ipc_output_total("60"), 40000, "output: every byte is counted");
+var otext = ipc_output_text("60");
+assert_eq(str_len(otext), AGENT_OUTPUT_RING, "output: the ring keeps the last AGENT_OUTPUT_RING bytes");
+assert_eq(load8(str_data(otext) + str_len(otext) - 1), 74, "output: ... the newest last (J)");
+assert_eq(load8(str_data(otext)), 65 + (40000 - AGENT_OUTPUT_RING) / 4000, "output: ... the oldest kept first");
+sys_close(out_wr);
+ipc_poll_once(0);
+assert_eq(ipc_output_total("60"), 40000, "output: the ring outlives its pipe (EOF)");
+ipc_output_forget("60");
+assert_eq(ipc_output_total("60"), 0 - 1, "output: forgotten when the agent is deleted");
+assert_eq(ipc_output_text("60"), 0, "output: ... and its text with it");
+
+# The shared heap: publishing and taking allocates nothing there once a queue's
+# storage has grown (the message is a freelist block, freed on take).
+var hq = msg_bus_new();
+msg_bus_subscribe(hq, "30");
+var hpay = str_from("{\"k\":1}");
+var hsrc = str_from("s");
+var htgt = str_from("30");
+var hk = 0;
+while (hk < 200) {
+    msg_bus_publish(hq, ipc_msg_new(hsrc, htgt, MSG_EVENT, hpay));
+    msg_bus_drop_front(hq, "30", 1);
+    hk = hk + 1;
+}
+var hh0 = alloc_used();
+hk = 0;
+while (hk < 1000) {
+    msg_bus_publish(hq, ipc_msg_new(hsrc, htgt, MSG_EVENT, hpay));
+    msg_bus_drop_front(hq, "30", 1);
+    hk = hk + 1;
+}
+assert(alloc_used() - hh0 < 1000, "memory: 1000 messages through a queue leave the shared heap as it was");
+assert_eq(msg_bus_bytes(), b0, "memory: and the bus holds none of them");
+
+# --- 2.3.4: names ---------------------------------------------------------------
+test_group("ipc_names");
+var nbus = msg_bus_new();
+msg_bus_subscribe(nbus, "40");
+msg_bus_subscribe(nbus, "41");
+assert_eq(msg_bus_register_name(nbus, "worker", "40"), 1, "names: the first agent to register a name gets it");
+assert_eq(msg_bus_register_name(nbus, "worker", "41"), 0, "names: a later one does not");
+assert(streq(msg_bus_get_agent_id(nbus, "worker"), "40") == 1, "names: ... it still routes to the first");
+msg_bus_publish(nbus, ipc_msg_new(str_from("s"), str_from("worker"), MSG_EVENT, str_from("1")));
+assert_eq(vec_len(msg_bus_queue(nbus, "40")), 1, "names: a message to the name reaches its owner");
+assert_eq(vec_len(msg_bus_queue(nbus, "41")), 0, "names: and not the later registrant");
+assert_eq(msg_bus_register_name(nbus, "41", "40"), 0,
+  "names: an all-digit name is not registered (it would shadow an id)");
+assert_eq(msg_bus_register_name(nbus, "*", "40"), 0, "names: nor \"*\"");
+assert_eq(msg_bus_register_name(nbus, "Broadcast", "40"), 0, "names: nor \"broadcast\"");
+assert_eq(msg_bus_unregister_name(nbus, "worker", "41"), 0, "names: only the owner releases a name");
+assert_eq(msg_bus_unregister_name(nbus, "worker", "40"), 1, "names: the owner does");
+assert_eq(msg_bus_register_name(nbus, "worker", "41"), 1, "names: then another agent may take it");
+msg_bus_unsubscribe(nbus, "40");
+msg_bus_unsubscribe(nbus, "41");
+
+# --- agent channels, through the loop's own channel pass --------------------
+# The test holds the AGENT's end of each channel and speaks the wire protocol on
+# it (docs/guides/agent-ipc.md). ipc_poll_once is the pass daimon's event loop
+# makes over the channels (2.3.4): it answers and publishes every frame that is
+# complete, on this thread, so nothing below waits on anything else.
 test_group("ipc_channel");
 
-# Small limits, set before the service starts: the hand-off's capacity is fixed
-# when it is created; the timeout is read on every pass.
-IPC_HANDOFF_CAP = 8;
-IPC_FRAME_TIMEOUT_MS = 300;
+IPC_FRAME_TIMEOUT_MS = 300;   # read on every pass
+
+var tbus = msg_bus_new();
+msg_bus_subscribe(tbus, "7");
+msg_bus_subscribe(tbus, "8");
+ipc_attach_bus(tbus);
 
 # A channel for agent `id`; returns the agent's end.
 fn _t_chan(id) {
@@ -201,8 +363,7 @@ fn _t_chan(id) {
     return load32(&fds + 4);
 }
 
-# `n` bytes of frame for a body of `blen` bytes: the 4-byte big-endian length,
-# then the body.
+# A frame: the 4-byte big-endian length, then the body.
 fn _t_frame(body, blen) {
     var buf = alloc(blen + 4);
     store8(buf, (blen >> 24) & 255);
@@ -230,17 +391,17 @@ fn _t_reply(fd, ms) {
     return load8(&b);
 }
 
-# The next record handed over, waiting up to ~2 s (a fault's record follows
-# the close the test sees).
-fn _t_take() {
-    var i = 0;
-    while (i < 200) {
-        var r = ipc_take();
-        if (r != 0) { return r; }
-        sleep_ms(10);
-        i = i + 1;
-    }
+# daimon's side: one pass over the channels.
+fn _t_pump() {
+    ipc_poll_once(100);
     return 0;
+}
+
+# Send one frame and return daimon's reply to it.
+fn _t_rt(fd, body) {
+    _t_send(fd, body);
+    _t_pump();
+    return _t_reply(fd, 1000);
 }
 
 fn _t_str_is(s, cstr) {
@@ -248,53 +409,68 @@ fn _t_str_is(s, cstr) {
     return str_eq(s, str_from(cstr));
 }
 
+fn _t_qlen(id) { return vec_len(msg_bus_queue(tbus, id)); }
+
+# The newest message in a subscriber's queue, or 0.
+fn _t_last(id) {
+    var q = msg_bus_queue(tbus, id);
+    if (vec_len(q) == 0) { return 0; }
+    return vec_get(q, vec_len(q) - 1);
+}
+
 var a41 = _t_chan("41");
 assert(a41 >= 0, "channel: a socketpair opens");
+# 2.3.4: channels are served on the one thread daimon has. From the moment a
+# thread starts, every allocation takes the stdlib's heap lock (lib/alloc.cyr);
+# 2.3.3's channel thread did that (alloc(64) 10 -> 53 ns).
+assert_eq(_threads_active, 0, "channel: no thread is started (allocations stay lock-free)");
+assert_eq(ipc_channel_count(), 1, "channel: daimon holds one channel");
 
-# A valid frame: ACK, and the record is already handed over when it arrives.
-_t_send(a41, "{\"target\":\"*\",\"type\":\"command\",\"payload\":{\"n\":1,\"s\":\"x\"}}");
-assert_eq(_t_reply(a41, 2000), ACK, "channel: a valid frame is ACKed");
-var r1 = ipc_take();
-assert(r1 != 0, "channel: the ACK follows the hand-over (the record is there)");
-if (r1 != 0) {
-    assert_eq(ipc_rec_kind(r1), IPC_REC_MESSAGE, "channel: a MESSAGE record");
-    assert_eq(_t_str_is(ipc_rec_agent(r1), "41"), 1, "channel: from the channel's agent");
-    assert_eq(_t_str_is(ipc_rec_target(r1), "*"), 1, "channel: target as sent");
-    assert_eq(ipc_rec_type(r1), MSG_COMMAND, "channel: type as sent");
-    assert_eq(_t_str_is(ipc_rec_payload(r1), "{\"n\":1,\"s\":\"x\"}"), 1, "channel: payload as compact JSON");
+# A valid frame: ACK, and the message is on the bus when the reply arrives.
+var q7a = _t_qlen("7");
+assert_eq(_t_rt(a41, "{\"target\":\"*\",\"type\":\"command\",\"payload\":{\"n\":1,\"s\":\"x\"}}"), ACK,
+  "channel: a valid frame is ACKed");
+assert_eq(_t_qlen("7"), q7a + 1, "channel: the broadcast reached 7");
+assert_eq(_t_qlen("8"), 1, "channel: ... and 8");
+var m1 = _t_last("7");
+assert(m1 != 0, "channel: the message is queued");
+if (m1 != 0) {
+    assert_eq(_t_str_is(ipc_msg_source(m1), "41"), 1, "channel: from the channel's agent");
+    assert_eq(_t_str_is(ipc_msg_target(m1), "*"), 1, "channel: target as sent");
+    assert_eq(ipc_msg_type(m1), MSG_COMMAND, "channel: type as sent");
+    assert_eq(_t_str_is(ipc_msg_payload(m1), "{\"n\":1,\"s\":\"x\"}"), 1, "channel: payload as compact JSON");
 }
 
 # Identity is the channel: whatever a frame claims, the source is its agent.
-_t_send(a41, "{\"target\":\"7\",\"source\":\"99\",\"agent\":\"99\",\"agent_id\":99}");
-assert_eq(_t_reply(a41, 2000), ACK, "channel: a frame claiming another source is still a frame");
-var r2 = ipc_take();
-assert(r2 != 0, "channel: handed over");
-if (r2 != 0) {
-    assert_eq(_t_str_is(ipc_rec_agent(r2), "41"), 1,
+assert_eq(_t_rt(a41, "{\"target\":\"7\",\"source\":\"99\",\"agent\":\"99\",\"agent_id\":99}"), ACK,
+  "channel: a frame claiming another source is still a frame");
+var m2 = _t_last("7");
+if (m2 != 0) {
+    assert_eq(_t_str_is(ipc_msg_source(m2), "41"), 1,
       "channel: a claimed source is ignored — it is the channel's agent");
-    assert_eq(ipc_rec_type(r2), MSG_EVENT, "channel: no type is an event");
-    assert_eq(_t_str_is(ipc_rec_payload(r2), "null"), 1, "channel: no payload is null");
+    assert_eq(ipc_msg_type(m2), MSG_EVENT, "channel: no type is an event");
+    assert_eq(_t_str_is(ipc_msg_payload(m2), "null"), 1, "channel: no payload is null");
 }
-# The arena is reset for each frame; what a record holds must not be in it.
-if (r1 != 0) {
-    assert_eq(_t_str_is(ipc_rec_target(r1), "*"), 1, "channel: a record's target outlives the next frame's parse");
+# The parse arena is rewound for each frame; a message must not point into it.
+if (m1 != 0) {
+    assert_eq(_t_str_is(ipc_msg_target(m1), "*"), 1, "channel: a message outlives the next frame's parse");
 }
-_t_send(a41, "{\"target\":\"7\",\"type\":null,\"payload\":\"caf\\u00e9\"}");
-assert_eq(_t_reply(a41, 2000), ACK, "channel: type null is ACKed");
-var r3 = ipc_take();
-if (r3 != 0) {
-    assert_eq(ipc_rec_type(r3), MSG_EVENT, "channel: type null is an event");
+assert_eq(_t_rt(a41, "{\"target\":\"7\",\"type\":null,\"payload\":\"caf\\u00e9\"}"), ACK,
+  "channel: type null is ACKed");
+var m3 = _t_last("7");
+if (m3 != 0) {
+    assert_eq(ipc_msg_type(m3), MSG_EVENT, "channel: type null is an event");
     # "café" as UTF-8, quoted: the \u00e9 is decoded, and re-encoded as bytes.
     var cafe: u8[8];
     memcpy(&cafe, "\"caf", 4);
     store8(&cafe + 4, 195);
     store8(&cafe + 5, 169);
     store8(&cafe + 6, 34);
-    assert_eq(str_eq(ipc_rec_payload(r3), str_new(&cafe, 7)), 1,
+    assert_eq(str_eq(ipc_msg_payload(m3), str_new(&cafe, 7)), 1,
       "channel: a string payload is decoded, then re-encoded");
 }
 
-# Refused bodies: NACK_INVALID, nothing handed over, the channel stays open.
+# Refused bodies: NACK_INVALID, nothing published, the channel stays open.
 var bad = vec_new();
 vec_push(bad, "hello");
 vec_push(bad, "[1,2]");
@@ -303,26 +479,39 @@ vec_push(bad, "{\"x\":1}");
 vec_push(bad, "{\"target\":\"\"}");
 vec_push(bad, "{\"target\":5}");
 vec_push(bad, "{\"target\":null}");
-vec_push(bad, "{\"target\":\"a\",\"target\":\"b\"}");
+vec_push(bad, "{\"target\":\"7\",\"target\":\"8\"}");
 vec_push(bad, "{\"target\":\"a\\u0000b\"}");
-vec_push(bad, "{\"target\":\"a\",\"note\":\"\\u0000\"}");
-vec_push(bad, "{\"target\":\"a\",\"type\":\"bogus\"}");
-vec_push(bad, "{\"target\":\"a\",\"type\":5}");
+vec_push(bad, "{\"target\":\"7\",\"note\":\"\\u0000\"}");
+vec_push(bad, "{\"target\":\"7\",\"type\":\"bogus\"}");
+vec_push(bad, "{\"target\":\"7\",\"type\":5}");
 var ref0 = ipc_refused_count();
+var pub0 = ipc_published_count();
+var q7b = _t_qlen("7");
 var bi = 0;
 var bad_ok = 0;
 while (bi < vec_len(bad)) {
-    _t_send(a41, vec_get(bad, bi));
-    if (_t_reply(a41, 2000) == NACK_INVALID) {
-        if (ipc_take() == 0) { bad_ok = bad_ok + 1; }
-    }
+    if (_t_rt(a41, vec_get(bad, bi)) == NACK_INVALID) { bad_ok = bad_ok + 1; }
     bi = bi + 1;
 }
-assert_eq(bad_ok, vec_len(bad), "channel: each malformed body is NACK_INVALID and never handed over");
+assert_eq(bad_ok, vec_len(bad), "channel: each malformed body is NACK_INVALID");
 assert_eq(ipc_refused_count() - ref0, vec_len(bad), "channel: each refusal is counted");
-_t_send(a41, "{\"target\":\"7\"}");
-assert_eq(_t_reply(a41, 2000), ACK, "channel: after refusals the channel still works");
-ipc_take();
+assert_eq(ipc_published_count(), pub0, "channel: none is published");
+assert_eq(_t_qlen("7"), q7b, "channel: none is queued");
+assert_eq(_t_rt(a41, "{\"target\":\"7\"}"), ACK, "channel: after refusals the channel still works");
+
+# The reply says what became of the message (2.3.4).
+var nt0 = ipc_refused_count();
+assert_eq(_t_rt(a41, "{\"target\":\"nobody\"}"), NACK_NO_TARGET, "channel: a target nothing has is NACK_NO_TARGET");
+assert_eq(ipc_refused_count() - nt0, 1, "channel: ... counted as refused");
+var fill = _t_qlen("8");
+while (fill < IPC_BUS_QUEUE_MAX) {
+    msg_bus_publish(tbus, ipc_msg_new(str_from("s"), str_from("8"), MSG_EVENT, str_from("0")));
+    fill = fill + 1;
+}
+assert_eq(_t_rt(a41, "{\"target\":\"8\"}"), NACK_QUEUE_FULL,
+  "channel: a target whose queue is full is NACK_QUEUE_FULL");
+msg_bus_drop_front(tbus, "8", IPC_BUS_QUEUE_MAX);
+assert_eq(_t_rt(a41, "{\"target\":\"8\"}"), ACK, "channel: once it has room, ACK again");
 
 # The target's length: 256 bytes pass, 257 do not.
 fn _t_target_of(n) {
@@ -333,246 +522,159 @@ fn _t_target_of(n) {
     str_builder_add_cstr(sb, "\"}");
     return str_data(str_builder_build(sb));
 }
-_t_send(a41, _t_target_of(IPC_TARGET_MAX));
-assert_eq(_t_reply(a41, 2000), ACK, "channel: a target of IPC_TARGET_MAX bytes is accepted");
-ipc_take();
-_t_send(a41, _t_target_of(IPC_TARGET_MAX + 1));
-assert_eq(_t_reply(a41, 2000), NACK_INVALID, "channel: one byte more is refused");
+var long_name = _t_target_of(IPC_TARGET_MAX);
+var long_sb = str_builder_new();
+var lni = 0;
+while (lni < IPC_TARGET_MAX) { str_builder_add_cstr(long_sb, "t"); lni = lni + 1; }
+msg_bus_register_name(tbus, str_data(str_builder_build(long_sb)), "7");
+assert_eq(_t_rt(a41, long_name), ACK, "channel: a target of IPC_TARGET_MAX bytes is accepted");
+assert_eq(_t_rt(a41, _t_target_of(IPC_TARGET_MAX + 1)), NACK_INVALID, "channel: one byte more is refused");
 
 # A zero-length frame is a keep-alive: no reply at all.
 var ka: u8[4];
 memset(&ka, 0, 4);
 sys_write(a41, &ka, 4);
-assert_eq(_t_reply(a41, 200), 0 - 1, "channel: a keep-alive gets no reply");
-_t_send(a41, "{\"target\":\"7\"}");
-assert_eq(_t_reply(a41, 2000), ACK, "channel: the next frame after a keep-alive is answered normally");
-ipc_take();
+_t_pump();
+assert_eq(_t_reply(a41, 100), 0 - 1, "channel: a keep-alive gets no reply");
+assert_eq(_t_rt(a41, "{\"target\":\"7\"}"), ACK, "channel: the next frame after a keep-alive is answered normally");
 
-# Two frames in one write: two replies, two records.
+# Two frames in one write: two replies, two messages, in order.
 var f1 = "{\"target\":\"7\",\"payload\":1}";
 var f2 = "{\"target\":\"7\",\"payload\":2}";
 var two = alloc(64);
 memcpy(two, _t_frame(f1, strlen(f1)), strlen(f1) + 4);
 memcpy(two + strlen(f1) + 4, _t_frame(f2, strlen(f2)), strlen(f2) + 4);
+var q7c = _t_qlen("7");
 sys_write(a41, two, strlen(f1) + strlen(f2) + 8);
-assert_eq(_t_reply(a41, 2000), ACK, "channel: first of two frames in one write");
-assert_eq(_t_reply(a41, 2000), ACK, "channel: second of two frames in one write");
-var t1 = ipc_take();
-var t2 = ipc_take();
-assert(t1 != 0, "channel: both handed over (1)");
-assert(t2 != 0, "channel: both handed over (2)");
-if (t2 != 0) { assert_eq(_t_str_is(ipc_rec_payload(t2), "2"), 1, "channel: in order"); }
+_t_pump();
+assert_eq(_t_reply(a41, 1000), ACK, "channel: first of two frames in one write");
+assert_eq(_t_reply(a41, 1000), ACK, "channel: second of two frames in one write");
+assert_eq(_t_qlen("7"), q7c + 2, "channel: both queued");
+var mlast = _t_last("7");
+if (mlast != 0) { assert_eq(_t_str_is(ipc_msg_payload(mlast), "2"), 1, "channel: in order"); }
 
-# A frame in pieces: header split, body split, all within the timeout.
+# A frame in pieces, with daimon's passes between them.
 var fr = "{\"target\":\"7\",\"payload\":\"pieces\"}";
 var frb = _t_frame(fr, strlen(fr));
 sys_write(a41, frb, 2);
-sleep_ms(30);
+_t_pump();
 sys_write(a41, frb + 2, 2);
-sleep_ms(30);
+_t_pump();
 sys_write(a41, frb + 4, 5);
-sleep_ms(30);
+_t_pump();
+assert_eq(_t_reply(a41, 50), 0 - 1, "channel: no reply before the frame is whole");
 sys_write(a41, frb + 9, strlen(fr) - 5);
-assert_eq(_t_reply(a41, 2000), ACK, "channel: a frame that arrives in pieces is reassembled");
-var tp = ipc_take();
-if (tp != 0) { assert_eq(_t_str_is(ipc_rec_payload(tp), "\"pieces\""), 1, "channel: ... intact"); }
+_t_pump();
+assert_eq(_t_reply(a41, 1000), ACK, "channel: a frame that arrives in pieces is reassembled");
+var mp = _t_last("7");
+if (mp != 0) { assert_eq(_t_str_is(ipc_msg_payload(mp), "\"pieces\""), 1, "channel: ... intact"); }
 
 # Exactly MAX_MESSAGE_SIZE is allowed.
 var bigsb = str_builder_new();
-str_builder_add_cstr(bigsb, "{\"target\":\"*\",\"payload\":\"");
+str_builder_add_cstr(bigsb, "{\"target\":\"7\",\"payload\":\"");
 var bx = 0;
 while (bx < MAX_MESSAGE_SIZE - 27) { str_builder_add_cstr(bigsb, "x"); bx = bx + 1; }
 str_builder_add_cstr(bigsb, "\"}");
 var big = str_builder_build(bigsb);
 assert_eq(str_len(big), MAX_MESSAGE_SIZE, "fixture: a body of exactly MAX_MESSAGE_SIZE");
 sys_write(a41, _t_frame(str_data(big), str_len(big)), str_len(big) + 4);
-assert_eq(_t_reply(a41, 2000), ACK, "channel: a frame of exactly MAX_MESSAGE_SIZE is accepted");
-var tb = ipc_take();
-if (tb != 0) { assert_eq(str_len(ipc_rec_payload(tb)), MAX_MESSAGE_SIZE - 25, "channel: ... whole"); }
+_t_pump();
+_t_pump();
+assert_eq(_t_reply(a41, 1000), ACK, "channel: a frame of exactly MAX_MESSAGE_SIZE is accepted");
+var mb2 = _t_last("7");
+if (mb2 != 0) { assert_eq(str_len(ipc_msg_payload(mb2)), MAX_MESSAGE_SIZE - 25, "channel: ... whole"); }
 
-# Faults close the channel and are handed over as events.
-fn _t_event_is(r, ev, id) {
-    if (r == 0) { return 0; }
-    if (ipc_rec_kind(r) != IPC_REC_EVENT) { return 0; }
-    if (ipc_rec_event(r) != ev) { return 0; }
-    return _t_str_is(ipc_rec_agent(r), id);
+# Faults close the channel and are audited with the agent's id.
+fn _t_audit_last_is(action, id) {
+    var c = daimon_audit_chain();
+    var e = vec_get(chain_entries(c), chain_len(c) - 1);
+    if (_t_str_is(entry_action(e), action) == 0) { return 0; }
+    return _t_str_is(entry_agent_id(e), id);
 }
 
-var a42 = _t_chan("42");
 var over: u8[4];
 store8(&over, 0);
 store8(&over + 1, 1);
 store8(&over + 2, 0);
 store8(&over + 3, 1);           # 65537
+var a42 = _t_chan("42");
+var alen = chain_len(daimon_audit_chain());
 sys_write(a42, &over, 4);
-assert_eq(_t_reply(a42, 2000), NACK_INVALID, "oversize: a length over MAX_MESSAGE_SIZE is NACK_INVALID");
-assert_eq(_t_reply(a42, 2000), 0, "oversize: ... and the channel is closed");
-assert_eq(_t_event_is(_t_take(), IPC_EV_OVERSIZE, "42"), 1, "oversize: handed over as an OVERSIZE event");
+_t_pump();
+assert_eq(_t_reply(a42, 1000), NACK_INVALID, "oversize: a length over MAX_MESSAGE_SIZE is NACK_INVALID");
+assert_eq(_t_reply(a42, 1000), 0, "oversize: ... and the channel is closed");
+assert_eq(chain_len(daimon_audit_chain()), alen + 1, "oversize: one audit entry");
+assert_eq(_t_audit_last_is("ipc.frame.oversize", "42"), 1, "oversize: ipc.frame.oversize, with the agent's id");
 
-var a43 = _t_chan("43");
 var part: u8[14];
 memset(&part, 120, 14);
 store8(&part, 0);
 store8(&part + 1, 0);
 store8(&part + 2, 0);
 store8(&part + 3, 100);         # promises 100 bytes, sends 10
+var a43 = _t_chan("43");
+var q7d = _t_qlen("7");
 sys_write(a43, &part, 14);
-sleep_ms(50);
+_t_pump();
 sys_close(a43);
-assert_eq(_t_event_is(_t_take(), IPC_EV_SHORT, "43"), 1, "short: a frame cut off by the agent is a SHORT event");
-assert_eq(ipc_take(), 0, "short: and nothing of it is delivered");
+_t_pump();
+assert_eq(_t_audit_last_is("ipc.frame.short", "43"), 1, "short: a frame cut off by the agent is audited");
+assert_eq(_t_qlen("7"), q7d, "short: and nothing of it is delivered");
 
 var a44 = _t_chan("44");
 var t44 = clock_now_ms();
 sys_write(a44, &part, 14);
-assert_eq(_t_reply(a44, 3000), NACK_INVALID, "timeout: a frame that stalls is NACK_INVALID");
+var got44 = 0 - 1;
+while (got44 < 0) {
+    _t_pump();
+    got44 = _t_reply(a44, 10);
+    if (clock_now_ms() - t44 > 3000) { got44 = 99; }
+}
 var w44 = clock_now_ms() - t44;
+assert_eq(got44, NACK_INVALID, "timeout: a frame that stalls is NACK_INVALID");
 assert(w44 >= IPC_FRAME_TIMEOUT_MS, "timeout: ... not before IPC_FRAME_TIMEOUT_MS");
 assert(w44 < IPC_FRAME_TIMEOUT_MS + 1500, "timeout: ... and not long after");
-assert_eq(_t_reply(a44, 2000), 0, "timeout: the channel is closed");
-assert_eq(_t_event_is(_t_take(), IPC_EV_TIMEOUT, "44"), 1, "timeout: handed over as a TIMEOUT event");
+assert_eq(_t_reply(a44, 1000), 0, "timeout: the channel is closed");
+assert_eq(_t_audit_last_is("ipc.frame.timeout", "44"), 1, "timeout: audited");
 
-# A full hand-off: the agent is told, and nothing is lost that was ACKed.
-while (ipc_take() != 0) { }
-var a45 = _t_chan("45");
-var hf = 0;
-var hi = 0;
-while (hi < IPC_HANDOFF_CAP) {
-    _t_send(a45, "{\"target\":\"7\"}");
-    if (_t_reply(a45, 2000) == ACK) { hf = hf + 1; }
-    hi = hi + 1;
-}
-assert_eq(hf, IPC_HANDOFF_CAP, "hand-off: frames are ACKed until it is full");
-_t_send(a45, "{\"target\":\"7\"}");
-assert_eq(_t_reply(a45, 2000), NACK_QUEUE_FULL, "hand-off: then NACK_QUEUE_FULL");
-# ...and a refused frame costs the shared heap nothing: the room is checked
-# before the record is built. (It cost 224 bytes a frame before 2.3.3's fix.)
-var qff = "{\"target\":\"7\",\"payload\":{\"k\":[1,2,3]}}";
-var qfb = _t_frame(qff, strlen(qff));
-var qfn = strlen(qff) + 4;
-var qh0 = alloc_used();
-var qk = 0;
-var qfull = 0;
-while (qk < 50) {
-    sys_write(a45, qfb, qfn);
-    if (_t_reply(a45, 2000) == NACK_QUEUE_FULL) { qfull = qfull + 1; }
-    qk = qk + 1;
-}
-assert_eq(qfull, 50, "hand-off: every frame while it is full is NACK_QUEUE_FULL");
-assert(alloc_used() - qh0 < 50 * 8, "hand-off: and a refused frame allocates nothing on the shared heap");
-var dbus = msg_bus_new();
-msg_bus_subscribe(dbus, "7");
-msg_bus_subscribe(dbus, "8");
-var pub0 = ipc_published_count();
-assert_eq(ipc_drain(dbus), IPC_HANDOFF_CAP, "hand-off: ipc_drain takes every ACKed frame");
-assert_eq(ipc_published_count() - pub0, IPC_HANDOFF_CAP, "hand-off: ... and counts them");
-assert_eq(vec_len(msg_bus_queue(dbus, "7")), IPC_HANDOFF_CAP, "hand-off: all of them on the bus");
-_t_send(a45, "{\"target\":\"7\"}");
-assert_eq(_t_reply(a45, 2000), ACK, "hand-off: once drained, frames are accepted again");
-assert_eq(ipc_drain(dbus), 1, "hand-off: and drained in turn");
-
-# ipc_drain routes like any publish, with the channel's agent as the source.
+# Remove reads what the agent already wrote, answers it, then closes.
 var a46 = _t_chan("46");
-_t_send(a46, "{\"target\":\"8\",\"payload\":{\"k\":\"v\"}}");
-assert_eq(_t_reply(a46, 2000), ACK, "drain: frame accepted");
-var q7 = vec_len(msg_bus_queue(dbus, "7"));
-assert_eq(ipc_drain(dbus), 1, "drain: the pending record");
-assert_eq(vec_len(msg_bus_queue(dbus, "7")), q7, "drain: a message for 8 does not reach 7");
-var q8 = msg_bus_queue(dbus, "8");
-assert_eq(vec_len(q8), 1, "drain: it reaches 8");
-if (vec_len(q8) == 1) {
-    var dm = vec_get(q8, 0);
-    assert_eq(_t_str_is(ipc_msg_source(dm), "46"), 1, "drain: the message's source is the channel's agent");
-    assert_eq(_t_str_is(ipc_msg_payload(dm), "{\"k\":\"v\"}"), 1, "drain: payload intact");
-}
-_t_send(a46, "{\"target\":\"*\"}");
-_t_reply(a46, 2000);
-ipc_drain(dbus);
-assert_eq(vec_len(msg_bus_queue(dbus, "8")), 2, "drain: a broadcast reaches 8");
-assert_eq(vec_len(msg_bus_queue(dbus, "7")), q7 + 1, "drain: ... and 7");
-
-# A fault's event is audited by the drain, with the agent's id.
-var alen = chain_len(daimon_audit_chain());
-var a47 = _t_chan("47");
-sys_write(a47, &over, 4);
-_t_reply(a47, 2000);
-var ev47 = 0;
-var ew = 0;
-while (ew < 200) {
-    ipc_drain(dbus);
-    if (chain_len(daimon_audit_chain()) > alen) { ew = 200; }
-    else { sleep_ms(10); }
-    ew = ew + 1;
-}
-assert_eq(chain_len(daimon_audit_chain()), alen + 1, "audit: the fault is one audit entry");
-var aent = vec_get(chain_entries(daimon_audit_chain()), chain_len(daimon_audit_chain()) - 1);
-assert_eq(_t_str_is(entry_action(aent), "ipc.frame.oversize"), 1, "audit: action ipc.frame.oversize");
-assert_eq(_t_str_is(entry_agent_id(aent), "47"), 1, "audit: the agent's id");
-
-# Remove closes the channel — after reading what the agent already wrote.
-_t_send(a46, "{\"target\":\"7\",\"payload\":\"last words\"}");
+var q8a = _t_qlen("8");
+_t_send(a46, "{\"target\":\"8\",\"payload\":\"last words\"}");
 ipc_service_remove(str_from("46"));
-assert_eq(_t_reply(a46, 2000), ACK, "remove: a frame written before the remove is still answered");
-assert_eq(_t_reply(a46, 2000), 0, "remove: then the channel is closed");
-var lw = _t_take();
-assert(lw != 0, "remove: and the frame is handed over");
-if (lw != 0) { assert_eq(_t_str_is(ipc_rec_payload(lw), "\"last words\""), 1, "remove: intact"); }
-
-# The same, deterministically: _ipc_apply on a channel the test owns (not the
-# service's), so no pass of the service can read the frame first.
-var uchans = vec_new();
-var uar = arena_allocator_growable(4096);
-var ufds: i32[2];
-assert_eq(ipc_channel_open(&ufds), 0, "apply: a pair for a channel the test owns");
-var uch = _ipc_chan_new(str_from("50"), load32(&ufds));
-vec_push(uchans, uch);
-_t_send(load32(&ufds + 4), "{\"target\":\"7\",\"payload\":\"final\"}");
-var ucmd = alloc(24);
-store64(ucmd, _IPC_CMD_REMOVE);
-store64(ucmd + 8, str_from("50"));
-store64(ucmd + 16, 0);
-_ipc_apply(uchans, ucmd, uar);
-assert_eq(load64(uch + 72), 0, "apply: REMOVE closes the channel");
-var ur = ipc_take();
-assert(ur != 0, "apply: the frame already written is read before the close");
-if (ur != 0) { assert_eq(_t_str_is(ipc_rec_payload(ur), "\"final\""), 1, "apply: ... and handed over whole"); }
-assert_eq(_t_reply(load32(&ufds + 4), 2000), ACK, "apply: the agent is answered");
-assert_eq(_t_reply(load32(&ufds + 4), 2000), 0, "apply: then sees the close");
+assert_eq(_t_qlen("8"), q8a + 1, "remove: a frame written before the remove is delivered");
+var mlw = _t_last("8");
+if (mlw != 0) { assert_eq(_t_str_is(ipc_msg_payload(mlw), "\"last words\""), 1, "remove: intact"); }
+assert_eq(_t_reply(a46, 1000), ACK, "remove: and answered");
+assert_eq(_t_reply(a46, 1000), 0, "remove: then the channel is closed");
 
 # Adding a channel for an agent that has one replaces it (a restart).
 var a48 = _t_chan("48");
 var a48b = _t_chan("48");
-assert_eq(_t_reply(a48, 2000), 0, "replace: the old channel is closed");
-_t_send(a48b, "{\"target\":\"7\"}");
-assert_eq(_t_reply(a48b, 2000), ACK, "replace: the new one works");
-ipc_take();
+assert_eq(_t_reply(a48, 1000), 0, "replace: the old channel is closed");
+assert_eq(_t_rt(a48b, "{\"target\":\"7\"}"), ACK, "replace: the new one works");
 
-# The parse runs in the service's own arena: what a frame costs the shared heap
-# is the record and the copies handed over, not the parse tree. 200 frames of a
-# 100-byte body with a nested payload.
-var hsb = str_builder_new();
-str_builder_add_cstr(hsb, "{\"target\":\"7\",\"type\":\"event\",");
-str_builder_add_cstr(hsb, "\"payload\":{\"a\":[1,2,3],\"b\":{\"c\":\"dddddddddddddddd\"},\"e\":true}}");
-var hbody = str_data(str_builder_build(hsb));
-var hframe = _t_frame(hbody, strlen(hbody));
-var hn = strlen(hbody) + 4;
-_t_send(a48b, hbody);
-_t_reply(a48b, 2000);
-ipc_take();                     # warm: the channel's body buffer and the arena
-var h0 = alloc_used();
-var hk = 0;
-while (hk < 200) {
-    sys_write(a48b, hframe, hn);
-    _t_reply(a48b, 2000);
-    ipc_take();
-    hk = hk + 1;
+# Channels closed by fault, remove or replace are no longer counted.
+assert_eq(ipc_channel_count(), 2, "channel count: 41 and 48 remain open");
+
+# A refused frame costs the shared heap nothing: the parse is in the channel
+# arena, and nothing is copied out before the frame is accepted.
+var rff = "{\"target\":\"7\",\"type\":\"bogus\",\"payload\":{\"k\":[1,2,3]}}";
+var rfb = _t_frame(rff, strlen(rff));
+var rfn = strlen(rff) + 4;
+sys_write(a41, rfb, rfn);
+_t_pump();
+_t_reply(a41, 1000);            # warm
+var rh0 = alloc_used();
+var rk = 0;
+while (rk < 50) {
+    sys_write(a41, rfb, rfn);
+    _t_pump();
+    _t_reply(a41, 1000);
+    rk = rk + 1;
 }
-# Measured at 2.3.3: 224 bytes a frame (the record, the target and payload
-# copies). Parsed on the shared heap instead it was 1,496; with a body buffer
-# allocated per frame instead of reused, 320. The bound sits between.
-var hper = (alloc_used() - h0) / 200;
-assert(hper < 288, "arena: a frame costs the shared heap only what it hands over");
+assert(alloc_used() - rh0 < 50 * 8, "refused frames allocate nothing on the shared heap");
 
-# exit_group, not exit: the agent channel service thread is running, and
-# exit(2) would end only this thread and leave the process alive (2.3.3).
+# exit_group: the program epilogue lib/syscalls prescribes (exit(2) ends only
+# the calling thread).
 syscall(SYS_EXIT_GROUP, assert_summary());

@@ -31,8 +31,47 @@ fn api_edge_stats(fd) {
     str_builder_add_int(sb, load64(st + 48));
     str_builder_add_cstr(sb, ",\"tasks_completed\":");
     str_builder_add_int(sb, load64(st + 56));
+    # 2.3.4: what the nodes that can take work (online, suspect, updating)
+    # have, as they registered it.
+    str_builder_add_cstr(sb, ",\"cpu_cores\":");
+    str_builder_add_int(sb, load64(st + 64));
+    str_builder_add_cstr(sb, ",\"memory_mb\":");
+    str_builder_add_int(sb, load64(st + 72));
+    str_builder_add_cstr(sb, ",\"gpu_nodes\":");
+    str_builder_add_int(sb, load64(st + 80));
     str_builder_add_cstr(sb, "}");
     http_ok(fd, str_builder_build(sb));
+}
+
+# An architecture name: 1..32 of [a-z0-9_] (x86_64, aarch64, riscv64, ...).
+fn _edge_arch_ok(s) {
+    var n = str_len(s);
+    if (n < 1) { return 0; }
+    if (n > 32) { return 0; }
+    var d = str_data(s);
+    var i = 0;
+    while (i < n) {
+        var c = load8(d + i);
+        var ok = 0;
+        if (c >= 97) { if (c <= 122) { ok = 1; } }
+        if (c >= 48) { if (c <= 57) { ok = 1; } }
+        if (c == 95) { ok = 1; }
+        if (ok == 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# A capacity field: its value, `dflt` when absent, or -1 when it is not an
+# integer in lo..hi. (A float is not accepted: http_json_int would truncate it.)
+fn _edge_int_field(root, key, dflt, lo, hi) {
+    if (http_json_has(root, key) == 0) { return dflt; }
+    var v = bayan_json_v_obj_get(root, key);
+    if (bayan_json_v_is_int(v) == 0) { return 0 - 1; }
+    var n = bayan_json_v_int(v);
+    if (n < lo) { return 0 - 1; }
+    if (n > hi) { return 0 - 1; }
+    return n;
 }
 
 # POST /v1/edge/nodes — register edge node
@@ -43,7 +82,35 @@ fn api_edge_register(fd, body) {
     var name = http_json_str(root, "name");
     if (name == 0) { http_error(fd, 422, str_from("name required")); return 0; }
     if (str_len(name) == 0) { http_error(fd, 422, str_from("name cannot be empty")); return 0; }
-    var node = edge_node_new(name, str_from("x86_64"), 4, 4096);
+    # 2.3.4: the node's own capabilities. Every node used to be recorded as
+    # x86_64 / 4 cores / 4096 MB, whatever it was; those remain the defaults for
+    # a registration that gives only a name.
+    var arch = 0;
+    if (http_json_has(root, "arch") == 1) {
+        arch = http_json_str(root, "arch");
+        if (arch == 0) { http_error(fd, 422, str_from("arch must be a string")); return 0; }
+        if (_edge_arch_ok(arch) == 0) {
+            http_error(fd, 422, str_from("arch must be 1-32 characters of a-z, 0-9 and _"));
+            return 0;
+        }
+    } else {
+        arch = str_from("x86_64");
+    }
+    var cores = _edge_int_field(root, "cpu_cores", 4, 1, 65536);
+    if (cores < 0) { http_error(fd, 422, str_from("cpu_cores must be an integer from 1 to 65536")); return 0; }
+    var mem = _edge_int_field(root, "memory_mb", 4096, 1, 1073741824);
+    if (mem < 0) { http_error(fd, 422, str_from("memory_mb must be an integer from 1 to 1073741824")); return 0; }
+    var disk = _edge_int_field(root, "disk_mb", 32768, 0, 1099511627776);
+    if (disk < 0) { http_error(fd, 422, str_from("disk_mb must be an integer from 0 to 1099511627776")); return 0; }
+    var gpu = 0;
+    if (http_json_has(root, "has_gpu") == 1) {
+        var gv = bayan_json_v_obj_get(root, "has_gpu");
+        if (bayan_json_v_is_bool(gv) == 0) { http_error(fd, 422, str_from("has_gpu must be true or false")); return 0; }
+        gpu = bayan_json_v_bool(gv);
+    }
+    var node = edge_node_new(name, arch, cores, mem);
+    edge_node_set_disk_mb(node, disk);
+    edge_node_set_has_gpu(node, gpu);
     var result_t, result_v = edge_fleet_register(_edge_fleet, node);
     if (is_err_result(result_t) == 1) {
         http_bad_request(fd, str_from("registration failed (duplicate or full)"));
@@ -112,6 +179,18 @@ fn api_edge_get(fd, id_cstr) {
     str_builder_add_cstr(sb, load64(&status_names + edge_node_status(n) * 8));
     str_builder_add_cstr(sb, "\",\"active_tasks\":");
     str_builder_add_int(sb, edge_node_active_tasks(n));
+    # 2.3.4: its capabilities, as registered.
+    str_builder_add_cstr(sb, ",\"arch\":\"");
+    str_builder_add(sb, json_escape_str(edge_node_arch(n)));
+    str_builder_add_cstr(sb, "\",\"cpu_cores\":");
+    str_builder_add_int(sb, edge_node_cpu_cores(n));
+    str_builder_add_cstr(sb, ",\"memory_mb\":");
+    str_builder_add_int(sb, edge_node_memory_mb(n));
+    str_builder_add_cstr(sb, ",\"disk_mb\":");
+    str_builder_add_int(sb, edge_node_disk_mb(n));
+    str_builder_add_cstr(sb, ",\"has_gpu\":");
+    if (edge_node_has_gpu(n) != 0) { str_builder_add_cstr(sb, "true"); }
+    else { str_builder_add_cstr(sb, "false"); }
     str_builder_add_cstr(sb, "}");
     http_ok(fd, str_builder_build(sb));
     return 0;

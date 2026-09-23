@@ -65,6 +65,112 @@ fn http_has_origin(buf, len) {
     return 1;
 }
 
+# --- VULN-012's remainder (2.3.4): DNS rebinding and cross-site writes --------
+#
+# A header value, copied into `_http_hdr_arena` (rewound here, so a lookup per
+# request costs nothing that lasts), or 0 if the header is absent.
+var _http_hdr_arena = 0;
+
+fn _http_header(buf, len, name) {
+    if (_http_hdr_arena == 0) { _http_hdr_arena = arena_allocator_growable(1024); }
+    reset_via(_http_hdr_arena);
+    return sandhi_server_find_header_a(_http_hdr_arena, buf, len, name);
+}
+
+fn _http_ieq(a, alen, b) {
+    if (alen != strlen(b)) { return 0; }
+    var i = 0;
+    while (i < alen) {
+        var c = load8(a + i);
+        if (c >= 65) { if (c <= 90) { c = c + 32; } }
+        if (c != load8(b + i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# 1 if the host `h` (its first `n` bytes, no port) is a loopback name:
+# localhost, [::1], or 127.x.y.z.
+fn _http_loopback_host(h, n) {
+    if (_http_ieq(h, n, "localhost") == 1) { return 1; }
+    if (_http_ieq(h, n, "[::1]") == 1) { return 1; }
+    if (n < 4) { return 0; }
+    if (memeq(h, "127.", 4) == 0) { return 0; }
+    var i = 4;
+    while (i < n) {
+        var c = load8(h + i);
+        var ok = 0;
+        if (c >= 48) { if (c <= 57) { ok = 1; } }
+        if (c == 46) { ok = 1; }
+        if (ok == 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# The host part of a Host header value — up to the port — as a length.
+fn _http_host_len(h) {
+    var n = strlen(h);
+    if (n > 0) {
+        if (load8(h) == 91) {                     # "[" : an IPv6 literal
+            var j = 0;
+            while (j < n) {
+                if (load8(h + j) == 93) { return j + 1; }   # "]"
+                j = j + 1;
+            }
+            return n;
+        }
+    }
+    var i = 0;
+    while (i < n) {
+        if (load8(h + i) == 58) { return i; }     # ":"
+        i = i + 1;
+    }
+    return n;
+}
+
+# DNS rebinding: a page on the attacker's name, re-pointed at 127.0.0.1, sends
+# requests carrying the attacker's name as Host. While daimon listens on
+# loopback only, a request whose Host is not a loopback name is refused. No
+# Host at all (an HTTP/1.0 tool) is not a browser, and passes. `loopback_only`
+# says whether the listen address is loopback (the check does not apply to an
+# operator's --listen 0.0.0.0). 1 = allowed.
+fn http_host_allowed(buf, len, loopback_only) {
+    if (loopback_only == 0) { return 1; }
+    var h = _http_header(buf, len, "Host");
+    if (h == 0) { return 1; }
+    return _http_loopback_host(h, _http_host_len(h));
+}
+
+# 1 if the request's Origin is a site other than daimon's own host: anything
+# but http(s)://<loopback name>[:port]. "null" (sandboxed frames, file://) is
+# foreign. No Origin at all is not a browser's cross-site request.
+fn http_origin_foreign(buf, len) {
+    var o = _http_header(buf, len, "Origin");
+    if (o == 0) { return 0; }
+    var n = strlen(o);
+    var p = 0;
+    if (n >= 7) { if (_http_ieq(o, 7, "http://") == 1) { p = 7; } }
+    if (p == 0) { if (n >= 8) { if (_http_ieq(o, 8, "https://") == 1) { p = 8; } } }
+    if (p == 0) { return 1; }
+    var rest = o + p;
+    var hl = _http_host_len(rest);
+    # Nothing may follow the port: an origin is scheme://host[:port].
+    var j = hl;
+    if (j < strlen(rest)) {
+        if (load8(rest + j) != 58) { return 1; }
+        j = j + 1;
+        while (j < strlen(rest)) {
+            var c = load8(rest + j);
+            if (c < 48) { return 1; }
+            if (c > 57) { return 1; }
+            j = j + 1;
+        }
+    }
+    if (_http_loopback_host(rest, hl) == 1) { return 0; }
+    return 1;
+}
+
 # Query param value, or 0 if absent. URL-decoded by sandhi.
 fn http_parse_query_param(buf, len, param_name) {
     return sandhi_server_get_param(sandhi_server_get_path(buf, len), param_name);
@@ -177,7 +283,7 @@ fn http_json_text(root, key) {
 # Status-code → reason-phrase. Centralized so http_send_response
 # (sandhi-backed shim) can hand the right RFC 7231 phrase to
 # sandhi_server_send_response. Codes daimon emits today: 200, 201,
-# 204, 400, 403, 404, 405, 409, 413, 422, 429, 500, 501, 502.
+# 204, 400, 403, 404, 405, 409, 413, 422, 429, 500, 501, 502, 504.
 fn _http_reason(status) {
     if (status == 200) { return "OK"; }
     if (status == 201) { return "Created"; }
@@ -196,6 +302,7 @@ fn _http_reason(status) {
     if (status == 500) { return "Internal Server Error"; }
     if (status == 501) { return "Not Implemented"; }
     if (status == 502) { return "Bad Gateway"; }
+    if (status == 504) { return "Gateway Timeout"; }   # 2.3.4: a detached call past its bound
     return "Error";
 }
 

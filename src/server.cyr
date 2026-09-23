@@ -1,5 +1,5 @@
 # =========================================================================
-# server — rate limiting, per-request dispatch, sync + async serve loops
+# server — rate limiting, per-request dispatch, and daimon's event loop
 # =========================================================================
 
 # --- HTTP server ---
@@ -74,10 +74,37 @@ fn ip_to_cstr(ip) {
 var RATE_LIMIT_SHARED_KEY = "?unidentified-peer";
 var RATE_LIMIT_MAX_SHARED = 960;   # RATE_LIMIT_MAX(120) x 8 inbound conns
 
+# The dotted form of `ip` into `out` (16 bytes: "255.255.255.255" and a NUL).
+fn _ip_to_buf(ip, out) {
+    var off = 0;
+    var pi = 0;
+    while (pi < 4) {
+        var val = (ip >> (pi * 8)) & 255;
+        if (val >= 100) {
+            store8(out + off, 48 + val / 100); off = off + 1; val = val % 100;
+            store8(out + off, 48 + val / 10); off = off + 1;
+            store8(out + off, 48 + val % 10); off = off + 1;
+        }
+        elif (val >= 10) {
+            store8(out + off, 48 + val / 10); off = off + 1;
+            store8(out + off, 48 + val % 10); off = off + 1;
+        }
+        else { store8(out + off, 48 + val); off = off + 1; }
+        if (pi < 3) { store8(out + off, 46); off = off + 1; }
+        pi = pi + 1;
+    }
+    store8(out + off, 0);
+    return out;
+}
+
 fn rate_check(cfd) {
     var ip = get_peer_ip(cfd);
     if (ip == 0) { return rate_check_shared(); }
-    var ip_key = ip_to_cstr(ip);
+    # 2.3.4: the lookup key is on the stack. ip_to_cstr allocated 24 bytes of
+    # never-freed heap for it on every request; only a new bucket needs a key
+    # that outlives the call.
+    var kb: u8[16];
+    var ip_key = _ip_to_buf(ip, &kb);
     var now = clock_epoch_secs();
 
     var bucket = map_get(_rate_limiter, ip_key);
@@ -86,7 +113,7 @@ fn rate_check(cfd) {
         bucket = alloc(16);
         store64(bucket, 1);
         store64(bucket + 8, now);
-        map_set(_rate_limiter, ip_key, bucket);
+        map_set(_rate_limiter, ip_to_cstr(ip), bucket);
         return 1;
     }
 
@@ -137,14 +164,9 @@ fn rate_check_shared() {
 # (2) MAX_REQUEST_SIZE oversized-request rejection (VULN-008),
 # (3) Transfer-Encoding rejection (daimon does not implement chunked
 # request decode; sandhi accepts it for legit servers, we reject).
-# Sandhi closes cfd after we return — do NOT sock_close here.
+# The loop (or sandhi's, on agnos) closes cfd after we return — do NOT
+# sock_close here. A handler that answers later calls server_defer.
 fn handle_request(ctx, cfd, buf, blen) {
-    # 2.3.3: first, what agents sent on their channels since the last request
-    # goes onto the bus (and channel faults onto the audit chain) — whoever is
-    # asking, rate-limited or not. The channel service thread hands it over;
-    # this thread owns the bus. An empty hand-off costs one uncontended lock.
-    ipc_drain(_msg_bus);
-
     if (rate_check(cfd) == 0) {
         var rl_msg = "{\"error\":\"too many requests\"}";
         daimon_audit(SEV_WARNING, "http", "http.ratelimit", "per-ip rate limit exceeded");
@@ -173,7 +195,27 @@ fn handle_request(ctx, cfd, buf, blen) {
         return 0;
     }
 
+    # VULN-012 (2.3.4). DNS rebinding: while daimon listens on loopback, a
+    # request must name a loopback host.
+    if (http_host_allowed(buf, blen, server_loopback_only()) == 0) {
+        daimon_audit(SEV_WARNING, "http", "http.host.reject",
+          "request for a host daimon does not serve (DNS rebinding?)");
+        http_error(cfd, 403, str_from("this server answers only to its loopback address"));
+        return 0;
+    }
+
     var method = http_parse_method(buf, blen);
+    # Cross-site writes: a state change from another site's page — the
+    # text/plain POST a browser sends with no CORS preflight — is refused on
+    # every route. 2.3.0 refused any Origin on agent and task control only.
+    # A page served from daimon's own loopback host keeps working.
+    if (method >= 1) {
+        if (http_origin_foreign(buf, blen) == 1) {
+            daimon_audit(SEV_WARNING, "http", "http.origin.reject", "state change from another site refused");
+            http_error(cfd, 403, str_from("state changes from other sites are refused"));
+            return 0;
+        }
+    }
     var path = http_parse_path(buf, blen);
     # Root request span: adopts/generates the trace id (from traceparent /
     # X-Trace-Id) and correlates every span + log emitted during routing.
@@ -186,9 +228,6 @@ fn handle_request(ctx, cfd, buf, blen) {
 }
 
 # --- Server banner ---
-# Both serve modes delegate bind/listen/accept to sandhi
-# (sandhi_server_run_opts sync, sandhi_server_run_async async), so daimon
-# no longer hand-rolls a socket setup helper.
 
 fn server_banner(port, mode) {
     sakshi_info("daimon listening", 16);
@@ -224,65 +263,684 @@ fn server_bind_addr() {
     return a;
 }
 
-# --- Synchronous server ---
+# 1 while daimon listens on a loopback address (127.0.0.0/8), the default. The
+# Host check (VULN-012) applies then; an operator who opened --listen 0.0.0.0
+# chose the names daimon is reached by.
+fn server_loopback_only() {
+    var a = server_bind_addr();
+    if ((a & 255) == 127) { return 1; }   # network byte order: the first octet is the low byte
+    return 0;
+}
 
-# Slowloris bound — per-connection SO_RCVTIMEO applied at accept time by
-# sandhi (sandhi_server_options_idle_ms → SO_RCVTIMEO on both the sync
-# sandhi_server_run_opts and async sandhi_server_run_async paths).
-# 5 000 ms covers normal P99 request durations (the request handler is
-# in-memory; no network egress in the happy path) while bounding a
-# malicious slow-sender to ~5 s of worker hold instead of sandhi's 30 s
-# default. Centralized so sync + async modes stay in lock-step.
+# Slowloris bound. A connection that sends nothing for SERVE_IDLE_MS is
+# closed, as is one whose request is not complete within SERVE_REQUEST_MAX_MS
+# however it trickles; a response write that makes no progress for
+# SERVE_IDLE_MS fails (SO_SNDTIMEO). 5 000 ms covers normal P99 request
+# durations (the handler is in-memory; no network egress on the happy path).
 var SERVE_IDLE_MS = 5000;
 
+# Connections open at once. At the cap the listener is not polled; new
+# connections wait in the kernel's backlog.
+var SERVE_MAX_CONNS = 128;
+
+# =========================================================================
+# daimon's event loop (2.3.4)
+# =========================================================================
+#
+# Through 2.3.3 daimon served HTTP from inside sandhi's serve loops
+# (sandhi_server_run_opts / _run_async), which own the accept loop and give
+# their caller no turn of its own. Whatever daimon had to do between requests
+# had nowhere to run:
+#   * the agent channels went on a background thread (2.3.3), and from the
+#     moment it started every allocation in daimon took the stdlib's heap lock
+#     (alloc(64) 10 -> 53 ns, json_parse 429 ns -> 1.24 us);
+#   * a stop held the whole server for the agent's grace period (VULN-014);
+#   * an agent that exited stayed RUNNING until someone asked about it.
+#
+# This loop is daimon's own. One thread and one epoll set holding the
+# listening socket, every connection still being read, and every agent channel
+# (src/ipc.cyr registers those itself), plus a tick every SERVE_TICK_MS for
+# deadlines and agent upkeep (agents_tick). epoll, not poll: a pass costs what
+# is READY, not what is open. With poll(2) over the channels a pass cost 9.3 us
+# at 100 open agents and 92.7 us at 1000 (measured), paid by every request.
+#
+# HTTP stays sandhi's. A request is complete by the rule
+# sandhi_server_recv_request uses (sandhi_server_body_offset +
+# sandhi_server_content_length), refused by the same three smuggling checks, and
+# answered through sandhi's senders. What changes is that a slow client holds
+# its own slot and not the server: reads never block (MSG_DONTWAIT), and each
+# slot has an idle and a total deadline. Connections stay BLOCKING for writes,
+# because sandhi writes a response with one sock_send; SO_SNDTIMEO bounds that.
+#
+# A handler may answer later (server_defer): a stop waits for its agent, not
+# the server's other clients.
+#
+# AGNOS keeps sandhi's loop: it has no agent processes or channels until 2.4.x,
+# and its sockets are driven differently (lib/net.cyr).
+
+#ifndef CYRIUS_TARGET_AGNOS
+
+var SERVE_TICK_MS = 100;           # the longest the loop sleeps
+var SERVE_TICK_BUSY_MS = 10;       # ... while a deferred answer is waiting
+var SERVE_REQ_MAX = 65536;         # one request, headers and body (sandhi's HSV_REQ_BUF_SIZE)
+var SERVE_REQUEST_MAX_MS = 30000;  # a request must arrive within this, however it trickles
+var SERVE_DRAIN_MS = 100;          # lingering read after a refusal (sandhi's SANDHI_SERVER_DRAIN_MS)
+var SERVE_DRAIN_MAX = 1048576;     # ... and at most this much (SANDHI_SERVER_DRAIN_MAX)
+var SERVE_DEFER_MAX_MS = 60000;    # a deferred answer is given within this
+var SERVE_BACKLOG = 128;
+
+var _SRV_SOCK_NONBLOCK = 2048;     # SOCK_NONBLOCK = O_NONBLOCK, asm-generic (x86_64, aarch64)
+var _SRV_SOCK_CLOEXEC = 524288;
+var _SRV_MSG_DONTWAIT = 64;
+var _SRV_EAGAIN = 11;
+var _SRV_EINTR = 4;
+
+enum SrvSlotState {
+    SRV_FREE = 0;
+    SRV_READING = 1;    # a request is arriving
+    SRV_DRAINING = 2;   # refused; reading what is in flight before the close
+    SRV_DEFERRED = 3;   # handled; the handler answers later (server_defer)
+    SRV_DETACHED = 4;   # handled by a child; the loop relays its answer (server_detach)
+}
+
+# Connection slot, SRV_SLOT_SIZE bytes:
+#   +0 state  +8 fd  +16 request buffer (SERVE_REQ_MAX, kept for the slot's
+#   life)  +24 bytes read  +32 end of the request (-1 until the headers are in)
+#   +40 idle deadline (ms)  +48 hard deadline (ms)  +56 bytes drained
+#   +64 deferred answer fn  +72 its argument  +80 in the epoll set
+#   +88 detached child's pid  +96 its pipe (read end)  +104 bytes relayed
+var SRV_SLOT_SIZE = 112;
+
+var _srv_slots = 0;
+var _srv_current = 0;         # the slot whose request is being handled
+var _srv_reject = 0;          # arena for refusals, rewound for each
+var _srv_epfd = 0;
+var _srv_lfd = 0 - 1;
+var _srv_listening = 0;       # the listener is in the epoll set
+var _srv_accept_backoff = 0;  # ms; 0 = none
+var _srv_accept_resume = 0;   # the listener is not re-armed before this (ms)
+var _srv_deferred = 0;        # deferred answers waiting
+var SRV_EVENTS = 64;          # events taken per epoll_wait
+var _srv_events = 0;
+
+# epoll data for the server's own descriptors: 1 is the listener, 2 + i is
+# connection slot i. Anything else is an agent channel record (a heap pointer,
+# never this small): src/ipc.cyr.
+var _SRV_TOKEN_LISTEN = 1;
+var _SRV_TOKEN_SLOT0 = 2;
+var _SRV_TOKEN_PIPE0 = 130;   # _SRV_TOKEN_SLOT0 + SERVE_MAX_CONNS: slot i's detached pipe
+
+fn _srv_slot(i) { return _srv_slots + i * SRV_SLOT_SIZE; }
+
+# Add (EPOLL_CTL_ADD) or remove (EPOLL_CTL_DEL) `fd` in the loop's epoll set
+# with data `token`. `struct epoll_event` is packed on x86_64 (data at +4) and
+# naturally aligned elsewhere (data at +8): include/uapi/linux/eventpoll.h.
+fn _srv_epoll(op, fd, token) {
+    var ev: i64[2];
+    store64(&ev, 0);
+    store64(&ev + 8, 0);
+    store32(&ev, EPOLLIN);
+    #ifdef CYRIUS_ARCH_AARCH64
+    store64(&ev + 8, token);
+    #else
+    store64(&ev + 4, token);
+    #endif
+    return sys_epoll_ctl(_srv_epfd, op, fd, &ev);
+}
+
+fn _srv_slot_index(slot) { return (slot - _srv_slots) / SRV_SLOT_SIZE; }
+
+fn _srv_unregister(slot) {
+    if (load64(slot + 80) == 1) {
+        _srv_epoll(EPOLL_CTL_DEL, load64(slot + 8), _SRV_TOKEN_SLOT0 + _srv_slot_index(slot));
+        store64(slot + 80, 0);
+    }
+    return 0;
+}
+
+fn _srv_close(slot) {
+    _srv_unregister(slot);
+    if (load64(slot) == SRV_DEFERRED) { _srv_deferred = _srv_deferred - 1; }
+    if (load64(slot) == SRV_DETACHED) {
+        if (load64(slot + 96) >= 0) { _srv_detach_end(slot, 1); }
+    }
+    sys_close(load64(slot + 8));
+    store64(slot, SRV_FREE);
+    return 0;
+}
+
+fn _srv_free_slot() {
+    var i = 0;
+    while (i < SERVE_MAX_CONNS) {
+        if (load64(_srv_slot(i)) == SRV_FREE) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+# SO_SNDTIMEO: a response write that makes no progress for SERVE_IDLE_MS
+# fails rather than holding the loop.
+fn _srv_send_timeout(fd) {
+    var tv: i64[2];
+    store64(&tv, SERVE_IDLE_MS / 1000);
+    store64(&tv + 8, (SERVE_IDLE_MS % 1000) * 1000);
+    sys_setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, 16);
+    return 0;
+}
+
+fn _srv_open(i, cfd, now) {
+    var slot = _srv_slot(i);
+    if (load64(slot + 16) == 0) { store64(slot + 16, alloc(SERVE_REQ_MAX)); }
+    store64(slot, SRV_READING);
+    store64(slot + 8, cfd);
+    store64(slot + 24, 0);
+    store64(slot + 32, 0 - 1);
+    store64(slot + 40, now + SERVE_IDLE_MS);
+    store64(slot + 48, now + SERVE_REQUEST_MAX_MS);
+    store64(slot + 56, 0);
+    store64(slot + 64, 0);
+    store64(slot + 72, 0);
+    store64(slot + 80, 0);
+    store64(slot + 88, 0);
+    store64(slot + 96, 0 - 1);
+    store64(slot + 104, 0);
+    _srv_send_timeout(cfd);
+    # A local client has usually sent its whole request by the time it is
+    # accepted: read at once, and a request that is complete is answered
+    # without the connection ever joining the epoll set. Measured on 3000
+    # sequential requests (medians of three): 142.6 us each without this, 133.8
+    # with it, against 134.6 on 2.3.3's sandhi loop.
+    _srv_read(slot, now);
+    var st = load64(slot);
+    if (st == SRV_READING || st == SRV_DRAINING) {
+        _srv_epoll(EPOLL_CTL_ADD, cfd, _SRV_TOKEN_SLOT0 + i);
+        store64(slot + 80, 1);
+    }
+    return 0;
+}
+
+# Refuse with a bare status line, as sandhi's loops do; `drain` = 1 reads
+# what the client still has in flight before closing (sandhi 1.9.4: a close
+# with unread input sends RST, which can discard the answer).
+fn _srv_refuse(slot, code, msg, drain) {
+    reset_via(_srv_reject);
+    sandhi_server_send_status_a(_srv_reject, load64(slot + 8), code, msg);
+    if (drain == 0) {
+        _srv_close(slot);
+        return 0;
+    }
+    var now = clock_now_ms();
+    store64(slot, SRV_DRAINING);
+    store64(slot + 56, 0);
+    store64(slot + 40, now + SERVE_DRAIN_MS);
+    return 0;
+}
+
+fn _srv_dispatch(slot, n) {
+    var fd = load64(slot + 8);
+    var buf = load64(slot + 16);
+    # The smuggling refusals sandhi's loops make before a handler runs.
+    if (sandhi_server_request_has_cl_te_conflict(buf, n) == 1) {
+        return _srv_refuse(slot, 400, "Bad Request", 0);
+    }
+    if (sandhi_server_request_has_dup_smuggling_header(buf, n) == 1) {
+        return _srv_refuse(slot, 400, "Bad Request", 0);
+    }
+    if (sandhi_server_request_has_unsupported_te(buf, n) == 1) {
+        return _srv_refuse(slot, 501, "Not Implemented", 1);
+    }
+    _srv_current = slot;
+    handle_request(0, fd, buf, n);
+    _srv_current = 0;
+    var st = load64(slot);
+    if (st != SRV_DEFERRED && st != SRV_DETACHED) { _srv_close(slot); }
+    return 0;
+}
+
+# A non-blocking read, retried if a signal interrupts it.
+fn _srv_recv(fd, buf, len) {
+    var n = sys_recvfrom(fd, buf, len, _SRV_MSG_DONTWAIT, 0, 0);
+    while (n == 0 - _SRV_EINTR) { n = sys_recvfrom(fd, buf, len, _SRV_MSG_DONTWAIT, 0, 0); }
+    return n;
+}
+
+# Read what a connection has sent; dispatch it once it is a whole request.
+fn _srv_read(slot, now) {
+    var fd = load64(slot + 8);
+    var buf = load64(slot + 16);
+    var cap = SERVE_REQ_MAX - 1;   # room for the NUL sandhi's readers expect
+    while (load64(slot) == SRV_READING) {
+        var have = load64(slot + 24);
+        if (have >= cap) { return _srv_refuse(slot, 413, "Payload Too Large", 1); }
+        var n = _srv_recv(fd, buf + have, cap - have);
+        if (n == 0 - _SRV_EAGAIN) { return 0; }
+        if (n < 0) { return _srv_close(slot); }
+        if (n == 0) {
+            # The client closed: nothing sent is an idle connection going away,
+            # anything else a request that never finished (sandhi answers it 400).
+            if (have == 0) { return _srv_close(slot); }
+            return _srv_refuse(slot, 400, "Bad Request", 0);
+        }
+        have = have + n;
+        store64(slot + 24, have);
+        store8(buf + have, 0);
+        store64(slot + 40, now + SERVE_IDLE_MS);
+        var need = load64(slot + 32);
+        if (need < 0) {
+            var bo = sandhi_server_body_offset(buf, have);
+            if (bo >= 0) {
+                var clen = sandhi_server_content_length(buf, have);
+                # An unrepresentable Content-Length is refused (sandhi 1.9.12).
+                if (clen < 0) { return _srv_refuse(slot, 413, "Payload Too Large", 1); }
+                need = bo + clen;
+                store64(slot + 32, need);
+            }
+        }
+        if (need >= 0) {
+            if (have >= need) { return _srv_dispatch(slot, have); }
+        }
+    }
+    return 0;
+}
+
+fn _srv_drain(slot) {
+    var fd = load64(slot + 8);
+    var buf = load64(slot + 16);
+    while (load64(slot) == SRV_DRAINING) {
+        var n = _srv_recv(fd, buf, SERVE_REQ_MAX);
+        if (n == 0 - _SRV_EAGAIN) { return 0; }
+        if (n <= 0) { return _srv_close(slot); }
+        store64(slot + 56, load64(slot + 56) + n);
+        if (load64(slot + 56) >= SERVE_DRAIN_MAX) { return _srv_close(slot); }
+    }
+    return 0;
+}
+
+# Accept every waiting connection there is a slot for. Returns 0 only when the
+# listener can never accept again. sandhi's accept-error policy
+# (_sandhi_accept_action), except that resource pressure (EMFILE and the like)
+# never ends the loop: the listener backs off, 1 ms doubling to 250 ms, while
+# the open connections and the channels are still served.
+fn _srv_accept(lfd, now) {
+    while (_srv_free_slot() >= 0) {
+        var cfd = sys_accept4(lfd, 0, 0, _SRV_SOCK_CLOEXEC);
+        if (cfd >= 0) {
+            _srv_accept_backoff = 0;
+            _srv_open(_srv_free_slot(), cfd, now);
+        } else {
+            var e = 0 - cfd;
+            if (e == _SRV_EAGAIN) { return 1; }
+            var retry = 0;
+            if (e == _SRV_EINTR) { retry = 1; }
+            if (e == 103) { retry = 1; }   # ECONNABORTED
+            if (e == 71) { retry = 1; }    # EPROTO
+            if (retry == 0) {
+                if (e == 9) { return 0; }    # EBADF
+                if (e == 22) { return 0; }   # EINVAL
+                if (e == 88) { return 0; }   # ENOTSOCK
+                if (e == 95) { return 0; }   # EOPNOTSUPP
+                if (_srv_accept_backoff == 0) { _srv_accept_backoff = 1; }
+                else { _srv_accept_backoff = _srv_accept_backoff * 2; }
+                if (_srv_accept_backoff > 250) { _srv_accept_backoff = 250; }
+                _srv_accept_resume = now + _srv_accept_backoff;
+                _srv_arm_listener(now);
+                return 1;
+            }
+        }
+    }
+    return 1;
+}
+
+# Deadlines: a request that stalls or trickles, a drain that has run its
+# course, and deferred answers (asked again every tick until given).
+fn _srv_tick(now) {
+    var i = 0;
+    while (i < SERVE_MAX_CONNS) {
+        var slot = _srv_slot(i);
+        var st = load64(slot);
+        if (st == SRV_READING) {
+            if (now > load64(slot + 40)) { _srv_close(slot); }
+            elif (now > load64(slot + 48)) { _srv_close(slot); }
+        } elif (st == SRV_DRAINING) {
+            if (now > load64(slot + 40)) { _srv_close(slot); }
+        } elif (st == SRV_DEFERRED) {
+            var timed_out = 0;
+            if (now > load64(slot + 48)) { timed_out = 1; }
+            var done = fncall3(load64(slot + 64), load64(slot + 8), load64(slot + 72), timed_out);
+            if (done == 1) { _srv_close(slot); }
+            elif (timed_out == 1) { _srv_close(slot); }
+        } elif (st == SRV_DETACHED) {
+            # The pipe is relayed as it becomes readable (the loop); the tick
+            # only enforces the deadline.
+            if (now > load64(slot + 48)) {
+                _srv_relay(slot, 1);
+                _srv_close(slot);
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# The listener is in the epoll set only while a slot is free and it is not
+# backing off; otherwise a pending connection would wake the loop on every
+# pass (epoll is level-triggered).
+fn _srv_arm_listener(now) {
+    var want = 1;
+    if (_srv_free_slot() < 0) { want = 0; }
+    if (_srv_accept_resume > now) { want = 0; }
+    if (want == _srv_listening) { return 0; }
+    if (want == 1) { _srv_epoll(EPOLL_CTL_ADD, _srv_lfd, _SRV_TOKEN_LISTEN); }
+    else { _srv_epoll(EPOLL_CTL_DEL, _srv_lfd, _SRV_TOKEN_LISTEN); }
+    _srv_listening = want;
+    return 0;
+}
+
+# The data word of event `i` in _srv_events (x86_64 packs the struct: 12 bytes,
+# data at +4; aarch64: 16 bytes, data at +8).
+fn _srv_event_data(i) {
+    #ifdef CYRIUS_ARCH_AARCH64
+    return load64(_srv_events + i * 16 + 8);
+    #else
+    return load64(_srv_events + i * 12 + 4);
+    #endif
+}
+
+fn _srv_listen(addr, port) {
+    var fd = sys_socket(AF_INET, SOCK_STREAM | _SRV_SOCK_NONBLOCK | _SRV_SOCK_CLOEXEC, 0);
+    if (fd < 0) { return 0 - 1; }
+    var one: i32[1];
+    store32(&one, 1);
+    sys_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, 4);
+    if (sys_bind(fd, sockaddr_in(addr, port), 16) < 0) {
+        sys_close(fd);
+        return 0 - 1;
+    }
+    if (sys_listen(fd, SERVE_BACKLOG) < 0) {
+        sys_close(fd);
+        return 0 - 1;
+    }
+    return fd;
+}
+
+# Serve on addr:port until the listener fails. Returns 1 then (or when it
+# cannot bind), as sandhi's loops did; it does not return otherwise.
+fn server_loop(addr, port) {
+    _srv_lfd = _srv_listen(addr, port);
+    if (_srv_lfd < 0) { return 1; }
+    _srv_epfd = sys_epoll_create();
+    if (_srv_epfd < 0) {
+        sys_close(_srv_lfd);
+        return 1;
+    }
+    _srv_slots = alloc(SERVE_MAX_CONNS * SRV_SLOT_SIZE);
+    memset(_srv_slots, 0, SERVE_MAX_CONNS * SRV_SLOT_SIZE);
+    _srv_events = alloc(SRV_EVENTS * 16);
+    _srv_reject = arena_allocator(4096);
+    ipc_use_epoll(_srv_epfd);
+    var last_upkeep = 0;
+    while (1 == 1) {
+        var now = clock_now_ms();
+        _srv_arm_listener(now);
+        # A deferred answer (a stop) is given within a busy tick of its agent
+        # exiting, not a full one.
+        var tick = SERVE_TICK_MS;
+        if (_srv_deferred > 0) { tick = SERVE_TICK_BUSY_MS; }
+        var nr = sys_epoll_wait(_srv_epfd, _srv_events, SRV_EVENTS, tick);
+        now = clock_now_ms();
+        var i = 0;
+        while (i < nr) {
+            var tok = _srv_event_data(i);
+            if (tok == _SRV_TOKEN_LISTEN) {
+                if (_srv_accept(_srv_lfd, now) == 0) {
+                    sys_close(_srv_lfd);
+                    return 1;
+                }
+            } elif (tok >= _SRV_TOKEN_SLOT0) {
+                if (tok < _SRV_TOKEN_SLOT0 + SERVE_MAX_CONNS) {
+                    var slot = _srv_slot(tok - _SRV_TOKEN_SLOT0);
+                    if (load64(slot) == SRV_READING) { _srv_read(slot, now); }
+                    elif (load64(slot) == SRV_DRAINING) { _srv_drain(slot); }
+                } elif (tok < _SRV_TOKEN_PIPE0 + SERVE_MAX_CONNS) {
+                    var dslot = _srv_slot(tok - _SRV_TOKEN_PIPE0);
+                    if (load64(dslot) == SRV_DETACHED) {
+                        if (_srv_relay(dslot, 0) == 1) { _srv_close(dslot); }
+                    }
+                } else {
+                    ipc_on_ready(tok);
+                }
+            }
+            i = i + 1;
+        }
+        if (now - last_upkeep >= tick) {
+            agents_tick(now);    # first: a deferred stop answers as its agent is reaped
+            _srv_tick(now);
+            _srv_reap_tick();
+            ipc_tick(now);
+            last_upkeep = now;
+        }
+    }
+    return 0;
+}
+
+# For a handler: answer this request later. The loop keeps the connection open
+# and calls fp(cfd, arg, timed_out) each tick until it returns 1 (it has
+# answered; the loop then closes the connection). After SERVE_DEFER_MAX_MS it
+# is called with timed_out = 1 and must answer. Returns 1, or 0 when the
+# request is not being served by this loop (a test calling a handler directly;
+# agnos): the handler then answers at once.
+fn server_defer(fp, arg) {
+    if (_srv_current == 0) { return 0; }
+    var slot = _srv_current;
+    # Out of the epoll set: a client that sends more, or hangs up, would
+    # otherwise wake the loop on every pass while the answer is pending.
+    _srv_unregister(slot);
+    _srv_deferred = _srv_deferred + 1;
+    store64(slot, SRV_DEFERRED);
+    store64(slot + 64, fp);
+    store64(slot + 72, arg);
+    store64(slot + 48, clock_now_ms() + SERVE_DEFER_MAX_MS);
+    return 1;
+}
+
+# --- Detached work ---------------------------------------------------------
+#
+# Some handlers wait on another server: an MCP call forwarded to a registered
+# endpoint (tools/call, resources/read, prompts/get) and bote's web_fetch /
+# web_search. On the loop, each held every other client, every agent channel
+# and every stop for as long as that server took. sandhi's client sets no
+# timeout unless asked (read, write, connect and total are all 0 by default),
+# so a server that accepted and never answered held daimon indefinitely; the
+# sync loop before 2.3.4 did the same.
+#
+# server_detach runs such work in a child process. The child writes the answer
+# it would have sent into a pipe and exits; the loop relays the pipe to the
+# client as it is written, and serves everyone else meanwhile. The child
+# dies with daimon and keeps no descriptor but the pipe and stdio. One that has
+# not finished within SERVE_DETACH_MAX_MS is killed, and the client is answered
+# 504. 60 s is the MCP TypeScript SDK's default request timeout
+# (DEFAULT_REQUEST_TIMEOUT_MSEC), the bound MCP clients already work to.
+var SERVE_DETACH_MAX_MS = 60000;
+var SERVE_RELAY_READS = 16;        # pipe reads relayed per wake, SERVE_REQ_MAX each
+
+# Children whose call is over, waiting to be reaped. By pid, never
+# waitpid(-1), which would take an agent's exit status from agent_reap.
+var SERVE_REAP_MAX = 256;
+var _srv_reap_pids: i64[256];
+var _srv_reap_n = 0;
+
+# Write all of `n` bytes to a client. 0, or -1 when it cannot take them
+# (gone, or stalled past SO_SNDTIMEO).
+fn _srv_send_all(fd, buf, n) {
+    var off = 0;
+    while (off < n) {
+        var w = sys_write(fd, buf + off, n - off);
+        if (w == 0 - _SRV_EINTR) { w = 0; }
+        elif (w <= 0) { return 0 - 1; }
+        off = off + w;
+    }
+    return 0;
+}
+
+fn _srv_reap_later(pid) {
+    if (pid <= 0) { return 0; }
+    if (daimon_reap_code(pid) != 0 - 2) { return 0; }
+    if (_srv_reap_n < SERVE_REAP_MAX) {
+        store64(&_srv_reap_pids + _srv_reap_n * 8, pid);
+        _srv_reap_n = _srv_reap_n + 1;
+        return 0;
+    }
+    # Unreachable while a child needs a connection slot (SERVE_MAX_CONNS is
+    # half the table); bounded if it ever is.
+    daimon_reap_within(pid, DAIMON_REAP_BUDGET_MS);
+    return 0;
+}
+
+fn _srv_reap_tick() {
+    var i = 0;
+    while (i < _srv_reap_n) {
+        var pid = load64(&_srv_reap_pids + i * 8);
+        if (daimon_reap_code(pid) == 0 - 2) {
+            i = i + 1;
+        } else {
+            _srv_reap_n = _srv_reap_n - 1;
+            store64(&_srv_reap_pids + i * 8, load64(&_srv_reap_pids + _srv_reap_n * 8));
+        }
+    }
+    return 0;
+}
+
+# The detached call on `slot` is over: its pipe is closed, its child killed if
+# `kill` (it may still be running) and reaped once it has exited.
+fn _srv_detach_end(slot, kill) {
+    var pid = load64(slot + 88);
+    if (kill == 1) { daimon_signal(pid, SIGKILL); }
+    _srv_epoll(EPOLL_CTL_DEL, load64(slot + 96), _SRV_TOKEN_PIPE0 + _srv_slot_index(slot));
+    sys_close(load64(slot + 96));
+    store64(slot + 88, 0);
+    store64(slot + 96, 0 - 1);
+    _srv_reap_later(pid);
+    return 0;
+}
+
+fn _srv_detach_fail(cfd, code, action, msg) {
+    daimon_audit(SEV_WARNING, "http", action, msg);
+    var b = error_json(code, str_from(msg));
+    http_send_response(cfd, code, str_data(b), str_len(b));
+    return 0;
+}
+
+# Relay what a detached call's child has written to its client. Returns 1 when
+# the call is over (answered, failed, or past its deadline if `timed_out`).
+fn _srv_relay(slot, timed_out) {
+    var cfd = load64(slot + 8);
+    var pfd = load64(slot + 96);
+    var buf = load64(slot + 16);   # the request is handled; its buffer is free
+    var k = 0;
+    while (k < SERVE_RELAY_READS) {
+        var n = sys_read(pfd, buf, SERVE_REQ_MAX);
+        while (n == 0 - _SRV_EINTR) { n = sys_read(pfd, buf, SERVE_REQ_MAX); }
+        if (n == 0 - _SRV_EAGAIN) {
+            k = SERVE_RELAY_READS;   # nothing more yet
+        } elif (n <= 0) {
+            # The child has finished, or died. An answer that never began is 502.
+            if (load64(slot + 104) == 0) {
+                _srv_detach_fail(cfd, 502, "http.detached.noanswer", "the call ended without an answer");
+            }
+            _srv_detach_end(slot, 0);
+            return 1;
+        } else {
+            if (_srv_send_all(cfd, buf, n) != 0) {
+                _srv_detach_end(slot, 1);   # the client is gone, and with it the call's point
+                return 1;
+            }
+            store64(slot + 104, load64(slot + 104) + n);
+            k = k + 1;
+        }
+    }
+    if (timed_out == 1) {
+        if (load64(slot + 104) == 0) {
+            _srv_detach_fail(cfd, 504, "http.detached.timeout", "the call did not finish within 60 s");
+        }
+        _srv_detach_end(slot, 1);
+        return 1;
+    }
+    return 0;
+}
+
+# For a handler whose answer waits on another server: run work(fd, arg) in a
+# child process, `fd` being a pipe the loop relays to the client. Returns 1
+# when a child took the work (the handler returns without answering), 0 when
+# the handler must do it itself: the request is not served by this loop (a
+# test; agnos), or no child could be made (the work then runs inline, as it
+# did before 2.3.4).
+fn server_detach(work, arg) {
+    if (_srv_current == 0) { return 0; }
+    var slot = _srv_current;
+    var pfd: i32[2];
+    if (syscall(_DAIMON_SYS_PIPE2, &pfd, _DAIMON_O_CLOEXEC) != 0) { return 0; }
+    var rfd = load32(&pfd);
+    var wfd = load32(&pfd + 4);
+    var parent = sys_getpid();
+    var pid = sys_fork();
+    if (pid < 0) {
+        sys_close(rfd);
+        sys_close(wfd);
+        return 0;
+    }
+    if (pid == 0) {
+        # A connection, channel or listener the child kept would stay open
+        # after daimon closed it, so it keeps only the pipe.
+        sys_prctl(_DAIMON_PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
+        if (sys_getppid() != parent) { sys_exit_group(0); }
+        _agent_close_inherited(3, wfd);
+        fncall2(work, wfd, arg);
+        sys_exit_group(0);
+    }
+    sys_close(wfd);
+    var fl = syscall(SYS_FCNTL, rfd, 3, 0);
+    if (fl >= 0) { syscall(SYS_FCNTL, rfd, 4, fl | 2048); }   # F_SETFL | O_NONBLOCK
+    # The client's socket leaves the epoll set, and the pipe joins it: the
+    # answer is relayed as the child writes it, not on the next tick.
+    _srv_unregister(slot);
+    store64(slot, SRV_DETACHED);
+    store64(slot + 48, clock_now_ms() + SERVE_DETACH_MAX_MS);
+    store64(slot + 88, pid);
+    store64(slot + 96, rfd);
+    store64(slot + 104, 0);
+    _srv_epoll(EPOLL_CTL_ADD, rfd, _SRV_TOKEN_PIPE0 + _srv_slot_index(slot));
+    return 1;
+}
+
+#else
+
+fn server_defer(fp, arg) { return 0; }
+
+fn server_detach(work, arg) { return 0; }
+
+#endif
+
+# `serve` and `serve --async` are the same loop since 2.3.4. --async chose
+# sandhi's epoll-cooperative loop, which ran each connection's handler to
+# completion just as the sync one did; the flag is still accepted.
 fn serve(port) {
+    #ifdef CYRIUS_TARGET_AGNOS
     server_banner(port, "sync");
-    # sandhi_server_run_opts owns bind/listen/accept/recv + smuggling
-    # rejection (CL+TE conflict, Host.Host / CL.CL / TE.TE duplicates per
-    # RFC 7230 §3.3.2 + §3.3.3) before our handler runs, and applies
-    # SO_RCVTIMEO = SERVE_IDLE_MS per accepted connection. It closes cfd
-    # after the handler returns. Returns when the loop exits (today: never).
     var opts = sandhi_server_options_new();
     sandhi_server_options_idle_ms(opts, SERVE_IDLE_MS);
     return sandhi_server_run_opts(server_bind_addr(), port, &handle_request, 0, opts);
+    #else
+    server_banner(port, "event loop");
+    # Room for every agent's channel plus the connections (agent_nofile_raise;
+    # four per agent leaves room for more than the channel).
+    var want = config_max_agents(_config) * 4 + SERVE_MAX_CONNS + 64;
+    if (agent_nofile_raise(want) < want) {
+        sakshi_warn("descriptor limit below what max_agents needs; later agent starts may fail", 73);
+    }
+    return server_loop(server_bind_addr(), port);
+    #endif
 }
-
-# --- Async server (sandhi epoll-cooperative accept loop) ---
-#
-# Collapsed onto sandhi_server_run_async at 1.2.6 (was a hand-rolled epoll
-# accept loop, 1.1.0–1.2.5). Upstream sandhi 1.4.9 made
-# sandhi_server_run_async honor sandhi_server_options_max_conns: an
-# epoll-cooperative loop that drains the non-blocking accept queue up to
-# max_conns, spawns a handler task per connection from a SINGLE reused
-# per-batch arena, runs the batch via async_run, resets the arena, and
-# blocks on the listen fd when the queue is empty. It applies
-# SO_RCVTIMEO = idle_ms per accepted connection (slowloris bound) and runs
-# the same CL/TE + duplicate-header smuggling rejection before our handler.
-#
-# This subsumes the entire hand-rolled loop, plus two wins it lacked:
-#   1. Bounded recv buffers — the old async_handle_client alloc'd
-#      MAX_REQUEST_SIZE (64 KiB) per connection from the never-freeing
-#      global bump, so every batch leaked. sandhi's per-batch arena is
-#      sized once and reset each drain.
-#   2. Enforced concurrency cap via max_conns (the old loop had an
-#      implicit max_batch = 64).
-# handle_request keeps the shared (ctx, cfd, buf, len) handler contract
-# used by the sync path, so one handler serves both modes.
-
-# Per-drain concurrency cap. 128 matches sandhi's documented default (was
-# an implicit max_batch = 64 in the hand-rolled loop). sandhi sizes its
-# reused per-batch arena at max_conns × (HSV_REQ_BUF_SIZE + slack), so this
-# is the steady-state recv-buffer working set (~8.4 MiB), allocated once.
-var SERVE_MAX_CONNS = 128;
 
 fn serve_async(port) {
-    server_banner(port, "async");
-    var opts = sandhi_server_options_new();
-    sandhi_server_options_idle_ms(opts, SERVE_IDLE_MS);
-    sandhi_server_options_max_conns(opts, SERVE_MAX_CONNS);
-    # sandhi owns bind/listen/accept/recv + smuggling rejection + per-conn
-    # SO_RCVTIMEO; closes each cfd after handle_request returns. Returns 1
-    # on bind/listen/arena failure; otherwise loops forever.
-    return sandhi_server_run_async(server_bind_addr(), port, &handle_request, 0, opts);
+    return serve(port);
 }
-

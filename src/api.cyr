@@ -54,6 +54,12 @@ fn api_metrics(fd) {
     str_builder_add_int(sb, ipc_refused_count());
     str_builder_add_cstr(sb, ",\"bus_dropped\":");
     str_builder_add_int(sb, msg_bus_dropped_count());
+    # 2.3.4: open agent channels, and the bytes the bus holds (bounded by
+    # IPC_BUS_BYTES_MAX; freed as messages are taken).
+    str_builder_add_cstr(sb, ",\"ipc_channels\":");
+    str_builder_add_int(sb, ipc_channel_count());
+    str_builder_add_cstr(sb, ",\"bus_bytes\":");
+    str_builder_add_int(sb, msg_bus_bytes());
     str_builder_add_cstr(sb, "}");
     http_ok(fd, str_builder_build(sb));
 }

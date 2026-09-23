@@ -1,10 +1,6 @@
 # =========================================================================
-# ipc — messages, the message bus, RPC routing, and agent channels (2.3.3)
+# ipc — messages, the message bus, RPC routing, and agent channels
 # =========================================================================
-
-# IpcMessage: {id: Str, source: Str, target: Str, msg_type, payload: Str,
-#               timestamp}
-# 6 fields x 8 = 48 bytes
 
 enum MessageType {
     MSG_REQUEST = 0;
@@ -16,40 +12,79 @@ enum MessageType {
 
 var MAX_MESSAGE_SIZE = 65536;
 
-# Own a retained Str (0 stays 0 — an absent field is not an error here).
-fn _ipc_own_str(s) {
-    if (s == 0) { return 0; }
-    return str_clone(s);
-}
-
-# ⛔ 2.2.3 — the message OWNS its three Strs. A message outlives the call that
-# made it: msg_bus_publish pushes it onto subscriber queues, where it waits to be
-# read. Borrowed, a source/target/payload that came from a request (a jget VIEW
-# into the buffer sandhi reuses) would be rewritten by the next request while
-# still queued — the same class as the 2.2.1 registry fix, one struct over, and
-# missed by that sweep. It also makes `target` NUL-terminated, which
-# msg_bus_publish relies on when it uses str_data(target) as a map key.
-# Message ids have their own counter (2.3.3). They were drawn from agent.cyr's
-# _next_agent_id, which was harmless while nothing published; once agent channels
-# carried messages, every message would have used up an agent id.
+# --- messages ------------------------------------------------------------------
+#
+# A message is ONE freelist block (2.3.4), freed when the last queue holding it
+# lets go (VULN-018). Through 2.3.3 it was five allocations from the bump heap,
+# which never frees: 451 bytes stayed allocated for every message delivered,
+# read or not. Layout, MSG_HEAD bytes and then the text:
+#   +0 queues holding it   +8 id   +16 type   +24 timestamp (epoch s)
+#   +32 source Str   +48 target Str   +64 payload Str   ({data, len}; the data
+#   points into the text below, each part NUL-terminated)
+#   +80 bus bytes it is counted for (0 while it is on no queue)
+#
+# ⛔ 2.2.3 — the message OWNS its text. A message outlives the call that made it
+# (it waits on subscriber queues), so a source/target/payload that were views
+# of a request buffer sandhi reuses would be rewritten under it; the text is
+# also what makes `target` a NUL-terminated map key.
+#
+# Message ids have their own counter (2.3.3); they were drawn from agent.cyr's
+# _next_agent_id, and every message would have used up an agent id.
+var MSG_HEAD = 88;
 var _next_msg_id = 1;
 
+fn _msg_put(m, off, dst, s) {
+    var n = 0;
+    if (s != 0) { n = str_len(s); }
+    if (n > 0) { memcpy(dst, str_data(s), n); }
+    store8(dst + n, 0);
+    store64(m + off, dst);
+    store64(m + off + 8, n);
+    return dst + n + 1;
+}
+
 fn ipc_msg_new(source, target, msg_type, payload) {
-    var m = alloc(48);
-    store64(m, str_from_int(_next_msg_id));
+    var sl = 0;
+    var tl = 0;
+    var pl = 0;
+    if (source != 0) { sl = str_len(source); }
+    if (target != 0) { tl = str_len(target); }
+    if (payload != 0) { pl = str_len(payload); }
+    var m = fl_alloc(MSG_HEAD + sl + tl + pl + 3);
+    store64(m, 0);
+    store64(m + 8, _next_msg_id);
     _next_msg_id = _next_msg_id + 1;
-    store64(m + 8, _ipc_own_str(source));
-    store64(m + 16, _ipc_own_str(target));
-    store64(m + 24, msg_type);
-    store64(m + 32, _ipc_own_str(payload));
-    store64(m + 40, clock_epoch_secs());
+    store64(m + 16, msg_type);
+    store64(m + 24, clock_epoch_secs());
+    store64(m + 80, 0);
+    var t = m + MSG_HEAD;
+    t = _msg_put(m, 32, t, source);
+    t = _msg_put(m, 48, t, target);
+    _msg_put(m, 64, t, payload);
     return m;
 }
 
-fn ipc_msg_source(m) { return load64(m + 8); }
-fn ipc_msg_target(m) { return load64(m + 16); }
-fn ipc_msg_type(m) { return load64(m + 24); }
-fn ipc_msg_payload(m) { return load64(m + 32); }
+fn ipc_msg_id(m) { return load64(m + 8); }
+fn ipc_msg_type(m) { return load64(m + 16); }
+fn ipc_msg_timestamp(m) { return load64(m + 24); }
+fn ipc_msg_source(m) { return m + 32; }
+fn ipc_msg_target(m) { return m + 48; }
+fn ipc_msg_payload(m) { return m + 64; }
+fn ipc_msg_size(m) { return MSG_HEAD + load64(m + 40) + load64(m + 56) + load64(m + 72) + 3; }
+
+fn ipc_msg_type_name(t) {
+    if (t == MSG_REQUEST) { return "request"; }
+    if (t == MSG_RESPONSE) { return "response"; }
+    if (t == MSG_HEARTBEAT) { return "heartbeat"; }
+    if (t == MSG_COMMAND) { return "command"; }
+    return "event";
+}
+
+# A message that reached no queue (refused, or published to nobody).
+fn ipc_msg_discard(m) {
+    if (load64(m) == 0) { fl_free(m); }
+    return 0;
+}
 
 # MessageBus: {subscribers: map<agent_id_cstr, queue_vec>,
 #               agent_names: map<name_cstr, agent_id_cstr>}
@@ -78,90 +113,238 @@ fn msg_bus_new() {
     return mb;
 }
 
-fn msg_bus_subscribe(mb, agent_id_cstr) {
-    map_set(load64(mb), _ipc_own(agent_id_cstr), vec_new());
-}
-
-fn msg_bus_unsubscribe(mb, agent_id_cstr) {
-    map_delete(load64(mb), agent_id_cstr);
-}
-
-fn msg_bus_register_name(mb, name_cstr, agent_id_cstr) {
-    map_set(load64(mb + 8), _ipc_own(name_cstr), _ipc_own(agent_id_cstr));
-}
-
-# A subscriber queue holds at most this many messages; past it, new messages
-# for that subscriber are dropped and counted. The Rust original gave every
-# agent an mpsc channel of 100. Until 2.3.3 the queues were unbounded — harmless
-# while nothing published, not once agents can.
+# --- bounds (VULN-018) -------------------------------------------------------------
+#
+# A subscriber queue holds at most IPC_BUS_QUEUE_MAX messages (the Rust original
+# gave every agent an mpsc channel of 100), and the bus as a whole at most
+# IPC_BUS_BYTES_MAX bytes of messages. A message held by several queues (a
+# broadcast) is counted once. Past either bound a message is not queued, and
+# that is counted (bus_dropped). Messages leave when they are taken, or when
+# their agent is deleted.
 var IPC_BUS_QUEUE_MAX = 100;
+var IPC_BUS_BYTES_MAX = 67108864;   # 64 MiB
 var _msg_bus_dropped = 0;
+var _msg_bus_bytes = 0;
 
 fn msg_bus_dropped_count() { return _msg_bus_dropped; }
+fn msg_bus_bytes() { return _msg_bus_bytes; }
 
-fn _msg_bus_enqueue(queue, msg) {
+# One more queue holds `m`.
+fn _msg_hold(m) {
+    if (load64(m) == 0) {
+        store64(m + 80, ipc_msg_size(m));
+        _msg_bus_bytes = _msg_bus_bytes + load64(m + 80);
+    }
+    store64(m, load64(m) + 1);
+    return 0;
+}
+
+# A queue lets go of `m`; the last one frees it.
+fn ipc_msg_release(m) {
+    var n = load64(m) - 1;
+    store64(m, n);
+    if (n <= 0) {
+        _msg_bus_bytes = _msg_bus_bytes - load64(m + 80);
+        fl_free(m);
+    }
+    return 0;
+}
+
+# Queue `m` on `queue` if both bounds allow; 1 if it was queued.
+fn _msg_bus_enqueue(queue, m) {
     if (vec_len(queue) >= IPC_BUS_QUEUE_MAX) {
         _msg_bus_dropped = _msg_bus_dropped + 1;
         return 0;
     }
-    vec_push(queue, msg);
+    if (load64(m) == 0) {
+        if (_msg_bus_bytes + ipc_msg_size(m) > IPC_BUS_BYTES_MAX) {
+            _msg_bus_dropped = _msg_bus_dropped + 1;
+            return 0;
+        }
+    }
+    vec_push(queue, m);
+    _msg_hold(m);
+    return 1;
+}
+
+fn msg_bus_subscribe(mb, agent_id_cstr) {
+    map_set(load64(mb), _ipc_own(agent_id_cstr), vec_new());
+}
+
+# Remove a subscriber, letting go of everything still in its queue.
+fn msg_bus_unsubscribe(mb, agent_id_cstr) {
+    var q = map_get(load64(mb), agent_id_cstr);
+    if (q != 0) {
+        var i = 0;
+        while (i < vec_len(q)) {
+            ipc_msg_release(vec_get(q, i));
+            i = i + 1;
+        }
+        vec_truncate(q, 0);
+    }
+    map_delete(load64(mb), agent_id_cstr);
+}
+
+# A name routes to the FIRST agent that registers it (2.3.4); a later
+# registration of the same name gets no route. The Rust original let the last
+# writer win, which on an unauthenticated API lets any registration take over
+# another agent's messages. A name that is all digits is not registered either
+# (ids are resolved first, so it could never route), nor "*" or "broadcast".
+# Returns 1 if `name` now routes to `agent_id`.
+fn msg_bus_register_name(mb, name_cstr, agent_id_cstr) {
+    if (strlen(name_cstr) == 0) { return 0; }
+    if (_msg_bus_is_broadcast(name_cstr) == 1) { return 0; }
+    if (_msg_bus_all_digits(name_cstr) == 1) { return 0; }
+    if (map_get(load64(mb + 8), name_cstr) != 0) { return 0; }
+    map_set(load64(mb + 8), _ipc_own(name_cstr), _ipc_own(agent_id_cstr));
+    return 1;
+}
+
+# Drop `name`'s route, if it is `agent_id`'s.
+fn msg_bus_unregister_name(mb, name_cstr, agent_id_cstr) {
+    var owner = map_get(load64(mb + 8), name_cstr);
+    if (owner == 0) { return 0; }
+    if (streq(owner, agent_id_cstr) == 0) { return 0; }
+    map_delete(load64(mb + 8), name_cstr);
+    return 1;
+}
+
+fn _msg_bus_all_digits(s) {
+    var n = strlen(s);
+    if (n == 0) { return 0; }
+    var i = 0;
+    while (i < n) {
+        var c = load8(s + i);
+        if (c < 48) { return 0; }
+        if (c > 57) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# "*" or "broadcast" in any case (the Rust original's two spellings).
+fn _msg_bus_is_broadcast(t) {
+    if (streq(t, "*") == 1) { return 1; }
+    if (strlen(t) != 9) { return 0; }
+    var want = "broadcast";
+    var i = 0;
+    while (i < 9) {
+        var c = load8(t + i);
+        if (c >= 65) { if (c <= 90) { c = c + 32; } }
+        if (c != load8(want + i)) { return 0; }
+        i = i + 1;
+    }
     return 1;
 }
 
 # Broadcast walks the subscriber map in place (map_iter), not over map_keys: a
-# key vector per broadcast came from the never-freed heap, and since 2.3.3 any
-# agent can broadcast. The message rides in this global for the callback's
-# duration (single-threaded: the bus is the main thread's).
+# key vector per broadcast came from the never-freed heap. The message and the
+# count ride in these globals for the callback's duration (single-threaded:
+# the bus is the event loop's).
 var _msg_bus_bcast = 0;
+var _msg_bus_bcast_n = 0;
+var _msg_bus_bcast_full = 0;
 
 fn _msg_bus_bcast_entry(key, queue) {
-    if (queue != 0) { _msg_bus_enqueue(queue, _msg_bus_bcast); }
+    if (queue != 0) {
+        if (_msg_bus_enqueue(queue, _msg_bus_bcast) == 1) { _msg_bus_bcast_n = _msg_bus_bcast_n + 1; }
+        else { _msg_bus_bcast_full = _msg_bus_bcast_full + 1; }
+    }
     return 0;
 }
 
+# Route `msg` by its target and queue it. The bus takes the message: whatever
+# happens, the caller does not touch it again (a message that reached no queue
+# is freed here).
+#   Ok(n)   queued on n queues. A broadcast reaches every subscriber with room,
+#           the sender's own queue included (Rust parity); with no subscribers
+#           at all it is Ok(0).
+#   Err(DAIMON_ERR_AGENT_NOT_FOUND)  no agent has that id or name. (The Rust
+#           original broadcast such a message to EVERY agent; a mistyped target
+#           would have reached them all.)
+#   Err(DAIMON_ERR_IPC_FAULT)  the target's queue, or the bus, is full.
+# A target is resolved as an agent id first, then as a name, so a name can
+# never take over an id.
 fn msg_bus_publish(mb, msg) {
-    var target = ipc_msg_target(msg);
-    var target_cstr = str_data(target);
+    var target_cstr = str_data(ipc_msg_target(msg));
     var subs = load64(mb);
-
-    # Check if broadcast
-    if (streq(target_cstr, "*") == 1) {
+    if (_msg_bus_is_broadcast(target_cstr) == 1) {
         _msg_bus_bcast = msg;
+        _msg_bus_bcast_n = 0;
+        _msg_bus_bcast_full = 0;
         map_iter(subs, &_msg_bus_bcast_entry);
         _msg_bus_bcast = 0;
-        return Ok(0);
+        var n = _msg_bus_bcast_n;
+        var full = _msg_bus_bcast_full;
+        ipc_msg_discard(msg);
+        if (n == 0) {
+            if (full > 0) { return Err(DAIMON_ERR_IPC_FAULT); }
+        }
+        return Ok(n);
     }
-
-    # Named routing
-    var names = load64(mb + 8);
-    var resolved = map_get(names, target_cstr);
-    if (resolved != 0) {
-        var queue = map_get(subs, resolved);
-        if (queue != 0) { _msg_bus_enqueue(queue, msg); }
-        return Ok(0);
-    }
-
-    # Direct ID routing
     var queue = map_get(subs, target_cstr);
-    if (queue != 0) { _msg_bus_enqueue(queue, msg); }
-    return Ok(0);
+    if (queue == 0) {
+        var resolved = map_get(load64(mb + 8), target_cstr);
+        if (resolved != 0) { queue = map_get(subs, resolved); }
+    }
+    if (queue == 0) {
+        ipc_msg_discard(msg);
+        return Err(DAIMON_ERR_AGENT_NOT_FOUND);
+    }
+    if (_msg_bus_enqueue(queue, msg) == 0) {
+        ipc_msg_discard(msg);
+        return Err(DAIMON_ERR_IPC_FAULT);
+    }
+    return Ok(1);
 }
 
+# Queue `msg` for one agent by id. Takes the message, as msg_bus_publish does.
 fn msg_bus_send_to(mb, agent_id_cstr, msg) {
     var queue = map_get(load64(mb), agent_id_cstr);
-    if (queue == 0) { return Err(DAIMON_ERR_AGENT_NOT_FOUND); }
-    if (_msg_bus_enqueue(queue, msg) == 0) { return Err(DAIMON_ERR_IPC_FAULT); }
+    if (queue == 0) {
+        ipc_msg_discard(msg);
+        return Err(DAIMON_ERR_AGENT_NOT_FOUND);
+    }
+    if (_msg_bus_enqueue(queue, msg) == 0) {
+        ipc_msg_discard(msg);
+        return Err(DAIMON_ERR_IPC_FAULT);
+    }
     return Ok(0);
 }
 
 # The queued messages for a subscriber (a vec), or 0 if it is not subscribed.
+# Read-only: take with msg_bus_take, which lets go of them.
 fn msg_bus_queue(mb, agent_id_cstr) {
     return map_get(load64(mb), agent_id_cstr);
 }
 
+# Remove the first `n` messages of a subscriber's queue (all if n exceeds it),
+# letting go of them. The caller has read them (msg_bus_queue) first.
+fn msg_bus_drop_front(mb, agent_id_cstr, n) {
+    var q = map_get(load64(mb), agent_id_cstr);
+    if (q == 0) { return 0; }
+    var len = vec_len(q);
+    if (n > len) { n = len; }
+    var i = 0;
+    while (i < n) {
+        ipc_msg_release(vec_get(q, i));
+        i = i + 1;
+    }
+    var j = n;
+    while (j < len) {
+        vec_set(q, j - n, vec_get(q, j));
+        j = j + 1;
+    }
+    vec_truncate(q, len - n);
+    return n;
+}
+
 fn msg_bus_send_to_name(mb, name_cstr, msg) {
     var id = map_get(load64(mb + 8), name_cstr);
-    if (id == 0) { return Err(DAIMON_ERR_AGENT_NOT_FOUND); }
+    if (id == 0) {
+        ipc_msg_discard(msg);
+        return Err(DAIMON_ERR_AGENT_NOT_FOUND);
+    }
     return msg_bus_send_to(mb, id, msg);
 }
 
@@ -232,7 +415,8 @@ fn rpc_list_methods(rr) {
 #   frame  4-byte big-endian length, then that many bytes of UTF-8 JSON
 #          (at most MAX_MESSAGE_SIZE). Length 0 is a keep-alive: skipped, no
 #          reply, as in the Rust original.
-#   reply  one byte per frame: ACK (1), NACK_QUEUE_FULL (2), NACK_INVALID (3)
+#   reply  one byte per frame: ACK (1), NACK_QUEUE_FULL (2), NACK_INVALID (3),
+#          NACK_NO_TARGET (4, since 2.3.4: nothing has that id or name)
 #   body   a JSON object (json_object_ok): "target" a non-empty string — an
 #          agent id, a registered name, or "*" — required; "type" one of
 #          request / response / event / heartbeat / command, default event;
@@ -242,87 +426,60 @@ fn rpc_list_methods(rr) {
 #   channel (the framing cannot be trusted after it). A malformed body is
 #   answered NACK_INVALID and the channel stays open.
 #
-# THREADS. A background service thread reads every channel, so an agent's send
-# is answered while daimon's one-request-at-a-time server is busy. The thread
-# touches only what it owns (its channel list, the frames it reads) plus two
-# bounded thread channels (lib/thread.cyr): commands in from the main thread,
-# records out to it. The agent registry, the bus, the audit chain and the logger
-# stay single-threaded: the main thread drains the records (ipc_drain) at
-# the top of every HTTP request. alloc() is safe from both threads (a
-# process-wide lock, armed when the thread starts). The frame parse uses bayan's
-# REENTRANT entry point (bayan_json_v_parse_ctx), which keeps its state in the
-# call, not in bayan's error globals.
+# THE LOOP (2.3.4). daimon's own event loop (src/server.cyr) polls every channel
+# alongside its HTTP connections, and this module is called from it on the one
+# thread daimon has. A frame is answered and put on the bus the moment it
+# completes; there is no hand-off and no lock. 2.3.3 ran the channels on a
+# background thread, and from the moment it started every allocation in daimon
+# took the stdlib's heap lock (alloc(64) 10 -> 53 ns; ADR-005, ADR-006).
 #
-# ⚠ BACKPRESSURE. Records wait in the hand-off for the main thread, which runs
-# only when a request arrives. A daimon with no HTTP traffic stops accepting
-# after IPC_HANDOFF_CAP messages; the agent is told so (NACK_QUEUE_FULL).
+# A frame is parsed in _ipc_arena, rewound for every frame, so the parse tree
+# never reaches the shared heap; the message the bus keeps is its own copy.
 #
 # AGNOS: no channels until 2.4.x maps chan_op. Agents cannot start there yet
 # (agent_start answers AGENT_OP_UNSUPPORTED), so nothing below is reached.
 
 # Wire reply codes.
-var ACK = 1;
-var NACK_QUEUE_FULL = 2;
-var NACK_INVALID = 3;
+var ACK = 1;               # queued for its target (a broadcast: for every subscriber with room)
+var NACK_QUEUE_FULL = 2;   # the target's queue, or the bus, is full; nothing was kept
+var NACK_INVALID = 3;      # not a valid frame
+var NACK_NO_TARGET = 4;    # no agent has that id or name; nothing was kept (2.3.4)
 
 # (The agent's end is fd AGENT_IPC_FD = 3 inside the agent: src/agent.cyr.)
 var IPC_FRAME_TIMEOUT_MS = 5000;   # a started frame must finish within this (SERVE_IDLE_MS)
-var IPC_POLL_MS = 100;             # how soon the service notices a new channel
-var IPC_HANDOFF_CAP = 1024;        # records waiting for the main thread
-var IPC_CMD_CAP = 1024;            # add / remove commands in flight
 var IPC_TARGET_MAX = 256;          # the longest target a frame may name
-var IPC_FRAMES_PER_PASS = 16;      # frames one channel may complete per service pass
-var IPC_ARENA_CHUNK = 65536;       # the service's parse arena grows in chunks of this
-
-# What the service hands the main thread.
-enum IpcRecKind {
-    IPC_REC_MESSAGE = 1;   # a valid frame: publish it on the bus
-    IPC_REC_EVENT = 2;     # a channel closed on a fault: audit it
-}
+var IPC_FRAMES_PER_PASS = 16;      # frames one channel may complete per pass of the loop
+var IPC_ARENA_CHUNK = 65536;       # the frame parser's arena grows in chunks of this
+var IPC_CLOSE_DRAIN_MAX = 1024;    # frames read from a channel as it is closed, at most
 
 # Faults that close a channel (each one is audited). A refused but well-framed
-# frame is only counted (ipc_refused_count): a noisy agent must not be able to
-# fill the hand-off other agents' messages go through.
+# frame is only counted (ipc_refused_count).
 enum IpcEvent {
     IPC_EV_OVERSIZE = 1;   # a length over MAX_MESSAGE_SIZE
     IPC_EV_SHORT = 2;      # the agent closed its end mid-frame
     IPC_EV_TIMEOUT = 3;    # a started frame did not finish in time
 }
 
-var _IPC_CMD_ADD = 1;
-var _IPC_CMD_REMOVE = 2;
 var _IPC_EAGAIN = 11;              # asm-generic/errno-base.h, both arches
 var _IPC_EINTR = 4;
 var _IPC_MSG_DONTWAIT = 64;        # 0x40, bits/socket.h
 var _IPC_MSG_NOSIGNAL = 16384;     # 0x4000
 var _IPC_SOCK_CLOEXEC = 524288;    # 02000000, bits/socket_type.h
 
-var _ipc_cmds = 0;       # main -> service (commands)
-var _ipc_out = 0;        # service -> main (records)
-var _ipc_started = 0;    # main thread: the service thread is running
-var _ipc_refused = 0;    # service thread writes (atomic): frames answered with a NACK
-var _ipc_published = 0;  # main thread: messages put on the bus
-var _ipc_sent = 0;       # service thread only: records put in the hand-off
-var _ipc_taken = 0;      # main thread writes (atomic): records taken from it
+var _ipc_chans = 0;      # channel records (vec); ipc_tick drops closed ones
+var _ipc_bus = 0;        # where accepted messages go (ipc_attach_bus)
+var _ipc_arena = 0;      # the frame parser's arena
+var _ipc_refused = 0;    # frames answered with a NACK, plus channels closed on a fault
+var _ipc_published = 0;  # messages put on the bus
+var _ipc_pfds = 0;       # ipc_poll_once's pollfd array, grown as needed
+var _ipc_pfds_cap = 0;
+var _ipc_epfd = 0;       # the event loop's epoll set, once it has one (ipc_use_epoll)
 
-# --- records (service -> main) -------------------------------------------------
-# {kind, agent_id: Str, target: Str, type, payload: Str} — an event reuses
-# `type` for its IpcEvent code. 5 x 8 = 40 bytes.
-fn ipc_rec_kind(r) { return load64(r); }
-fn ipc_rec_agent(r) { return load64(r + 8); }
-fn ipc_rec_target(r) { return load64(r + 16); }
-fn ipc_rec_type(r) { return load64(r + 24); }
-fn ipc_rec_event(r) { return load64(r + 24); }
-fn ipc_rec_payload(r) { return load64(r + 32); }
-
-fn _ipc_rec_new(kind, agent_id, target, type, payload) {
-    var r = alloc(40);
-    store64(r, kind);
-    store64(r + 8, agent_id);
-    store64(r + 16, target);
-    store64(r + 24, type);
-    store64(r + 32, payload);
-    return r;
+# The bus accepted messages are published on. app_init attaches daimon's; a
+# test attaches its own.
+fn ipc_attach_bus(mb) {
+    _ipc_bus = mb;
+    return 0;
 }
 
 fn ipc_event_action(ev) {
@@ -337,8 +494,8 @@ fn ipc_event_detail(ev) {
     return "frame did not complete in time; channel closed";
 }
 
-# The message type a frame names, or -1.
-fn _ipc_type_parse(s) {
+# The message type a name spells (a frame's or a request's "type"), or -1.
+fn ipc_msg_type_parse(s) {
     if (str_eq_cstr(s, "event") == 1) { return MSG_EVENT; }
     if (str_eq_cstr(s, "request") == 1) { return MSG_REQUEST; }
     if (str_eq_cstr(s, "response") == 1) { return MSG_RESPONSE; }
@@ -347,39 +504,12 @@ fn _ipc_type_parse(s) {
     return 0 - 1;
 }
 
-# Frames answered with a NACK since start (read from any thread).
-fn ipc_refused_count() { return atomic_load(&_ipc_refused); }
+fn ipc_refused_count() { return _ipc_refused; }
 fn ipc_published_count() { return _ipc_published; }
 
-# Main thread: the next record the service handed over, or 0.
-fn ipc_take() {
-    if (_ipc_out == 0) { return 0; }
-    var r = chan_try_recv(_ipc_out);
-    if (r != 0) { atomic_fetch_add(&_ipc_taken, 1); }
-    return r;
-}
-
-# Main thread: move what the service handed over onto `mb` (messages) and the
-# audit chain (channel faults). At most IPC_HANDOFF_CAP records a call, so a
-# service that keeps producing cannot hold the caller. Returns how many it took.
-# server.cyr runs it at the top of every HTTP request.
-fn ipc_drain(mb) {
-    var taken = 0;
-    while (taken < IPC_HANDOFF_CAP) {
-        var r = ipc_take();
-        if (r == 0) { return taken; }
-        if (ipc_rec_kind(r) == IPC_REC_MESSAGE) {
-            msg_bus_publish(mb, ipc_msg_new(ipc_rec_agent(r), ipc_rec_target(r),
-                ipc_rec_type(r), ipc_rec_payload(r)));
-            _ipc_published = _ipc_published + 1;
-        } else {
-            var ev = ipc_rec_event(r);
-            daimon_audit_agent(SEV_WARNING, "ipc", ipc_event_action(ev), ipc_event_detail(ev),
-              str_data(ipc_rec_agent(r)));
-        }
-        taken = taken + 1;
-    }
-    return taken;
+fn _ipc_chan_list() {
+    if (_ipc_chans == 0) { _ipc_chans = vec_new(); }
+    return _ipc_chans;
 }
 
 #ifndef CYRIUS_TARGET_AGNOS
@@ -391,8 +521,7 @@ fn ipc_channel_open(fds) {
     return sys_socketpair(1, 1 | _IPC_SOCK_CLOEXEC, 0, fds);   # AF_UNIX, SOCK_STREAM
 }
 
-# --- the service thread -------------------------------------------------------
-# Channel record, owned by the service thread:
+# --- channel records -----------------------------------------------------------
 #   +0 agent_id Str   +8 fd   +16 header bytes read   +24 header (4 bytes)
 #   +32 body buffer   +40 its capacity   +48 this frame's length (0 = reading
 #   the header)   +56 body bytes read   +64 frame start (ms, 0 = idle)   +72 open
@@ -408,8 +537,28 @@ fn _ipc_chan_new(agent_id, fd) {
     return ch;
 }
 
+# Add (op EPOLL_CTL_ADD) or remove (EPOLL_CTL_DEL) a channel in the loop's epoll
+# set; the event's data is the channel record. `struct epoll_event` is packed on
+# x86_64 (data at +4) and naturally aligned elsewhere (data at +8):
+# include/uapi/linux/eventpoll.h, EPOLL_PACKED.
+fn _ipc_epoll(op, ch) {
+    if (_ipc_epfd == 0) { return 0; }
+    var ev: i64[2];
+    store64(&ev, 0);
+    store64(&ev + 8, 0);
+    store32(&ev, EPOLLIN);
+    #ifdef CYRIUS_ARCH_AARCH64
+    store64(&ev + 8, ch);
+    #else
+    store64(&ev + 4, ch);
+    #endif
+    sys_epoll_ctl(_ipc_epfd, op, load64(ch + 8), &ev);
+    return 0;
+}
+
 fn _ipc_close(ch) {
     if (load64(ch + 72) == 1) {
+        _ipc_epoll(EPOLL_CTL_DEL, ch);
         sys_close(load64(ch + 8));
         store64(ch + 72, 0);
     }
@@ -425,44 +574,29 @@ fn _ipc_reply(ch, code) {
     return 0;
 }
 
-# 1 if the hand-off can take another record. Asked BEFORE a record is built:
-# records come from the shared heap, which never frees, so one built for a full
-# hand-off would leak (measured: 224 bytes a refused frame, i.e. an agent
-# flooding a full hand-off grew daimon without bound). Only this thread sends,
-# and the main thread only takes, so room seen here is still there at the send.
-fn _ipc_handoff_room() {
-    if (_ipc_sent - atomic_load(&_ipc_taken) < IPC_HANDOFF_CAP) { return 1; }
-    return 0;
-}
-
-fn _ipc_handoff(rec) {
-    if (chan_try_send(_ipc_out, rec) != 0) { return 0; }
-    _ipc_sent = _ipc_sent + 1;
-    return 1;
-}
-
-# Close a channel on a fault and tell the main thread (dropped if the hand-off
-# is full; the count still records it).
+# Close a channel on a fault and audit it, with the agent's id.
 fn _ipc_fault(ch, ev) {
     _ipc_close(ch);
-    atomic_fetch_add(&_ipc_refused, 1);
-    if (_ipc_handoff_room() == 1) { _ipc_handoff(_ipc_rec_new(IPC_REC_EVENT, load64(ch), 0, ev, 0)); }
+    _ipc_refused = _ipc_refused + 1;
+    daimon_audit_agent(SEV_WARNING, "ipc", ipc_event_action(ev), ipc_event_detail(ev),
+      str_data(load64(ch)));
     return 0;
 }
 
 fn _ipc_refuse(ch, code) {
     _ipc_reply(ch, code);
-    atomic_fetch_add(&_ipc_refused, 1);
+    _ipc_refused = _ipc_refused + 1;
     return 0;
 }
 
-# A complete frame body: validate, hand over, reply. The parse tree goes into
-# `ar`, the service's own arena, reset here for every frame; only what is handed
-# over (target, payload, the record) is copied out to the shared heap.
-fn _ipc_frame(ch, body, len, ar) {
-    reset_via(ar);
-    var ps: i64[6];   # bayan's reentrant parser state (_JP_STATE_SIZE = 48)
-    var root = bayan_json_v_parse_ctx_a(ar, &ps, body, len);
+# A complete frame body: validate, publish, reply. The parse tree lives in
+# _ipc_arena, rewound here for every frame; ipc_msg_new copies out what the
+# message keeps.
+fn _ipc_frame(ch, body, len) {
+    if (_ipc_arena == 0) { _ipc_arena = arena_allocator_growable(IPC_ARENA_CHUNK); }
+    reset_via(_ipc_arena);
+    var ps: i64[6];   # bayan's parser state (_JP_STATE_SIZE = 48)
+    var root = bayan_json_v_parse_ctx_a(_ipc_arena, &ps, body, len);
     if (json_object_ok(root) == 0) { return _ipc_refuse(ch, NACK_INVALID); }
     var target = bayan_json_v_str(bayan_json_v_obj_get(root, "target"));
     if (target == 0) { return _ipc_refuse(ch, NACK_INVALID); }
@@ -473,16 +607,23 @@ fn _ipc_frame(ch, body, len, ar) {
     if (tv != 0) {
         if (bayan_json_v_is_null(tv) == 0) {
             mtype = 0 - 1;
-            if (bayan_json_v_is_str(tv) == 1) { mtype = _ipc_type_parse(bayan_json_v_str(tv)); }
+            if (bayan_json_v_is_str(tv) == 1) { mtype = ipc_msg_type_parse(bayan_json_v_str(tv)); }
             if (mtype < 0) { return _ipc_refuse(ch, NACK_INVALID); }
         }
     }
-    if (_ipc_handoff_room() == 0) { return _ipc_refuse(ch, NACK_QUEUE_FULL); }
     var payload = 0;
     var pv = bayan_json_v_obj_get(root, "payload");
-    if (pv != 0) { payload = bayan_json_v_build(pv); } else { payload = str_from("null"); }
-    var rec = _ipc_rec_new(IPC_REC_MESSAGE, load64(ch), str_clone(target), mtype, payload);
-    if (_ipc_handoff(rec) == 0) { return _ipc_refuse(ch, NACK_QUEUE_FULL); }
+    if (pv != 0) { payload = bayan_json_v_build_a(_ipc_arena, pv); }
+    else { payload = str_new_a(_ipc_arena, "null", 4); }
+    if (_ipc_bus == 0) { return _ipc_refuse(ch, NACK_QUEUE_FULL); }
+    # The bus takes the message (a freelist block, freed when the last queue
+    # holding it lets go) and reports what became of it; the agent is told.
+    var r_t, r_v = msg_bus_publish(_ipc_bus, ipc_msg_new(load64(ch), target, mtype, payload));
+    if (is_err_result(r_t) == 1) {
+        if (r_v == DAIMON_ERR_AGENT_NOT_FOUND) { return _ipc_refuse(ch, NACK_NO_TARGET); }
+        return _ipc_refuse(ch, NACK_QUEUE_FULL);
+    }
+    _ipc_published = _ipc_published + 1;
     _ipc_reply(ch, ACK);
     return 0;
 }
@@ -508,9 +649,9 @@ fn _ipc_body_room(ch, len) {
 
 # Read what a readable channel has — without ever blocking — and act on each
 # frame that completes, at most `budget` of them (keep-alives count), so one
-# busy agent cannot hold the service while the others wait. What is left is
-# still readable, and poll reports it again on the next pass.
-fn _ipc_service_channel(ch, budget, ar) {
+# busy agent cannot hold the loop while the others wait. What is left is still
+# readable, and poll reports it again on the next pass.
+fn _ipc_service_channel(ch, budget) {
     var fd = load64(ch + 8);
     var done = 0;
     while (load64(ch + 72) == 1) {
@@ -560,7 +701,7 @@ fn _ipc_service_channel(ch, budget, ar) {
                 store64(ch + 48, 0);
                 store64(ch + 56, 0);
                 store64(ch + 64, 0);
-                _ipc_frame(ch, load64(ch + 32), blen, ar);
+                _ipc_frame(ch, load64(ch + 32), blen);
                 done = done + 1;
             }
         }
@@ -568,42 +709,55 @@ fn _ipc_service_channel(ch, budget, ar) {
     return 0;
 }
 
-fn _ipc_check_timeout(ch) {
+fn _ipc_check_timeout(ch, now) {
     if (load64(ch + 72) == 0) { return 0; }
     var started = load64(ch + 64);
     if (started == 0) { return 0; }
-    if (clock_now_ms() - started > IPC_FRAME_TIMEOUT_MS) {
+    if (now - started > IPC_FRAME_TIMEOUT_MS) {
         _ipc_reply(ch, NACK_INVALID);
         _ipc_fault(ch, IPC_EV_TIMEOUT);
     }
     return 0;
 }
 
-# An agent's channel goes, whatever the command: REMOVE closes it, and ADD for
-# an agent that already has one (a restart) replaces it. Frames the agent wrote
-# before it exited are read first — the main thread removes a channel only after
-# reaping its agent, so they are all in the socket already — and delivered like
-# any other (at most IPC_HANDOFF_CAP of them).
-fn _ipc_apply(chans, cmd, ar) {
-    var id = load64(cmd + 8);
+# Close the agent's channel, if it has one, after acting on every frame it had
+# already written (at most IPC_CLOSE_DRAIN_MAX of them — a child still writing to
+# an inherited fd 3 cannot keep this going). daimon closes a channel only after
+# reaping its agent, so what the agent wrote before it exited is all there.
+fn _ipc_close_agent(agent_id_str) {
+    var chans = _ipc_chan_list();
     var i = 0;
     while (i < vec_len(chans)) {
         var ch = vec_get(chans, i);
         if (load64(ch + 72) == 1) {
-            if (str_eq(load64(ch), id) == 1) {
-                _ipc_service_channel(ch, IPC_HANDOFF_CAP, ar);
+            if (str_eq(load64(ch), agent_id_str) == 1) {
+                _ipc_service_channel(ch, IPC_CLOSE_DRAIN_MAX);
                 _ipc_close(ch);
             }
         }
         i = i + 1;
     }
-    if (load64(cmd) == _IPC_CMD_ADD) { vec_push(chans, _ipc_chan_new(id, load64(cmd + 16))); }
     return 0;
 }
 
-# Drop closed channel records, in place — the loop runs forever, so it must not
-# allocate per pass.
-fn _ipc_sweep(chans) {
+# Take daimon's end of an agent's channel. The channel list OWNS it from here
+# on; any earlier channel of the same agent (a restart) is closed first.
+fn ipc_service_add(agent_id_str, fd) {
+    _ipc_close_agent(agent_id_str);
+    var ch = _ipc_chan_new(str_clone(agent_id_str), fd);
+    vec_push(_ipc_chan_list(), ch);
+    _ipc_epoll(EPOLL_CTL_ADD, ch);
+    return 1;
+}
+
+# Close an agent's channel (after its process is reaped).
+fn ipc_service_remove(agent_id_str) {
+    return _ipc_close_agent(agent_id_str);
+}
+
+# Drop closed channel records, in place.
+fn _ipc_sweep() {
+    var chans = _ipc_chan_list();
     var i = vec_len(chans) - 1;
     while (i >= 0) {
         if (load64(vec_get(chans, i) + 72) == 0) { vec_remove(chans, i); }
@@ -612,86 +766,223 @@ fn _ipc_sweep(chans) {
     return 0;
 }
 
-fn _ipc_service_main(arg) {
-    var chans = vec_new();
-    var ar = arena_allocator_growable(IPC_ARENA_CHUNK);
-    var pfds = 0;
-    var pcap = 0;
-    while (1 == 1) {
-        var cmd = chan_try_recv(_ipc_cmds);
-        while (cmd != 0) {
-            _ipc_apply(chans, cmd, ar);
-            cmd = chan_try_recv(_ipc_cmds);
-        }
-        _ipc_sweep(chans);
-        var n = vec_len(chans);
-        if (n > pcap) {
-            pcap = n * 2 + 8;
-            pfds = alloc(pcap * 8);
-        }
-        var i = 0;
-        while (i < n) {
-            store32(pfds + i * 8, load64(vec_get(chans, i) + 8));
-            store16(pfds + i * 8 + 4, 1);   # POLLIN
-            store16(pfds + i * 8 + 6, 0);
-            i = i + 1;
-        }
-        # syscall 7 is poll on x86_64; the backend routes it to ppoll on aarch64
-        # (lib/chrono.cyr's sleep_ms relies on the same). With no channels it is
-        # a plain IPC_POLL_MS sleep.
-        var pr = syscall(7, pfds, n, IPC_POLL_MS);
-        if (pr < 0) {
-            # EINTR: go round again. Anything else would come straight back on
-            # the next call; pause rather than spin.
-            if (pr != 0 - _IPC_EINTR) { sleep_ms(IPC_POLL_MS); }
-        }
-        i = 0;
-        while (i < n) {
-            var ch = vec_get(chans, i);
-            if (pr > 0) {
-                if (load16(pfds + i * 8 + 6) != 0) { _ipc_service_channel(ch, IPC_FRAMES_PER_PASS, ar); }
-            }
-            _ipc_check_timeout(ch);
-            i = i + 1;
-        }
+# Open channels.
+fn ipc_channel_count() {
+    var chans = _ipc_chan_list();
+    var n = 0;
+    var i = 0;
+    while (i < vec_len(chans)) {
+        if (load64(vec_get(chans, i) + 72) == 1) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+# For the event loop: from now on every channel is in `epfd` (the ones open
+# now, and each one added later), and leaves it as it closes. An event's data is
+# the channel record, for ipc_on_ready.
+fn ipc_use_epoll(epfd) {
+    _ipc_epfd = epfd;
+    var chans = _ipc_chan_list();
+    var i = 0;
+    while (i < vec_len(chans)) {
+        var ch = vec_get(chans, i);
+        if (load64(ch + 72) == 1) { _ipc_epoll(EPOLL_CTL_ADD, ch); }
+        i = i + 1;
     }
     return 0;
 }
 
-fn _ipc_start() {
-    if (_ipc_started == 1) { return 1; }
-    _ipc_cmds = chan_new(IPC_CMD_CAP);
-    _ipc_out = chan_new(IPC_HANDOFF_CAP);
-    if (thread_create_detached(&_ipc_service_main, 0) == 0) { return 0; }
-    _ipc_started = 1;
-    return 1;
+# For the event loop: the descriptor behind epoll data `tok` is readable — a
+# channel record, or (low bit set) an agent's output record.
+fn ipc_on_ready(tok) {
+    if ((tok & 1) == 1) { return _ipc_output_read(tok - 1); }
+    if (load64(tok + 72) == 1) { _ipc_service_channel(tok, IPC_FRAMES_PER_PASS); }
+    return 0;
 }
 
-# Main thread: hand daimon's end of an agent's channel to the service, which
-# OWNS it from here on and is the only thing that closes it — a close from this
-# thread could race the service's poll, and the reused fd number would then be
-# read as the channel. Returns 1, or 0 (the fd closed).
-fn ipc_service_add(agent_id_str, fd) {
-    if (_ipc_start() == 0) {
-        sys_close(fd);
-        return 0;
+# Frame timeouts for every open channel, then drop the records of closed ones.
+# The event loop runs it every SERVE_TICK_MS.
+fn ipc_tick(now) {
+    var chans = _ipc_chan_list();
+    var i = 0;
+    while (i < vec_len(chans)) {
+        _ipc_check_timeout(vec_get(chans, i), now);
+        i = i + 1;
     }
-    var cmd = alloc(24);
-    store64(cmd, _IPC_CMD_ADD);
-    store64(cmd + 8, str_clone(agent_id_str));
-    store64(cmd + 16, fd);
-    chan_send(_ipc_cmds, cmd);
+    _ipc_sweep();
+    return 0;
+}
+
+# One pass over the channels alone, waiting up to `ms` for one to be readable,
+# with poll(2). Tests and benchmarks drive channels with it; the event loop
+# uses its epoll set instead.
+fn ipc_poll_once(ms) {
+    _ipc_sweep();
+    var chans = _ipc_chan_list();
+    var n = vec_len(chans);
+    if (n + 1 > _ipc_pfds_cap) {
+        _ipc_pfds_cap = n * 2 + 8;
+        _ipc_pfds = alloc(_ipc_pfds_cap * 8);
+    }
+    var i = 0;
+    while (i < n) {
+        store32(_ipc_pfds + i * 8, load64(vec_get(chans, i) + 8));
+        store16(_ipc_pfds + i * 8 + 4, 1);   # POLLIN
+        store16(_ipc_pfds + i * 8 + 6, 0);
+        i = i + 1;
+    }
+    syscall(7, _ipc_pfds, n, ms);   # poll; with no channels, a plain sleep
+    i = 0;
+    while (i < n) {
+        if (load16(_ipc_pfds + i * 8 + 6) != 0) { ipc_on_ready(vec_get(chans, i)); }
+        i = i + 1;
+    }
+    # Captured output, read whenever there is any (a pipe with nothing waiting
+    # answers EAGAIN at once).
+    var outs = _ipc_output_list();
+    i = 0;
+    while (i < vec_len(outs)) {
+        var rec = vec_get(outs, i);
+        if (load64(rec + 32) == 1) { _ipc_output_read(rec); }
+        i = i + 1;
+    }
+    ipc_tick(clock_now_ms());
+    return n;
+}
+
+# --- captured output (2.3.4, `serve --agent-output capture`) ---------------------
+#
+# One record per agent whose output daimon has captured, kept after the agent's
+# pipe closes so the output can still be read:
+#   +0 agent id Str   +8 read end   +16 ring (AGENT_OUTPUT_RING bytes, a
+#   freelist block)   +24 bytes written since the start   +32 pipe open
+# The ring holds the most recent AGENT_OUTPUT_RING bytes; older ones are
+# overwritten, never allocated for, so a chatty agent costs daimon a fixed ring.
+var AGENT_OUTPUT_RING = 32768;
+var IPC_OUTPUT_READS_PER_PASS = 4;   # reads of up to 4 KiB per record per pass
+var _ipc_outputs = 0;                # map<agent id cstr, record>
+var _ipc_output_vec = 0;
+
+fn _ipc_output_list() {
+    if (_ipc_output_vec == 0) { _ipc_output_vec = vec_new(); }
+    return _ipc_output_vec;
+}
+
+fn _ipc_output_close(rec) {
+    if (load64(rec + 32) == 1) {
+        if (_ipc_epfd != 0) {
+            var ev: i64[2];
+            store64(&ev, 0);
+            store64(&ev + 8, 0);
+            sys_epoll_ctl(_ipc_epfd, EPOLL_CTL_DEL, load64(rec + 8), &ev);
+        }
+        sys_close(load64(rec + 8));
+        store64(rec + 32, 0);
+    }
+    return 0;
+}
+
+# Read what the pipe has into the ring, without blocking; close at EOF.
+fn _ipc_output_read(rec) {
+    var fd = load64(rec + 8);
+    var ring = load64(rec + 16);
+    var k = 0;
+    while (k < IPC_OUTPUT_READS_PER_PASS) {
+        if (load64(rec + 32) == 0) { return 0; }
+        var total = load64(rec + 24);
+        var pos = total % AGENT_OUTPUT_RING;
+        var room = AGENT_OUTPUT_RING - pos;
+        if (room > 4096) { room = 4096; }
+        var n = sys_read(fd, ring + pos, room);
+        while (n == 0 - _IPC_EINTR) { n = sys_read(fd, ring + pos, room); }
+        if (n == 0 - _IPC_EAGAIN) { return 0; }
+        if (n <= 0) { return _ipc_output_close(rec); }   # every writer is gone
+        store64(rec + 24, total + n);
+        k = k + 1;
+    }
+    return 0;
+}
+
+# Take the read end of an agent's output pipe. The ring starts empty; a record
+# from an earlier run of the agent is reused (its old pipe closed first).
+fn ipc_output_add(agent_id_str, fd) {
+    if (_ipc_outputs == 0) { _ipc_outputs = map_new(); }
+    var key = str_cstr(agent_id_str);
+    var rec = map_get(_ipc_outputs, key);
+    if (rec == 0) {
+        rec = alloc(40);
+        memset(rec, 0, 40);
+        store64(rec, str_clone(agent_id_str));
+        store64(rec + 16, fl_alloc(AGENT_OUTPUT_RING));
+        map_set(_ipc_outputs, key, rec);
+        vec_push(_ipc_output_list(), rec);
+    } else {
+        _ipc_output_close(rec);
+    }
+    # O_NONBLOCK, so a read never waits (the loop reads only when it is told the
+    # pipe has something, and ipc_poll_once reads regardless).
+    var fl = syscall(SYS_FCNTL, fd, 3, 0);   # F_GETFL
+    if (fl >= 0) { syscall(SYS_FCNTL, fd, 4, fl | 2048); }   # F_SETFL | O_NONBLOCK
+    store64(rec + 8, fd);
+    store64(rec + 24, 0);
+    store64(rec + 32, 1);
+    if (_ipc_epfd != 0) {
+        var ev: i64[2];
+        store64(&ev, 0);
+        store64(&ev + 8, 0);
+        store32(&ev, EPOLLIN);
+        #ifdef CYRIUS_ARCH_AARCH64
+        store64(&ev + 8, rec | 1);
+        #else
+        store64(&ev + 4, rec | 1);
+        #endif
+        sys_epoll_ctl(_ipc_epfd, EPOLL_CTL_ADD, fd, &ev);
+    }
     return 1;
 }
 
-# Main thread: close an agent's channel (after its process is reaped).
-fn ipc_service_remove(agent_id_str) {
-    if (_ipc_started == 0) { return 0; }
-    var cmd = alloc(24);
-    store64(cmd, _IPC_CMD_REMOVE);
-    store64(cmd + 8, str_clone(agent_id_str));
-    store64(cmd + 16, 0);
-    chan_send(_ipc_cmds, cmd);
+# Bytes the agent has written since its latest start, or -1 if none was captured.
+fn ipc_output_total(agent_id_cstr) {
+    if (_ipc_outputs == 0) { return 0 - 1; }
+    var rec = map_get(_ipc_outputs, agent_id_cstr);
+    if (rec == 0) { return 0 - 1; }
+    return load64(rec + 24);
+}
+
+# The output kept for an agent — the last AGENT_OUTPUT_RING bytes, oldest
+# first — as a Str (raw bytes, possibly cut mid-character at the start), or 0.
+fn ipc_output_text(agent_id_cstr) {
+    if (_ipc_outputs == 0) { return 0; }
+    var rec = map_get(_ipc_outputs, agent_id_cstr);
+    if (rec == 0) { return 0; }
+    var ring = load64(rec + 16);
+    var total = load64(rec + 24);
+    if (total <= AGENT_OUTPUT_RING) { return str_new(ring, total); }
+    var out = alloc(AGENT_OUTPUT_RING);
+    var pos = total % AGENT_OUTPUT_RING;
+    memcpy(out, ring + pos, AGENT_OUTPUT_RING - pos);
+    memcpy(out + AGENT_OUTPUT_RING - pos, ring, pos);
+    return str_new(out, AGENT_OUTPUT_RING);
+}
+
+# An agent is deleted: close its pipe and free its ring.
+fn ipc_output_forget(agent_id_cstr) {
+    if (_ipc_outputs == 0) { return 0; }
+    var rec = map_get(_ipc_outputs, agent_id_cstr);
+    if (rec == 0) { return 0; }
+    _ipc_output_close(rec);
+    fl_free(load64(rec + 16));
+    map_delete(_ipc_outputs, agent_id_cstr);
+    var outs = _ipc_output_list();
+    var i = 0;
+    while (i < vec_len(outs)) {
+        if (vec_get(outs, i) == rec) {
+            vec_remove(outs, i);
+            return 1;
+        }
+        i = i + 1;
+    }
     return 1;
 }
 
@@ -700,5 +991,14 @@ fn ipc_service_remove(agent_id_str) {
 fn ipc_channel_open(fds) { return 0 - 1; }
 fn ipc_service_add(agent_id_str, fd) { return 0; }
 fn ipc_service_remove(agent_id_str) { return 0; }
+fn ipc_channel_count() { return 0; }
+fn ipc_output_add(agent_id_str, fd) { return 0; }
+fn ipc_output_total(agent_id_cstr) { return 0 - 1; }
+fn ipc_output_text(agent_id_cstr) { return 0; }
+fn ipc_output_forget(agent_id_cstr) { return 0; }
+fn ipc_use_epoll(epfd) { return 0; }
+fn ipc_on_ready(ch) { return 0; }
+fn ipc_tick(now) { return 0; }
+fn ipc_poll_once(ms) { return 0; }
 
 #endif

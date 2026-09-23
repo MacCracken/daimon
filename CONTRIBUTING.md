@@ -6,16 +6,19 @@ to get involved.
 ## Getting Started
 
 1. Fork the repository and clone your fork
-2. Install [Cyrius](https://github.com/MacCracken/cyrius) 6.3.43+ (see `cyrius.cyml` `[package].cyrius`)
-3. Run `cyrius check` to verify your environment
+2. Install [Cyrius](https://github.com/MacCracken/cyrius) 6.6.6, the pin in `cyrius.cyml` (`[package].cyrius`)
+3. Build and run `sh tests/test.sh` (below) to verify your environment
 
 ## Development Workflow
 
 ```bash
+export CYRIUS_NO_WARN_SHADOW_LIB=1 CYRIUS_DCE=1   # what CI sets
 cyrius lib sync                      # Vendor the stdlib subset from the pin
 cyrius deps                          # Resolve git dependencies (e.g. sakshi)
-cyrius build src/main.cyr build/daimon  # Build
-cyrius check                         # Format + lint + test + build
+cyrius build src/main.cyr build/daimon  # Build (also --agnos, --aarch64)
+cyrius vet src/main.cyr              # Include dependencies
+cyrius fmt <file> --check            # Formatting (without --check it rewrites the file)
+cyrius lint <file>                   # CI fails on any warning
 cyrius tests                         # Run every test suite
 cyrius fuzz                          # Run the fuzz harnesses
 cyrius bench tests/daimon.bcyr       # Run benchmarks
@@ -30,7 +33,9 @@ the pin) and `cyrius deps` (git deps like sakshi). Run both after cloning.
 
 - Keep PRs focused — one feature or fix per PR
 - Add tests for new logic
-- Run `cyrius check` before submitting
+- Run the gate before submitting: `cyrius vet`, `cyrius fmt --check` and `cyrius lint` on every
+  file you touched, the three builds, and `sh tests/test.sh`. (`cyrius check` is only a syntax
+  check.)
 - Update `CHANGELOG.md` under an `[Unreleased]` heading
 
 ## Code Style
@@ -48,10 +53,12 @@ the pin) and `cyrius deps` (git deps like sakshi). Run both after cloning.
    dependencies — never a copy of the functions under test. Until 2.2.3 `tests/daimon.tcyr`
    tested simplified local copies, and two security defects shipped green because the copies did
    not contain them; moving the last modules onto their real source found more (2.2.3 CHANGELOG).
-   A suite that includes `src/agent.cyr` must also include `src/ipc.cyr` and `lib/thread.cyr`
-   (agent starts open channels). A suite that may start an agent, and so the channel thread, must
-   end with `syscall(SYS_EXIT_GROUP, assert_summary())`. With `SYS_EXIT` only the main thread exits,
-   and the suite never finishes (2.3.3).
+   A suite that includes `src/agent.cyr` must also include `src/ipc.cyr` (agent starts open
+   channels). End a suite with `syscall(SYS_EXIT_GROUP, assert_summary())`, the epilogue
+   `lib/syscalls.cyr` prescribes: with `SYS_EXIT` only the calling thread ends, and a suite that
+   ever started one never finishes (2.3.3 learned that). A fixture agent's own children must not
+   keep the suite's output (redirect them): a regression that leaves one running would otherwise
+   make the harness wait for it.
 3. Add benchmarks in `tests/daimon.bcyr` if performance-relevant — against the real functions too
 4. Add a fuzz harness in `fuzz/` for code that takes untrusted input: drive the real module with
    `fuzz/rng.cyr`, check properties from the documented contract, and exit with the number of the
@@ -65,8 +72,14 @@ the pin) and `cyrius deps` (git deps like sakshi). Run both after cloning.
    (`src/http.cyr`), and answer `http_bad_body` when `http_body_json` refuses it. Do **not** use
    bayan's flat `json_parse`. It keeps JSON escapes undecoded and misreads nested objects, which is
    why daimon stopped using it at 2.3.2 (CHANGELOG 2.3.2).
-3. Escape every string you echo with `json_escape_str`.
-4. Add checks to `tests/smoke.sh`, which drives the linked binary over HTTP.
+3. Escape every string you echo with `json_escape_str` (`json_escape_text` for bytes that are not
+   known to be UTF-8, such as an agent's output).
+4. The Host allowlist and the cross-site-write refusal already cover every route
+   (`handle_request`); route agent or task control through `_route_refuse_browser` as well.
+5. Do not block. A handler runs on daimon's one event loop, so waiting for a process or a peer holds
+   every other client and every agent channel. Answer later instead (`server_defer`, as
+   `api_agent_stop` does).
+6. Add checks to `tests/smoke.sh`, which drives the linked binary over HTTP.
 
 ## Reporting Issues
 

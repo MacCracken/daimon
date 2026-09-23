@@ -8,8 +8,8 @@
 # functions, none of which had a test or a caller — are covered for the first
 # time.
 #
-# screen.cyr draws session ids from agent.cyr's `_next_agent_id`, so the
-# include chain is agent.tcyr's.
+# The include chain is agent.tcyr's. (Session ids came from agent.cyr's
+# `_next_agent_id` until 2.3.4; they have their own counter now, tested below.)
 # =========================================================================
 
 include "lib/string.cyr"
@@ -28,7 +28,6 @@ include "lib/math.cyr"
 include "lib/process.cyr"
 include "lib/sakshi.cyr"
 include "lib/libro.cyr"
-include "lib/thread.cyr"
 include "lib/assert.cyr"
 
 include "src/syscalls.cyr"
@@ -128,5 +127,9 @@ var vb = alloc(32);
 memcpy(vb, "agent-V,trailing-bytes", 22);
 cap_mgr_grant(cm, cap_perm_new(str_new(vb, 7), 5));
 assert(is_ok(cap_mgr_check(cm, "agent-V")) == 1, "a grant whose id is a view is found by that id");
+
+var sa0 = _next_agent_id;
+var rsess = recording_session_new(str_from("agent-x"));
+assert_eq(_next_agent_id, sa0, "2.3.4: a recording does not use up an agent id");
 
 syscall(SYS_EXIT, assert_summary());

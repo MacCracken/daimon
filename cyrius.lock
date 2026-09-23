@@ -6,7 +6,7 @@ commit	baca558bc178e86c8a1fa57d3c6bfaa1bc1ded29	majra	https://github.com/MacCrac
 commit	d0e8d868eb8b69ad98feb0a8d8c7850310c2ca0f	bote	https://github.com/MacCracken/bote.git	3.3.13
 commit	b9d3cf8c9e8a6ff14cf169c2f1ce336113beef5a	patra	https://github.com/MacCracken/patra.git	1.14.3
 commit	d0e8d868eb8b69ad98feb0a8d8c7850310c2ca0f	bote-core	https://github.com/MacCracken/bote.git	3.3.13
-88901cb4c80590ebf2531e825f912d2238d449f15577363ea2baa77694535a17  lib/ai-hwaccel.cyr
+eda0cabeb6712f735b048f9bf1ccadd49fc4186c161af942f0ed9a8287ab0f63  lib/ai-hwaccel.cyr
 417031acfb92b8f018315ebf375a410c7aecafecd1175c2e691097bb3373a0ee  lib/alloc.cyr
 69e92cc4b67f1a936f94c92ce8a4c66673758b84dba385e96fbeaa46fa692b4c  lib/alloc_agnos.cyr
 c3b7f80d39f39610f44bebf34ba8f31c82eb85b1a7b7ff5327ef5a81e4945889  lib/alloc_cx.cyr

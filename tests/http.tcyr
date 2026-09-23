@@ -82,6 +82,81 @@ assert_eq(_has_origin("Content-Type: text/plain\r\nOrigin: https://a.example\r\n
 assert_eq(_has_origin("X-Origin: https://a.example\r\n"), 0, "X-Origin is a different header");
 assert_eq(_has_origin("Origins: https://a.example\r\n"), 0, "Origins is a different header");
 
+# --- 2.3.4: arbitrary bytes as JSON text (captured agent output) ----------------
+test_group("json_escape_text");
+fn _jt(bytes, n, want) {
+    return str_eq(json_escape_text(bytes, n), str_from(want));
+}
+var jb = alloc(32);
+memcpy(jb, "plain text", 10);
+assert_eq(_jt(jb, 10, "plain text"), 1, "text: ASCII unchanged");
+store8(jb, 34); store8(jb + 1, 92); store8(jb + 2, 10); store8(jb + 3, 1);
+assert_eq(_jt(jb, 4, "\\\"\\\\\\n\\u0001"), 1, "text: quote, backslash, newline, control byte escaped");
+store8(jb, 99); store8(jb + 1, 195); store8(jb + 2, 169);            # "c", e-acute
+assert_eq(str_len(json_escape_text(jb, 3)), 3, "text: valid 2-byte UTF-8 kept as bytes");
+store8(jb, 240); store8(jb + 1, 159); store8(jb + 2, 152); store8(jb + 3, 128);   # U+1F600
+assert_eq(str_len(json_escape_text(jb, 4)), 4, "text: valid 4-byte UTF-8 kept");
+store8(jb, 97); store8(jb + 1, 255); store8(jb + 2, 98);
+assert_eq(_jt(jb, 3, "a\\ufffdb"), 1, "text: an invalid byte is U+FFFD");
+store8(jb, 128);
+assert_eq(_jt(jb, 1, "\\ufffd"), 1, "text: a stray continuation byte is U+FFFD");
+store8(jb, 192); store8(jb + 1, 128);
+assert_eq(_jt(jb, 2, "\\ufffd\\ufffd"), 1, "text: an overlong form is not accepted");
+store8(jb, 237); store8(jb + 1, 160); store8(jb + 2, 128);
+assert_eq(_jt(jb, 3, "\\ufffd\\ufffd\\ufffd"), 1, "text: an encoded surrogate is not accepted");
+store8(jb, 226); store8(jb + 1, 130);
+assert_eq(_jt(jb, 2, "\\ufffd\\ufffd"), 1, "text: a sequence cut off by the end is not read past it");
+store8(jb, 244); store8(jb + 1, 144); store8(jb + 2, 128); store8(jb + 3, 128);
+assert_eq(_jt(jb, 4, "\\ufffd\\ufffd\\ufffd\\ufffd"), 1, "text: past U+10FFFF is not accepted");
+
+# --- 2.3.4: the Host allowlist and foreign origins (VULN-012) -----------------
+test_group("http_host");
+
+# A request with the given header lines (each ending \r\n).
+fn _req(hdrs) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "POST /v1/mcp/tools HTTP/1.1\r\n");
+    str_builder_add_cstr(sb, hdrs);
+    str_builder_add_cstr(sb, "\r\n");
+    return str_builder_build(sb);
+}
+
+fn _host_ok(hdrs) {
+    var r = _req(hdrs);
+    return http_host_allowed(str_data(r), str_len(r), 1);
+}
+
+fn _foreign(hdrs) {
+    var r = _req(hdrs);
+    return http_origin_foreign(str_data(r), str_len(r));
+}
+
+assert_eq(_host_ok("Host: 127.0.0.1:8090\r\n"), 1, "host: 127.0.0.1 with a port");
+assert_eq(_host_ok("Host: 127.0.0.1\r\n"), 1, "host: 127.0.0.1 alone");
+assert_eq(_host_ok("Host: localhost:8090\r\n"), 1, "host: localhost");
+assert_eq(_host_ok("Host: LocalHost\r\n"), 1, "host: localhost in any case");
+assert_eq(_host_ok("Host: [::1]:8090\r\n"), 1, "host: [::1]");
+assert_eq(_host_ok("Host: 127.3.2.1\r\n"), 1, "host: anywhere in 127.0.0.0/8");
+assert_eq(_host_ok(""), 1, "host: none (an HTTP/1.0 tool, not a browser)");
+assert_eq(_host_ok("Host: attacker.example:8090\r\n"), 0, "host: a DNS-rebinding name is refused");
+assert_eq(_host_ok("Host: 127.0.0.1.attacker.example\r\n"), 0, "host: a name that starts like 127.0.0.1 is refused");
+assert_eq(_host_ok("Host: localhost.attacker.example\r\n"), 0, "host: ... or like localhost");
+assert_eq(_host_ok("Host: 10.0.0.5:8090\r\n"), 0, "host: another address is refused");
+var off_r = _req("Host: attacker.example\r\n");
+assert_eq(http_host_allowed(str_data(off_r), str_len(off_r), 0), 1,
+  "host: not checked when daimon listens beyond loopback (--listen)");
+
+assert_eq(_foreign(""), 0, "origin: none is not a cross-site request");
+assert_eq(_foreign("Origin: http://127.0.0.1:8090\r\n"), 0, "origin: daimon's own loopback page");
+assert_eq(_foreign("Origin: http://localhost\r\n"), 0, "origin: localhost");
+assert_eq(_foreign("Origin: https://[::1]:8443\r\n"), 0, "origin: [::1] over https");
+assert_eq(_foreign("Origin: https://attacker.example\r\n"), 1, "origin: another site is foreign");
+assert_eq(_foreign("Origin: null\r\n"), 1, "origin: null is foreign");
+assert_eq(_foreign("Origin: http://127.0.0.1.attacker.example\r\n"), 1, "origin: a look-alike host is foreign");
+assert_eq(_foreign("Origin: http://localhost:80/x\r\n"), 1, "origin: an origin has no path");
+assert_eq(_foreign("Origin: file://\r\n"), 1, "origin: file:// is foreign");
+assert_eq(_foreign("Origin: http://[::1]x\r\n"), 1, "origin: only a port may follow the host");
+
 # --- 2.3.2: request bodies, read with the typed parser --------------------
 # Each case is a body the flat parser (json_parse + jget) got wrong — measured
 # on the 2.3.1 binary — or a boundary the new reader enforces.

@@ -6,7 +6,7 @@ type: state
 
 # Documentation Health — daimon
 
-> **Last refresh**: 2026-09-22 (2.3.3 — agent channels: a new guide (agent-ipc.md) and ADR-005, the API guide, overview, README, quickstart, BENCHMARKS, SECURITY, CLAUDE.md, roadmap, a third addendum to the lifecycle audit, and VULN-006 marked superseded in the 2026-04-13 audit. Rows below that predate 2.3.3 are as last recorded.)
+> **Last refresh**: 2026-09-22 (2.3.4 — daimon's own event loop: ADR-006 new, ADR-005 §2 superseded, the IPC and API guides, overview, README, quickstart, BENCHMARKS, SECURITY, CONTRIBUTING, CLAUDE.md, roadmap, and a fourth addendum to the lifecycle audit. The tier tables below were brought current at 2.3.4; the at-a-glance bucket table is the 2026-07-03 inventory.)
 > **Refresh cadence**: when docs are touched, update the affected row. Full re-audit at each minor cut.
 > **Scope**: this repo only (`daimon`) — root-level files plus the entire `docs/` tree.
 
@@ -104,6 +104,38 @@ Daimon is the AGNOS agent orchestrator — every consumer (hoosh, agnoshi, aethe
   `agent_ipc_send` and samay's `task_scheduler_complete_task`.
 - ✅ `CHANGELOG.md` / `VERSION` / `src/config.cyr` — 2.3.0 (`scripts/version-bump.sh`).
 
+**Doc work shipped in 2.3.4 (2026-09-22):**
+- ✅ `docs/adr/006-own-event-loop.md` — **new**. Why daimon runs its own loop (one thread, one epoll
+  set) instead of sandhi's serve loops and a channel thread; what stays sandhi's (framing, smuggling
+  checks, senders); the rejected alternatives; the consequences, including the handlers that still
+  block.
+- ✅ `docs/adr/005-agent-channels.md` — status: §2 (the service thread) superseded by ADR-006.
+- ✅ ADR-006, the API guide, the audit addendum, CLAUDE.md, overview — calls that wait on another
+  server run in a child (`server_detach`); 504 after 60 s. The API guide's error table gains 502,
+  which MCP forwarding has answered since 1.2.1 without a row.
+- ✅ `docs/guides/agent-ipc.md` — reply 4 (`NACK_NO_TARGET`), replies given after routing, names
+  (first wins), the bus byte limit, the HTTP message routes, the two new metrics.
+- ✅ `docs/guides/api.md` — who may call (Host allowlist, foreign Origin), the event loop, stop
+  semantics, the message and output routes, `--agent-env` / `--agent-output`, edge capabilities,
+  metrics, errors.
+- ✅ `docs/audit/2026-09-22-agent-lifecycle-audit.md` — the 2.3.4 addendum. VULN-012's remainder,
+  VULN-014 and VULN-018 fixed with evidence; VULN-015 given an operator option; CVE-2007-6750
+  (slowloris) cited for the loop's deadlines.
+- ✅ `docs/architecture/overview.md` — the loop, the message layout, captured output; the route
+  count (41 → 44, counted from `src/router.cyr`).
+- ✅ `docs/development/roadmap.md` — 2.3.4 done and removed; what stays open is listed with the reason
+  (handlers that block, `setsid` escaping the group stop, the 128-connection cap, aarch64
+  `RLIMIT_AS` unverified on hardware).
+- ✅ `README.md`, `docs/guides/quickstart.md` — 1033 assertions; the message and output routes; `help`.
+- ✅ `BENCHMARKS.md` — the 2.3.4 section: the allocation-lock A/B, HTTP on the 200 and 429 paths, the
+  poll-versus-epoll scan cost, the suite A/B. The ipc and coverage rows are updated.
+- ✅ `SECURITY.md` — the IPC and browser-reach scope.
+- ✅ `CONTRIBUTING.md` — the endpoint rules: Host / Origin coverage and not blocking the event loop.
+  Its setup named cyrius 6.3.43 and `cyrius check` as "format + lint + test + build"; it is a syntax
+  check (`cyrius help`). It now names the 6.6.6 pin and the real gate.
+- ✅ `CLAUDE.md` — the event-loop conventions, the `thread` row, "Commands (verified at 2.3.4)".
+- ✅ `CHANGELOG.md` / `VERSION` / `src/config.cyr` — 2.3.4 (`scripts/version-bump.sh`).
+
 **Doc work shipped in 2.3.3 (2026-09-22):**
 - ✅ `docs/guides/agent-ipc.md` — **new**: the wire protocol an agent speaks on fd 3. It covers the
   frame, the body, the replies, what closes a channel, where messages go, the metrics, sh and Python
@@ -187,14 +219,14 @@ Each change was checked against `cyrius.cyml`, the source or the tool's own help
 
 | File | Last touched | Status | Notes |
 |---|---|---|---|
-| `README.md` | 2026-07-03 | ✅ Fresh | Cyrius pin → 6.3.43; `cyrius lib sync` + `cyrius deps` build block; deps example lists sakshi/bote/libro/majra; 225 tests / 17 benchmarks; added MCP-audit-tools + Documentation-links sections (1.3.1). Footprint line left as-is. |
-| `CHANGELOG.md` | 2026-05-10 | ✅ Fresh | Source of truth for shipped work. 1.2.0 entry covers toolchain bump, sakshi bump, CI/release modernization, /lib/ gitignored, lint-clean, fmt re-enabled. |
-| `CLAUDE.md` | 2026-05-10 | ✅ Fresh | Durable rules. 1.2.0 pin refreshes: cyrius 6.3.43, sakshi 2.4.3. |
-| `CONTRIBUTING.md` | 2026-07-03 | ✅ Fresh | Cyrius pin → 6.3.43; workflow updated (`cyrius lib sync` + `cyrius deps`, explicit build, `cyrius tests`); lib/ gitignored note; module-split note. |
-| `SECURITY.md` | 2026-07-03 | ✅ Fresh | Supported-versions table rolled `1.0.x` → `1.3.x` (+ `< 1.3` unsupported) in the 1.3.1 sweep. Reporting policy + scope (incl. bump-allocator memory safety, VULN-007) unchanged. |
+| `README.md` | 2026-09-22 | ✅ Fresh | 2.3.4: 1033 assertions in 17 suites; what the smoke script covers; `help` lists every flag. |
+| `CHANGELOG.md` | 2026-09-22 | ✅ Fresh | Source of truth for shipped work. 2.3.4 entry: the event loop, the fixes it closed, performance with numbers. |
+| `CLAUDE.md` | 2026-09-22 | ✅ Fresh | Durable rules. 2.3.4: event-loop conventions, the `thread` row, "Commands (verified at 2.3.4)". |
+| `CONTRIBUTING.md` | 2026-09-22 | ✅ Fresh | 2.3.4: six endpoint rules (methods, bodies, escaping, Host / Origin, not blocking the loop, smoke checks); the 6.6.6 pin and the real gate. |
+| `SECURITY.md` | 2026-09-22 | ✅ Fresh | Supported versions `2.3.x`. 2.3.4: IPC and browser-reach scope. |
 | `CODE_OF_CONDUCT.md` | (initial) | 🔵 Evergreen | Standard. |
-| `BENCHMARKS.md` | 2026-07-03 | ✅ Fresh | Re-baselined under cyrius 6.3.43 (17-benchmark current-baseline table added); frozen Rust-vs-Cyrius v1.0.1 port comparison preserved; mcp / http-forward status rows updated. |
-| `VERSION` | 2026-05-10 | ✅ Fresh | `1.3.0` — single source of truth, read into `cyrius.cyml` via `${file:VERSION}`. |
+| `BENCHMARKS.md` | 2026-09-22 | ✅ Fresh | A section per 2.3.x release with its A/B; 2.3.4: allocation lock, HTTP 200 / 429 paths, poll vs epoll. Frozen v1.0.1 port comparison kept. |
+| `VERSION` | 2026-09-22 | ✅ Fresh | `2.3.4`, written with `src/config.cyr` by `scripts/version-bump.sh`; `tests/version_sync.tcyr` checks they agree. |
 | `LICENSE` | (initial) | 🔵 Evergreen | GPL-3.0-only. |
 
 ---
@@ -203,7 +235,7 @@ Each change was checked against `cyrius.cyml`, the source or the tool's own help
 
 | File | Last touched | Status | Notes |
 |---|---|---|---|
-| `overview.md` | 2026-07-03 | ✅ Fresh | Dependency design-decision refreshed: full `[deps].stdlib` list incl. sigil, sandhi 1.7.0 / sigil 3.10.0 / sakshi 2.4.3, lib/ gitignored, cyrius.lock 61 deps. Design-decision #2 corrected to sync+async HTTP. |
+| `overview.md` | 2026-09-22 | ✅ Fresh | 2.3.4: the event loop (design decision 2), message layout, captured output, 44 routes. |
 
 ---
 
@@ -211,7 +243,7 @@ Each change was checked against `cyrius.cyml`, the source or the tool's own help
 
 | File | Last touched | Status | Notes |
 |---|---|---|---|
-| `roadmap.md` | 2026-07-03 | ✅ Fresh | **Trimmed to open-work-only (1.3.1)**: all completed `[x]` sections + met v1.0-criteria removed (history lives in CHANGELOG); consolidated to the VULN-007 gate, the nein firewall-MCP blocker, and the v1.4.0+ backlog. |
+| `roadmap.md` | 2026-09-22 | ✅ Fresh | Open work only (since 1.3.1). 2.3.4 removed; the 2.3.x items left open carry their reason, then 2.4.x (AGNOS) and 2.5.x (authentication). |
 
 **Missing today (file in 1.2.x cleanup):**
 - `development/state.md` — agnosys convention for the live volatile state file (pin / build sizes / test count / consumer table / recent releases / slot ledger). Daimon's roadmap.md partially covers this; consider splitting in 1.2.x if scope grows.
@@ -219,7 +251,7 @@ Each change was checked against `cyrius.cyml`, the source or the tool's own help
 
 **Tier — Engineering issues (upstream trackers)**
 
-⚠ **Corrected 2.1.7.** This line read *"Daimon does not carry its own `docs/development/issues/` directory"* — false since 1.2.x. Daimon carries `docs/development/issues/` for filings it owns or co-owns, with resolved ones moved to `issues/archive/`. As of **2.1.7** there is exactly **one open filing** ([`2026-09-14-daimon-does-not-build-for-agnos.md`](development/issues/archive/2026-09-14-daimon-does-not-build-for-agnos.md)) and **seven archived**. The table below tracks filings that live in an UPSTREAM repo's tracker.
+⚠ **Corrected 2.1.7.** This line read *"Daimon does not carry its own `docs/development/issues/` directory"* — false since 1.2.x. Daimon carries `docs/development/issues/` for filings it owns or co-owns, with resolved ones moved to `issues/archive/`. As of **2.3.4** there are **no open filings** and **eight archived** (the 2.1.7 count named one open filing that was already in `archive/`). The table below tracks filings that live in an UPSTREAM repo's tracker.
 
 | Tracker | Severity | Filed | Status | Notes |
 |---|---|---|---|---|
@@ -235,6 +267,9 @@ Each change was checked against `cyrius.cyml`, the source or the tool's own help
 | `001-rust-to-cyrius-port.md` | 2026-04-13 | 📦 Frozen | Accepted (0.7.0). Rust → Cyrius port rationale. Historical record. |
 | `002-synchronous-http.md` | 2026-04-13 | 📦 Frozen | Accepted, then partially superseded by 1.1.0 (async via lib/async.cyr) and again by 1.1.4 (sandhi adoption). The ADR's "invalid" note is captured in CLAUDE.md; re-read at v2.0 to decide whether to revise or supersede with a new ADR. |
 | `003-security-audit-process.md` | 2026-04-13 | 📦 Frozen | Accepted (0.7.0). P(-1) + Work-Loop audit cadence. Verified by every release since; the rule holds. |
+| `004-agent-process-control.md` | 2026-09-22 | ✅ Accepted | 2.3.0. Process control on an unauthenticated API: executable by type, loopback bind, browser control refused, bounded stop. |
+| `005-agent-channels.md` | 2026-09-22 | ✅ Accepted, §2 superseded | 2.3.3. A socketpair per agent on fd 3; §2 (the service thread) superseded by ADR-006 at 2.3.4. |
+| `006-own-event-loop.md` | 2026-09-22 | ✅ Accepted | 2.3.4. daimon's own epoll loop over sandhi's HTTP; the serving model since 2.3.4. |
 
 **ADR posture**: low decision-velocity. Only architecturally significant calls earn an ADR — minor decisions ride CHANGELOG + design comments. 1.1.4 sandhi adoption was a candidate but rode the CHANGELOG entry; the migration audit at `docs/audit/2026-04-27-sandhi-migration.md` carries the deep rationale. Re-evaluate at v2.0.0 cut.
 
@@ -248,8 +283,9 @@ Date-stamped, frozen by design. Each P(-1) hardening pass per CLAUDE.md cadence 
 |---|---|---|---|
 | `2026-04-13-security-audit.md` | 2026-04-13 | 📦 Frozen | 0.7.0 P(-1) security audit. 10 findings, 9 fixed at 0.7.0, VULN-007 gated. |
 | `2026-04-27-sandhi-migration.md` | 2026-04-27 | 📦 Frozen | 1.1.4 sandhi adoption — VULN-001 strengthened, VULN-008 trade-off documented (sandhi's 30s SO_RCVTIMEO replaces no-timeout), 1.1.5 sandhi follow-ups (now 1.2.1 / 1.2.2). |
+| `2026-09-22-agent-lifecycle-audit.md` | 2026-09-22 | ✅ Open (addenda per 2.3.x release) | VULN-011 – VULN-018. 2.3.4 addendum: VULN-012 remainder, VULN-014 and VULN-018 fixed; VULN-015 an operator option; VULN-016 waits for 2.5.x identity. |
 
-Next audit slot: at v1.3.0 cut, or sooner if a CVE pattern surfaces in daimon's parser surfaces (HTTP server via sandhi, JSON via lib/json, Unix-socket IPC wire protocol, /proc resource scrape paths). The CLAUDE.md cadence sets the trigger.
+Next audit slot: the CLAUDE.md cadence sets the trigger (security-touching work, or a CVE pattern in daimon's surfaces: its event loop and sandhi's HTTP framing, bayan's JSON parser, the agent channels, /proc scrape paths, the bump allocator).
 
 ---
 
@@ -257,8 +293,9 @@ Next audit slot: at v1.3.0 cut, or sooner if a CVE pattern surfaces in daimon's 
 
 | File | Last touched | Status | Notes |
 |---|---|---|---|
-| `api.md` | 2026-07-03 | ✅ Fresh | 24-endpoint API reference. Verified current in the 1.3.0 pass — carries no cyrius-pin or version-tied example commands; no change needed. |
-| `quickstart.md` | 2026-07-03 | ✅ Fresh | Prereq → cyrius 6.3.43; build block adds `cyrius lib sync` + `cyrius deps` (lib/ gitignored); 225-test count; 28-module structure. |
+| `api.md` | 2026-09-22 | ✅ Fresh | 2.3.4: who may call, the event loop, stops, messages, output, env, edge capabilities, metrics, errors. |
+| `quickstart.md` | 2026-09-22 | ✅ Fresh | 2.3.4: 1033 assertions; taking an agent's messages; captured output. |
+| `agent-ipc.md` | 2026-09-22 | ✅ Fresh | 2.3.3, new: the fd-3 wire protocol. 2.3.4: reply 4, names, the HTTP message routes, byte limit. |
 
 ---
 

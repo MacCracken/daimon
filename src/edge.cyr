@@ -15,10 +15,15 @@ enum EdgeStatus {
 #             active_tasks, tasks_completed, agent_version: Str}
 # 12 fields x 8 = 96 bytes
 
+# Edge node ids have their own counter (2.3.4). They were drawn from agent.cyr's
+# _next_agent_id, so agents and edge nodes interleaved: after five agents the
+# first edge node was "6".
+var _next_edge_id = 1;
+
 fn edge_node_new(name, arch, cpu_cores, memory_mb) {
     var n = alloc(96);
-    var nid = str_from_int(_next_agent_id);
-    _next_agent_id = _next_agent_id + 1;
+    var nid = str_from_int(_next_edge_id);
+    _next_edge_id = _next_edge_id + 1;
     store64(n, nid);
     # ⛔ str_clone the retained Strs — 2.2.1. `api_edge_register` passes
     # `jget(pairs, "name")`, a VIEW into the request buffer sandhi reuses.
@@ -47,6 +52,13 @@ fn edge_node_id(n) { return load64(n); }
 fn edge_node_name(n) { return load64(n + 8); }
 fn edge_node_status(n) { return load64(n + 16); }
 fn edge_node_set_status(n, s) { store64(n + 16, s); }
+fn edge_node_arch(n) { return load64(n + 24); }
+fn edge_node_cpu_cores(n) { return load64(n + 32); }
+fn edge_node_memory_mb(n) { return load64(n + 40); }
+fn edge_node_disk_mb(n) { return load64(n + 48); }
+fn edge_node_has_gpu(n) { return load64(n + 56); }
+fn edge_node_set_disk_mb(n, v) { store64(n + 48, v); }
+fn edge_node_set_has_gpu(n, v) { store64(n + 56, v); }
 fn edge_node_active_tasks(n) { return load64(n + 72); }
 fn edge_node_tasks_completed(n) { return load64(n + 80); }
 
@@ -66,11 +78,13 @@ fn edge_fleet_config_default() {
     return c;
 }
 
-# EdgeFleetManager: {config, nodes: map<id_cstr, EdgeNode>}
+# EdgeFleetManager: {config, nodes: map<id_cstr, EdgeNode>,
+#                    names: map<name_cstr, id_cstr> (2.3.4)}
 fn edge_fleet_new(config) {
-    var ef = alloc(16);
+    var ef = alloc(24);
     store64(ef, config);
     store64(ef + 8, map_new());
+    store64(ef + 16, map_new());
     return ef;
 }
 
@@ -84,16 +98,15 @@ fn edge_fleet_register(ef, node) {
     var name = load64(node + 8);
     if (str_len(name) == 0) { return Err(DAIMON_ERR_INVALID_PARAM); }
 
-    # Check for duplicate name
-    var keys = map_keys(nodes);
-    var di = 0;
-    while (di < vec_len(keys)) {
-        var existing = map_get(nodes, vec_get(keys, di));
-        if (str_eq(load64(existing + 8), name) == 1) { return Err(DAIMON_ERR_INVALID_PARAM); }
-        di = di + 1;
-    }
+    # Duplicate name: a lookup (2.3.4). It was a scan over map_keys, which
+    # allocated a key vector from the never-freed heap for every registration.
+    # Nodes are never removed (decommissioning keeps the record), so a name
+    # stays taken.
+    var name_cstr = str_cstr(name);
+    if (map_get(load64(ef + 16), name_cstr) != 0) { return Err(DAIMON_ERR_INVALID_PARAM); }
 
     map_set(nodes, str_cstr(edge_node_id(node)), node);
+    map_set(load64(ef + 16), name_cstr, str_cstr(edge_node_id(node)));
     return Ok(edge_node_id(node));
 }
 
@@ -174,10 +187,21 @@ fn edge_fleet_stats(ef) {
     var decomm = 0;
     var active = 0;
     var completed = 0;
+    var cores = 0;
+    var mem = 0;
+    var gpus = 0;
     var i = 0;
     while (i < total) {
         var n = map_get(nodes, vec_get(keys, i));
         var s = edge_node_status(n);
+        # 2.3.4: capacity, over the nodes that can take work.
+        if (s != EDGE_DECOMMISSIONED) {
+            if (s != EDGE_OFFLINE) {
+                cores = cores + edge_node_cpu_cores(n);
+                mem = mem + edge_node_memory_mb(n);
+                if (edge_node_has_gpu(n) != 0) { gpus = gpus + 1; }
+            }
+        }
         if (s == EDGE_ONLINE) { online = online + 1; }
         elif (s == EDGE_SUSPECT) { suspect = suspect + 1; }
         elif (s == EDGE_OFFLINE) { offline = offline + 1; }
@@ -187,8 +211,8 @@ fn edge_fleet_stats(ef) {
         completed = completed + edge_node_tasks_completed(n);
         i = i + 1;
     }
-    # Return stats as 8 packed fields
-    var st = alloc(64);
+    # Return stats as 11 packed fields
+    var st = alloc(88);
     store64(st, total);
     store64(st + 8, online);
     store64(st + 16, suspect);
@@ -197,6 +221,9 @@ fn edge_fleet_stats(ef) {
     store64(st + 40, decomm);
     store64(st + 48, active);
     store64(st + 56, completed);
+    store64(st + 64, cores);
+    store64(st + 72, mem);
+    store64(st + 80, gpus);
     return st;
 }
 

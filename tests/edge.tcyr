@@ -15,8 +15,8 @@
 # copies had — are covered for the first time. (The health checker also had no
 # CALLER: see src/api_edge.cyr, which now runs it on every read.)
 #
-# edge.cyr draws node ids from agent.cyr's `_next_agent_id`, so the include
-# chain is agent.tcyr's.
+# edge.cyr's include chain is agent.tcyr's. (Node ids came from agent.cyr's
+# `_next_agent_id` until 2.3.4; they have their own counter now, tested below.)
 # =========================================================================
 
 include "lib/string.cyr"
@@ -35,7 +35,6 @@ include "lib/math.cyr"
 include "lib/process.cyr"
 include "lib/sakshi.cyr"
 include "lib/libro.cyr"
-include "lib/thread.cyr"
 include "lib/assert.cyr"
 
 include "src/syscalls.cyr"
@@ -180,5 +179,32 @@ assert_eq(load64(st + 8) + load64(st + 16) + load64(st + 24) + load64(st + 32) +
   "stats: the five status counts sum to the total");
 assert_eq(load64(st + 48), 4, "stats: active tasks summed");
 assert_eq(load64(st + 56), 10, "stats: completed tasks summed");
+
+# --- 2.3.4: ids, names, capabilities ----------------------------------------
+test_group("edge_234");
+var cfleet = edge_fleet_new(edge_fleet_config_default());
+var aid_before = _next_agent_id;
+var cn1 = edge_node_new(str_from("cap-1"), str_from("aarch64"), 8, 16384);
+edge_node_set_disk_mb(cn1, 100000);
+edge_node_set_has_gpu(cn1, 1);
+var cr_t, cr_v = edge_fleet_register(cfleet, cn1);
+assert_eq(is_ok(cr_t), 1, "edge 2.3.4: registers");
+assert_eq(_next_agent_id, aid_before, "edge 2.3.4: a node does not use up an agent id");
+assert_eq(str_eq(edge_node_arch(cn1), str_from("aarch64")), 1, "edge 2.3.4: arch kept");
+assert_eq(edge_node_cpu_cores(cn1), 8, "edge 2.3.4: cores kept");
+assert_eq(edge_node_memory_mb(cn1), 16384, "edge 2.3.4: memory kept");
+assert_eq(edge_node_disk_mb(cn1), 100000, "edge 2.3.4: disk kept");
+assert_eq(edge_node_has_gpu(cn1), 1, "edge 2.3.4: gpu kept");
+var dup_t, dup_v = edge_fleet_register(cfleet, edge_node_new(str_from("cap-1"), str_from("x86_64"), 1, 1));
+assert_eq(is_err_result(dup_t), 1, "edge 2.3.4: a duplicate name is refused (by lookup)");
+var cn2 = edge_node_new(str_from("cap-2"), str_from("x86_64"), 4, 4096);
+edge_fleet_register(cfleet, cn2);
+var cst = edge_fleet_stats(cfleet);
+assert_eq(load64(cst + 64), 12, "edge 2.3.4: stats total the cores");
+assert_eq(load64(cst + 72), 20480, "edge 2.3.4: ... and the memory");
+assert_eq(load64(cst + 80), 1, "edge 2.3.4: ... and count GPU nodes");
+edge_fleet_decommission(cfleet, str_cstr(edge_node_id(cn1)));
+var cst2 = edge_fleet_stats(cfleet);
+assert_eq(load64(cst2 + 64), 4, "edge 2.3.4: a decommissioned node's capacity is not counted");
 
 syscall(SYS_EXIT, assert_summary());

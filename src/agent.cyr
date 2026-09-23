@@ -46,7 +46,7 @@ enum AgentOpError {
 # 12 fields x 8 bytes = 96 bytes (type + exit_code added at 2.3.0)
 
 fn agent_handle_new(id, name) {
-    var h = alloc(96);
+    var h = alloc(112);
     store64(h, id);                # id (integer counter)
     # ⛔ str_clone THE NAME — copy at the RETENTION boundary. 2.2.1.
     #
@@ -77,6 +77,8 @@ fn agent_handle_new(id, name) {
     store64(h + 72, 0);            # threads_used
     store64(h + 80, AGENT_TYPE_USER);   # type — agnostik's AgentConfig default
     store64(h + 88, 0 - 1);        # exit_code: -1 until the process has exited
+    store64(h + 96, 0);            # a stop's SIGKILL deadline, ms (0 = no stop under way; 2.3.4)
+    store64(h + 104, 0);           # when that stop sent SIGKILL, ms (0 = not yet)
     return h;
 }
 
@@ -345,6 +347,49 @@ var RLIMIT_CPU = 0;   # CPU time in seconds
 # socket activation uses too (SD_LISTEN_FDS_START).
 var AGENT_IPC_FD = 3;
 
+# RLIMIT_NOFILE as daimon found it, {cur, max} (2.3.4). Every running agent
+# holds one of daimon's descriptors (its channel; with --agent-output capture
+# its output pipe too), and the loop keeps up to SERVE_MAX_CONNS connections
+# open, so daimon raises its own soft limit to fit max_agents
+# (agent_nofile_raise). Measured with the limit pinned at 1024 (systemd's
+# default soft limit): with capture, the 507th start failed. Each agent is given
+# this original limit back: a program that select()s cannot see a descriptor
+# past 1023, the reason that default is low. Recorded before any agent is
+# forked; the child only reads it.
+var _agent_nofile: i64[2];
+var _agent_nofile_set = 0;
+
+# Raise daimon's soft RLIMIT_NOFILE to `want`, or to the hard limit if that is
+# lower, and record the original for agents. Returns the soft limit in force.
+fn agent_nofile_raise(want) {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 0;
+    #else
+    var now: i64[2];
+    if (syscall(_DAIMON_SYS_PRLIMIT64, 0, _DAIMON_RLIMIT_NOFILE, 0, &now) != 0) { return 0 - 1; }
+    # The original is recorded once: a later call would otherwise record the
+    # limit an earlier one raised (the test that asks twice caught exactly that).
+    if (_agent_nofile_set == 0) {
+        store64(&_agent_nofile, load64(&now));
+        store64(&_agent_nofile + 8, load64(&now + 8));
+        _agent_nofile_set = 1;
+    }
+    var cur = load64(&now);
+    var max = load64(&now + 8);             # RLIM_INFINITY reads as -1
+    if (cur < 0) { return cur; }            # already unlimited
+    if (cur >= want) { return cur; }
+    var target = want;
+    if (max >= 0) {
+        if (target > max) { target = max; }
+    }
+    var nl: i64[2];
+    store64(&nl, target);
+    store64(&nl + 8, max);
+    if (syscall(_DAIMON_SYS_PRLIMIT64, 0, _DAIMON_RLIMIT_NOFILE, &nl, 0) != 0) { return cur; }
+    return target;
+    #endif
+}
+
 # 2.3.0 — the first time this runs for real (a route now reaches it), so it
 # grew what a supervisor's spawn needs. `exe` is a NUL-terminated path; `argv`
 # and `envp` are NULL-terminated arrays of NUL-terminated strings (argv[0] =
@@ -354,6 +399,8 @@ var AGENT_IPC_FD = 3;
 # `ipc_fd` (2.3.3) is the agent's end of its channel, or -1 for none: in the
 # child it becomes fd AGENT_IPC_FD and every other inherited descriptor is closed.
 # (-1, not 0: a daimon started with stdin closed can be handed fd 0 by socketpair.)
+# `out_fd` (2.3.4) is the write end of a pipe for the agent's stdout AND stderr
+# (`serve --agent-output capture`), or -1 to leave them daimon's.
 #
 # Returns Ok(pid) only once the child has EXEC'D. Anything that stops it first
 # comes back as Err(AGENT_OP_*): the child reports {reason, errno} down a
@@ -361,7 +408,7 @@ var AGENT_IPC_FD = 3;
 # Rust original got this from std's Command::spawn, which uses the same pipe.)
 # Before 2.3.0 a missing executable looked like a successful start, and only a
 # later exit status of 127 told the difference.
-fn agent_spawn_with_limits(exe, argv, envp, mem_limit, cpu_limit, ipc_fd) {
+fn agent_spawn_with_limits(exe, argv, envp, mem_limit, cpu_limit, ipc_fd, out_fd) {
     #ifdef CYRIUS_TARGET_AGNOS
     return Err(AGENT_OP_UNSUPPORTED);
     #else
@@ -378,6 +425,7 @@ fn agent_spawn_with_limits(exe, argv, envp, mem_limit, cpu_limit, ipc_fd) {
     if (syscall(_DAIMON_SYS_PIPE2, &pfd, _DAIMON_O_CLOEXEC) != 0) {
         return Err(AGENT_OP_NO_PROCESS);
     }
+    _agent_daimon_pid = sys_getpid();   # the child checks it still has this parent
     var rfd = load32(&pfd);
     var wfd = load32(&pfd + 4);
 
@@ -391,7 +439,7 @@ fn agent_spawn_with_limits(exe, argv, envp, mem_limit, cpu_limit, ipc_fd) {
         return Err(AGENT_OP_NO_PROCESS);
     }
     if (pid == 0) {
-        _agent_child(exe, argv, envp, rlim_as, mem_limit, rlim_cpu, cpu_limit, rfd, wfd, ipc_fd);
+        _agent_child(exe, argv, envp, rlim_as, mem_limit, rlim_cpu, cpu_limit, rfd, wfd, ipc_fd, out_fd);
     }
 
     sys_close(wfd);
@@ -409,28 +457,56 @@ fn agent_spawn_with_limits(exe, argv, envp, mem_limit, cpu_limit, ipc_fd) {
     #endif
 }
 
+# daimon's pid at the fork (2.3.4), read by the child: see _agent_child.
+var _agent_daimon_pid = 0;
+
 # Host-only: agnos has no fork/execve/dup2 (its spawn is sys_spawn_path, 2.4.x),
 # and agent_spawn_with_limits's agnos arm never reaches these.
 #ifndef CYRIUS_TARGET_AGNOS
 # The child's half, from fork to execve. It never returns: it execs, or writes
 # {reason, errno} to the report pipe and exits 126 (limits) / 127 (exec) — the
 # codes that still tell the two apart if the report is ever lost.
-fn _agent_child(exe, argv, envp, rlim_as, mem_limit, rlim_cpu, cpu_limit, rfd, wfd, ipc_fd) {
+fn _agent_child(exe, argv, envp, rlim_as, mem_limit, rlim_cpu, cpu_limit, rfd, wfd, ipc_fd, out_fd) {
     sys_close(rfd);
 
-    # The agent's channel (2.3.3) becomes fd AGENT_IPC_FD. The report pipe and
-    # the channel are first moved above 9 (F_DUPFD_CLOEXEC), so the dup2 onto 3
-    # can land on neither: dup2(3, 3) would leave close-on-exec set, and on
-    # aarch64 sys_dup2 is dup3, for which (3, 3) is EINVAL.
+    # 2.3.4 — the agent leads its own process group, so a stop, pause or resume
+    # reaches the processes it starts (daimon_signal_tree); a stop used to leave
+    # them running. And it dies with daimon: PR_SET_PDEATHSIG. The registry is
+    # in memory, so an agent that outlived daimon could never be reached again.
+    # If daimon was already gone when the prctl ran, the signal was never armed:
+    # the parent check catches that window.
+    syscall(_DAIMON_SYS_SETPGID, 0, 0);
+    sys_prctl(_DAIMON_PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
+    if (sys_getppid() != _agent_daimon_pid) { sys_exit(127); }
+
+    # The agent's channel (2.3.3) becomes fd AGENT_IPC_FD, and its output pipe
+    # (2.3.4) fds 1 and 2. The report pipe, the channel and the output pipe are
+    # first moved above 9 (F_DUPFD_CLOEXEC), so no dup2 onto 1-3 can land on one
+    # of them: dup2(3, 3) would leave close-on-exec set, and on aarch64 sys_dup2
+    # is dup3, for which (3, 3) is EINVAL.
     var first_closed = 3;
-    if (ipc_fd >= 0) {
+    if (ipc_fd >= 0 || out_fd >= 0) {
         var w2 = syscall(SYS_FCNTL, wfd, _DAIMON_F_DUPFD_CLOEXEC, 10);
         if (w2 < 0) { _agent_child_fail(wfd, AGENT_OP_NO_PROCESS, 0 - w2, 127); }
         wfd = w2;
-        var c2 = syscall(SYS_FCNTL, ipc_fd, _DAIMON_F_DUPFD_CLOEXEC, 10);
+    }
+    var c2 = 0 - 1;
+    var o2 = 0 - 1;
+    if (ipc_fd >= 0) {
+        c2 = syscall(SYS_FCNTL, ipc_fd, _DAIMON_F_DUPFD_CLOEXEC, 10);
         if (c2 < 0) { _agent_child_fail(wfd, AGENT_OP_NO_PROCESS, 0 - c2, 127); }
+    }
+    if (out_fd >= 0) {
+        o2 = syscall(SYS_FCNTL, out_fd, _DAIMON_F_DUPFD_CLOEXEC, 10);
+        if (o2 < 0) { _agent_child_fail(wfd, AGENT_OP_NO_PROCESS, 0 - o2, 127); }
+    }
+    if (c2 >= 0) {
         if (sys_dup2(c2, AGENT_IPC_FD) < 0) { _agent_child_fail(wfd, AGENT_OP_NO_PROCESS, 0, 127); }
         first_closed = AGENT_IPC_FD + 1;
+    }
+    if (o2 >= 0) {
+        if (sys_dup2(o2, 1) < 0) { _agent_child_fail(wfd, AGENT_OP_NO_PROCESS, 0, 127); }
+        if (sys_dup2(o2, 2) < 0) { _agent_child_fail(wfd, AGENT_OP_NO_PROCESS, 0, 127); }
     }
 
     # Descriptors. lib/net.cyr's tcp_socket and sock_accept do not set
@@ -456,6 +532,12 @@ fn _agent_child(exe, argv, envp, rlim_as, mem_limit, rlim_cpu, cpu_limit, rfd, w
     if (cpu_limit > 0) {
         var rc = syscall(_DAIMON_SYS_PRLIMIT64, 0, RLIMIT_CPU, rlim_cpu, 0);
         if (rc != 0) { _agent_child_fail(wfd, AGENT_OP_NO_LIMITS, 0 - rc, 126); }
+    }
+    # The descriptor limit daimon started with, not the one it raised for
+    # itself (agent_nofile_raise). Lowering a soft limit cannot fail; if it did,
+    # the agent would merely keep daimon's, so it is not a reason to refuse it.
+    if (_agent_nofile_set == 1) {
+        syscall(_DAIMON_SYS_PRLIMIT64, 0, _DAIMON_RLIMIT_NOFILE, &_agent_nofile, 0);
     }
 
     var er = sys_execve(exe, argv, envp);
@@ -553,8 +635,66 @@ fn agent_environ() {
     return envp;
 }
 
-# An agent's environment: daimon's own (agent_environ), minus any AGNOS_IPC_FD
-# daimon was itself given, plus AGNOS_IPC_FD=<AGENT_IPC_FD>. Built once.
+# Where an agent's stdout and stderr go (2.3.4). INHERIT (the default, as since
+# 2.3.0): daimon's own, so they land wherever daimon's do (its journal). CAPTURE
+# (`serve --agent-output capture`): a pipe the event loop reads into a ring of
+# AGENT_OUTPUT_RING bytes per agent (src/ipc.cyr), served at
+# GET /v1/agents/{id}/output. The Rust original piped both and never read them:
+# an agent that wrote more than a pipe holds (64 KiB) blocked forever.
+var AGENT_OUTPUT_INHERIT = 0;
+var AGENT_OUTPUT_CAPTURE = 1;
+var _agent_output_mode = 0;
+
+fn agent_set_output_mode(mode) {
+    _agent_output_mode = mode;
+    return 0;
+}
+
+fn agent_output_mode() { return _agent_output_mode; }
+
+# Which of daimon's environment agents get (2.3.4, VULN-015): all of it
+# (inherit, the default and the Rust original's behaviour), or only the
+# variables a program needs to run (minimal, `serve --agent-env minimal`), which
+# keeps daimon's own secrets — tokens, credentials — out of every agent.
+var AGENT_ENV_INHERIT = 0;
+var AGENT_ENV_MINIMAL = 1;
+var _agent_env_mode = 0;
+
+fn agent_set_env_mode(mode) {
+    _agent_env_mode = mode;
+    _agent_envp_ipc = 0;   # rebuilt on the next start
+    return 0;
+}
+
+fn _agent_env_is(e, n, prefix) {
+    var pl = strlen(prefix);
+    if (n < pl) { return 0; }
+    return memeq(e, prefix, pl);
+}
+
+# 1 if `e` ("NAME=value") is one a minimal environment keeps: what a program
+# needs to find its tools, its home and its locale, and AGNOS's own variables.
+fn _agent_env_keep(e) {
+    var n = strlen(e);
+    if (_agent_env_is(e, n, "PATH=") == 1) { return 1; }
+    if (_agent_env_is(e, n, "HOME=") == 1) { return 1; }
+    if (_agent_env_is(e, n, "USER=") == 1) { return 1; }
+    if (_agent_env_is(e, n, "LOGNAME=") == 1) { return 1; }
+    if (_agent_env_is(e, n, "SHELL=") == 1) { return 1; }
+    if (_agent_env_is(e, n, "TERM=") == 1) { return 1; }
+    if (_agent_env_is(e, n, "TMPDIR=") == 1) { return 1; }
+    if (_agent_env_is(e, n, "TZ=") == 1) { return 1; }
+    if (_agent_env_is(e, n, "LANG=") == 1) { return 1; }
+    if (_agent_env_is(e, n, "LANGUAGE=") == 1) { return 1; }
+    if (_agent_env_is(e, n, "LC_") == 1) { return 1; }
+    if (_agent_env_is(e, n, "XDG_RUNTIME_DIR=") == 1) { return 1; }
+    if (_agent_env_is(e, n, "AGNOS_") == 1) { return 1; }
+    return 0;
+}
+
+# An agent's environment: daimon's own (agent_environ), or its minimal part,
+# minus any AGNOS_IPC_FD daimon was itself given, plus
+# AGNOS_IPC_FD=<AGENT_IPC_FD>. Built once per mode.
 var _agent_envp_ipc = 0;
 
 fn agent_environ_ipc() {
@@ -567,9 +707,13 @@ fn agent_environ_ipc() {
     var i = 0;
     while (i < n) {
         var e = load64(base + i * 8);
-        var inherited = 0;
-        if (strlen(e) >= 13) { if (memeq(e, "AGNOS_IPC_FD=", 13) == 1) { inherited = 1; } }
-        if (inherited == 0) {
+        var drop = 0;
+        # daimon's own AGNOS_IPC_FD, if it was given one, is replaced below.
+        if (strlen(e) >= 13) { if (memeq(e, "AGNOS_IPC_FD=", 13) == 1) { drop = 1; } }
+        if (_agent_env_mode == AGENT_ENV_MINIMAL) {
+            if (_agent_env_keep(e) == 0) { drop = 1; }
+        }
+        if (drop == 0) {
             store64(envp + o * 8, e);
             o = o + 1;
         }
@@ -680,13 +824,30 @@ fn agent_start(h, mem_limit, cpu_secs) {
     if (ipc_channel_open(&chfds) != 0) { return Err(AGENT_OP_NO_PROCESS); }
     var own_end = load32(&chfds);
     var agent_end = load32(&chfds + 4);
+    # Its output pipe, when daimon captures output (2.3.4): [0] daimon reads,
+    # [1] becomes the agent's stdout and stderr.
+    var out_r = 0 - 1;
+    var out_w = 0 - 1;
+    if (_agent_output_mode == AGENT_OUTPUT_CAPTURE) {
+        var ofds: i32[2];
+        if (syscall(_DAIMON_SYS_PIPE2, &ofds, _DAIMON_O_CLOEXEC) != 0) {
+            sys_close(own_end);
+            sys_close(agent_end);
+            return Err(AGENT_OP_NO_PROCESS);
+        }
+        out_r = load32(&ofds);
+        out_w = load32(&ofds + 4);
+    }
 
     agent_set_status(h, AGENT_STARTING);
     sakshi_info("starting agent", 14);
-    var r_t, r_v = agent_spawn_with_limits(exe, argv, agent_environ_ipc(), mem_limit, cpu_secs, agent_end);
+    var r_t, r_v = agent_spawn_with_limits(exe, argv, agent_environ_ipc(), mem_limit, cpu_secs,
+      agent_end, out_w);
     sys_close(agent_end);   # the child has its copy; daimon never keeps this end
+    if (out_w >= 0) { sys_close(out_w); }   # likewise: at EOF, every writer is gone
     if (is_err_result(r_t) == 1) {
         sys_close(own_end);
+        if (out_r >= 0) { sys_close(out_r); }
         agent_set_status(h, AGENT_FAILED);
         daimon_audit_agent(SEV_WARNING, "agent", "agent.spawn.fail", "agent process failed to start",
           str_data(agent_name(h)));
@@ -697,13 +858,11 @@ fn agent_start(h, mem_limit, cpu_secs) {
     agent_set_started_at(h, clock_epoch_secs());
     agent_set_status(h, AGENT_RUNNING);
     daimon_audit_agent(SEV_INFO, "agent", "agent.spawn", "agent process started", str_data(agent_name(h)));
-    # The channel service owns daimon's end from here (and replaces any channel
-    # left from an earlier run of this agent).
-    if (ipc_service_add(id_str, own_end) == 0) {
-        daimon_audit_agent(SEV_WARNING, "ipc", "ipc.channel.unavailable",
-          "the agent channel service could not start; the agent runs without a channel",
-          str_data(agent_name(h)));
-    }
+    # daimon's end joins the channels the event loop polls (src/ipc.cyr), which
+    # own it from here on, replacing any channel left from an earlier run; the
+    # output pipe likewise (its ring starts empty).
+    ipc_service_add(id_str, own_end);
+    if (out_r >= 0) { ipc_output_add(id_str, out_r); }
     return Ok(r_v);
     #endif
 }
@@ -715,51 +874,101 @@ fn agent_start(h, mem_limit, cpu_secs) {
 # slow connection (src/server.cyr). A variable, so tests can shorten it.
 var AGENT_STOP_GRACE_MS = 5000;
 
-# Stop an agent: SIGTERM, up to AGENT_STOP_GRACE_MS for it to exit, then
-# SIGKILL. Always Ok — stopping is idempotent, and it is how a FAILED agent is
-# returned to STOPPED.
+# Stopping (2.3.4: without holding the server).
 #
-# ⛔ Through 2.2.3 this checked ONCE, immediately after SIGTERM, with a
+# agent_stop_begin sends SIGTERM (and SIGCONT to a paused agent, which cannot
+# act on SIGTERM until it runs) to the agent's process group and returns;
+# agent_stop_step — the event loop's upkeep, every SERVE_TICK_MS — collects the
+# process once it exits, sends SIGKILL at AGENT_STOP_GRACE_MS, and gives up
+# DAIMON_REAP_BUDGET_MS after that. Through 2.3.3 a stop was one call that
+# waited up to ~6 s, and the single-threaded server with it (VULN-014,
+# measured: a request sent during a 5 s stop waited 4.8 s).
+#
+# ⛔ Through 2.2.3 the stop checked ONCE, immediately after SIGTERM, with a
 # non-blocking wait, and sent SIGKILL if the agent had not exited in those few
 # instructions — so in practice every agent was SIGKILLed and none got to shut
-# down. (Never executed until 2.3.0: nothing called it.)
-fn agent_stop(h, reason) {
+# down.
+
+# Begin stopping. Returns 1 if the agent is already stopped (it had no process),
+# 0 if the stop is under way (agent_stop_step finishes it). A second call while
+# one is under way changes nothing. Stopping is how a FAILED agent is returned
+# to STOPPED.
+fn agent_stop_begin(h, reason) {
+    var pid = agent_pid(h);
+    if (pid <= 0) {
+        agent_set_status(h, AGENT_STOPPED);
+        daimon_audit_agent(SEV_INFO, "agent", "agent.stop", "agent stopped", str_data(agent_name(h)));
+        return 1;
+    }
+    if (load64(h + 96) != 0) { return 0; }
+    var paused = 0;
+    if (agent_status(h) == AGENT_PAUSED) { paused = 1; }
+    agent_set_status(h, AGENT_STOPPING);
+    daimon_signal_tree(pid, SIGTERM);
+    if (paused == 1) { daimon_signal_tree(pid, 18); }   # SIGCONT
+    store64(h + 96, clock_now_ms() + AGENT_STOP_GRACE_MS);
+    store64(h + 104, 0);
+    return 0;
+}
+
+# 1 while a stop begun by agent_stop_begin is under way.
+fn agent_stop_pending(h) {
+    if (load64(h + 96) != 0) { return 1; }
+    return 0;
+}
+
+# Advance a stop. Returns 1 when it is over: the process was collected (the
+# agent is STOPPED), or it outlived SIGKILL's budget — uninterruptible sleep —
+# and the agent stays STOPPING with its pid kept, for agent_reap to collect.
+fn agent_stop_step(h, now) {
+    if (load64(h + 96) == 0) { return 1; }
     var pid = agent_pid(h);
     if (pid > 0) {
-        var paused = 0;
-        if (agent_status(h) == AGENT_PAUSED) { paused = 1; }
-        agent_set_status(h, AGENT_STOPPING);
-        daimon_signal(pid, SIGTERM);
-        # A SIGSTOPped process cannot act on SIGTERM until it runs again.
-        if (paused == 1) { daimon_signal(pid, 18); }   # SIGCONT
-        var code = daimon_reap_within(pid, AGENT_STOP_GRACE_MS);
-        if (code == 0 - 2) {
-            daimon_signal(pid, SIGKILL);
-            code = daimon_reap_within(pid, DAIMON_REAP_BUDGET_MS);
+        var code = daimon_reap_code(pid);
+        if (code != 0 - 2) {
+            # Reaped (or not daimon's to reap): the pid may now belong to another
+            # process, so it is cleared in the same step — never signalled again.
+            agent_set_pid(h, 0);
+            agent_set_exit_code(h, code);
+            ipc_service_remove(str_from_int(agent_id(h)));   # its channel goes with it
+            pid = 0;
         }
-        if (code == 0 - 2) {
-            # Outlived SIGKILL's budget (uninterruptible sleep). It is still
-            # daimon's unreaped child, so KEEP the pid: agent_reap collects it
-            # later, and STOPPING says exactly where it is.
-            daimon_audit_agent(SEV_WARNING, "agent", "agent.stop.pending",
-              "agent did not exit after SIGKILL; still stopping", str_data(agent_name(h)));
-            return Ok(0);
-        }
-        # Reaped (or not daimon's to reap): the pid may now belong to another
-        # process, so it is cleared in the same step — never signalled again.
-        agent_set_pid(h, 0);
-        agent_set_exit_code(h, code);
-        ipc_service_remove(str_from_int(agent_id(h)));   # its channel goes with it
     }
-    agent_set_status(h, AGENT_STOPPED);
-    daimon_audit_agent(SEV_INFO, "agent", "agent.stop", "agent stopped", str_data(agent_name(h)));
+    if (pid <= 0) {
+        store64(h + 96, 0);
+        agent_set_status(h, AGENT_STOPPED);
+        daimon_audit_agent(SEV_INFO, "agent", "agent.stop", "agent stopped", str_data(agent_name(h)));
+        return 1;
+    }
+    var killed = load64(h + 104);
+    if (killed == 0) {
+        if (now >= load64(h + 96)) {
+            daimon_signal_tree(pid, SIGKILL);
+            store64(h + 104, now);
+        }
+        return 0;
+    }
+    if (now - killed >= DAIMON_REAP_BUDGET_MS) {
+        store64(h + 96, 0);
+        daimon_audit_agent(SEV_WARNING, "agent", "agent.stop.pending",
+          "agent did not exit after SIGKILL; still stopping", str_data(agent_name(h)));
+        return 1;
+    }
+    return 0;
+}
+
+# Stop and wait: SIGTERM, up to AGENT_STOP_GRACE_MS, SIGKILL. Always Ok. For a
+# caller that may block (tests; a request not served by the event loop).
+fn agent_stop(h, reason) {
+    if (agent_stop_begin(h, reason) == 1) { return Ok(0); }
+    while (agent_stop_step(h, clock_now_ms()) == 0) { sleep_ms(1); }
     return Ok(0);
 }
 
 # Pause (SIGSTOP) a RUNNING agent.
 fn agent_pause(h) {
     if (agent_status(h) != AGENT_RUNNING) { return Err(AGENT_OP_BAD_STATE); }
-    if (daimon_signal(agent_pid(h), 19) != 0) { return Err(AGENT_OP_SIGNAL); }   # SIGSTOP
+    if (daimon_signal_tree(agent_pid(h), 19) != 0) { return Err(AGENT_OP_SIGNAL); }   # SIGSTOP
     agent_set_status(h, AGENT_PAUSED);
     return Ok(0);
 }
@@ -767,7 +976,7 @@ fn agent_pause(h) {
 # Resume (SIGCONT) a PAUSED agent.
 fn agent_resume(h) {
     if (agent_status(h) != AGENT_PAUSED) { return Err(AGENT_OP_BAD_STATE); }
-    if (daimon_signal(agent_pid(h), 18) != 0) { return Err(AGENT_OP_SIGNAL); }   # SIGCONT
+    if (daimon_signal_tree(agent_pid(h), 18) != 0) { return Err(AGENT_OP_SIGNAL); }   # SIGCONT
     agent_set_status(h, AGENT_RUNNING);
     return Ok(0);
 }
@@ -786,8 +995,15 @@ fn agent_reap(h) {
     agent_set_exit_code(h, code);      # -1: there was no such child to reap
     ipc_service_remove(str_from_int(agent_id(h)));   # its channel goes with it
     var was = agent_status(h);
-    if (was == AGENT_STOPPING) { agent_set_status(h, AGENT_STOPPED); }
-    elif (code == 0) { agent_set_status(h, AGENT_STOPPED); }
+    if (was == AGENT_STOPPING) {
+        # A stop's process, collected by the sweep before agent_stop_step saw
+        # it: the stop is over, and it is recorded as one.
+        store64(h + 96, 0);
+        agent_set_status(h, AGENT_STOPPED);
+        daimon_audit_agent(SEV_INFO, "agent", "agent.stop", "agent stopped", str_data(agent_name(h)));
+        return 1;
+    }
+    if (code == 0) { agent_set_status(h, AGENT_STOPPED); }
     else { agent_set_status(h, AGENT_FAILED); }
     if (code == 0) {
         daimon_audit_agent(SEV_INFO, "agent", "agent.exit", "agent process exited", str_data(agent_name(h)));

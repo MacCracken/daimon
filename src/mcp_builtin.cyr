@@ -51,6 +51,15 @@ fn mcp_web_init(reg) {
     return 0;
 }
 
+# 1 for a builtin whose answer waits on the network (bote's web tools), which
+# api_mcp_call runs in a detached child (server_detach, 2.3.4) rather than on
+# daimon's loop. The libro and nein tools answer from memory.
+fn mcp_builtin_waits(name_c) {
+    if (streq(name_c, "web_fetch") == 1) { return 1; }
+    if (streq(name_c, "web_search") == 1) { return 1; }
+    return 0;
+}
+
 # Dispatch a builtin tool in-process. name_c: tool name (cstr). args: the raw
 # MCP `arguments` object (cstr). Returns the handler's JSON result (cstr), or
 # 0 if name_c is not a known builtin (the caller falls back to 501).

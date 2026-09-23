@@ -35,6 +35,7 @@ fn app_init() {
     _fed_mgr = fed_mgr_new(SCHED_BALANCED);
     _edge_fleet = edge_fleet_new(edge_fleet_config_default());
     _msg_bus = msg_bus_new();
+    ipc_attach_bus(_msg_bus);       # agent channels publish on it (2.3.4)
     _rec_mgr = rec_mgr_new();
     _cap_mgr = cap_mgr_new();
     _rag_pipeline = rag_pipeline_new(rag_config_default());

@@ -1,4 +1,4 @@
-# Agent IPC — the agent's channel (2.3.3)
+# Agent IPC — the agent's channel (2.3.3; 2.3.4)
 
 Every agent daimon starts gets a **channel** to daimon: one end of a Unix socketpair, open in the
 agent as **file descriptor 3**. daimon announces it in the agent's environment as
@@ -31,7 +31,7 @@ One JSON **object**:
 
 | field | required | meaning |
 |---|---|---|
-| `target` | yes | a non-empty string of at most 256 bytes: an agent id (`"7"`), a registered name, or `"*"` for every agent |
+| `target` | yes | a non-empty string of at most 256 bytes: an agent id (`"7"`), a registered name, or `"*"` (or `"broadcast"`, in any case) for every agent |
 | `type` | no | `"request"`, `"response"`, `"event"`, `"heartbeat"` or `"command"`. Absent or `null` means `"event"` |
 | `payload` | no | any JSON value. daimon keeps it as compact JSON text; absent is `null` |
 
@@ -50,12 +50,13 @@ daimon answers each frame with **one byte**:
 
 | byte | name | meaning |
 |---|---|---|
-| 1 | `ACK` | accepted: the message will be put on daimon's message bus |
-| 2 | `NACK_QUEUE_FULL` | daimon is holding 1024 messages it has not yet routed. Nothing was kept; send it again later |
+| 1 | `ACK` | queued for its target (a broadcast: on every queue that had room) |
+| 2 | `NACK_QUEUE_FULL` | the target's queue is full, or the bus holds its limit in bytes (a broadcast: every queue was full). Nothing was kept; send it again later |
 | 3 | `NACK_INVALID` | the frame was refused (see above). The channel stays open, except for the two faults below |
+| 4 | `NACK_NO_TARGET` | no agent has that id or name. Nothing was kept. (Since 2.3.4; 2.3.3 answered ACK and dropped it) |
 
-`ACK` means *accepted for routing*, not *delivered*. A message to an id or name with no queue is
-dropped when it is routed.
+Since 2.3.4 the reply is given after the message is routed, so it says where it went. In 2.3.3,
+`ACK` meant only "accepted for routing".
 
 daimon never waits on an agent. A reply that the agent's socket buffer cannot hold (the agent has
 stopped reading them) is dropped.
@@ -77,20 +78,40 @@ Audit entries go to daimon's libro chain (`libro_export` over MCP). They carry t
 
 ## Where messages go
 
-daimon's main thread routes accepted messages onto its **message bus** at the start of each HTTP
-request:
+daimon routes a frame onto its **message bus** as soon as its event loop reads it (2.3.4; in 2.3.3
+this waited for the next HTTP request):
 - a target that is an agent **id** goes to that agent's queue;
-- a **name** goes to the agent registered under it;
-- `"*"` goes to the queue of every registered agent, the sender's included.
+- otherwise a **name** goes to the agent registered under it;
+- `"*"` goes to the queue of every registered agent, the sender's included (as in the Rust
+  original).
+
+An id is tried before a name. A **name** belongs to the first agent registered with it, until that
+agent is deleted; a later agent with the same name gets no name route (the Rust original let the
+last one take it). A name that is all digits, or `*`, or `broadcast`, never routes.
 
 An agent has a queue from registration (`POST /v1/agents`) until it is deleted, whether or not it
-is running. Each queue holds **100** messages. Messages past that are dropped and counted.
+is running. Each queue holds **100** messages, and the bus as a whole at most **64 MiB** of them. A
+message held by several queues counts once. Past either limit a message is not queued; that is
+counted (`bus_dropped`), and a sender on a channel is told (`NACK_QUEUE_FULL`).
 
-⚠ 2.3.3 is the first half:
-- no route reads a queue or sends to an agent yet;
-- registration does not yet register names, so a name target reaches no one.
+## Reading and sending over HTTP
 
-Both come in the next release. Until then the bus fills, and `/v1/metrics` shows the traffic.
+```
+# Take an agent's queued messages, oldest first (they leave the queue). Body optional.
+POST /v1/agents/7/messages/take
+{"max": 10}
+→ {"messages":[{"id":12,"source":"3","target":"7","type":"command","payload":{"k":"v"},"timestamp":1790137973}],
+   "count":1,"remaining":0}
+
+# Queue a message for an agent. Its source is "api".
+POST /v1/agents/7/messages
+{"type":"command","payload":{"k":"v"}}
+→ 201 {"id":13} · 404 no such agent · 429 its queue (or the bus) is full
+```
+
+Both refuse browsers, like agent control. The API has no authentication until 2.5.x, so any
+client that can reach it can read any agent's queue. A message's memory is freed when it is taken,
+or when its agent is deleted (VULN-018).
 
 ## Metrics
 
@@ -98,9 +119,11 @@ Both come in the next release. Until then the bus fills, and `/v1/metrics` shows
 
 | field | counts |
 |---|---|
-| `ipc_messages` | messages put on the bus |
-| `ipc_refused` | frames answered 2 or 3, plus channels closed on a fault |
-| `bus_dropped` | messages dropped at a full queue |
+| `ipc_messages` | frames put on the bus |
+| `ipc_refused` | frames answered 2, 3 or 4, plus channels closed on a fault |
+| `bus_dropped` | messages not queued because a queue, or the bus, was full |
+| `ipc_channels` | open channels (2.3.4) |
+| `bus_bytes` | bytes of messages the bus holds (2.3.4) |
 
 ## Examples
 
@@ -119,7 +142,7 @@ import json, os, struct
 fd = int(os.environ["AGNOS_IPC_FD"])
 body = json.dumps({"target": "*", "type": "event", "payload": {"status": "ready"}}).encode()
 os.write(fd, struct.pack(">I", len(body)) + body)
-reply = os.read(fd, 1)[0]    # 1 ACK, 2 NACK_QUEUE_FULL, 3 NACK_INVALID
+reply = os.read(fd, 1)[0]    # 1 ACK, 2 NACK_QUEUE_FULL, 3 NACK_INVALID, 4 NACK_NO_TARGET
 ```
 
 ## Limits
@@ -129,9 +152,9 @@ reply = os.read(fd, 1)[0]    # 1 ACK, 2 NACK_QUEUE_FULL, 3 NACK_INVALID
 | frame body | 65536 bytes | `MAX_MESSAGE_SIZE` |
 | target | 256 bytes | `IPC_TARGET_MAX` |
 | time to finish a begun frame | 5000 ms | `IPC_FRAME_TIMEOUT_MS` |
-| messages waiting for the main thread | 1024 | `IPC_HANDOFF_CAP` |
-| frames one channel may complete per service pass | 16 | `IPC_FRAMES_PER_PASS` |
+| frames one channel may complete per pass of the loop | 16 | `IPC_FRAMES_PER_PASS` |
 | messages per bus queue | 100 | `IPC_BUS_QUEUE_MAX` |
+| bytes the bus holds | 64 MiB | `IPC_BUS_BYTES_MAX` |
 
-Why the channel works this way, and what it costs daimon, is in
-[ADR-005](../adr/005-agent-channels.md).
+Why the channel works this way is in [ADR-005](../adr/005-agent-channels.md), and why daimon
+reads it on its own event loop in [ADR-006](../adr/006-own-event-loop.md).

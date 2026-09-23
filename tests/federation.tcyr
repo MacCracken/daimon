@@ -14,8 +14,8 @@
 # The ownership groups close the last latent entries on the roadmap's aliasing
 # list.
 #
-# federation.cyr draws node ids from agent.cyr's `_next_agent_id`, so the
-# include chain is agent.tcyr's.
+# The include chain is agent.tcyr's. (Node ids came from agent.cyr's
+# `_next_agent_id` until 2.3.4; they have their own counter now, tested below.)
 # =========================================================================
 
 include "lib/string.cyr"
@@ -34,7 +34,6 @@ include "lib/math.cyr"
 include "lib/process.cyr"
 include "lib/sakshi.cyr"
 include "lib/libro.cyr"
-include "lib/thread.cyr"
 include "lib/assert.cyr"
 
 include "src/syscalls.cyr"
@@ -269,5 +268,9 @@ if (vec_len(oreps2) == 1) {
     assert(str_eq(load64(vec_get(oreps2, 0) + 8), str_from("10.8.8.8:2")) == 1,
       "a replica's address survives its buffer being reused");
 }
+
+var fa0 = _next_agent_id;
+var cnode = fed_node_new(str_from("counter-check"), 2, 1024, 0);
+assert_eq(_next_agent_id, fa0, "2.3.4: a federation node does not use up an agent id");
 
 syscall(SYS_EXIT, assert_summary());

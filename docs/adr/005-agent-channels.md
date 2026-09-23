@@ -1,6 +1,9 @@
 # ADR-005: Agent Channels — an Inherited Socketpair per Agent, Read by a Service Thread
 
-**Status**: Accepted
+**Status**: Accepted. §2 (the service thread) is **superseded by
+[ADR-006](006-own-event-loop.md)** at 2.3.4: the channels are read by daimon's own event loop, and
+the thread, its hand-off and its allocation-lock cost are gone. §1, §3 and §4 stand; the byte
+figures in §3 are 2.3.3's (2.3.4 frees messages: see the 2.3.4 audit addendum).
 **Date**: 2026-09-22 (2.3.3)
 **Context**: agents need a way to send messages to daimon. The port carried a socket-FILE endpoint
 (`agent_ipc_new` / `bind` / `accept_one` / `send`): one listening Unix socket per agent under a

@@ -136,6 +136,73 @@ fn json_escape_str(s) {
     return str_builder_build(sb);
 }
 
+# The length of the valid UTF-8 sequence at d[i] (RFC 3629, section 4), or 0 if
+# the bytes there are not one: a stray continuation byte, an overlong form, a
+# surrogate, past U+10FFFF, or a sequence cut off by the end of the data.
+fn _utf8_len_at(d, n, i) {
+    var c = load8(d + i);
+    if (c < 128) { return 1; }
+    var need = 0;
+    var lo = 128;
+    var hi = 191;
+    if (c >= 194) { if (c <= 223) { need = 1; } }
+    if (c == 224) { need = 2; lo = 160; }
+    if (c >= 225) { if (c <= 236) { need = 2; } }
+    if (c == 237) { need = 2; hi = 159; }
+    if (c >= 238) { if (c <= 239) { need = 2; } }
+    if (c == 240) { need = 3; lo = 144; }
+    if (c >= 241) { if (c <= 243) { need = 3; } }
+    if (c == 244) { need = 3; hi = 143; }
+    if (need == 0) { return 0; }
+    if (i + need >= n) { return 0; }   # bytes i .. i+need must all be inside the data
+    var b = load8(d + i + 1);
+    if (b < lo) { return 0; }
+    if (b > hi) { return 0; }
+    var k = 2;
+    while (k <= need) {
+        var cb = load8(d + i + k);
+        if (cb < 128) { return 0; }
+        if (cb > 191) { return 0; }
+        k = k + 1;
+    }
+    return need + 1;
+}
+
+# Arbitrary bytes as the inside of a JSON string (2.3.4): escaped as
+# json_escape_str does, with every byte that is not part of valid UTF-8
+# replaced by U+FFFD. For text daimon did not get from JSON, such as an agent's
+# captured output; a JSON string must be UTF-8.
+fn json_escape_text(data, len) {
+    var sb = str_builder_new();
+    var i = 0;
+    var run = 0;   # start of the pending run of bytes that need no escape
+    while (i < len) {
+        var c = load8(data + i);
+        var ul = _utf8_len_at(data, len, i);
+        var plain = 1;
+        if (ul == 0) { plain = 0; }
+        if (c < 32) { plain = 0; }
+        if (c == 34) { plain = 0; }
+        if (c == 92) { plain = 0; }
+        if (plain == 1) {
+            i = i + ul;
+        } else {
+            if (i > run) { str_builder_add(sb, str_new(data + run, i - run)); }
+            if (ul == 0) {
+                str_builder_add_cstr(sb, "\\ufffd");
+            } else {
+                var one: u8[1];
+                store8(&one, c);
+                str_builder_add(sb, json_escape_str(str_new(&one, 1)));
+            }
+            i = i + 1;
+            run = i;
+        }
+    }
+    if (len > run) { str_builder_add(sb, str_new(data + run, len - run)); }
+    return str_builder_build(sb);
+}
+
 # ⛔ 2.2.1 — `msg` is now JSON-ESCAPED. It used to be inserted raw between the
 # quotes, so a message containing `"` or `\` produced malformed JSON, and one
 # shaped like `x","admin":true,"y":"` injected fields into the error body.

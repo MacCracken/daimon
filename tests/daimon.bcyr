@@ -38,7 +38,6 @@ include "lib/math.cyr"
 include "lib/process.cyr"
 include "lib/sakshi.cyr"
 include "lib/libro.cyr"
-include "lib/thread.cyr"
 
 include "src/syscalls.cyr"
 include "src/error.cyr"
@@ -251,7 +250,7 @@ var _bench_live_agent = 0;
 # descriptor / stdin / SIGPIPE / limit setup, exec of /bin/true, the parent's
 # wait for the exec report — plus the reap of the exited child.
 fn bench_agent_spawn_reap() {
-    var r_t, r_v = agent_spawn_with_limits("/bin/true", _bench_true_argv, 0, 0, 0, 0 - 1);
+    var r_t, r_v = agent_spawn_with_limits("/bin/true", _bench_true_argv, 0, 0, 0, 0 - 1, 0 - 1);
     if (is_ok(r_t) == 1) { daimon_reap_within(r_v, 5000); }
     return 0;
 }
@@ -291,38 +290,43 @@ fn bench_sched_start_complete() {
     return 0;
 }
 
-# 2.3.3 — agent channels.
+# 2.3.3 — agent channels (on daimon's own loop since 2.3.4).
 # One message through an agent's channel, as the agent sees it: its write, the
-# service thread's wakeup, read, parse (in the service's arena) and hand-off,
-# the ACK, the agent's read of it — plus the main thread's take.
+# loop's pass over the channels (read, parse in the channel arena, publish),
+# the ACK, and the agent's read of it.
 var _bench_ch_fd = 0;
 var _bench_ch_frame = 0;
 var _bench_ch_len = 0;
 fn bench_ipc_frame_roundtrip() {
     sys_write(_bench_ch_fd, _bench_ch_frame, _bench_ch_len);
+    ipc_poll_once(0);
     var b: u8[8];
     sys_read(_bench_ch_fd, &b, 1);
-    ipc_take();
     return 0;
 }
 
-# What every HTTP request now pays first: ipc_drain with nothing handed over.
+# What each pass of the event loop pays for 100 open, quiet channels: the
+# pollfds, the poll itself, and the frame-timeout check.
 var _bench_bus = 0;
-fn bench_ipc_drain_empty() {
-    ipc_drain(_bench_bus);
+fn bench_ipc_poll_100_idle() {
+    ipc_poll_once(0);
     return 0;
 }
 
-# A broadcast to 100 subscribers (then each queue emptied again, so every
-# iteration enqueues 100). map_iter since 2.3.3, where it was map_keys.
+# A broadcast's whole life on the bus (2.3.4): a new message published to 100
+# subscribers, then taken off each queue — the last take frees it. (2.3.3's
+# bus_broadcast_100 re-published one message and emptied the queues without
+# letting go; messages are freed now, so that is no longer a valid use.)
 var _bench_bcast_bus = 0;
-var _bench_bcast_queues = 0;
-var _bench_bcast_msg = 0;
-fn bench_bus_broadcast_100() {
-    msg_bus_publish(_bench_bcast_bus, _bench_bcast_msg);
+var _bench_bcast_ids = 0;
+var _bench_bcast_src = 0;
+var _bench_bcast_tgt = 0;
+var _bench_bcast_pay = 0;
+fn bench_bus_broadcast_take_100() {
+    msg_bus_publish(_bench_bcast_bus, ipc_msg_new(_bench_bcast_src, _bench_bcast_tgt, MSG_EVENT, _bench_bcast_pay));
     var i = 0;
     while (i < 100) {
-        vec_truncate(vec_get(_bench_bcast_queues, i), 0);
+        msg_bus_drop_front(_bench_bcast_bus, vec_get(_bench_bcast_ids, i), 1);
         i = i + 1;
     }
     return 0;
@@ -502,7 +506,7 @@ fn main() {
     store64(sl_argv, "/bin/sleep");
     store64(sl_argv + 8, "600");
     store64(sl_argv + 16, 0);
-    var sl_t, sl_pid = agent_spawn_with_limits("/bin/sleep", sl_argv, 0, 0, 0, 0 - 1);
+    var sl_t, sl_pid = agent_spawn_with_limits("/bin/sleep", sl_argv, 0, 0, 0, 0 - 1, 0 - 1);
     _bench_live_agent = agent_handle_new(1000, str_from("live"));
     agent_set_pid(_bench_live_agent, sl_pid);
     agent_set_status(_bench_live_agent, AGENT_RUNNING);
@@ -539,8 +543,10 @@ fn main() {
     bench_run(b23, &bench_http_body_read3, 10000);
     vec_push(benches, b23);
 
-    # 2.3.3 — a channel through the real service thread, for a stand-in agent
-    # the benchmark plays itself.
+    # A channel for a stand-in agent the benchmark plays itself. The bus has no
+    # subscribers, so a broadcast is delivered to nobody (no queue grows).
+    _bench_bus = msg_bus_new();
+    ipc_attach_bus(_bench_bus);
     var chf: i32[2];
     ipc_channel_open(&chf);
     ipc_service_add(str_from("bench-agent"), load32(&chf));
@@ -551,29 +557,38 @@ fn main() {
     store32(_bench_ch_frame, 0);
     store8(_bench_ch_frame + 3, strlen(chbody));
     memcpy(_bench_ch_frame + 4, chbody, strlen(chbody));
-    _bench_bus = msg_bus_new();
 
     var b24 = bench_new("ipc_frame_roundtrip");
     bench_run(b24, &bench_ipc_frame_roundtrip, 10000);
     vec_push(benches, b24);
 
-    var b25 = bench_new("ipc_drain_empty");
-    bench_run(b25, &bench_ipc_drain_empty, 100000);
+    # 99 more quiet channels beside the benchmark's own.
+    var qi = 0;
+    while (qi < 99) {
+        var qf: i32[2];
+        ipc_channel_open(&qf);
+        ipc_service_add(str_from_int(5000 + qi), load32(&qf));
+        qi = qi + 1;
+    }
+    var b25 = bench_new("ipc_poll_100_idle");
+    bench_run(b25, &bench_ipc_poll_100_idle, 10000);
     vec_push(benches, b25);
 
     _bench_bcast_bus = msg_bus_new();
-    _bench_bcast_queues = vec_new();
+    _bench_bcast_ids = vec_new();
     var bi = 1;
     while (bi <= 100) {
-        var bid = str_from_int(bi);
-        msg_bus_subscribe(_bench_bcast_bus, str_data(bid));
-        vec_push(_bench_bcast_queues, map_get(load64(_bench_bcast_bus), str_data(bid)));
+        var bid = str_data(str_from_int(bi));
+        msg_bus_subscribe(_bench_bcast_bus, bid);
+        vec_push(_bench_bcast_ids, bid);
         bi = bi + 1;
     }
-    _bench_bcast_msg = ipc_msg_new(str_from("bench"), str_from("*"), MSG_EVENT, str_from("p"));
+    _bench_bcast_src = str_from("bench");
+    _bench_bcast_tgt = str_from("*");
+    _bench_bcast_pay = str_from("{\"n\":1}");
 
-    var b26 = bench_new("bus_broadcast_100");
-    bench_run(b26, &bench_bus_broadcast_100, 10000);
+    var b26 = bench_new("bus_broadcast_take_100");
+    bench_run(b26, &bench_bus_broadcast_take_100, 10000);
     vec_push(benches, b26);
 
     bench_report_all(benches);
@@ -581,6 +596,6 @@ fn main() {
 }
 
 var r = main();
-# exit_group: the channel service thread is running (2.3.3), and exit(2) would
-# end only this thread.
+# exit_group: the program epilogue lib/syscalls prescribes (exit(2) ends only
+# the calling thread).
 syscall(SYS_EXIT_GROUP, r);

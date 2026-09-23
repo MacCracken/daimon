@@ -107,6 +107,34 @@ fn main() {
                     }
                     agent_set_agents_dir(argv(argi));
                 }
+                elif (streq(arg, "--agent-output") == 1) {
+                    # 2.3.4: agents' stdout and stderr: daimon's own, or captured.
+                    argi = argi + 1;
+                    if (argi >= argc()) {
+                        println("serve: --agent-output needs inherit or capture");
+                        return 1;
+                    }
+                    if (streq(argv(argi), "inherit") == 1) { agent_set_output_mode(AGENT_OUTPUT_INHERIT); }
+                    elif (streq(argv(argi), "capture") == 1) { agent_set_output_mode(AGENT_OUTPUT_CAPTURE); }
+                    else {
+                        println("serve: --agent-output takes inherit or capture");
+                        return 1;
+                    }
+                }
+                elif (streq(arg, "--agent-env") == 1) {
+                    # 2.3.4 (VULN-015): what of daimon's environment agents get.
+                    argi = argi + 1;
+                    if (argi >= argc()) {
+                        println("serve: --agent-env needs inherit or minimal");
+                        return 1;
+                    }
+                    if (streq(argv(argi), "inherit") == 1) { agent_set_env_mode(AGENT_ENV_INHERIT); }
+                    elif (streq(argv(argi), "minimal") == 1) { agent_set_env_mode(AGENT_ENV_MINIMAL); }
+                    else {
+                        println("serve: --agent-env takes inherit or minimal");
+                        return 1;
+                    }
+                }
                 elif (streq(arg, "--listen") == 1) {
                     # 2.3.0: the bind address (default 127.0.0.1, config.cyr).
                     # An IPv4 literal; 0.0.0.0 opens every interface.
@@ -145,6 +173,7 @@ fn main() {
             println("");
             println("Commands:");
             println("  serve [port] [--async] [--trace] [--agents-dir DIR] [--listen ADDR]");
+            println("        [--agent-env inherit|minimal] [--agent-output inherit|capture]");
             println("                          Start HTTP API server (default: 127.0.0.1:8090)");
             println("  version                 Print version");
             println("  help                    Show this help");

@@ -1,4 +1,4 @@
-# Security Audit — 2026-09-22: the agent lifecycle (2.3.0, with 2.3.1, 2.3.2 and 2.3.3 addenda)
+# Security Audit — 2026-09-22: the agent lifecycle (2.3.0, with 2.3.1, 2.3.2, 2.3.3 and 2.3.4 addenda)
 
 2.3.0 connects process control to the HTTP API: an unauthenticated client can now start, stop,
 pause, resume and delete agents. This audit covers that new surface and two older exposures that
@@ -52,7 +52,7 @@ with `--listen 0.0.0.0`, exit 1 for a malformed address. `tests/config.tcyr` cov
 
 ---
 
-### VULN-012: Cross-site requests and DNS rebinding reach the API (HIGH for agent control) — MITIGATED for agent control in 2.3.0; OPEN for the other routes
+### VULN-012: Cross-site requests and DNS rebinding reach the API (HIGH for agent control) — MITIGATED for agent control in 2.3.0; FIXED for the other routes in 2.3.4
 
 **CWE**: [CWE-352](https://cwe.mitre.org/data/definitions/352.html) (CSRF),
 [CWE-346](https://cwe.mitre.org/data/definitions/346.html) (Origin Validation Error — the class recent
@@ -88,11 +88,21 @@ the whole name case-insensitively, so `X-Origin` and `Origins` do not count.
 **Tests**: 8 in `tests/http.tcyr` (`http_origin`). 3 in `tests/smoke.sh`: a cross-site `text/plain` start
 gets 403, nothing starts, and a DELETE carrying Origin gets 403.
 
-**Still open** (roadmap 2.5.x):
-- every other mutating route still accepts a cross-site simple POST: MCP tool registration, RAG
-  ingest, edge decommission, scheduler cancel and submit;
-- no `Host` allowlist, so a rebinding page can still READ every GET response;
-- no authentication. The guard stops browsers, not a local process or a direct network client.
+**Fixed in 2.3.4** (`http_host_allowed` / `http_origin_foreign`, `src/http.cyr`; checked in
+`handle_request`):
+- **Host allowlist.** While daimon listens on loopback, a request must name a loopback host
+  (`127.0.0.0/8`, `localhost`, `[::1]`). Anything else gets 403 (`http.host.reject` on the audit
+  chain), so a DNS-rebinding page can neither write nor READ. With `--listen` beyond loopback the
+  operator has chosen daimon's names, and the check is off. Reference: [CVE-2024-28224](https://www.nccgroup.com/research/technical-advisory-ollama-dns-rebinding-attack-cve-2024-28224/)
+  (Ollama), fixed the same way.
+- **Cross-site writes on every route.** POST, PUT and DELETE carrying an `Origin` from another site
+  get 403 (`http.origin.reject`): MCP tool registration, RAG ingest, edge decommission, scheduler
+  cancel and submit, messages. An origin on a loopback host may still write, so a local browser UI
+  keeps working. Agent and task control still refuse any `Origin`.
+- Tests: 22 in `tests/http.tcyr` (`http_host`); 6 smoke checks.
+
+**Still open**: no authentication (roadmap 2.5.x). These checks stop browsers, not a local process or
+a direct network client.
 
 ---
 
@@ -137,7 +147,7 @@ directory lets whoever controls daimon's cwd choose what it executes.
 
 ---
 
-### VULN-014: A stop holds the single-threaded server (MEDIUM, denial of service) — OPEN
+### VULN-014: A stop holds the single-threaded server (MEDIUM, denial of service) — FIXED in 2.3.4
 
 **CWE**: [CWE-400](https://cwe.mitre.org/data/definitions/400.html) — Uncontrolled Resource Consumption.
 
@@ -155,13 +165,22 @@ async: stop took 5009 ms; a /v1/health sent 200 ms into it took 4806 ms
 that can reach the API and start such an agent type, if one is installed, can hold the server about
 5 s per stop. The rate limit (120/min per IP) bounds that but does not prevent it.
 
-**Remediation (roadmap)**: a non-blocking stop, answering 202 and escalating to SIGKILL from a
-supervisor tick. That needs a periodic hook the sync server loop does not have. Authentication
-(2.5.x) limits who can ask.
+**Fixed in 2.3.4**: daimon now runs its own event loop (ADR-006), so it has the periodic tick the
+sync loop lacked. `agent_stop_begin` signals the agent and returns; the loop's upkeep sends SIGKILL
+at the deadline and collects the process (`agent_stop_step`). The stop route **defers its answer**
+(`server_defer`): the client is answered when the agent is gone, with the same body as before, and
+everyone else is served meanwhile. Measured on 2.3.4 with an agent that ignores SIGTERM:
+
+```
+the stop answered after 5.01 s (status 5, exit_code 137)
+/v1/health during it, five times 0.5 s apart: 0.001 s each
+```
+
+Smoke checks it on every run.
 
 ---
 
-### VULN-015: Agents inherit daimon's environment (LOW) — ACCEPTED (Rust parity), recorded
+### VULN-015: Agents inherit daimon's environment (LOW) — ACCEPTED as the default (Rust parity); an operator option since 2.3.4
 
 **CWE**: [CWE-526](https://cwe.mitre.org/data/definitions/526.html) — Cleartext Storage of Sensitive
 Information in an Environment Variable.
@@ -169,7 +188,12 @@ Information in an Environment Variable.
 Every agent receives daimon's own environment, `agent_environ()` read from `/proc/self/environ`, as
 tokio's `Command` gave it in the Rust original. Any secret placed in daimon's environment reaches
 every agent. Before 2.3.0 the (never-run) spawn passed an EMPTY environment, which would have left
-agents without `PATH`. **Remediation option**: an allowlisted environment per agent type.
+agents without `PATH`.
+
+**2.3.4**: `serve --agent-env minimal` gives agents only PATH, HOME, USER, LOGNAME, SHELL, TERM,
+TMPDIR, TZ, LANG, LANGUAGE, LC_*, XDG_RUNTIME_DIR and AGNOS_*, keeping daimon's other variables
+(tokens, credentials) out of them. The default stays `inherit`: changing what every agent receives
+would break agents that rely on it, which is for a major version.
 
 ---
 
@@ -247,7 +271,7 @@ false refusal, not a bypass: nothing decoded the stored raw URL later.
 duplicate-key refusals, and that nested keys never surface. There are 10 smoke checks, which pass
 on 2.3.2 and all fail on 2.3.1. Five mutation runs were all caught.
 
-### VULN-018: An agent's messages grow daimon's heap without bound (MEDIUM, denial of service) — OPEN, recorded (2.3.3)
+### VULN-018: An agent's messages grow daimon's heap without bound (MEDIUM, denial of service) — FIXED in 2.3.4
 
 **CWE**: [CWE-770](https://cwe.mitre.org/data/definitions/770.html) — Allocation of Resources Without
 Limits or Throttling; [CWE-400](https://cwe.mitre.org/data/definitions/400.html) — Uncontrolled
@@ -275,9 +299,18 @@ exposure in the hands of every started agent.
 - refused frames costing nothing (fixed during 2.3.3, below);
 - the parse running in a per-frame arena (the tree cost 1,496 bytes a frame on the shared heap).
 
-**Remediation**, recorded on the roadmap:
-- a per-agent frame rate (NACK past it), which bounds the rate but not the total;
-- a heap that can free, for the bus. That is the 3.0.0 arena-isolation arc.
+**Fixed in 2.3.4**: a message is now **one freelist block** (`lib/freelist.cyr`, which frees), held
+by every queue it is on and freed when the last lets go — taken (`POST .../messages/take`), or its
+agent deleted. The bus holds at most **64 MiB** (`IPC_BUS_BYTES_MAX`); past it, and past a full
+queue, nothing is queued, and a channel's sender is told (`NACK_QUEUE_FULL`). So the bus's memory is
+bounded by what is queued, not by what was ever sent. The frame's parse stays in the channel
+arena; its payload is built there too, so a delivered frame no longer allocates on the bump heap
+at all. Measured: 1000 messages published and taken through one queue leave the bump heap as it
+was (under 1 KiB of change, from the queue vector), and `bus_bytes` returns to 0. Tests:
+`tests/ipc.tcyr` (`ipc_bus_memory`), including that a freed message's block is reused by the next.
+
+What remains is the general property that daimon's HTTP handlers allocate per request on the bump
+heap, which never frees: the 3.0.0 arena-isolation arc.
 
 ## 2.3.3 addendum — agent channels
 
@@ -342,6 +375,60 @@ literals until `execve`, so it never takes a lock copied in a held state.
   does under qemu: QEMU applies no RLIMIT_AS, and qemu-user adds a thread of its own.
 - **AGNOS**: builds. A start answers 501 before any channel is made.
 
+## 2.3.4 addendum — daimon's own event loop
+
+2.3.4 replaces sandhi's serve loops with daimon's own single-threaded epoll loop (ADR-006) and, with
+it, fixes VULN-014, VULN-018 and VULN-012's remainder, above. What the new loop changes about the
+attack surface:
+
+| Surface | 2.3.3 | 2.3.4 |
+|---|---|---|
+| a client that sends slowly (the Slowloris class, [CVE-2007-6750](https://www.cve.org/CVERecord?id=CVE-2007-6750)) | held the whole server: sandhi's blocking recv waited up to 5 s per read, and trickling reset it | holds one of 128 slots; closed after 5 s idle or 30 s without a whole request. Measured: a request beside a stalled client answered in 6 ms |
+| a client that never reads its answer | could hold the server in `write` indefinitely (sandhi set no send timeout) | `SO_SNDTIMEO` of 5 s |
+| request framing and smuggling | sandhi's `recv_request` and three checks | the same rule and the same three checks; 8 probes answered identically on both |
+| agent channels | a second thread; every allocation took the heap lock | the same loop; no thread (`_threads_active` stays 0, tested) |
+
+**Agents and their processes (2.3.4):**
+- Each agent **leads its own process group** (`setpgid` in the child), and stop / pause / resume
+  signal the group (`daimon_signal_tree`): a stop used to leave the agent's children running.
+  **Residual**: a child that leaves the group (`setsid`, `setpgid`) is out of reach, as with any
+  process-group supervisor. Only a cgroup would hold it (Linux-specific), and that is recorded on the
+  roadmap.
+- Each agent **dies with daimon** (`PR_SET_PDEATHSIG` = SIGKILL, with the check for a daimon that died
+  before the prctl). The registry is in memory, so a survivor could never be reached. **Residual**: the
+  agent's own children are not the daimon's, so they get no death signal; they lose the agent,
+  and with it their fd 3's peer.
+- **Descriptor limit**: each running agent holds one of daimon's descriptors (its channel), two with
+  `--agent-output capture`, and the loop keeps up to 128 connections open. daimon raises its soft
+  `RLIMIT_NOFILE` to fit `max_agents` (4192 for the default 1000) and gives each agent the limit it
+  started with (1024 in the run below). It warns at start when the hard limit is lower. Measured
+  with the limit pinned at 1024, systemd's default soft limit: in capture mode the 507th start
+  answered 500 while the API kept answering. 2.3.3 (four descriptors of its own, one per agent) fit
+  the default 1000 agents.
+- **Captured output** (`--agent-output capture`, opt-in): a fixed ring per agent (32 KiB, one freelist
+  block), so a chatty agent costs daimon that ring and no more; invalid UTF-8 is repaired before it
+  becomes JSON (`json_escape_text`).
+
+- **Calls to other servers are bounded and off the loop** ([CWE-1088](https://cwe.mitre.org/data/definitions/1088.html),
+  synchronous access of a remote resource without a timeout). sandhi's HTTP client applies no
+  timeout unless its caller sets one (read, write, connect and total all default to 0), and daimon
+  set none. So an MCP endpoint that accepted and never answered held daimon: measured on 2.3.3,
+  `/v1/health` got no answer 11 s into such a call, after its caller had given up. 2.3.4 runs
+  forwarded MCP calls (`tools/call`, `resources/read`, `prompts/get`) and `web_fetch` /
+  `web_search` in a child process (`server_detach`). The child keeps only the pipe it answers on,
+  dies with daimon, and is killed at 60 s; its client is answered 504 and the event audited
+  (`http.detached.timeout`). Measured: `/v1/health` during a 2 s call, 1.70 s → 0.0004–0.0005 s.
+
+**Residual, recorded:**
+- **An agent start runs on the loop**: its fork and exec report take milliseconds.
+- **One local client can take all 128 slots** by holding 128 slow connections, each for up to 30 s.
+  All loopback clients share 127.0.0.1, so a per-IP cap would be a global cap. It is bounded, and
+  far from 2.3.3, where one slow connection held the server.
+
+**Verification**: 25 mutation runs over the 2.3.4 changes, all caught (one only after a test was
+added for it). aarch64 under qemu: the loop served health, an agent start, its channel's frame (the
+aarch64 `epoll_event` layout), take, captured output, a stop, the Host check and a detached MCP call.
+
 ## Defects fixed in the lifecycle code when it first ran
 
 None of this code had ever executed: it had no caller until 2.3.0. Each fix has a test that fails
@@ -361,10 +448,10 @@ were caught.
 
 ## Recorded on the roadmap, not fixed here
 
-- VULN-012's remainder, VULN-014 and VULN-018, above.
-- An agent's own children are not signalled: stop signals the agent's process, not a process group.
-- Agents outlive a daimon crash: there is no parent-death signal, and the registry is in memory.
-- stdout and stderr are inherited, not captured. The supervisor's `OutputCapture` is not wired.
+- (2.3.4 fixed VULN-012's remainder, VULN-014 and VULN-018, above, and the four items below.)
+- ~~An agent's own children are not signalled~~ — process groups (2.3.4).
+- ~~Agents outlive a daimon crash~~ — `PR_SET_PDEATHSIG` (2.3.4).
+- ~~stdout and stderr are inherited, not captured~~ — `--agent-output capture` (2.3.4).
 
 ## Verification limits
 
@@ -388,3 +475,4 @@ were caught.
 - [CVE-2026-48592 — Oban Web missing authorization](https://basefortify.eu/cve_reports/2026/05/cve-2026-48592.html); [CWE-862](https://cwe.mitre.org/data/definitions/862.html) (2.3.1 addendum)
 - [CVE-2017-12635 — CouchDB](https://docs.couchdb.org/en/stable/cve/2017-12635.html); [Bishop Fox — JSON interoperability vulnerabilities](https://bishopfox.com/blog/json-interoperability-vulnerabilities); [CWE-436](https://cwe.mitre.org/data/definitions/436.html) (2.3.2 addendum)
 - [CVE-2014-3639](https://www.cve.org/CVERecord?id=CVE-2014-3639) and [CVE-2014-3638](https://www.cve.org/CVERecord?id=CVE-2014-3638) — D-Bus; [CVE-2018-16865](https://www.cve.org/CVERecord?id=CVE-2018-16865) — systemd-journald; [CWE-130](https://cwe.mitre.org/data/definitions/130.html), [CWE-636](https://cwe.mitre.org/data/definitions/636.html) (2.3.3 addendum)
+- [CVE-2007-6750](https://www.cve.org/CVERecord?id=CVE-2007-6750) — Apache, "partial HTTP requests, as demonstrated by Slowloris" (2.3.4 addendum)

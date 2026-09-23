@@ -64,11 +64,34 @@ fn http_route(fd, method, path, buf, buf_len) {
         return 0;
     }
 
-    # /v1/agents/{id} (GET, DELETE) and /v1/agents/{id}/{start,stop,pause,resume}
-    # (POST only — a state change never rides a GET, 2.2.2). 2.3.0.
+    # /v1/agents/{id} (GET, DELETE), /v1/agents/{id}/{start,stop,pause,resume}
+    # (POST only — a state change never rides a GET, 2.2.2; 2.3.0), and
+    # /v1/agents/{id}/messages[/take] (POST; 2.3.4).
     if (memeq(path, "/v1/agents/", 11) == 1) {
         var asub = path + 11;
         var aslen = strlen(asub);
+        # 2.3.4: captured output (GET).
+        var oid = _route_id_before(asub, aslen, "/output", 7);
+        if (oid != 0) {
+            if (route_method(fd, method, 0) == 0) { return 0; }
+            api_agent_output(fd, oid);
+            return 0;
+        }
+        # 2.3.4: messages. "/messages/take" first: "/messages" is its prefix.
+        var mid = _route_id_before(asub, aslen, "/messages/take", 14);
+        if (mid != 0) {
+            if (route_method(fd, method, 1) == 0) { return 0; }
+            if (_route_refuse_browser(fd, buf, buf_len, "agent") == 1) { return 0; }
+            api_agent_message_take(fd, mid, http_parse_body(buf, buf_len));
+            return 0;
+        }
+        mid = _route_id_before(asub, aslen, "/messages", 9);
+        if (mid != 0) {
+            if (route_method(fd, method, 1) == 0) { return 0; }
+            if (_route_refuse_browser(fd, buf, buf_len, "agent") == 1) { return 0; }
+            api_agent_message_send(fd, mid, http_parse_body(buf, buf_len));
+            return 0;
+        }
         var aid = _route_id_before(asub, aslen, "/start", 6);
         if (aid != 0) {
             if (route_method(fd, method, 1) == 0) { return 0; }

@@ -31,10 +31,14 @@ enum SchedulingStrategy {
 # as "federation.cyr:62", which pointed at fed_mgr_add_node's map key; that key
 # is in fact safe — the node's own freshly formatted id, which fmt_int_buf
 # NUL-terminates — and this field was the borrowed one.
+# Federation node ids have their own counter (2.3.4); they were drawn from
+# agent.cyr's _next_agent_id, so every federation node used up an agent id.
+var _next_fed_node_id = 1;
+
 fn fed_node_new(name, cpu_cores, memory_mb, gpu_count) {
     var n = alloc(80);
-    var nid = str_from_int(_next_agent_id);
-    _next_agent_id = _next_agent_id + 1;
+    var nid = str_from_int(_next_fed_node_id);
+    _next_fed_node_id = _next_fed_node_id + 1;
     store64(n, nid);
     var owned_name = 0;
     if (name != 0) { owned_name = str_clone(name); }

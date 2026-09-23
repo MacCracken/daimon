@@ -4,6 +4,186 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.3.4] - 2026-09-22
+
+**daimon runs its own event loop, and the 2.3.x follow-ups are fixed rather than deferred.** Through
+2.3.3 daimon served HTTP from inside sandhi's serve loops, which give their caller no turn of its
+own. 2.3.3 therefore put the agent channels on a thread, whose heap lock slowed every allocation
+once an agent started. A stop held the server for its agent's grace period, and messages waited
+for an HTTP request to be routed. 2.3.4 replaces those loops with daimon's own: one thread, one
+epoll set ([ADR-006](docs/adr/006-own-event-loop.md)). With it come the message routes, freed
+messages, a non-blocking stop, process groups, death with daimon, the Host allowlist, cross-site
+writes refused everywhere, output capture, edge capabilities, and calls that wait on another server
+moved off the loop into a child process.
+
+**1033 tests** (was 917) across 17 suites, **130 HTTP smoke checks** (was 84), 29 benchmarks and 7
+fuzz harnesses, all green. **25 mutation runs, all caught** (one only after a test was added for it).
+fmt / lint / vet clean; x86_64, aarch64
+and agnos build. On aarch64 under qemu, the loop served an agent start, its channel's frame, take,
+captured output and a stop.
+
+### Fixed
+
+- **The allocation lock is gone.** No thread is started (`tests/ipc.tcyr` checks `_threads_active`
+  stays 0), so allocations are lock-free again with agents running. Measured with 100 channels open,
+  against 2.3.3 with an agent started (medians of three):
+
+  | | 2.3.3 | 2.3.4 |
+  |---|---:|---:|
+  | `config_default` | 294 ns | 87 ns |
+  | `json_parse` | 1.24 µs | 440 ns |
+  | `http_body_read3` | 2.75 µs | 1.25 µs |
+  | `mcp_manifest_100_tools` | 258 µs | 141 µs |
+
+- **A stop no longer holds the server** (VULN-014). The stop route begins the stop and defers its
+  answer; the loop sends SIGKILL at the deadline and answers when the agent is gone, with the same
+  body as before. Measured with an agent that ignores SIGTERM: the stop answered after 5.01 s (exit
+  137), and `/v1/health` during it took 0.001 s five times out of five. In 2.3.3 it waited 4.8 s. A
+  GET in between shows the agent Stopping (4).
+- **Messages are freed** (VULN-018). A message is one freelist block, freed when the last queue
+  holding it lets go: taken, or its agent deleted. The bus holds at most 64 MiB
+  (`IPC_BUS_BYTES_MAX`). A delivered frame no longer allocates on the never-freed heap: 1000
+  messages through a queue leave it as it was, and `bus_bytes` returns to 0.
+- **Messages reach the bus at once.** Frames are routed as the loop reads them, not at the next HTTP
+  request.
+- **DNS rebinding and cross-site writes** (VULN-012's remainder):
+  - While daimon listens on loopback, a request must name a loopback host (`127.0.0.0/8`,
+    `localhost`, `[::1]`), or it gets 403.
+  - A POST / PUT / DELETE from another site's page gets 403 on every route; in 2.3.0 only agent and
+    task control refused it. A page served from a loopback host may still write.
+- **An agent's children are stopped with it.** Each agent leads its own process group, and stop,
+  pause and resume signal the group.
+- **Agents die with daimon** (`PR_SET_PDEATHSIG`). The registry is in memory, so a survivor could
+  never be reached.
+- **Agents are collected as they exit** (within one 100 ms tick), not at the next agent request.
+  Measured: an agent that exited at once was gone from `/proc` within 0.05 s; under 2.3.3 it stayed
+  a zombie until a request (still one after 1.5 s).
+- **A slow HTTP client holds only its own connection.** Reads never block, so a request beside a
+  stalled client was answered in 6 ms; in 2.3.3 one slow client blocked everyone. A connection is
+  closed after 5 s with nothing sent or 30 s without a whole request, and a response write that
+  stalls fails after 5 s. sandhi's loop set no send timeout.
+- **A call that waits on another server no longer holds daimon.** An MCP call forwarded to a
+  registered endpoint (`tools/call`, `resources/read`, `prompts/get`) and `web_fetch` /
+  `web_search` run in a child process; the loop relays the child's answer and serves everyone else
+  meanwhile. sandhi's client sets no timeout by default, so on 2.3.3 an endpoint that accepted and
+  never answered held all of daimon: `/v1/health` got no answer 11 s into such a call, after its
+  caller had given up. Measured during a 2 s call, on each of the three paths: `/v1/health` 1.70 s
+  → 0.0004–0.0005 s. A call now ends at 60 s (the MCP TypeScript SDK's default request timeout) with 504
+  and an audit entry. With the bound cut to 3 s in a scratch build, the client got 504 at 3.01 s
+  and the child was killed and reaped. When no child can be made, the call runs inline as before.
+- **Ids no longer use up agent ids.** Edge nodes, federation nodes and recordings each have their own
+  counter. Edge ids interleaved with agent ids: after five agents the first node was `"6"`.
+- **Edge nodes keep their capabilities.** `POST /v1/edge/nodes` read none, and recorded every node as
+  x86_64 / 4 cores / 4096 MB. The duplicate-name check is a lookup, not a scan that allocated a key
+  vector per registration (`edge_register_100` 930 → 282 µs).
+- The rate limiter no longer allocates a key per request.
+
+### Added
+
+- `POST /v1/agents/{id}/messages` (queue a message for an agent; source `"api"`) and
+  `POST /v1/agents/{id}/messages/take` (take its queued messages, oldest first). Both refuse
+  browsers.
+- **Names on the bus**, first registration wins. A later agent with the same name gets no name route;
+  the Rust original let the last one take it over. An all-digit name never routes, and an id is
+  resolved before a name.
+- A channel reply for a target nobody has: **`NACK_NO_TARGET` (4)**.
+- `serve --agent-output capture`: each agent's stdout and stderr in a 32 KiB ring, served at
+  `GET /v1/agents/{id}/output`, with invalid UTF-8 shown as U+FFFD. The default stays `inherit`.
+- `serve --agent-env minimal`: agents get only PATH, HOME, USER, LOGNAME, SHELL, TERM, TMPDIR, TZ,
+  LANG, LANGUAGE, LC_*, XDG_RUNTIME_DIR and AGNOS_* (VULN-015). The default stays `inherit`.
+- Edge capabilities: `arch`, `cpu_cores`, `memory_mb`, `disk_mb` and `has_gpu`, validated (422). They
+  appear in `GET /v1/edge/nodes/{id}` and are totalled in `/v1/edge/stats`.
+- `/v1/metrics`: `ipc_channels`, `bus_bytes`.
+- **504 Gateway Timeout**: a forwarded MCP call or `web_fetch` / `web_search` that has not finished
+  within 60 s. Audit actions `http.detached.timeout`, and `http.detached.noanswer` (502) for a call
+  whose child ended without an answer.
+
+### Changed
+
+- **The HTTP loop is daimon's** (ADR-006). Requests are framed, smuggling-checked and answered with
+  sandhi's public functions as before, and eight probes answered identically on 2.3.3 and 2.3.4.
+  `serve --async` is accepted and runs the same loop; the banner says `event loop`. AGNOS keeps
+  sandhi's loop.
+- **daimon raises its own descriptor limit** to fit `max_agents` (4192 for the default 1000), warns
+  at start when the hard limit is lower, and gives each agent back the limit it started with. Each
+  running agent holds one of daimon's descriptors (two with `--agent-output capture`), and the loop
+  keeps up to 128 connections open. With the limit pinned at 1024, systemd's default soft limit,
+  capture mode's 507th start answered 500 while the API kept answering.
+- **Channel replies say where the message went.** `ACK` means queued, `NACK_QUEUE_FULL` means the
+  target's queue or the bus is full, and `NACK_NO_TARGET` is new. In 2.3.3 `ACK` meant only
+  accepted, and an unknown target was dropped silently.
+- **Library:** `msg_bus_publish` / `msg_bus_send_to` take the message, and free it if no queue does.
+  They return the routing outcome: `Ok(n)`, `Err(DAIMON_ERR_AGENT_NOT_FOUND)` or
+  `Err(DAIMON_ERR_IPC_FAULT)`. A message's id is `ipc_msg_id(m)`, an integer.
+  `agent_spawn_with_limits` takes a seventh argument, the output pipe (`-1` for none), and
+  `agent_stop` is now `agent_stop_begin` + `agent_stop_step` (the blocking `agent_stop` remains).
+  `server_detach(work, arg)` runs a handler's work in a child; `server_defer(fp, arg)` answers
+  later.
+
+### Removed
+
+- The channel service thread, its hand-off, `ipc_take` and `ipc_drain` (2.3.3).
+
+### Performance
+
+Three interleaved runs each, medians.
+- **Sequential HTTP requests over fresh connections** (3000 × `GET /v1/health`, all answered 200):
+  2.3.3's sandhi loop 111.9 µs, 2.3.4's loop 113.3 µs (+1.3%, higher in each of the three pairs).
+  On the rate-limited path (429, each with an audit entry) an early version of the loop measured
+  +6.7%; reading on accept (a local client has usually sent its whole request) removed an epoll
+  round trip, and that path measured 133.8 µs against 134.6.
+- The shared benchmarks, 2.3.3 against 2.3.4, agree within ±3%, except:
+  - `edge_register_100`: 930 → 282 µs;
+  - `edge_stats_500`: 58.6 → 63.6 µs (+8.4%; it now totals capacities);
+  - `agent_reap_live`: −5.0%, on code 2.3.4 did not change.
+- New or changed (still 27 + 2 benchmarks):
+  - `ipc_frame_roundtrip` 12.1 µs (single-threaded; 2.3.3's thread: 11.6);
+  - `ipc_poll_100_idle` 9.5 µs, the poll-based pass tests use (the loop uses epoll). It replaces
+    `ipc_drain_empty`, whose hand-off is gone;
+  - `bus_broadcast_take_100` 14.0 µs, a broadcast's whole life including the frees. It replaces
+    `bus_broadcast_100`, which only published.
+- A poll-based loop measured 92.7 µs per pass at 1000 open channels; that is why the loop uses epoll.
+- A detached call costs a fork: a forwarded MCP call to an endpoint that answers at once took
+  470.3 µs on 2.3.3 and 616.8 µs now (+146.5 µs; 300 calls a run, three runs each).
+
+### Security
+
+The 2.3.4 addendum to [docs/audit/2026-09-22-agent-lifecycle-audit.md](docs/audit/2026-09-22-agent-lifecycle-audit.md)
+covers the new loop against the Slowloris class (CVE-2007-6750). It closes VULN-012's remainder,
+VULN-014 and VULN-018, gives VULN-015 its option, and bounds calls to other servers (CWE-1088:
+sandhi's client had no timeout, so one hung MCP endpoint held daimon). It also records what is left:
+- a child that leaves its agent's process group is out of reach;
+- one local client can take all 128 connection slots, each for up to 30 s.
+
+### Tests
+
+- `tests/ipc.tcyr` (146):
+  - the channel tests drive the loop's channel pass (`ipc_poll_once`), with no thread and no
+    timing races;
+  - the bus: freeing (a freed block is reused), broadcast sharing, the byte cap, unsubscribe, names;
+  - reply codes;
+  - output rings.
+- `tests/agent.tcyr` (173):
+  - the non-blocking stop;
+  - stop / pause / resume reaching an agent's child;
+  - an agent dying with the daimon that started it;
+  - the descriptor limit;
+  - the minimal environment;
+  - captured output.
+- `tests/http.tcyr` (90): the Host allowlist and origin checks, and UTF-8 repair.
+- `tests/edge.tcyr` (53), `tests/federation.tcyr` (82) and `tests/screen.tcyr` (33): the id counters
+  and capabilities.
+- `tests/smoke.sh` (130):
+  - messages end to end;
+  - detached calls: `/v1/health` during 2 s calls on the three paths, their answers, every child
+    reaped (mutation-checked: run inline, the three health checks fail at 1.70 s);
+  - a slow client and a 5 s stop not holding the server;
+  - Host and Origin;
+  - edge capabilities;
+  - captured output.
+- A fixture agent's own children write to `/dev/null`. One left running by a regression held the
+  suite's output pipe for 300 s instead of failing it.
+
 ## [2.3.3] - 2026-09-22
 
 **Agents can talk to daimon.** Every agent daimon starts now has a channel: one end of a socketpair,
