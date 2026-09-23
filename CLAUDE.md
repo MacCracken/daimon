@@ -6,10 +6,10 @@
 
 - **Type**: Service binary + library
 - **Language**: Cyrius (ported from 9,724 LOC Rust)
-- **Purpose**: AGNOS agent orchestrator — HTTP API, supervisor, IPC, scheduler, federation, edge fleet, memory, MCP dispatch (port 8090)
+- **Purpose**: AGNOS agent orchestrator — HTTP API, supervisor, IPC, scheduler, federation, edge fleet, memory, MCP dispatch (binds `127.0.0.1:8090` by default)
 - **License**: GPL-3.0-only
-- **Cyrius**: 6.6.4 (pinned in `cyrius.cyml`)
-- **Version**: CalVer (see VERSION file)
+- **Cyrius**: 6.6.6 (pinned in `cyrius.cyml`, which is authoritative for every pin below)
+- **Version**: `MAJOR.MINOR.PATCH` in the `VERSION` file (not CalVer). `./scripts/version-bump.sh <v>` writes `VERSION` and `src/config.cyr`'s `DAIMON_VERSION` together; `tests/version_sync.tcyr` fails if they drift
 - **Genesis repo**: [agnosticos](https://github.com/MacCracken/agnosticos)
 - **Philosophy**: [AGNOS Philosophy & Intention](https://github.com/MacCracken/agnosticos/blob/main/docs/philosophy.md)
 - **Standards**: [First-Party Standards](https://github.com/MacCracken/agnosticos/blob/main/docs/development/applications/first-party-standards.md)
@@ -26,10 +26,10 @@ The following stdlib modules are available via `cyrius.cyml` deps. **Async IS av
 | `async` | **Cooperative async runtime — epoll event loop, spawn, sleep, await_readable, timeout** |
 | `thread` | Clone-based threads, mutex, MPSC channels |
 | `net` | TCP sockets (connect, listen, accept, read, write) |
-| `sandhi` | **In use as of 1.1.4** (the cyrius 6.6.4 toolchain bundles `sandhi 1.9.17`) — drives both sync (`sandhi_server_run`) and async (`sandhi_server_recv_request` + smuggling checks inline) HTTP paths. `http_*` shims in `src/main.cyr` are sandhi-backed. Daimon does NOT use sandhi's HTTP/2 / SSE / RPC modules at runtime — but their compile-time deps (`tls`, `mmap`, `dynlib`, `fdlopen`) ARE in `[deps].stdlib`, and `sigil` is an explicit `[deps.sigil]` git pin (see the `sigil` row below), because sandhi's bundle unconditionally references `TLS_EARLY_DATA_ACCEPTED` (0-RTT client-write path) and, since 6.3.43, `sha384_init_into` (defined in `sigil`, called by `tls_native_lowlevel`). DCE NOPs the unused runtime; `sandhi_rpc_mcp_call` is the 1.2.1 hook for unstubbing external MCP forwarding (see `api_mcp_call`). |
+| `sandhi` | **In use as of 1.1.4** (`lib/sandhi.cyr` is sandhi 1.9.17) — drives both serve modes in `src/server.cyr`: sync `sandhi_server_run_opts`, async `sandhi_server_run_async`, each bound to `server_bind_addr()` (config `listen_addr`, 127.0.0.1 unless `serve --listen`). The `http_*` shims in `src/http.cyr` are sandhi-backed. Daimon does NOT use sandhi's HTTP/2 / SSE / RPC modules at runtime — but their compile-time deps (`tls`, `mmap`, `dynlib`, `fdlopen`) ARE in `[deps].stdlib`, and `sigil` is an explicit `[deps.sigil]` git pin (see the `sigil` row below), because sandhi's bundle unconditionally references `TLS_EARLY_DATA_ACCEPTED` (0-RTT client-write path) and, since 6.3.43, `sha384_init_into` (defined in `sigil`, called by `tls_native_lowlevel`). DCE NOPs the unused runtime; `sandhi_rpc_mcp_call` is the 1.2.1 hook for unstubbing external MCP forwarding (see `api_mcp_call`). |
 | `tls`, `mmap`, `dynlib`, `fdlopen` | Pulled in transitively by sandhi's bundle. Daimon does not call any of these directly today — present for compile-time symbol resolution only. (`tls_native` is split into per-concern peers — `tls_native_conn/ctx/hs12/hs13/keysched/lowlevel` — all resolved transitively.) |
 | `sigil` (3.12.18) | Crypto (sha256/sha384/hmac/ed25519/ML-DSA…). Provides the `sha384_init_into` that `tls_native_lowlevel` calls (0-RTT / handshake path) plus the symbols libro/bote consume. **Moved from `[deps].stdlib` to an explicit `[deps.sigil]` git pin at 1.4.2**: sigil 3.12.x ships a *modular* dist (`dist/sigil-mldsa.cyr`, `dist/sigil-sha.cyr`, …) which libro 2.8.x's `.deps` sidecar pulls, and that collided with the monolithic `dist/sigil.cyr` the stdlib snapshot vendored — 227 `duplicate fn (last definition wins)` warnings between two packagings of the *same* release. The explicit top-level pin at `modules=["dist/sigil.cyr"]` (self-contained umbrella) overrides the transitive modular selection so exactly one packaging is vendored. Mirrors bote/libro/majra, which all pin sigil explicitly. |
-| `bayan` | JSON parse/emit (+ base64, csv, u128). The `json` stdlib module folded into the `bayan` distribution bundle in the 6.1.x line as of the 6.1.39 pin; `json_parse` / `json_get` / `json_get_int` ship as compat shims from `bayan.cyr`. Daimon's own `json_escape_str` lives in `src/main.cyr`. |
+| `bayan` (1.5.6) | JSON parse/emit (+ base64, csv, u128). Also an explicit `[deps.bayan]` pin at `modules=["dist/bayan.cyr"]`, for the same one-packaging reason as `sigil` (see the `cyrius.cyml` comment). **daimon reads request bodies ONLY with `http_body_json` + `http_json_str` / `_int` / `_has` / `_text` (`src/http.cyr`)**, which use bayan's TYPED parser (`bayan_json_v_parse`). Never the flat `json_parse` / `json_get`. Its own contract says values keep their JSON escapes undecoded, and its scan misreads nested objects, which is why daimon's `jget` was removed at 2.3.2 (CHANGELOG 2.3.2, audit VULN-017). `json_escape_str` (output escaping, every control byte) lives in `src/error.cyr`. |
 | `hashmap` | Hash map. `map_new()` = cstr keys; `map_new_str()` = `Str` struct keys; `map_u64_new()` = u64 inline keys (5.5.20). Pick at construction. |
 | `process` | Fork, exec, waitpid |
 | `fs` | File operations |
@@ -40,10 +40,11 @@ External (non-stdlib) deps used by daimon:
 | Dep | Purpose |
 |--------|--------|
 | `sakshi` (2.5.2) | Structured logging/tracing — git-pinned via `[deps.sakshi]` in `cyrius.cyml`; resolved into `lib/sakshi.cyr` (gitignored) by `cyrius deps`. The 2.4.x line carries the daimon-class slot-array fix (`ts[2]` timespec → `i64[N]`; requires pin ≥ 6.2.1), arch-portable syscalls (x86_64 + aarch64), opt-in `sakshi_clock_recalibrate()`, and the agnos x86-TSC-calibration guard. **2.4.4** adds 128-bit trace-id support (`sakshi_trace_set_128`/`_hi`/`_lo`) that daimon's tracing (`src/trace.cyr`) adopts for full W3C `traceparent` round-trip. The `msg_len`-required call surface is unchanged since 2.0.0. |
-| `bote` (3.3.9) | MCP core service. **As of 1.3.0** daimon hosts bote's five `libro_*` audit tools as builtin MCP tools (`src/mcp_builtin.cyr` → `libro_tools_init` + the `libro_tool_query/verify/export/proof/retention` handlers). Vendored as the `dist/bote.cyr` bundle. daimon calls the libro handlers directly rather than bote's `dispatcher_dispatch`, keeping its own MCP registry + response shape. |
-| `libro` (2.10.1) | Hash-linked audit chain (chain / merkle / query / retention / proof) backing bote's libro tools. daimon owns one `chain_new()` chain in `src/audit.cyr` (genesis-seeded at `daimon_audit_init`); the `daimon_audit` / `daimon_audit_agent` helpers append daimon's own lifecycle + security events (agent spawn/stop, IPC auth-deny, rate-limit, MCP SSRF-reject, external MCP call) to it, and the libro_* MCP tools read the same chain. Vendored `dist/libro.cyr`; pulls the `ct` / `keccak` / `random` / `slice` / `thread_local` / `sync` stdlib modules. |
-| `majra` (2.7.2) | Event-sink dep of bote's bundle (`events_majra.cyr`). Present for compile-time resolution of the full bote bundle; daimon does not use it at runtime today. **Owns `ERR_IPC = 4`** — historically daimon renamed its own IPC error `ERR_IPC_FAULT` (1.3.0) to dodge this collision; at 1.4.2 every daimon error constant was namespaced `DAIMON_ERR_*` (now `DAIMON_ERR_IPC_FAULT`), so no daimon constant can collide with a vendored `ERR_*` and the rename satisfies cyrlint's `lint_error_enum_namespace` rule (6.4.51). |
-| `samay` (1.1.2) | Task scheduler — the extraction of daimon's own `scheduler.cyr`/`cron.cyr`, which daimon 2.0.0 replaced with this library. `[deps.samay]` carries both a `path = "../samay"` (local dev checkout) and a `tag` (the release pin). |
+| `bote` (3.3.13) | MCP core service. daimon hosts **13 builtin MCP tools** (`src/mcp_builtin.cyr`): bote's five `libro_*` audit tools (1.3.0), bote's `web_fetch` / `web_search` (1.4.0) and nein's six firewall tools (2.1.8). Vendored as the `dist/bote.cyr` bundle. daimon calls the handlers directly rather than bote's `dispatcher_dispatch`, keeping its own MCP registry and response shape. An external registration can never take a builtin's name (2.2.3). |
+| `libro` (2.10.3) | Hash-linked audit chain (chain / merkle / query / retention / proof) backing bote's libro tools. daimon owns one `chain_new()` chain in `src/audit.cyr` (genesis-seeded at `daimon_audit_init`); the `daimon_audit` / `daimon_audit_agent` helpers append daimon's own lifecycle + security events (agent spawn/stop, IPC auth-deny, rate-limit, MCP SSRF-reject, external MCP call) to it, and the libro_* MCP tools read the same chain. Vendored `dist/libro.cyr`; pulls the `ct` / `keccak` / `random` / `slice` / `thread_local` / `sync` stdlib modules. |
+| `majra` (2.9.1) | Event-sink dep of bote's bundle (`events_majra.cyr`). Present for compile-time resolution of the full bote bundle; daimon does not use it at runtime today. **Owns `ERR_IPC = 4`** — historically daimon renamed its own IPC error `ERR_IPC_FAULT` (1.3.0) to dodge this collision; at 1.4.2 every daimon error constant was namespaced `DAIMON_ERR_*` (now `DAIMON_ERR_IPC_FAULT`), so no daimon constant can collide with a vendored `ERR_*` and the rename satisfies cyrlint's `lint_error_enum_namespace` rule (6.4.51). |
+| `samay` (1.1.3) | Task scheduler — the extraction of daimon's own `scheduler.cyr`/`cron.cyr`, which daimon 2.0.0 replaced with this library. `[deps.samay]` carries both a `path = "../samay"` (local dev checkout) and a `tag` (the release pin). samay has no scheduler-level "start": daimon's task start / complete live in `src/sched.cyr` (2.3.1). ⚠ `task_scheduler_complete_task` answers `Err(1)` both for an unknown id and for a refused transition, so look the task up first. |
+| `nein` (1.7.0) | Firewall MCP tools (2.1.8, `dist/nein-mcp.cyr`). It is declared after `bote` and `sigil` in `cyrius.cyml` because its bundle leaves their symbols for the host to supply. The mutating half (`nein_allow` / `nein_deny`) is **gated shut** until caller authentication (roadmap 2.5.x). |
 | `ai-hwaccel` (2.3.23) | samay's hardware-acceleration dependency (samay's own `[deps.ai-hwaccel]`), declared here since 2.0.0 so the full `dist/samay.cyr` bundle resolves at compile time. daimon calls nothing in it directly. Same `path` + `tag` shape as samay. |
 
 **ADR-002 is invalid** — `lib/async.cyr` provides epoll-based cooperative async:
@@ -64,7 +65,7 @@ Every AGNOS agent, every consumer app, hoosh, agnoshi, aethersafha.
 
 0. Read roadmap, CHANGELOG, and open issues — know what was intended before auditing what was built
 1. Test + benchmark sweep of existing code
-2. Cleanliness check: `cyrius check` (fmt + lint + test + build)
+2. Cleanliness check — the gate under **Commands** below (vet, fmt, lint, three builds, `sh tests/test.sh`). ⚠ `cyrius check` is only a syntax check (`cyrius help`), not this gate
 3. Get baseline benchmarks (`./scripts/bench-history.sh`)
 4. Internal deep review — gaps, optimizations, security, logging/errors, docs
 5. External security research — search for CVEs, 0-days, and vulnerability patterns relevant to daimon's attack surface (HTTP servers, Unix sockets, process supervisors, JSON parsers, file-based stores, bump allocators). Cross-reference against our code.
@@ -79,7 +80,7 @@ Every AGNOS agent, every consumer app, hoosh, agnoshi, aethersafha.
 ### Work Loop / Working Loop (continuous)
 
 1. Work phase — new features, roadmap items, bug fixes
-2. Cleanliness check: `cyrius check`
+2. Cleanliness check (the gate under **Commands**)
 3. Test + benchmark additions for new code
 4. Run benchmarks (`./scripts/bench-history.sh`)
 5. Internal review — performance, memory, security, throughput, correctness
@@ -116,7 +117,59 @@ Every AGNOS agent, every consumer app, hoosh, agnoshi, aethersafha.
 - Zero-crash in library code — no unguarded aborts
 - Use accessor functions for struct fields
 - **Fixed local arrays: use element-typed `var a: i64[N]` for slot arrays** (and `u8[N]` / `i32[N]` / `u32[N]` for sized byte/scalar buffers). Since cyrius 6.2.1, bare `var a[N]` is **N bytes in a function** (N i64 slots only at top level) — an address-taken `var a[N]` written via `store64(&a + i*8)` under-reserves and silently corrupts adjacent memory. This caused the 1.2.6 routing-404 bug; swept in 1.2.7. Before re-testing any "fixed" compiler footgun, **read the cyrius language CHANGELOG** — fixes there are often language changes, not silent codegen patches.
-- Original Rust implementations available in git history (pre-v0.7.0 tags)
+- Original Rust implementations are in git history at tags `0.5.0` / `0.6.0` (e.g. `git show 0.6.0:src/agent.rs`). The Cyrius port starts at `0.7.0`.
+
+## Commands (verified at 2.3.2)
+
+```sh
+export CYRIUS_NO_WARN_SHADOW_LIB=1 CYRIUS_DCE=1   # what CI sets
+cyrius build src/main.cyr build/daimon           # also: --agnos build/daimon-agnos, --aarch64 build/daimon-aarch64
+cyrius test tests/<suite>.tcyr                   # one suite (17 suites, each includes its real src/ module)
+sh tests/test.sh                                 # every suite + tests/smoke.sh (the linked binary over HTTP) + cyrius fuzz
+cyrius vet src/main.cyr
+cyrius fmt <file> --check                        # CI runs this on src/*.cyr tests/*.tcyr tests/*.bcyr fuzz/*
+cyrius lint <file>                               # CI fails on any `warn`
+./scripts/bench-history.sh                       # tests/daimon.bcyr; `cyrius bench tests/rag_ingest.bcyr` for the other two
+./scripts/version-bump.sh <version>              # VERSION + src/config.cyr, only when the user names the version
+```
+
+`cyrius fmt <file>` without `--check` rewrites the file in place. `cyrius check` is only a syntax check.
+The QEMU AGNOS boot harness belongs to the agnos repo; its `agnsh-smoke` gate looks for agnsh's own
+banner, so it reports FAIL for any other binary.
+
+## Conventions that bite (read before writing code)
+
+- **Read the contract before you use a stdlib function** (`lib/*.cyr` header comments; the cyrius
+  docs and CHANGELOG). Cyrius is not C or Rust. When daimon breaks, assume daimon's usage first, not
+  the stdlib or compiler. A grep miss proves nothing: read the source.
+- **`Str` is a fat pointer `{data, len}`.** Its data is NUL-terminated only when the maker made it
+  so: `str_builder_build`, `str_clone`, `str_from_buf`, `str_cstr`, `str_from_int`. `str_cat` does
+  not. A string literal passed to a `: Str` parameter is converted; a `str_data(...)` expression is
+  not. At every C-string boundary (paths, syscalls, `map_new()` cstr keys, argv, audit details) use
+  `str_cstr` or `path_join`. 2.2.3's CI failure was `str_data(str_cat(...))` handed to `is_dir`.
+- **Request bodies**: `http_body_json` + `http_json_*` only (see the `bayan` row). They are already
+  decoded, owned copies.
+- **Retention**: anything a struct keeps from a request must be owned (`str_clone`). sandhi reuses the
+  request buffer, and this caused the 1.2.5 / 2.1.6 / 2.2.1 leaks.
+- **Agent processes**: only through `agent_spawn_with_limits` (`src/agent.cyr`), which:
+  - closes inherited descriptors (`lib/net.cyr` sockets are not close-on-exec);
+  - gives the child stdin from `/dev/null`;
+  - resets SIGPIPE;
+  - applies checked rlimits;
+  - reports exec failure synchronously.
+
+  The executable comes from the agent's TYPE (`agnos-agent-<type>-agent` in `/usr/lib/agnos/agents`,
+  `/opt/agnos/agents` or `serve --agents-dir`), **never from a request**.
+- **The HTTP API has no authentication** until roadmap 2.5.x:
+  - it binds 127.0.0.1 (`serve --listen` widens it);
+  - state changes are POST / DELETE only (`route_method`);
+  - agent and task control answer 403 to any request carrying `Origin` (`_route_refuse_browser`).
+
+  Keep all three for new routes.
+- **AGNOS is the primary target.** Arch- and kernel-specific calls go through the shims in
+  `src/syscalls.cyr` (`daimon_reap_code`, `daimon_signal`, …). Their agnos arms refuse process
+  operations until 2.4.x. For agnos syscalls read `agnos/kernel/core/syscall.cyr`, not the cyrius
+  peer `lib/syscalls_x86_64_agnos.cyr`, which mirrors an older kernel.
 
 ## DO NOT
 
@@ -126,11 +179,17 @@ Every AGNOS agent, every consumer app, hoosh, agnoshi, aethersafha.
   seems to warrant a version bump, *ask first*. (Work-loop step 12 below means
   keep VERSION/cyrius.cyml/recipe *consistent with each other*, NOT "bump VERSION
   yourself.")
+  **When the user NAMES the version for the work** ("do 2.3.0 next", "cut it as
+  2.2.3"), **that IS the permission**. Run `./scripts/version-bump.sh <version>`
+  at once and do the release's work; do not ask again.
 - **Do not commit or push** — the user handles all git operations
 - **NEVER use `gh` CLI** — use `curl` to GitHub API only
 - Do not add unnecessary dependencies
 - Do not break backward compatibility without a major version bump
 - Do not skip benchmarks before claiming performance improvements
+- Do not blame the Cyrius stdlib, compiler or kernel for a defect in daimon's usage. Read the
+  contract first; report what failed, with its output, not a guessed cause
+- Do not raise, or work on, other projects (agnos, agnoshi, cyrius, …) unless they block daimon work
 
 ## Documentation Structure
 
@@ -143,12 +202,16 @@ docs/ (required):
   development/roadmap.md — completed, backlog, future, v1.0 criteria
 
 docs/ (when earned):
-  adr/ — architectural decision records
+  adr/ — architectural decision records (004: agent process control on an unauthenticated API)
+  audit/ — security audit reports (ADR-003; required after security-touching work)
   guides/ — usage guides, integration patterns
   examples/ — worked examples
   standards/ — external spec conformance
   compliance/ — regulatory, audit, security compliance
   sources.md — source citations for algorithms/formulas (required for science/math crates)
+
+docs/doc-health.md — the doc-currency ledger; update its rows when docs change.
+docs/development/roadmap.md — OPEN work only; shipped work goes in CHANGELOG.md.
 ```
 
 ## CHANGELOG Format

@@ -140,11 +140,17 @@ Daimon is the AGNOS agent orchestrator — every consumer (hoosh, agnoshi, aethe
 counts and BENCHMARKS.md called untested modules "Complete". A doc can only be as fresh as the check
 that reads it: the rows below are what was last *recorded*, not a guarantee.
 
-**Stale set:** `CLAUDE.md`'s dependency rows still quote older pins (cyrius 6.6.4, samay 1.1.2,
-bote 3.3.9, libro 2.10.1, majra 2.7.2); `cyrius.cyml` is authoritative. Its `bayan` row also
-presents `json_parse` as how daimon reads JSON, which stopped being true at 2.3.2, and places
-`json_escape_str` in `src/main.cyr`, which is wrong: it is in `src/error.cyr`. Left for the
-maintainer, as CLAUDE.md is the instruction file.
+**Stale set:** none recorded. `CLAUDE.md` was refreshed on 2026-09-22 at the maintainer's request.
+Each change was checked against `cyrius.cyml`, the source or the tool's own help:
+- pins: cyrius 6.6.6, samay 1.1.3, bote 3.3.13, libro 2.10.3, majra 2.9.1, with bayan 1.5.6 and
+  nein 1.7.0 added;
+- the `bayan` row: request bodies are read with `http_body_json` / `http_json_*`, and
+  `json_escape_str` lives in `src/error.cyr`;
+- sandhi's serve entry points, and the `http_*` shims in `src/http.cyr`;
+- "CalVer" became `MAJOR.MINOR.PATCH`;
+- `cyrius check` (a syntax check only) is replaced by the real gate under **Commands**;
+- the Rust tags are `0.5.0` / `0.6.0`;
+- new sections: **Commands**, **Conventions that bite**, the version-naming rule, and two DO NOTs.
 
 ---
 
