@@ -537,11 +537,14 @@ var _IPC_EPOLL_DEL = 2;
 # A connected pair for a new agent's channel, into `fds` (an i32[2]): [0] stays
 # with daimon, [1] becomes the agent's fd 3. Both are close-on-exec, so neither
 # can leak into another agent. 0 on success, negative on failure.
-# agnos: CH_MINT writes the two fds as 8-byte words.
+# agnos: CH_MINT writes the two fds as 8-byte words. Its failure is returned as
+# the kernel gave it: -CH_E_FULL means there is no room (the machine's 16
+# channels are in use, or daimon's 32-slot fd table is full).
 fn ipc_channel_open(fds) {
     #ifdef CYRIUS_TARGET_AGNOS
     var pair: i64[2];
-    if (sys_chan_mint(&pair) != 0) { return 0 - 1; }
+    var mr = sys_chan_mint(&pair);
+    if (mr != 0) { return mr; }
     store32(fds, load64(&pair));
     store32(fds + 4, load64(&pair + 8));
     return 0;
@@ -736,7 +739,7 @@ fn _ipc_service_channel(ch, budget) {
                 if (got > 0) { _ipc_fault(ch, IPC_EV_SHORT); } else { _ipc_close(ch); }
                 return 0;
             }
-            if (got == 0) { store64(ch + 64, clock_now_ms()); }
+            if (got == 0) { store64(ch + 64, daimon_now_ms()); }
             got = got + n;
             store64(ch + 16, got);
             if (got == 4) {
@@ -899,7 +902,7 @@ fn ipc_poll_once(ms) {
         if (load64(ach + 72) == 1) { _ipc_service_channel(ach, IPC_FRAMES_PER_PASS); }
         ai = ai + 1;
     }
-    ipc_tick(clock_now_ms());
+    ipc_tick(daimon_now_ms());
     return vec_len(achans);
     #else
     _ipc_sweep();
@@ -931,7 +934,7 @@ fn ipc_poll_once(ms) {
         if (load64(rec + 32) == 1) { _ipc_output_read(rec); }
         i = i + 1;
     }
-    ipc_tick(clock_now_ms());
+    ipc_tick(daimon_now_ms());
     return n;
     #endif
 }

@@ -40,6 +40,36 @@ those numbers are not comparable.
 
 `tests/rag_ingest.bcyr` (real since 2.1.6): `rag_ingest_real_5k` 133.1µs, `rag_chunk_only_5k` 508ns.
 
+### 2.4.1 — AGNOS follow-ups
+
+**No performance claim for AGNOS.** On agnos, 2.4.1 writes each answer 1 KB at a time with a yield
+between writes, because one send over a connection's 2 KB receive ring to a local process stops the
+machine there. That trades speed for not stopping; measuring it under QEMU would measure QEMU.
+
+**The Linux side is unchanged.** 2.4.0 against 2.4.1, `tests/daimon.bcyr`, ten interleaved runs with
+the order alternating, medians. On Linux, 2.4.1 changed two things: the clock call (`daimon_now_ms`,
+in the loop, the channels and the stops) and one compare in `http_send_response`. Everything they
+reach is within ±2%:
+
+| Benchmark | 2.4.0 | 2.4.1 | change |
+|---|---:|---:|---:|
+| agent_spawn_reap | 1.365 ms | 1.367 ms | +0.2% |
+| ipc_frame_roundtrip | 12.80 µs | 12.62 µs | −1.4% |
+| ipc_poll_100_idle | 10.17 µs | 10.11 µs | −0.6% |
+| bus_broadcast_take_100 | 15.25 µs | 15.00 µs | −1.7% |
+| http_body_read3 | 1.411 µs | 1.395 µs | −1.1% |
+
+Four benchmarks in code 2.4.1 did not touch moved 3–7%:
+- `cosine_128d` +5.4%;
+- `mcp_register_100_tools` +6.7%;
+- `edge_stats_500` +4.2%;
+- `mcp_find_tool_in_100` +3.0%.
+
+Their own run-to-run spread in the same set was 12–22% (max − min, over the median). Another session
+was using the machine, so this is noise, not a change. The absolute numbers are higher than in
+2.4.0's section for the same reason; only the within-set comparison counts. The binary grew 4.2 KB
+(ai-hwaccel 2.3.27).
+
 ### 2.4.0 — daimon on AGNOS
 
 **No performance claim for AGNOS yet.** 2.4.0 makes daimon's agent lifecycle, channels and loop
@@ -376,7 +406,7 @@ Scheduler scheduling (1.5x), supervisor registration (2.5x), MCP registration (1
 | | Rust | Cyrius |
 |---|---|---|
 | Unit tests | 305 | — (inline in test groups) |
-| Integration tests | 28 | 1038 assertions / 17 suites, each against its real `src/` module (2.4.0); AGNOS guest test 64 checks (tests/agnos/run.sh, by hand) |
+| Integration tests | 28 | 1050 assertions / 17 suites, each against its real `src/` module (2.4.1); AGNOS guest test 92 checks (tests/agnos/run.sh --release, in CI) |
 | Benchmarks | 19 | 29, against the real code (2.3.4) |
 | Fuzz harnesses | 0 | 7, property-based, run in CI (2.3.2) |
 | HTTP smoke | — | tests/smoke.sh, 131 checks, run in CI (2.4.0) |

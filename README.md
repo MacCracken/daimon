@@ -19,7 +19,7 @@ cyrius build src/main.cyr build/daimon # build
 ## Testing
 
 ```bash
-cyrius tests                        # every suite in tests/ — 1038 assertions, 17 files
+cyrius tests                        # every suite in tests/ — 1050 assertions, 17 files
 cyrius fuzz                         # 7 property-based harnesses, 176,349 generated cases
 cyrius bench tests/daimon.bcyr      # 27 benchmarks (+2 in tests/rag_ingest.bcyr)
 sh tests/smoke.sh                   # the linked binary over HTTP: libro, tracing, regressions,
@@ -28,11 +28,13 @@ sh tests/smoke.sh                   # the linked binary over HTTP: libro, tracin
                                     # the event loop, hosts and origins, captured output,
                                     # detached MCP calls
 sh tests/test.sh                    # all of the above except the benchmarks
-sh tests/agnos/run.sh               # on AGNOS: boots a built agnos kernel under QEMU and runs
-                                    # daimon's agent lifecycle, channels and API there (64 checks)
+sh tests/agnos/run.sh --release     # on AGNOS: boots the released agnos kernel under QEMU and runs
+                                    # daimon's agent lifecycle, channels and API there (92 checks;
+                                    # CI runs it on every push). Without --release: ../agnos's build
 ```
 
-**On AGNOS** (2.4.0) daimon starts, stops and hears its agents with the kernel's own primitives.
+**On AGNOS** (2.4.0) daimon starts, stops and hears its agents with the kernel's own primitives, and
+(2.4.1) runs its calls to other servers in a child as on Linux.
 What agnos does not do yet, such as resource limits, ending a process, and a loopback-only listener,
 is filed with agnos. What daimon does meanwhile is in
 [ADR-007](docs/adr/007-daimon-on-agnos.md) and the

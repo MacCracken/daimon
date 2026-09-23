@@ -69,7 +69,8 @@ VULN-013's class. Channel fds are safe, because an inherited channel is inert by
 **daimon**:
 - `serve --agent-output capture` is refused on agnos. Capture would put every agent's output pipe in
   every later agent, which could then read or forge another agent's output.
-- Without capture, the kernel fds daimon holds at a spawn are its console (0–2) and its channel ends.
+- Without capture, the kernel fds daimon holds at a spawn are its console (0–2), its channel ends and,
+  since 2.4.1, the read end of the pipe of each detached call under way (AG-13).
   Its listener and connections are the cyrius peer's user-space handles, not kernel descriptors, and
   every file it opens is opened and closed within one call (`src/` checked: no file descriptor is kept
   across calls).
@@ -112,6 +113,72 @@ answering.
 **daimon**: an agent whose name has a space, or whose command line is over 127 bytes, is refused (422)
 rather than started with a split name.
 
+### AG-11: A failed `spawn_path` gives no reason (LOW, observability) — agnos filing (2.4.1)
+
+`#43` answers -1 for every failure, from a missing executable to a full process table. `proclist`#99
+cannot tell them apart either: agnos has no zombie state, so an exited, unreaped process holds its
+slot without being listed.
+**Filed**: `2026-09-23-spawn-path-failure-gives-no-reason.md`.
+**daimon**: a failed spawn answers 500, "its process table is full, or it cannot load the
+executable", and is audited `agent.spawn.fail`. A full *channel* table is distinct (`-CH_E_FULL`):
+daimon answers it with 503 and leaves the agent as it was. Measured: 12 agents run at once in the
+guest, where 4 of the 16 process slots are already taken.
+
+### AG-12: A refused TSC calibration stopped daimon's clock (MEDIUM, availability) — fixed in daimon; agnos and cyrius filings (2.4.1)
+
+cyrius's `clock_now_ms` on agnos reads `uptime_us`#95. The kernel calibrates that once at boot, and
+refuses a result outside 100–10000 cycles per µs. After a refusal, #95 answers -1 for the whole boot
+and `clock_now_ms` returns 0 forever. Through 2.4.0 every deadline in daimon read `clock_now_ms`, so
+none would ever pass:
+- a connection's read deadline, so a silent client would hold its slot, and 5 of them the whole
+  server;
+- deferred answers;
+- a stop's SIGKILL escalation;
+- `daimon_yield_ms`, which would spin forever.
+
+Measured: a guest booted with QEMU held to 25% of a CPU logged `tsc: calibration REFUSED`, and hung
+in its first 10 ms wait.
+**Filed**: agnos `2026-09-23-tsc-calibration-refused-stops-the-us-clock.md`; cyrius
+`2026-09-23-daimon-agnos-clock-stands-still-when-tsc-calibration-refused.md`.
+**daimon**: `daimon_now_ms` (`src/syscalls.cyr`) reads #95, and after a -1 reads `uptime_ms`#40, the
+100 Hz tick. Every deadline in daimon goes through it. Measured: with the calibration refused, the
+guest test passes. The vendored libraries' own reads of `clock_now_ms` are not covered, but daimon's
+loop on agnos does not run sandhi's.
+
+### AG-13: A call that waited on another server ran on the loop (MEDIUM, availability) — fixed in daimon (2.4.1)
+
+On Linux, an MCP forward and the builtins that wait on another server (`web_fetch`, `web_search`)
+run in a child process (`server_detach`, 2.3.4), and the loop keeps serving. Through 2.4.0 they ran
+in place on agnos, because `server_detach` had no agnos arm. 2.4.0 put that down to agnos having no
+fork. It has one: `fork`#96, since 1.56.54. So a slow upstream held every other client, every agent
+channel and every stop. The peer bounds each receive at 30 s by the RTC, so that could be up to 30 s
+for each receive that got nothing. External MCP registration is unauthenticated (2.5.x), so any local
+client could point daimon at such an upstream.
+**Fixed** (2.4.1): `server_detach` forks on agnos too. Measured in the guest: with a forwarded call
+waiting on its server, `GET /v1/health` is answered in 2 ms, and a 9 KB answer comes back whole
+through the child's pipe. Residuals, each on an agnos filing:
+- a child past the deadline cannot be killed (AG-4). The client gets its 504, and the child runs until
+  its upstream gives up. At most 4 children are alive at once, and one more call answers 503;
+- an agent started while a detached call is under way inherits that call's pipe (AG-5), and could
+  read its answer. Today that adds nothing to AG-1, under which any process can already read daimon's
+  connections;
+- a child's connect to a host that does not answer holds the CPU for up to ~8 s (AG-14).
+
+### AG-14: A send over 2 KB to a local process stops the machine (HIGH, availability) — agnos filing; daimon mitigates (2.4.1)
+
+A TCP connection's receive ring on agnos is 2048 bytes. `sock_send`#48 holds the CPU while it waits
+for each chunk's ACK, and sends 1-byte probes into a zero window, each waiting up to ~8 s. The
+receiver, a process on the same machine, cannot run to drain its ring. So a single write over
+~2 KB to it never finishes, and nothing else runs meanwhile. `sock_connect`#47 holds the CPU the same
+way for up to ~8 s.
+Measured: a `GET /v1/agents` with a 2389-byte body stopped the guest (150 s, no progress), and so did
+a 9 KB answer sent to daimon's detached child.
+**Filed**: `2026-09-23-sock-send-and-connect-hold-the-cpu.md`.
+**daimon**: on agnos it writes every answer, and every relayed one, in pieces of at most 1 KB, with a
+yield between them (`daimon_write_all`). A client that reads keeps up: the same `GET` now arrives
+whole. A local client that stops reading can still stop the machine from inside daimon's `#48`, and
+only agnos can fix that.
+
 ---
 
 ## What 2.4.0 fixed in daimon itself
@@ -125,9 +192,21 @@ rather than started with a split name.
   (NACK_INVALID, channel closed, audited `ipc.frame.oversize`). A longer one would lose its first
   records in the kernel's drop-oldest inbox before daimon read them.
 
+## What 2.4.1 fixed in daimon itself
+
+- **daimon's clock on agnos** (AG-12).
+- **CI never verified the committed `cyrius.lock`.** `cyrius deps` rewrote it just before
+  `cyrius deps --verify` ran, so the verify step checked a lock written a moment before. CI now
+  resolves with `--no-lock`, so the committed lock is what gets verified. The committed lock also
+  carried 36 entries that a clean resolution does not vendor: leftovers from a local `lib/`,
+  identical to the 6.6.6 stdlib's own files and included by nothing. They are gone.
+
 ## Verification
 
-- The guest test passes 44 + 20 checks on agnos 1.57.5 under QEMU (57 s).
+- 2.4.1: the guest test runs in CI on the released agnos 1.57.5 and gnoboot 0.7.2, pinned by SHA-256
+  (`tests/agnos/run.sh --release`), with 85 checks. Measured locally, it passes unrestricted, with
+  QEMU held to 50% of a CPU, and at 25%, where the kernel refused its TSC calibration.
+- The guest test passes 44 + 20 checks on agnos 1.57.5 under QEMU (57 s; 2.4.0).
 - The Linux suites, smoke (131) and fuzz are unchanged and green.
 - The agnos-specific refusals (pause 501, the 422, capture at startup) and the audits
   (`agent.limits.unenforced`, `http.listen.not_loopback`) are in the code paths the guest test runs.

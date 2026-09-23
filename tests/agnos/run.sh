@@ -9,22 +9,54 @@
 #                guest's own address (the kernel's loopback path).
 #
 #   sh tests/agnos/run.sh            # exit 0 = every assertion passed
+#   sh tests/agnos/run.sh --release  # on the released binaries pinned below (CI)
 #
-# Needs a built agnos kernel and gnoboot (they are read, never written):
+# Needs an agnos kernel and gnoboot (they are read, never written):
 #   AGNOS_KERNEL  default ../agnos/build/agnos
 #   GNOBOOT_EFI   default ../gnoboot/build/BOOTX64.EFI
-# and qemu-system-x86_64, OVMF, parted, sgdisk, mtools and mkfs.ext2 (the same
+# or, with --release, the published releases below, downloaded into
+# build/agnos-release/ and refused unless they match the SHA-256 recorded here.
+# Also qemu-system-x86_64, OVMF, parted, sgdisk, mtools and mkfs.ext2 (the same
 # tools as agnos's scripts/smoke/agnsh-smoke.sh, whose image layout this
-# follows). Not run in CI, which has no agnos kernel.
+# follows). CI runs it with --release on every push (2.4.1).
 set -u
 cd "$(dirname "$0")/../.."
 ROOT=$(pwd)
+# The releases --release boots (2.4.1). Each is byte-identical to the build 2.4.0
+# was first measured on. Move a pin by changing the version and its SHA-256 together,
+# from the release's own SHA256SUMS.
+AGNOS_RELEASE=1.57.5
+AGNOS_RELEASE_SHA256=5b73d81c2e872f72396840f9d25036e7245f50f231b1cf4873fd27432ad079be
+GNOBOOT_RELEASE=0.7.2
+GNOBOOT_RELEASE_SHA256=7420e59dcd26da498babc8ad0ff24d37b3bea8d832f670be3225ea5162c6d7e3
 KERNEL=${AGNOS_KERNEL:-$ROOT/../agnos/build/agnos}
 GNOBOOT=${GNOBOOT_EFI:-$ROOT/../gnoboot/build/BOOTX64.EFI}
 WORK=$ROOT/build/agnos-guest
 TIMEOUT=${GUEST_TIMEOUT:-240}
-[ -f "$KERNEL" ] || { echo "agnos-guest: no agnos kernel at $KERNEL (set AGNOS_KERNEL)"; exit 2; }
-[ -f "$GNOBOOT" ] || { echo "agnos-guest: no gnoboot at $GNOBOOT (set GNOBOOT_EFI)"; exit 2; }
+
+# fetch URL FILE SHA256: download FILE unless it is already there with that hash.
+fetch() {
+    if [ -f "$2" ] && echo "$3  $2" | sha256sum -c --status 2>/dev/null; then return 0; fi
+    curl -fsSL --retry 5 --retry-all-errors -o "$2.part" "$1" \
+        || { echo "agnos-guest: download of $1 failed"; rm -f "$2.part"; return 1; }
+    if ! echo "$3  $2.part" | sha256sum -c --status; then
+        echo "agnos-guest: $1 does not match its pinned SHA-256"; rm -f "$2.part"; return 1
+    fi
+    mv "$2.part" "$2"
+}
+if [ "${1:-}" = "--release" ]; then
+    REL=$ROOT/build/agnos-release
+    mkdir -p "$REL"
+    KERNEL=$REL/agnos-$AGNOS_RELEASE
+    GNOBOOT=$REL/gnoboot-$GNOBOOT_RELEASE.efi
+    fetch "https://github.com/MacCracken/agnos/releases/download/$AGNOS_RELEASE/agnos-x86_64" \
+        "$KERNEL" "$AGNOS_RELEASE_SHA256" || exit 2
+    fetch "https://github.com/MacCracken/gnoboot/releases/download/$GNOBOOT_RELEASE/BOOTX64.EFI" \
+        "$GNOBOOT" "$GNOBOOT_RELEASE_SHA256" || exit 2
+    echo "agnos-guest: agnos $AGNOS_RELEASE and gnoboot $GNOBOOT_RELEASE (released, SHA-256 checked)"
+fi
+[ -f "$KERNEL" ] || { echo "agnos-guest: no agnos kernel at $KERNEL (set AGNOS_KERNEL, or use --release)"; exit 2; }
+[ -f "$GNOBOOT" ] || { echo "agnos-guest: no gnoboot at $GNOBOOT (set GNOBOOT_EFI, or use --release)"; exit 2; }
 for tool in qemu-system-x86_64 parted sgdisk mformat mmd mcopy mkfs.ext2 strings; do
     command -v "$tool" >/dev/null 2>&1 || { echo "agnos-guest: missing tool $tool"; exit 2; }
 done
@@ -84,7 +116,7 @@ done
 i=0; while [ $i -lt "$TIMEOUT" ]; do strings "$LOG" | grep -q "LAUNCHER DONE" && break; i=$((i + 1)); sleep 1; done
 kill $QP 2>/dev/null; wait $QP 2>/dev/null
 
-strings "$LOG" | grep -E "AGNOS kernel v|^GUEST|^AGENT|^CLIENT|^LAUNCHER|daimon v|FAIL|passed, |response:" | sed 's/^/  /'
+strings "$LOG" | grep -E "AGNOS kernel v|tsc: |^GUEST|^AGENT|^CLIENT|^LAUNCHER|daimon v|FAIL|passed, |response:" | sed 's/^/  /'
 rc=0
 if ! strings "$LOG" | grep -q "LAUNCHER DONE"; then echo "agnos-guest: FAIL: the run did not finish within ${TIMEOUT}s"; rc=1; fi
 if ! strings "$LOG" | grep -q "GUEST DONE 0"; then echo "agnos-guest: FAIL: the agent test"; rc=1; fi

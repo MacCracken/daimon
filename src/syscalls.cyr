@@ -228,6 +228,79 @@ fn daimon_reap_wait(pid) {
     return 0 - 1;
 }
 
+# daimon's monotonic clock, in milliseconds. Every deadline, grace period and
+# tick in daimon reads this, not clock_now_ms (2.4.1).
+#
+# ⛔ agnos. cyrius's clock_now_ms reads uptime_us#95: rdtsc, scaled by a
+# calibration the kernel makes once at boot, over 5 timer ticks. The kernel
+# refuses a result outside 100–10000 cycles per µs, and #95 then answers -1 for
+# the rest of the boot, so clock_now_ms is 0 forever and no wait in daimon ever
+# ends. Measured: a guest booted with QEMU held to 25% of a CPU (its ticks came
+# in bursts) logged "tsc: calibration REFUSED", and hung in its first 10 ms wait.
+# daimon then reads uptime_ms#40 instead, the 100 Hz tick, which advances for a
+# background process like daimon. (Filed with agnos and cyrius, 2026-09-23.)
+var _daimon_clock_src = 0;   # agnos: 0 not yet known, 1 uptime_us#95, 2 uptime_ms#40
+
+fn daimon_now_ms() {
+    #ifdef CYRIUS_TARGET_AGNOS
+    if (_daimon_clock_src != 2) {
+        var us = sys_uptime_us();
+        if (us >= 0) {
+            _daimon_clock_src = 1;
+            return us / 1000;
+        }
+        _daimon_clock_src = 2;
+    }
+    return sys_uptime_ms();
+    #else
+    return clock_now_ms();
+    #endif
+}
+
+# Which clock daimon_now_ms reads: 1 uptime_us#95, 2 uptime_ms#40 (agnos, once
+# read); 0 on other targets, where it is clock_now_ms.
+fn daimon_clock_source() { return _daimon_clock_src; }
+
+# Write all `n` bytes of `buf` to `fd`, waiting (daimon_yield_ms) while a write
+# takes nothing, until `deadline` (daimon_now_ms). 0 when all were written, -1
+# on an error or at the deadline. 2.4.1. On agnos every answer daimon sends goes
+# through here (http_send_response), because of two limits there:
+# - a detached call's pipe is a 4080-byte ring, and a write into a full one
+#   returns 0 until the loop has read from it;
+# - a TCP connection's receive ring is 2048 bytes, and sock_send#48 holds the CPU
+#   while it waits for room. One larger write to a process on the same machine
+#   never finishes, because that process cannot run to drain it. Measured: a
+#   GET /v1/agents with a 2389-byte body stopped the guest (filed with agnos,
+#   2026-09-23).
+# So on agnos it writes at most DAIMON_WRITE_PIECE bytes at a time and yields
+# between writes: a receiver that is reading keeps up. One that is not can
+# still stop the machine; only agnos can fix that.
+var DAIMON_WRITE_PIECE = 1024;
+
+fn daimon_write_all(fd, buf, n, deadline) {
+    var off = 0;
+    while (off < n) {
+        var want = n - off;
+        #ifdef CYRIUS_TARGET_AGNOS
+        if (want > DAIMON_WRITE_PIECE) { want = DAIMON_WRITE_PIECE; }
+        #endif
+        var w = sys_write(fd, buf + off, want);
+        if (w == 0 - 4) { w = 0; }   # EINTR: as if nothing was taken
+        if (w > 0) {
+            off = off + w;
+            #ifdef CYRIUS_TARGET_AGNOS
+            if (off < n) { sys_pause(); }   # the receiver's turn
+            #endif
+        } elif (w == 0) {
+            if (daimon_now_ms() > deadline) { return 0 - 1; }
+            daimon_yield_ms(1);
+        } else {
+            return 0 - 1;
+        }
+    }
+    return 0;
+}
+
 # Poll daimon_reap_code, 1 ms apart, until `ms` milliseconds of MONOTONIC time
 # have passed. Returns what the last poll returned: the exit code, -2 if the
 # child outlived the bound, -1 if there is no such child. 2.3.0: the SIGTERM
@@ -235,10 +308,10 @@ fn daimon_reap_wait(pid) {
 # (Counting sleeps instead of reading the clock ran a 5 s grace to 5.36 s —
 # measured — because each 1 ms sleep costs more than 1 ms.)
 fn daimon_reap_within(pid, ms) {
-    var deadline = clock_now_ms() + ms;
+    var deadline = daimon_now_ms() + ms;
     var r = daimon_reap_code(pid);
     while (r == 0 - 2) {
-        if (clock_now_ms() >= deadline) { return r; }
+        if (daimon_now_ms() >= deadline) { return r; }
         daimon_yield_ms(1);
         r = daimon_reap_code(pid);
     }
@@ -255,8 +328,8 @@ fn daimon_reap_within(pid, ms) {
 fn daimon_yield_ms(ms) {
     if (ms <= 0) { return 0; }
     #ifdef CYRIUS_TARGET_AGNOS
-    var t0 = clock_now_ms();
-    while (clock_now_ms() - t0 < ms) { sys_pause(); }
+    var t0 = daimon_now_ms();
+    while (daimon_now_ms() - t0 < ms) { sys_pause(); }
     return 0;
     #else
     # timespec {i64 tv_sec, i64 tv_nsec}: element-typed `i64[2]` per CLAUDE.md.

@@ -9,7 +9,11 @@
 # What it pins: start (spawn_path#43), reap (waitpid#4), stop (kill#16 SIGTERM
 # to an agent that honours it), the refusals agnos needs (a name with a space,
 # a command line over 127 bytes, pause), and what agnos cannot do yet: end an
-# agent that ignores SIGTERM.
+# agent that ignores SIGTERM. 2.4.1: how many agents the machine holds, that a
+# start past that is refused cleanly, and that every slot and channel comes back.
+#
+# Every wait is for a condition, with a deadline far past what it needs here:
+# CI runs this under emulation on a slower machine (2.4.1).
 # =========================================================================
 
 include "lib/string.cyr"
@@ -46,8 +50,8 @@ fn _g_say(s) {
 # whole sleep, so the agents this test waits for would not run meanwhile;
 # pause#14 yields to a ready process first.
 fn _g_wait(ms) {
-    var t0 = clock_now_ms();
-    while (clock_now_ms() - t0 < ms) {
+    var t0 = daimon_now_ms();
+    while (daimon_now_ms() - t0 < ms) {
         ipc_poll_once(0);   # serve the agents' channels, as daimon's loop does
         sys_pause();
     }
@@ -56,22 +60,140 @@ fn _g_wait(ms) {
 
 # Step a stop until it is over, or `ms` pass. Returns agent_stop_step's last answer.
 fn _g_stop(h, ms) {
-    var t0 = clock_now_ms();
+    var t0 = daimon_now_ms();
     var done = 0;
     while (done == 0) {
-        done = agent_stop_step(h, clock_now_ms());
+        done = agent_stop_step(h, daimon_now_ms());
         if (done == 0) {
-            if (clock_now_ms() - t0 > ms) { return 0; }
+            if (daimon_now_ms() - t0 > ms) { return 0; }
             _g_wait(10);
         }
     }
     return done;
 }
 
+# The live processes in agnos's table (proclist#99). An exited process its
+# parent has not reaped still holds its slot and is not listed: agnos has no
+# zombie state.
+var _g_pl: u8[2048];
+fn _g_live_procs() {
+    return sys_proclist(&_g_pl, 32);
+}
+
+# The live processes' names, from the last _g_live_procs: "name(pid) ...".
+fn _g_proc_names(sb, n) {
+    var i = 0;
+    while (i < n) {
+        var rec = &_g_pl + i * 64;
+        str_builder_add_cstr(sb, " ");
+        str_builder_add_cstr(sb, rec + 24);
+        str_builder_add_cstr(sb, "(");
+        str_builder_add_int(sb, load64(rec));
+        str_builder_add_cstr(sb, ")");
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Start agents with ids from `first` until one is refused or `max` are running.
+# The started ones go into `v`; the refused handle into `refused` (a 1-slot
+# i64 array). Returns the refusal's AGENT_OP_* code, or 0 if none was refused.
+fn _g_fill(v, first, max, refused) {
+    var i = 0;
+    while (i < max) {
+        var nb = str_builder_new();
+        str_builder_add_cstr(nb, "cap");
+        str_builder_add_int(nb, first + i);
+        var h = agent_handle_new(first + i, str_builder_build(nb));
+        var r_t, r_v = agent_start(h, 0, 0);
+        if (is_err_result(r_t) == 1) {
+            store64(refused, h);
+            return r_v;
+        }
+        vec_push(v, h);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Start `h`: 0 if it started, else the refusal's AGENT_OP_* code (-1 for no agent).
+fn _g_start_code(h) {
+    if (h == 0) { return 0 - 1; }
+    var r_t, r_v = agent_start(h, 0, 0);
+    if (is_err_result(r_t) == 1) { return r_v; }
+    return 0;
+}
+
+# Start every agent in `v` again. Returns how many started.
+fn _g_restart(v) {
+    var n = 0;
+    var i = 0;
+    while (i < vec_len(v)) {
+        var r_t, r_v = agent_start(vec_get(v, i), 0, 0);
+        if (is_ok(r_t) == 1) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+# Stop every agent in `v` at once, stepping the stops together as daimon's tick
+# does. Returns how many are STOPPED within `ms`.
+fn _g_stop_all(v, ms) {
+    var n = vec_len(v);
+    var i = 0;
+    while (i < n) {
+        agent_stop_begin(vec_get(v, i), "test");
+        i = i + 1;
+    }
+    var t0 = daimon_now_ms();
+    var pending = n;
+    while (pending > 0 && daimon_now_ms() - t0 <= ms) {
+        pending = 0;
+        i = 0;
+        while (i < n) {
+            if (agent_stop_step(vec_get(v, i), daimon_now_ms()) == 0) { pending = pending + 1; }
+            i = i + 1;
+        }
+        if (pending > 0) { _g_wait(10); }
+    }
+    var stopped = 0;
+    i = 0;
+    while (i < n) {
+        if (agent_status(vec_get(v, i)) == AGENT_STOPPED) { stopped = stopped + 1; }
+        i = i + 1;
+    }
+    return stopped;
+}
+
+# Take channels until CH_MINT refuses; their fds go into `v`. Returns CH_MINT's
+# refusal (-CH_E_FULL once this process's fd table or the machine's 16 channels
+# are full), or 0 if it never refused.
+fn _g_mint_all(v) {
+    var i = 0;
+    while (i < 64) {
+        var pair: i64[2];
+        var r = sys_chan_mint(&pair);
+        if (r != 0) { return r; }
+        vec_push(v, load64(&pair));
+        vec_push(v, load64(&pair + 8));
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _g_close_all(v) {
+    var i = 0;
+    while (i < vec_len(v)) {
+        sys_chan_close(vec_get(v, i));
+        i = i + 1;
+    }
+    return 0;
+}
+
 # Reap until the agent's process is collected, or `ms` pass. Returns 1 if reaped.
 fn _g_reap(h, ms) {
-    var t0 = clock_now_ms();
-    while (clock_now_ms() - t0 <= ms) {
+    var t0 = daimon_now_ms();
+    while (daimon_now_ms() - t0 <= ms) {
         if (agent_reap(h) == 1) { return 1; }
         _g_wait(10);
     }
@@ -81,12 +203,19 @@ fn _g_reap(h, ms) {
 alloc_init();
 daimon_audit_init();
 _g_say("GUEST start\n");
+# Which clock daimon_now_ms found: the kernel refuses to calibrate the TSC when its
+# ticks come in bursts (seen under a CPU quota), and then uptime_us#95 is -1.
+daimon_now_ms();
+if (daimon_clock_source() == 2) { _g_say("\nGUEST clock: uptime_ms#40 (the kernel refused the TSC calibration)\n"); }
+else { _g_say("\nGUEST clock: uptime_us#95\n"); }
 var bus = msg_bus_new();
 ipc_attach_bus(bus);
 msg_bus_subscribe(bus, "1");
 agent_set_agents_dir("/agents");
-AGENT_STOP_GRACE_MS = 400;
-DAIMON_REAP_BUDGET_MS = 400;
+# Long enough for a dozen agents to see SIGTERM and exit under emulation; it
+# also sets how long the stubborn agent's stop takes to give up (both summed).
+AGENT_STOP_GRACE_MS = 3000;
+DAIMON_REAP_BUDGET_MS = 1000;
 
 # --- a user agent: started, running, stopped by SIGTERM -----------------------
 var h1 = agent_handle_new(1, str_from("worker"));
@@ -95,7 +224,8 @@ assert_eq(is_ok(r1_t), 1, "agnos: a user agent starts (spawn_path#43)");
 assert(r1_v > 0, "agnos: ... and has a pid");
 assert_eq(agent_status(h1), AGENT_RUNNING, "agnos: ... RUNNING");
 assert_eq(agent_limits_enforced(h1), 0, "agnos: ... without its limits (agnos has none yet)");
-_g_wait(300);
+var tf = daimon_now_ms();
+while (ipc_published_count() < 1 && daimon_now_ms() - tf < 20000) { _g_wait(10); }
 assert_eq(ipc_channel_count(), 1, "agnos: its channel is open (CH_MINT, CH_ENDOW)");
 assert(ipc_published_count() >= 1, "agnos: the frame it sent on its channel reached the bus");
 var q1 = msg_bus_queue(bus, "1");
@@ -114,7 +244,7 @@ assert_eq(agent_reap(h1), 0, "agnos: a running agent is not reaped (waitpid#4 an
 assert_eq(agent_status(h1), AGENT_RUNNING, "agnos: ... and stays RUNNING");
 assert_eq(agent_stop_begin(h1, "test"), 0, "agnos: a stop begins (SIGTERM, kill#16)");
 assert_eq(agent_status(h1), AGENT_STOPPING, "agnos: ... STOPPING meanwhile");
-assert_eq(_g_stop(h1, 5000), 1, "agnos: ... and ends");
+assert_eq(_g_stop(h1, 20000), 1, "agnos: ... and ends");
 assert_eq(agent_status(h1), AGENT_STOPPED, "agnos: ... STOPPED");
 assert_eq(agent_exit_code(h1), 0, "agnos: ... with the agent's own exit code (it read its signalfd)");
 assert_eq(agent_pid(h1), 0, "agnos: ... and its pid cleared");
@@ -125,7 +255,7 @@ var h2 = agent_handle_new(2, str_from("crasher"));
 agent_set_type(h2, AGENT_TYPE_SYSTEM);
 var r2_t, r2_v = agent_start(h2, 0, 0);
 assert_eq(is_ok(r2_t), 1, "agnos: a system agent starts");
-assert_eq(_g_reap(h2, 3000), 1, "agnos: an agent that exits is reaped");
+assert_eq(_g_reap(h2, 20000), 1, "agnos: an agent that exits is reaped");
 assert_eq(agent_status(h2), AGENT_FAILED, "agnos: ... FAILED (exit 3)");
 assert_eq(agent_exit_code(h2), 3, "agnos: ... with exit code 3");
 
@@ -153,7 +283,7 @@ var p5_t, p5_v = agent_pause(h5);
 assert_eq(p5_v, AGENT_OP_UNSUPPORTED, "agnos: pause is refused (SIGSTOP stops nothing there yet)");
 assert_eq(agent_status(h5), AGENT_RUNNING, "agnos: ... and the agent keeps RUNNING");
 agent_stop_begin(h5, "test");
-assert_eq(_g_stop(h5, 5000), 1, "agnos: ... then stops");
+assert_eq(_g_stop(h5, 20000), 1, "agnos: ... then stops");
 assert_eq(agent_status(h5), AGENT_STOPPED, "agnos: ... STOPPED");
 
 # --- daimon's own blocking stop waits without holding the CPU -------------------
@@ -168,6 +298,77 @@ agent_stop(h8, "test");
 assert_eq(agent_status(h8), AGENT_STOPPED, "agnos: agent_stop ends it (daimon_yield_ms lets the agent run)");
 assert_eq(agent_exit_code(h8), 0, "agnos: ... with the agent's own exit code");
 
+# --- capacity: agnos's tables bound the running agents, not max_agents (2.4.1) --
+# agnos 1.57.5 has 16 process slots and 16 channels for the whole machine.
+# Start user agents until one is refused; the refusal must leave nothing behind.
+# Stop them all; the same number must start again (every slot and channel came
+# back), and the next one must be refused again.
+var capv = vec_new();
+var cap_ref: i64[1];
+store64(&cap_ref, 0);
+var live0 = _g_live_procs();
+var names0 = str_builder_new();
+_g_proc_names(names0, live0);
+var cap_code = _g_fill(capv, 100, 40, &cap_ref);
+var cap_n = vec_len(capv);
+var cap_h = load64(&cap_ref);
+# One write, so the agents' own console lines cannot land inside it, and led by a
+# newline, so it starts a line even when an agent's line is half written.
+var cl = str_builder_new();
+str_builder_add_cstr(cl, "\nGUEST capacity: ");
+str_builder_add_int(cl, live0);
+str_builder_add_cstr(cl, " processes before (");
+str_builder_add(cl, str_builder_build(names0));
+str_builder_add_cstr(cl, " ), ");
+str_builder_add_int(cl, cap_n);
+str_builder_add_cstr(cl, " agents started, ");
+str_builder_add_int(cl, _g_live_procs());
+str_builder_add_cstr(cl, " processes then; the next start refused with code ");
+str_builder_add_int(cl, cap_code);
+str_builder_add_cstr(cl, "\n");
+_g_say(str_data(str_builder_build(cl)));
+assert(cap_n >= 8, "agnos: at least 8 agents run at once");
+assert(cap_code == AGENT_OP_NO_EXEC || cap_code == AGENT_OP_CAPACITY,
+  "agnos: a start past the machine's tables is refused (spawn_path#43, or no free channel)");
+assert(cap_h != 0 && agent_pid(cap_h) == 0, "agnos: ... the refused agent has no process");
+assert_eq(ipc_channel_count(), cap_n, "agnos: ... and daimon closed its channel");
+# The kernel must not keep it either: were a refusal's channel kept, four more
+# refusals would take the table past its 16 and the answer would change.
+var rsame = 0;
+var rr = 0;
+while (rr < 4) {
+    if (_g_start_code(cap_h) == cap_code) { rsame = rsame + 1; }
+    rr = rr + 1;
+}
+assert_eq(rsame, 4, "agnos: ... four more refusals answer the same (a refusal keeps no channel)");
+assert_eq(_g_stop_all(capv, 30000), cap_n, "agnos: every one of them stops");
+assert_eq(ipc_channel_count(), 0, "agnos: ... and every channel is closed");
+assert_eq(_g_restart(capv), cap_n, "agnos: the same number start again: every slot and channel came back");
+assert_eq(_g_start_code(cap_h), cap_code, "agnos: ... and the next start is refused again, the same way");
+assert_eq(_g_stop_all(capv, 30000), cap_n, "agnos: ... then they all stop");
+
+# --- no free channel: the start is refused as AGENT_OP_CAPACITY, and succeeds
+# --- once a channel is free (2.4.1) --------------------------------------------
+var minted = vec_new();
+var mint_code = _g_mint_all(minted);
+var ml = str_builder_new();
+str_builder_add_cstr(ml, "\nGUEST channels: CH_MINT refused after ");
+str_builder_add_int(ml, vec_len(minted) / 2);
+str_builder_add_cstr(ml, " channels with ");
+str_builder_add_int(ml, mint_code);
+str_builder_add_cstr(ml, "\n");
+_g_say(str_data(str_builder_build(ml)));
+assert_eq(mint_code, 0 - CH_E_FULL, "agnos: CH_MINT answers -CH_E_FULL once there is no room");
+var h9 = agent_handle_new(9, str_from("roomless"));
+var r9_t, r9_v = agent_start(h9, 0, 0);
+assert_eq(r9_v, AGENT_OP_CAPACITY, "agnos: a start with no free channel is refused as AGENT_OP_CAPACITY");
+assert_eq(agent_status(h9), AGENT_PENDING, "agnos: ... and the agent stays PENDING");
+_g_close_all(minted);
+var r10_t, r10_v = agent_start(h9, 0, 0);
+assert_eq(is_ok(r10_t), 1, "agnos: ... and starts once a channel is free");
+agent_stop_begin(h9, "test");
+assert_eq(_g_stop(h9, 20000), 1, "agnos: ... then stops");
+
 # --- an agent that ignores SIGTERM: agnos cannot end it yet ---------------------
 var h6 = agent_handle_new(6, str_from("stubborn"));
 agent_set_type(h6, AGENT_TYPE_SERVICE);
@@ -175,7 +376,7 @@ var r6_t, r6_v = agent_start(h6, 0, 0);
 assert_eq(is_ok(r6_t), 1, "agnos: a service agent starts");
 _g_wait(200);
 agent_stop_begin(h6, "test");
-assert_eq(_g_stop(h6, 5000), 1, "agnos: a stop of an agent that ignores SIGTERM gives up");
+assert_eq(_g_stop(h6, 20000), 1, "agnos: a stop of an agent that ignores SIGTERM gives up");
 assert_eq(agent_status(h6), AGENT_STOPPING, "agnos: ... leaving it STOPPING (no signal ends a process yet)");
 assert(agent_pid(h6) > 0, "agnos: ... with its pid kept, for a later reap");
 assert_eq(daimon_reap_code(agent_pid(h6)), 0 - 2, "agnos: ... and it is still running");

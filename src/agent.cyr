@@ -39,6 +39,7 @@ enum AgentOpError {
     AGENT_OP_UNSUPPORTED = 6;     # this target cannot do this yet (agnos: pause / resume)
     AGENT_OP_SIGNAL = 7;          # the signal could not be delivered
     AGENT_OP_ARGS = 8;            # the command line cannot be passed (agnos: a space, or > 127 bytes)
+    AGENT_OP_CAPACITY = 9;        # no room for another agent's channel (agnos: CH_E_FULL). 2.4.1
 }
 
 # AgentHandle: {id, name, status, created_at, started_at, pid,
@@ -1037,7 +1038,15 @@ fn _agent_start_agnos(h) {
     var line = _agent_cmdline_agnos(exe, agent_id(h), agent_name(h));
     if (line == 0) { return Err(AGENT_OP_ARGS); }
     var chfds: i32[2];
-    if (ipc_channel_open(&chfds) != 0) { return Err(AGENT_OP_NO_PROCESS); }   # CH_E_FULL: 16 channels in all
+    # -CH_E_FULL: the machine's 16 channels are in use, or daimon's fd table
+    # (32 slots) is full. Nothing about the agent failed, so its status stays.
+    var mr = ipc_channel_open(&chfds);
+    if (mr == 0 - CH_E_FULL) {
+        daimon_audit_agent(SEV_WARNING, "agent", "agent.spawn.capacity",
+          "agent not started: agnos has no free channel for it", str_data(agent_name(h)));
+        return Err(AGENT_OP_CAPACITY);
+    }
+    if (mr != 0) { return Err(AGENT_OP_NO_PROCESS); }
     var own_end = load32(&chfds);
     var agent_end = load32(&chfds + 4);
     var child_fd = sys_chan_endow(agent_end);
@@ -1062,6 +1071,9 @@ fn _agent_start_agnos(h) {
     if (pid < 0) {
         # A failed spawn leaves the endowment armed for whatever spawns next;
         # with both ends closed, its placement is refused (filed with agnos).
+        # #43 answers -1 for every failure: a full process table (16 slots for
+        # the whole machine) and an executable it cannot load look the same
+        # (filed with agnos, 2026-09-23). The executable was just found by stat.
         sys_chan_close(agent_end);
         sys_chan_close(own_end);
         agent_set_status(h, AGENT_FAILED);
@@ -1133,7 +1145,7 @@ fn agent_stop_begin(h, reason) {
     agent_set_status(h, AGENT_STOPPING);
     daimon_signal_tree(pid, SIGTERM);
     if (paused == 1) { daimon_signal_tree(pid, 18); }   # SIGCONT
-    store64(h + 96, clock_now_ms() + AGENT_STOP_GRACE_MS);
+    store64(h + 96, daimon_now_ms() + AGENT_STOP_GRACE_MS);
     store64(h + 104, 0);
     return 0;
 }
@@ -1188,7 +1200,7 @@ fn agent_stop_step(h, now) {
 # caller that may block (tests; a request not served by the event loop).
 fn agent_stop(h, reason) {
     if (agent_stop_begin(h, reason) == 1) { return Ok(0); }
-    while (agent_stop_step(h, clock_now_ms()) == 0) { daimon_yield_ms(1); }
+    while (agent_stop_step(h, daimon_now_ms()) == 0) { daimon_yield_ms(1); }
     return Ok(0);
 }
 

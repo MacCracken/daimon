@@ -123,7 +123,8 @@ main.cyr   Preamble (syscall constants) + module includes + the `main` serve loo
 │   │                      for deadlines, deferred answers (server_defer) and agents_tick.
 │   │                      AGNOS (2.4.0): the same loop, polled, yielding with pause#14
 │   └── server_detach      (2.3.4) a handler's work in a child process (MCP forwards, web_fetch);
-│                          the loop relays its answer, 504 after 60 s
+│                          the loop relays its answer, 504 after 60 s. AGNOS (2.4.1): fork#96 and
+│                          a pipe; the child writes its answer whole (http_answer_into_pipe)
 │
 └── main.cyr        Entry point
     ├── serve(port)        dispatches to server.cyr
@@ -172,7 +173,9 @@ request. 2.3.3 read them on a thread, which put the heap lock on every allocatio
 On AGNOS (2.4.0, [ADR-007](../adr/007-daimon-on-agnos.md)) the same flow uses the kernel's
 primitives: `spawn_path` for fork/exec, `proclist` for `/proc`, `kill` (a pending signal the agent
 reads) for pidfd, and a `chan_op` pair, the agent's end endowed at spawn, for the socketpair. The
-loop polls and yields with `pause`.
+loop polls and yields with `pause`. Since 2.4.1 its deadlines read `daimon_now_ms`, which survives a
+refused TSC calibration. Its answers are written 1 KB at a time, because a larger write to a local
+process stops the machine there.
 
 ## Consumers
 

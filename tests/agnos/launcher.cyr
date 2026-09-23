@@ -13,16 +13,25 @@ fn _l_put(s) {
     return 0;
 }
 
+# The clock, in ms: uptime_us#95, or uptime_ms#40 when the kernel refused to
+# calibrate the TSC (#95 is then -1 for the whole boot, and clock_now_ms stands
+# still). The same fallback as daimon's own daimon_now_ms (src/syscalls.cyr, 2.4.1).
+fn _l_now_ms() {
+    var us = sys_uptime_us();
+    if (us >= 0) { return us / 1000; }
+    return sys_uptime_ms();
+}
+
 fn _l_wait_ms(ms) {
-    var t0 = clock_now_ms();
-    while (clock_now_ms() - t0 < ms) { sys_pause(); }
+    var t0 = _l_now_ms();
+    while (_l_now_ms() - t0 < ms) { sys_pause(); }
     return 0;
 }
 
 # The exit code of child `pid`, or -2 if it is still running after `ms`.
 fn _l_wait_exit(pid, ms) {
-    var t0 = clock_now_ms();
-    while (clock_now_ms() - t0 < ms) {
+    var t0 = _l_now_ms();
+    while (_l_now_ms() - t0 < ms) {
         var r = sys_waitpid(pid);
         if (r != 0 - 2) { return r; }
         sys_pause();

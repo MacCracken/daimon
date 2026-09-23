@@ -221,6 +221,19 @@ assert(yel >= 30, "daimon_yield_ms(30) lets at least 30 ms pass");
 assert(yel < 1000, "... and returns");
 assert_eq(daimon_yield_ms(0), 0, "daimon_yield_ms(0) returns at once");
 
+# --- daimon_now_ms (2.4.1): the clock every deadline in daimon reads ------
+# On agnos it reads uptime_us#95, or uptime_ms#40 once the kernel has refused
+# its TSC calibration (tests/agnos/guest.cyr reports which); here it is
+# clock_now_ms.
+var n0 = daimon_now_ms();
+daimon_yield_ms(30);
+var nel = daimon_now_ms() - n0;
+assert(nel >= 30, "daimon_now_ms advances across a 30 ms wait");
+assert(nel < 1000, "... by about that much");
+var ndiff = clock_now_ms() - daimon_now_ms();
+assert(ndiff >= 0 - 1 && ndiff <= 1, "daimon_now_ms is clock_now_ms off agnos");
+assert_eq(daimon_clock_source(), 0, "... and chose no agnos clock");
+
 # --- no daimon-owned name may be spelled SYS_* --------------------------
 # The defect class is a daimon global SHADOWING an arch-aware stdlib one.
 # The `_DAIMON_SYS_` prefix is what makes that impossible; assert the

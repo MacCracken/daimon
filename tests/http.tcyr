@@ -19,12 +19,17 @@ include "lib/alloc.cyr"
 include "lib/vec.cyr"
 include "lib/str.cyr"
 include "lib/io.cyr"
+include "lib/chrono.cyr"
+include "lib/random.cyr"
 include "lib/syscalls.cyr"
 include "lib/sandhi.cyr"
+include "lib/sakshi.cyr"
 include "lib/bayan.cyr"
 include "lib/assert.cyr"
 
 include "src/error.cyr"
+include "src/syscalls.cyr"
+include "src/trace.cyr"
 include "src/http.cyr"
 
 test_group("http");
@@ -57,6 +62,8 @@ assert(streq(_http_reason(405), "Method Not Allowed") == 1, "405 has its RFC 723
 # non-4xx DaimonError to 500, so this was on the common error path.
 assert(streq(_http_reason(500), "Internal Server Error") == 1, "500 has its RFC 7231 phrase");
 assert(streq(_http_reason(404), "Not Found") == 1, "existing phrases unchanged");
+# 2.4.1: an agent start with no room for its channel (agnos: CH_E_FULL).
+assert(streq(_http_reason(503), "Service Unavailable") == 1, "503 has its RFC 7231 phrase");
 
 # --- 2.3.0: the Origin test the agent-control routes refuse on ------------
 test_group("http_origin");
@@ -244,5 +251,55 @@ assert_eq(str_eq(http_json_text(r7, "s"), str_from("x")), 1, "text: a string as 
 assert_eq(str_eq(http_json_text(r7, "o"), str_from("{\"k\":[1,\"2\"]}")), 1, "text: an object as compact JSON");
 assert_eq(str_eq(http_json_text(r7, "n"), str_from("7")), 1, "text: a number as JSON");
 assert_eq(http_json_text(r7, "z"), 0, "text: null is 0");
+
+# --- 2.4.1: a detached call's answer through its pipe is sandhi's, byte for byte --
+# On agnos the child of a detached call answers into a 4080-byte pipe, through
+# http_answer_into_pipe: sandhi's one write per part would drop what does not
+# fit. The bytes must be the ones sandhi sends. Here, on Linux pipes, both paths
+# write an answer bigger than an agnos pipe, and are compared.
+test_group("http_answer_into_pipe");
+
+# Everything readable from `fd` (its writer closed), into a fresh buffer; the
+# length is stored at `lenp`.
+fn _read_all(fd, lenp) {
+    var cap = 65536;
+    var buf = alloc(cap);
+    var n = 0;
+    var r = sys_read(fd, buf, cap - n);
+    while (r > 0) {
+        n = n + r;
+        r = sys_read(fd, buf + n, cap - n);
+    }
+    store64(lenp, n);
+    return buf;
+}
+
+var bigb = str_builder_new();
+var bgi = 0;
+while (bgi < 10000) {
+    str_builder_add_cstr(bigb, "x");
+    bgi = bgi + 1;
+}
+str_builder_add_cstr(bigb, "END");
+var big = str_builder_build(bigb);
+var pa: i32[2];
+var pb: i32[2];
+assert_eq(syscall(_DAIMON_SYS_PIPE2, &pa, 0), 0, "a pipe for sandhi's answer");
+assert_eq(syscall(_DAIMON_SYS_PIPE2, &pb, 0), 0, "a pipe for the detached child's");
+http_send_response(load32(&pa + 4), 503, str_data(big), str_len(big));   # no pipe named: sandhi
+sys_close(load32(&pa + 4));
+http_answer_into_pipe(load32(&pb + 4), daimon_now_ms() + 5000);
+assert_eq(http_send_response(load32(&pb + 4), 503, str_data(big), str_len(big)), 0,
+  "the child's answer is written whole");
+http_answer_into_pipe(0 - 1, 0);
+sys_close(load32(&pb + 4));
+var la: i64[1];
+var lb: i64[1];
+var ba = _read_all(load32(&pa), &la);
+var bb = _read_all(load32(&pb), &lb);
+assert(load64(&lb) > 10000, "... all of it: more than an agnos pipe holds");
+assert_eq(load64(&lb), load64(&la), "... as many bytes as sandhi sends");
+assert_eq(memeq(ba, bb, load64(&la)), 1, "... and the same bytes");
+assert_eq(memeq(bb, "HTTP/1.1 503 Service Unavailable\r\n", 34), 1, "... beginning with the status line");
 
 syscall(SYS_EXIT, assert_summary());

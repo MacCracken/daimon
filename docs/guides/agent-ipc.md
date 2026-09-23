@@ -164,6 +164,10 @@ spawns (`CH_ENDOW`). **Three things differ from Linux:**
 A reply is one record of one byte. When daimon closes the channel (the agent is reaped), the agent's
 next `CH_RECV` answers `CH_E_PEERGONE`.
 
+The machine has 16 channels in all, one for each running agent and any other program's. When none is
+free, a start answers **503** and the agent stays as it was (2.4.1). A reaped agent's channel is free
+again at once.
+
 ## Limits
 
 | limit | value | constant (`src/ipc.cyr`) |

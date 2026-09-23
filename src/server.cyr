@@ -414,11 +414,9 @@ fn _srv_unregister(slot) {
 fn _srv_close(slot) {
     _srv_unregister(slot);
     if (load64(slot) == SRV_DEFERRED) { _srv_deferred = _srv_deferred - 1; }
-    #ifndef CYRIUS_TARGET_AGNOS
     if (load64(slot) == SRV_DETACHED) {
         if (load64(slot + 96) >= 0) { _srv_detach_end(slot, 1); }
     }
-    #endif
     sys_close(load64(slot + 8));
     store64(slot, SRV_FREE);
     return 0;
@@ -488,7 +486,7 @@ fn _srv_refuse(slot, code, msg, drain) {
         _srv_close(slot);
         return 0;
     }
-    var now = clock_now_ms();
+    var now = daimon_now_ms();
     store64(slot, SRV_DRAINING);
     store64(slot + 56, 0);
     store64(slot + 40, now + SERVE_DRAIN_MS);
@@ -656,12 +654,10 @@ fn _srv_tick(now) {
         } elif (st == SRV_DETACHED) {
             # The pipe is relayed as it becomes readable (the loop); the tick
             # only enforces the deadline.
-            #ifndef CYRIUS_TARGET_AGNOS
             if (now > load64(slot + 48)) {
                 _srv_relay(slot, 1);
                 _srv_close(slot);
             }
-            #endif
         }
         i = i + 1;
     }
@@ -748,13 +744,16 @@ fn server_loop(addr, port) {
     _srv_reject = arena_allocator(4096);
     var last_upkeep = 0;
     while (1 == 1) {
-        var now = clock_now_ms();
+        var now = daimon_now_ms();
         _srv_accept(_srv_lfd, now);
         var i = 0;
         while (i < SERVE_MAX_CONNS) {
             var slot = _srv_slot(i);
             if (load64(slot) == SRV_READING) { _srv_read(slot, now); }
             elif (load64(slot) == SRV_DRAINING) { _srv_drain(slot); }
+            elif (load64(slot) == SRV_DETACHED) {
+                if (_srv_relay(slot, 0) == 1) { _srv_close(slot); }   # 2.4.1: a detached call's pipe
+            }
             i = i + 1;
         }
         var tick = SERVE_TICK_MS;
@@ -763,6 +762,7 @@ fn server_loop(addr, port) {
         if (now - last_upkeep >= tick) {
             agents_tick(now);
             _srv_tick(now);
+            _srv_reap_tick();
             ipc_tick(now);
             last_upkeep = now;
         }
@@ -786,14 +786,14 @@ fn server_loop(addr, port) {
     ipc_use_epoll(_srv_epfd);
     var last_upkeep = 0;
     while (1 == 1) {
-        var now = clock_now_ms();
+        var now = daimon_now_ms();
         _srv_arm_listener(now);
         # A deferred answer (a stop) is given within a busy tick of its agent
         # exiting, not a full one.
         var tick = SERVE_TICK_MS;
         if (_srv_deferred > 0) { tick = SERVE_TICK_BUSY_MS; }
         var nr = sys_epoll_wait(_srv_epfd, _srv_events, SRV_EVENTS, tick);
-        now = clock_now_ms();
+        now = daimon_now_ms();
         var i = 0;
         while (i < nr) {
             var tok = _srv_event_data(i);
@@ -847,11 +847,10 @@ fn server_defer(fp, arg) {
     store64(slot, SRV_DEFERRED);
     store64(slot + 64, fp);
     store64(slot + 72, arg);
-    store64(slot + 48, clock_now_ms() + SERVE_DEFER_MAX_MS);
+    store64(slot + 48, daimon_now_ms() + SERVE_DEFER_MAX_MS);
     return 1;
 }
 
-#ifndef CYRIUS_TARGET_AGNOS
 # --- Detached work ---------------------------------------------------------
 #
 # Some handlers wait on another server: an MCP call forwarded to a registered
@@ -869,6 +868,17 @@ fn server_defer(fp, arg) {
 # not finished within SERVE_DETACH_MAX_MS is killed, and the client is answered
 # 504. 60 s is the MCP TypeScript SDK's default request timeout
 # (DEFAULT_REQUEST_TIMEOUT_MSEC), the bound MCP clients already work to.
+#
+# agnos (2.4.1): the same design, over fork#96 and a pipe#25. (2.4.0 ran this
+# work in place on the loop, having put it down to agnos lacking a fork; it has
+# had one since 1.56.54.) Three things differ there:
+# - an agnos pipe is a 4080-byte ring whose write returns short when full, so
+#   the child's answer goes through http_answer_into_pipe, which writes it whole;
+# - nothing ends a process yet (kill#16 only sets a pending bit; filed with
+#   agnos), so a child past the deadline is asked to stop, and runs until its
+#   upstream gives up (the peer bounds each silent receive at 30 s);
+# - SERVE_DETACH_CHILDREN_MAX bounds the children alive at once. The machine has
+#   16 process slots, and the agents need them.
 var SERVE_DETACH_MAX_MS = 60000;
 var SERVE_RELAY_READS = 16;        # pipe reads relayed per wake, SERVE_REQ_MAX each
 
@@ -879,8 +889,11 @@ var _srv_reap_pids: i64[256];
 var _srv_reap_n = 0;
 
 # Write all of `n` bytes to a client. 0, or -1 when it cannot take them
-# (gone, or stalled past SO_SNDTIMEO).
+# (gone, or stalled past SO_SNDTIMEO). agnos: in pieces (daimon_write_all).
 fn _srv_send_all(fd, buf, n) {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return daimon_write_all(fd, buf, n, daimon_now_ms() + SERVE_IDLE_MS);
+    #else
     var off = 0;
     while (off < n) {
         var w = sys_write(fd, buf + off, n - off);
@@ -889,6 +902,7 @@ fn _srv_send_all(fd, buf, n) {
         off = off + w;
     }
     return 0;
+    #endif
 }
 
 fn _srv_reap_later(pid) {
@@ -903,6 +917,18 @@ fn _srv_reap_later(pid) {
     # half the table); bounded if it ever is.
     daimon_reap_within(pid, DAIMON_REAP_BUDGET_MS);
     return 0;
+}
+
+# Children still alive: calls under way, and calls over whose child has not
+# been reaped yet.
+fn _srv_detach_live() {
+    var n = _srv_reap_n;
+    var i = 0;
+    while (i < SERVE_MAX_CONNS) {
+        if (load64(_srv_slot(i)) == SRV_DETACHED) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
 }
 
 fn _srv_reap_tick() {
@@ -923,8 +949,8 @@ fn _srv_reap_tick() {
 # `kill` (it may still be running) and reaped once it has exited.
 fn _srv_detach_end(slot, kill) {
     var pid = load64(slot + 88);
-    if (kill == 1) { daimon_signal(pid, SIGKILL); }
-    _srv_epoll(EPOLL_CTL_DEL, load64(slot + 96), _SRV_TOKEN_PIPE0 + _srv_slot_index(slot));
+    if (kill == 1) { daimon_signal(pid, SIGKILL); }   # agnos: a request only, until agnos can end a process
+    _srv_epoll(_SRV_EPOLL_DEL, load64(slot + 96), _SRV_TOKEN_PIPE0 + _srv_slot_index(slot));
     sys_close(load64(slot + 96));
     store64(slot + 88, 0);
     store64(slot + 96, 0 - 1);
@@ -939,6 +965,18 @@ fn _srv_detach_fail(cfd, code, action, msg) {
     return 0;
 }
 
+# Read a detached call's pipe: bytes read, 0 once every writer is gone,
+# -_SRV_EAGAIN while it is empty with a writer, other negatives for errors.
+fn _srv_pipe_read(fd, buf, len) {
+    var n = sys_read(fd, buf, len);
+    #ifdef CYRIUS_TARGET_AGNOS
+    if (n == 0 - 2) { return 0 - _SRV_EAGAIN; }   # pipe_read: empty, a writer still open
+    #else
+    while (n == 0 - _SRV_EINTR) { n = sys_read(fd, buf, len); }
+    #endif
+    return n;
+}
+
 # Relay what a detached call's child has written to its client. Returns 1 when
 # the call is over (answered, failed, or past its deadline if `timed_out`).
 fn _srv_relay(slot, timed_out) {
@@ -947,8 +985,7 @@ fn _srv_relay(slot, timed_out) {
     var buf = load64(slot + 16);   # the request is handled; its buffer is free
     var k = 0;
     while (k < SERVE_RELAY_READS) {
-        var n = sys_read(pfd, buf, SERVE_REQ_MAX);
-        while (n == 0 - _SRV_EINTR) { n = sys_read(pfd, buf, SERVE_REQ_MAX); }
+        var n = _srv_pipe_read(pfd, buf, SERVE_REQ_MAX);
         if (n == 0 - _SRV_EAGAIN) {
             k = SERVE_RELAY_READS;   # nothing more yet
         } elif (n <= 0) {
@@ -981,8 +1018,54 @@ fn _srv_relay(slot, timed_out) {
 # child process, `fd` being a pipe the loop relays to the client. Returns 1
 # when a child took the work (the handler returns without answering), 0 when
 # the handler must do it itself: the request is not served by this loop (a
-# test; agnos), or no child could be made (the work then runs inline, as it
-# did before 2.3.4).
+# test), or no child could be made (the work then runs inline, as it did
+# before 2.3.4).
+#ifdef CYRIUS_TARGET_AGNOS
+var SERVE_DETACH_CHILDREN_MAX = 4;
+
+fn server_detach(work, arg) {
+    if (_srv_current == 0) { return 0; }
+    var slot = _srv_current;
+    if (_srv_detach_live() >= SERVE_DETACH_CHILDREN_MAX) {
+        # Answered here, and the loop closes the connection.
+        _srv_detach_fail(load64(slot + 8), 503, "http.detached.busy",
+          "too many calls to other servers are still running");
+        return 1;
+    }
+    var pfd: i64[2];
+    if (sys_pipe(&pfd) != 0) { return 0; }
+    var rfd = load64(&pfd);
+    var wfd = load64(&pfd + 8);
+    var pid = sys_fork();
+    if (pid < 0) {
+        sys_close(rfd);
+        sys_close(wfd);
+        return 0;
+    }
+    if (pid == 0) {
+        # The child keeps stdio and the pipe's write end. Channel fds are inert
+        # in it (chan_auth), but another call's pipe is not. The connections are
+        # the peer's handles above fd 31 and stay untouched: closing one would
+        # close daimon's.
+        var f = 3;
+        while (f < 32) {
+            if (f != wfd) { sys_close(f); }
+            f = f + 1;
+        }
+        http_answer_into_pipe(wfd, daimon_now_ms() + SERVE_DETACH_MAX_MS);
+        fncall2(work, wfd, arg);
+        sys_close(wfd);
+        sys_exit_group(0);
+    }
+    sys_close(wfd);
+    store64(slot, SRV_DETACHED);
+    store64(slot + 48, daimon_now_ms() + SERVE_DETACH_MAX_MS);
+    store64(slot + 88, pid);
+    store64(slot + 96, rfd);
+    store64(slot + 104, 0);
+    return 1;
+}
+#else
 fn server_detach(work, arg) {
     if (_srv_current == 0) { return 0; }
     var slot = _srv_current;
@@ -1013,19 +1096,13 @@ fn server_detach(work, arg) {
     # answer is relayed as the child writes it, not on the next tick.
     _srv_unregister(slot);
     store64(slot, SRV_DETACHED);
-    store64(slot + 48, clock_now_ms() + SERVE_DETACH_MAX_MS);
+    store64(slot + 48, daimon_now_ms() + SERVE_DETACH_MAX_MS);
     store64(slot + 88, pid);
     store64(slot + 96, rfd);
     store64(slot + 104, 0);
-    _srv_epoll(EPOLL_CTL_ADD, rfd, _SRV_TOKEN_PIPE0 + _srv_slot_index(slot));
+    _srv_epoll(_SRV_EPOLL_ADD, rfd, _SRV_TOKEN_PIPE0 + _srv_slot_index(slot));
     return 1;
 }
-
-#else
-
-# agnos: no fork for daimon's use, so a handler's work runs inline.
-fn server_detach(work, arg) { return 0; }
-
 #endif
 
 # `serve` and `serve --async` are the same loop since 2.3.4. --async chose

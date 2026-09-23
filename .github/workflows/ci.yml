@@ -56,12 +56,20 @@ jobs:
         # plus [deps.sakshi] dist bundle at its tagged version.
         # ./lib/ is gitignored — first-party convention across
         # agnosys / bote / libro / majra.
-        run: cyrius deps
+        # 2.4.1: --no-lock. A plain `cyrius deps` REWRITES cyrius.lock from what
+        # it just vendored, so the verify step below checked a lock written a
+        # moment before, never the committed one. Measured in ubuntu:24.04: it
+        # rewrote the committed 119-entry lock (36 of them leftovers from a local
+        # lib/) to 83 entries before verify ran. With --no-lock the committed
+        # lock is what gets verified.
+        run: cyrius deps --no-lock
 
       - name: Verify dep hashes
         # Skip on the first push that introduces a new dep before
         # cyrius.lock has been generated and committed. Once present,
-        # enforce.
+        # enforce. Every file the committed lock names must be vendored with
+        # that hash: a leftover in a local lib/ that got into the lock, or a
+        # sibling checkout's mid-change copy of a path dep, fails here.
         run: |
           if [ -f cyrius.lock ]; then
             cyrius deps --verify
@@ -186,13 +194,15 @@ jobs:
         # gate, not best-effort like the aarch64 lane. It first built at 2.1.7;
         # before that the build had never succeeded.
         #
-        # One `undefined function` warning is expected (sys_dup2, in the Linux
-        # agent child, which agnos never reaches). The build must still link —
-        # cycc refuses to emit a binary with a REACHABLE undefined function,
-        # which is the real check here.
+        # One `undefined function` warning is expected: sys_dup2, called by
+        # nein's vendored bundle (`_child_redirect`, lib/nein-mcp.cyr), which
+        # daimon never reaches on agnos. (daimon's own agent child is Linux-only
+        # code, left out of the agnos build.) The build must still link: cycc
+        # refuses to emit a binary with a REACHABLE undefined function, which is
+        # the real check here.
         #
-        # 2.4.0: the AGNOS guest test's programs must build too. tests/agnos/run.sh
-        # boots them under QEMU against an agnos kernel, which CI does not have.
+        # 2.4.0: the AGNOS guest test's programs must build too. The agnos-guest
+        # job below boots them (2.4.1).
         run: |
           cyrius build --agnos src/main.cyr build/daimon-agnos
           xxd -l 4 build/daimon-agnos | grep -q "7f45 4c46" || {
@@ -265,6 +275,50 @@ jobs:
           out=$(cyrius fuzz 2>&1) || rc=$?
           echo "$out" | grep -E '^fuzz |PASS|FAIL|passed|failed' || true
           [ $rc -eq 0 ] || { echo "::error::a fuzz harness failed — its exit code names the property"; exit 1; }
+
+  agnos-guest:
+    # 2.4.1. daimon's AGNOS guest test on every push. tests/agnos/run.sh --release
+    # downloads agnos 1.57.5 and gnoboot 0.7.2 from their GitHub releases, refuses
+    # them unless they match the SHA-256 pinned in the script, boots them under
+    # QEMU (TCG; no KVM needed), and runs daimon's agent lifecycle (guest.cyr) and
+    # the real daimon binary over HTTP (http_client.cyr) inside the guest. Until
+    # 2.4.1 this ran by hand only. Every wait in it is a deadline poll. Measured
+    # locally, it passes with QEMU held to 50% of one CPU (136 s) and to 25%
+    # (295 s, where the kernel refused its TSC calibration).
+    name: AGNOS guest test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Cyrius toolchain
+        # Same installer and pin as the build job.
+        run: |
+          set -e
+          CYRIUS_VERSION="$(grep '^cyrius = ' cyrius.cyml | head -1 | sed 's/cyrius = "\(.*\)"/\1/')"
+          echo "Installing Cyrius $CYRIUS_VERSION"
+          curl -sSf https://raw.githubusercontent.com/MacCracken/cyrius/main/scripts/install.sh | \
+            CYRIUS_VERSION="$CYRIUS_VERSION" sh
+          echo "$HOME/.cyrius/bin" >> "$GITHUB_PATH"
+
+      - name: Resolve dependencies
+        run: cyrius deps --no-lock
+
+      - name: Install QEMU, OVMF and the disk-image tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            qemu-system-x86 ovmf parted gdisk mtools e2fsprogs
+
+      - name: Guest test on the released agnos kernel
+        run: GUEST_TIMEOUT=900 sh tests/agnos/run.sh --release
+
+      - name: Keep the serial log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agnos-guest-serial-log
+          path: build/agnos-guest/serial.log
+          if-no-files-found: ignore
 
   security:
     name: Security Scan

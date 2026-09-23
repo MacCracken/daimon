@@ -90,8 +90,17 @@ fn _api_agent_op_error(fd, code) {
           str_from("this agent cannot start on agnos: its name has a space, or its command line is over 127 bytes"));
     } elif (code == AGENT_OP_NO_LIMITS) {
         http_error(fd, 500, str_from("agent resource limits could not be applied; not started"));
+    } elif (code == AGENT_OP_CAPACITY) {
+        http_error(fd, 503, str_from("no room for another agent: agnos has no free channel for it"));
     } elif (code == AGENT_OP_NO_EXEC) {
+        #ifdef CYRIUS_TARGET_AGNOS
+        # spawn_path#43 gives no reason (filed with agnos).
+        # (A Str join: error_json escapes it by length, so no NUL is needed.)
+        http_error(fd, 500, str_cat(str_from("agnos could not create the agent's process: "),
+            str_from("its process table is full, or it cannot load the executable")));
+        #else
         http_error(fd, 500, str_from("the agent executable could not be run"));
+        #endif
     } elif (code == AGENT_OP_SIGNAL) {
         http_error(fd, 500, str_from("the signal could not be delivered"));
     } else {
@@ -215,7 +224,7 @@ fn api_agent_stop(fd, id_cstr) {
     }
     if (server_defer(&_api_agent_stop_answer, h) == 1) { return 0; }
     # Not served by the event loop: wait here.
-    while (agent_stop_step(h, clock_now_ms()) == 0) { daimon_yield_ms(1); }
+    while (agent_stop_step(h, daimon_now_ms()) == 0) { daimon_yield_ms(1); }
     _api_agent_ok(fd, h);
     return 0;
 }

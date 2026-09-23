@@ -4,6 +4,8 @@
 # in syscall context, so they are not subject to the SYN that interrupt context
 # drops (filed with agnos, 2026-09-23). Ends by printing
 #     CLIENT DONE <failures>
+# Every wait is a poll with a deadline, never a fixed pause: CI runs this under
+# emulation on a slower machine (2.4.1).
 include "lib/string.cyr"
 include "lib/alloc.cyr"
 include "lib/str.cyr"
@@ -15,6 +17,7 @@ var _c_fail = 0;
 var _c_total = 0;
 var _c_resp = 0;   # the last response, NUL-terminated
 var _c_resp_n = 0;
+var _C_RESP_MAX = 32768;
 
 fn _c_put(s) {
     syscall(SYS_WRITE, 1, s, strlen(s));
@@ -30,6 +33,139 @@ fn _c_check(cond, name) {
     _c_put("\n    response: ");
     if (_c_resp_n > 0) { _c_put(_c_resp); }
     _c_put("\n");
+    return 0;
+}
+
+# The clock, in ms: uptime_us#95, or uptime_ms#40 when the kernel refused to
+# calibrate the TSC (#95 is then -1 for the whole boot, and clock_now_ms stands
+# still). The same fallback as daimon's own daimon_now_ms (src/syscalls.cyr, 2.4.1).
+fn _c_now_ms() {
+    var us = sys_uptime_us();
+    if (us >= 0) { return us / 1000; }
+    return sys_uptime_ms();
+}
+
+# Take channels until CH_MINT refuses; their fds go into _c_chans. Returns how
+# many were taken.
+var _c_chans: i64[64];
+var _c_nchans = 0;
+fn _c_take_channels() {
+    while (_c_nchans < 60) {
+        var pair: i64[2];
+        if (sys_chan_mint(&pair) != 0) { return _c_nchans / 2; }
+        store64(&_c_chans + _c_nchans * 8, load64(&pair));
+        store64(&_c_chans + _c_nchans * 8 + 8, load64(&pair + 8));
+        _c_nchans = _c_nchans + 2;
+    }
+    return _c_nchans / 2;
+}
+
+fn _c_release_channels() {
+    var i = 0;
+    while (i < _c_nchans) {
+        sys_chan_close(load64(&_c_chans + i * 8));
+        i = i + 1;
+    }
+    _c_nchans = 0;
+    return 0;
+}
+
+# --- this process as a registered MCP server (2.4.1) ---------------------------
+var _c_up = 0;   # the request it read
+
+# A connection on listener `lid` within `ms`: its conn id, or -1.
+fn _c_accept(lid, ms) {
+    var t0 = _c_now_ms();
+    while (_c_now_ms() - t0 < ms) {
+        var c = syscall(SYS_SOCK_ACCEPT, lid);
+        if (c >= 0) { return c; }
+        sys_pause();
+    }
+    return 0 - 1;
+}
+
+# Read one HTTP request on `conn` (to its Content-Length) within `ms`. Returns
+# the JSON-RPC id in its body (0 if it has none), or -1 if it did not arrive.
+fn _c_upstream_request(conn, ms) {
+    if (_c_up == 0) { _c_up = alloc(16384); }
+    var n = 0;
+    var t0 = _c_now_ms();
+    while (_c_now_ms() - t0 < ms) {
+        var r = syscall(SYS_SOCK_RECV, conn, _c_up + n, 16382 - n);
+        if (r > 0) {
+            n = n + r;
+            store8(_c_up + n, 0);
+            var w = _c_whole_of(_c_up, n);
+            if (w >= 0 && n >= w) {
+                var i = 0;
+                while (i + 5 <= n) {
+                    if (memeq(_c_up + i, "\"id\":", 5) == 1) {
+                        var id = 0;
+                        var k = i + 5;
+                        while (load8(_c_up + k) >= 48 && load8(_c_up + k) <= 57) {
+                            id = id * 10 + load8(_c_up + k) - 48;
+                            k = k + 1;
+                        }
+                        return id;
+                    }
+                    i = i + 1;
+                }
+                return 0;
+            }
+        } elif (r < 0) {
+            return 0 - 1;
+        } else {
+            sys_pause();
+        }
+    }
+    return 0 - 1;
+}
+
+# Send `n` bytes on `conn` in pieces of at most 1 KB, yielding between them.
+# A connection's receive ring on agnos is 2048 bytes, and sock_send#48 holds the
+# CPU while it waits for room: one larger write to a process on this machine
+# never finishes (filed with agnos, 2026-09-23). daimon writes this way too.
+fn _c_send_paced(conn, buf, n) {
+    var off = 0;
+    while (off < n) {
+        var want = n - off;
+        if (want > 1024) { want = 1024; }
+        var w = syscall(SYS_SOCK_SEND, conn, buf + off, want);
+        if (w <= 0) { return 0 - 1; }
+        off = off + w;
+        if (off < n) { sys_pause(); }
+    }
+    return 0;
+}
+
+# Answer the request on `conn`: a JSON-RPC result whose one text block is `len`
+# x's and then END.
+fn _c_upstream_answer(conn, id, len) {
+    var bb = str_builder_new();
+    str_builder_add_cstr(bb, "{\"jsonrpc\":\"2.0\",\"id\":");
+    str_builder_add_int(bb, id);
+    str_builder_add_cstr(bb, ",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"");
+    var i = 0;
+    while (i < len) {
+        str_builder_add_cstr(bb, "x");
+        i = i + 1;
+    }
+    str_builder_add_cstr(bb, "END\"}],\"isError\":false}}");
+    var body = str_builder_build(bb);
+    var hb = str_builder_new();
+    str_builder_add_cstr(hb, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ");
+    str_builder_add_int(hb, str_len(body));
+    str_builder_add_cstr(hb, "\r\nConnection: close\r\n\r\n");
+    var head = str_builder_build(hb);
+    _c_send_paced(conn, str_data(head), str_len(head));
+    _c_send_paced(conn, str_data(body), str_len(body));
+    return 0;
+}
+
+# Let `ms` pass, yielding (pause#14; sleep_ms#41 would hold the CPU).
+fn _c_wait_ms(ms) {
+    var t0 = _c_now_ms();
+    while (_c_now_ms() - t0 < ms) { sys_pause(); }
     return 0;
 }
 
@@ -49,18 +185,18 @@ fn _c_has(needle) {
 # this rather than to the server's close: agnos's sock_recv#49 never reports the
 # end of a stream the peer has closed (CLOSE_WAIT reads as "nothing yet"; filed
 # with agnos, 2026-09-23).
-fn _c_whole() {
+fn _c_whole_of(buf, n) {
     var i = 0;
-    while (i + 4 <= _c_resp_n) {
-        if (memeq(_c_resp + i, "\r\n\r\n", 4) == 1) {
+    while (i + 4 <= n) {
+        if (memeq(buf + i, "\r\n\r\n", 4) == 1) {
             var hdr_end = i + 4;
             var cl = 0;
             var j = 0;
             while (j + 16 <= i) {
-                if (memeq(_c_resp + j, "Content-Length: ", 16) == 1) {
+                if (memeq(buf + j, "Content-Length: ", 16) == 1) {
                     var k = j + 16;
-                    while (load8(_c_resp + k) >= 48 && load8(_c_resp + k) <= 57) {
-                        cl = cl * 10 + load8(_c_resp + k) - 48;
+                    while (load8(buf + k) >= 48 && load8(buf + k) <= 57) {
+                        cl = cl * 10 + load8(buf + k) - 48;
                         k = k + 1;
                     }
                 }
@@ -73,10 +209,22 @@ fn _c_whole() {
     return 0 - 1;
 }
 
+fn _c_whole() { return _c_whole_of(_c_resp, _c_resp_n); }
+
 # One request on a fresh connection. Returns the status code, or -1.
 fn _c_req(method, path, body) {
-    _c_resp_n = 0;
-    store8(_c_resp, 0);
+    var conn = _c_open(method, path, body);
+    if (conn < 0) {
+        _c_resp_n = 0;
+        store8(_c_resp, 0);
+        return 0 - 1;
+    }
+    return _c_finish(conn);
+}
+
+# Open a connection to daimon and send one request on it, without reading the
+# answer. Returns the connection, or -1.
+fn _c_open(method, path, body) {
     var conn = syscall(SYS_SOCK_CONNECT, sys_net_ip(), 8090, 0);
     if (conn < 0) { return 0 - 1; }
     var sb = str_builder_new();
@@ -89,9 +237,17 @@ fn _c_req(method, path, body) {
     str_builder_add_cstr(sb, body);
     var r = str_builder_build(sb);
     syscall(SYS_SOCK_SEND, conn, str_data(r), str_len(r));
-    var t0 = clock_now_ms();
-    while (clock_now_ms() - t0 < 15000) {
-        var n = syscall(SYS_SOCK_RECV, conn, _c_resp + _c_resp_n, 8190 - _c_resp_n);
+    return conn;
+}
+
+# Read the answer on `conn` (to its Content-Length), and close it. Returns the
+# status code, or -1.
+fn _c_finish(conn) {
+    _c_resp_n = 0;
+    store8(_c_resp, 0);
+    var t0 = _c_now_ms();
+    while (_c_now_ms() - t0 < 15000) {
+        var n = syscall(SYS_SOCK_RECV, conn, _c_resp + _c_resp_n, _C_RESP_MAX - 2 - _c_resp_n);
         if (n > 0) {
             _c_resp_n = _c_resp_n + n;
             store8(_c_resp + _c_resp_n, 0);
@@ -110,18 +266,31 @@ fn _c_req(method, path, body) {
 }
 
 alloc_init();
-_c_resp = alloc(8192);
+_c_resp = alloc(_C_RESP_MAX);
 _c_put("CLIENT start\n");
 
-_c_check(_c_req("GET", "/v1/health", "") == 200, "health answers 200");
+# daimon may still be starting: its first answer ends the wait (60 s at most).
+var hs = 0 - 1;
+var t_up = _c_now_ms();
+while (hs != 200 && _c_now_ms() - t_up < 60000) {
+    hs = _c_req("GET", "/v1/health", "");
+    if (hs != 200) { _c_wait_ms(200); }
+}
+_c_check(hs == 200, "health answers 200");
 _c_check(_c_req("POST", "/v1/agents", "{\"name\":\"w1\"}") == 201, "an agent registers");
 _c_check(_c_req("POST", "/v1/agents/1/start", "") == 200, "it starts (spawn_path on agnos)");
 _c_check(_c_has("\"status\":2") == 1, "... RUNNING");
 _c_check(_c_has("\"limits_enforced\":false") == 1, "... and says its limits are not enforced");
-var tm = clock_now_ms();
-while (clock_now_ms() - tm < 500) { sys_pause(); }
-_c_check(_c_req("POST", "/v1/agents/1/messages/take", "") == 200, "its queue is taken");
-_c_check(_c_has("hello from an agnos agent") == 1, "... holding the frame it sent on its channel");
+# The agent sends its frame once it runs: take the queue until it holds it.
+var tk = 0;
+var got = 0;
+var t_msg = _c_now_ms();
+while (got == 0 && _c_now_ms() - t_msg < 20000) {
+    tk = _c_req("POST", "/v1/agents/1/messages/take", "");
+    if (tk == 200 && _c_has("hello from an agnos agent") == 1) { got = 1; } else { _c_wait_ms(100); }
+}
+_c_check(tk == 200, "its queue is taken");
+_c_check(got == 1, "... holding the frame it sent on its channel");
 _c_check(_c_has("\"source\":\"1\"") == 1, "... from the agent itself");
 _c_check(_c_req("POST", "/v1/agents/1/pause", "") == 501, "pause answers 501 on agnos");
 _c_check(_c_req("POST", "/v1/agents/1/stop", "") == 200, "stop answers (deferred, the loop steps it)");
@@ -129,13 +298,145 @@ _c_check(_c_has("\"status\":5") == 1, "... STOPPED");
 _c_check(_c_has("\"exit_code\":0") == 1, "... with the agent's own exit code");
 _c_check(_c_req("POST", "/v1/agents", "{\"name\":\"crash\",\"type\":\"System\"}") == 201, "a system agent registers");
 _c_check(_c_req("POST", "/v1/agents/2/start", "") == 200, "... starts");
-var tw = clock_now_ms();
-while (clock_now_ms() - tw < 1500) { sys_pause(); }
-_c_check(_c_req("GET", "/v1/agents/2", "") == 200, "... is read back");
-_c_check(_c_has("\"status\":6") == 1, "... FAILED once it exits");
+# It exits at once; daimon's tick collects it. Read it back until it has.
+var rb = 0;
+var gone = 0;
+var t_exit = _c_now_ms();
+while (gone == 0 && _c_now_ms() - t_exit < 20000) {
+    rb = _c_req("GET", "/v1/agents/2", "");
+    if (rb == 200 && _c_has("\"status\":6") == 1) { gone = 1; } else { _c_wait_ms(100); }
+}
+_c_check(rb == 200, "... is read back");
+_c_check(gone == 1, "... FAILED once it exits");
 _c_check(_c_has("\"exit_code\":3") == 1, "... with exit code 3");
 _c_check(_c_req("POST", "/v1/agents", "{\"name\":\"two words\"}") == 201, "a name with a space registers");
 _c_check(_c_req("POST", "/v1/agents/3/start", "") == 422, "... but cannot start on agnos (422)");
+
+# --- no room for an agent's channel: 503 (2.4.1) -------------------------------
+# This process takes channels until CH_MINT refuses (its own 32-slot fd table
+# runs out at 14), leaving few of the machine's 16. Agents 4 to 7 are then started
+# until one answers 503; it must stay Pending, and start once the channels are
+# given back.
+var taken = _c_take_channels();
+var reg = 0;
+var ri = 4;
+while (ri <= 7) {
+    var rb2 = str_builder_new();
+    str_builder_add_cstr(rb2, "{\"name\":\"r");
+    str_builder_add_int(rb2, ri);
+    str_builder_add_cstr(rb2, "\"}");
+    if (_c_req("POST", "/v1/agents", str_data(str_builder_build(rb2))) == 201) { reg = reg + 1; }
+    ri = ri + 1;
+}
+_c_check(taken > 0 && reg == 4, "agents 4-7 register while this process holds channels");
+var full_id = 0;
+var started = 0;
+var si2 = 4;
+while (si2 <= 7 && full_id == 0) {
+    var pb = str_builder_new();
+    str_builder_add_cstr(pb, "/v1/agents/");
+    str_builder_add_int(pb, si2);
+    str_builder_add_cstr(pb, "/start");
+    var st = _c_req("POST", str_data(str_builder_build(pb)), "");
+    if (st == 503) { full_id = si2; } elif (st == 200) { started = started + 1; }
+    si2 = si2 + 1;
+}
+_c_check(full_id > 0, "a start with no free channel answers 503");
+_c_check(_c_has("no room for another agent") == 1, "... saying there is no room");
+var gb = str_builder_new();
+str_builder_add_cstr(gb, "/v1/agents/");
+str_builder_add_int(gb, full_id);
+var full_path = str_data(str_builder_build(gb));
+_c_check(_c_req("GET", full_path, "") == 200 && _c_has("\"status\":0") == 1, "... and the agent stays Pending");
+_c_release_channels();
+var sb3 = str_builder_new();
+str_builder_add_cstr(sb3, full_path);
+str_builder_add_cstr(sb3, "/start");
+_c_check(_c_req("POST", str_data(str_builder_build(sb3)), "") == 200, "... and starts once channels are free");
+# Stop every agent this section started (each answers once its agent exits).
+var stopped = 0;
+var ti = 4;
+while (ti <= full_id) {
+    var tb = str_builder_new();
+    str_builder_add_cstr(tb, "/v1/agents/");
+    str_builder_add_int(tb, ti);
+    str_builder_add_cstr(tb, "/stop");
+    if (_c_req("POST", str_data(str_builder_build(tb)), "") == 200 && _c_has("\"status\":5") == 1) {
+        stopped = stopped + 1;
+    }
+    ti = ti + 1;
+}
+_c_check(stopped == started + 1, "... and they all stop");
+
+# --- detached calls (2.4.1): a forwarded MCP call runs in a child ---------------
+# Until 2.4.1 it ran on daimon's loop on agnos, holding every other client until
+# the MCP server answered. This process is the MCP server: it listens on 8091, and
+# the tool is registered at this guest's own address. agnos has 8 TCP slots for
+# every end of every connection, and a connection inside the guest takes two, so
+# each step below is laid out to fit.
+var ip = sys_net_ip();
+var ub = str_builder_new();
+str_builder_add_cstr(ub, "{\"name\":\"remote\",\"description\":\"a guest MCP server\",\"callback_url\":\"http://");
+str_builder_add_int(ub, (ip >> 24) & 255);
+str_builder_add_cstr(ub, ".");
+str_builder_add_int(ub, (ip >> 16) & 255);
+str_builder_add_cstr(ub, ".");
+str_builder_add_int(ub, (ip >> 8) & 255);
+str_builder_add_cstr(ub, ".");
+str_builder_add_int(ub, ip & 255);
+str_builder_add_cstr(ub, ":8091/mcp\"}");
+var lid = syscall(SYS_SOCK_LISTEN, 8091);
+_c_check(lid >= 0 && _c_req("POST", "/v1/mcp/tools", str_data(str_builder_build(ub))) == 201,
+  "an MCP server in the guest is registered");
+var call_body = "{\"name\":\"remote\",\"arguments\":{}}";
+# (1) An answer longer than an agnos pipe holds (4080 bytes) comes back whole.
+var ca = _c_open("POST", "/v1/mcp/call", call_body);
+var up = _c_accept(lid, 20000);
+var rid = 0 - 1;
+if (up >= 0) { rid = _c_upstream_request(up, 20000); }
+_c_check(rid >= 0, "the forwarded call reaches the MCP server");
+if (rid >= 0) { _c_upstream_answer(up, rid, 9000); }
+if (up >= 0) { syscall(SYS_SOCK_CLOSE, up); }
+var s1 = 0 - 1;
+if (ca >= 0) { s1 = _c_finish(ca); }
+_c_check(s1 == 200 && _c_resp_n > 9000 && _c_has("xxxxEND") == 1,
+  "a 9 KB answer comes back whole through the child's pipe");
+# (2) While the MCP server holds its answer, daimon answers others.
+var ca2 = _c_open("POST", "/v1/mcp/call", call_body);
+var up2 = _c_accept(lid, 20000);
+var rid2 = 0 - 1;
+if (up2 >= 0) { rid2 = _c_upstream_request(up2, 20000); }
+syscall(SYS_SOCK_CLOSE, lid);   # the listener's slot back, for the request below
+var t_h = _c_now_ms();
+var hs2 = _c_req("GET", "/v1/health", "");
+var h_ms = _c_now_ms() - t_h;
+_c_check(rid2 >= 0 && hs2 == 200 && h_ms < 10000,
+  "health answers while a forwarded call waits on its server (in place it waited for the server)");
+var hl = str_builder_new();
+str_builder_add_cstr(hl, "\nCLIENT detached: health answered in ");
+str_builder_add_int(hl, h_ms);
+str_builder_add_cstr(hl, " ms while a forwarded call waited\n");
+_c_put(str_data(str_builder_build(hl)));
+if (rid2 >= 0) { _c_upstream_answer(up2, rid2, 10); }
+if (up2 >= 0) { syscall(SYS_SOCK_CLOSE, up2); }
+var s2 = 0 - 1;
+if (ca2 >= 0) { s2 = _c_finish(ca2); }
+_c_check(s2 == 200 && _c_has("xxxxxxxxxxEND") == 1, "... and the waiting call is answered once its server is");
+_c_check(_c_req("DELETE", "/v1/mcp/tools/remote", "") == 200, "the MCP server is deregistered");
+
+# --- an answer larger than a connection's 2 KB receive ring (2.4.1) ------------
+# One write of it would stop the guest: sock_send#48 holds the CPU while it waits
+# for room this client cannot make without running. daimon writes in 1 KB pieces
+# and yields between them. Measured before that: this GET never returned.
+var ra = 0;
+var rk = 0;
+while (rk < 20) {
+    if (_c_req("POST", "/v1/agents", "{\"name\":\"an-agent-with-a-fairly-long-name\"}") == 201) { ra = ra + 1; }
+    rk = rk + 1;
+}
+var ls = _c_req("GET", "/v1/agents", "");
+_c_check(ra == 20 && ls == 200 && _c_resp_n > 2048 && _c_resp_n == _c_whole(),
+  "a 2 KB+ answer arrives whole (daimon writes it in pieces)");
 _c_check(_c_req("GET", "/v1/health", "") == 200, "health still answers");
 
 _c_put("CLIENT ");

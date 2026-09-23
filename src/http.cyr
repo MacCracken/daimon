@@ -283,7 +283,7 @@ fn http_json_text(root, key) {
 # Status-code → reason-phrase. Centralized so http_send_response
 # (sandhi-backed shim) can hand the right RFC 7231 phrase to
 # sandhi_server_send_response. Codes daimon emits today: 200, 201,
-# 204, 400, 403, 404, 405, 409, 413, 422, 429, 500, 501, 502, 504.
+# 204, 400, 403, 404, 405, 409, 413, 422, 429, 500, 501, 502, 503, 504.
 fn _http_reason(status) {
     if (status == 200) { return "OK"; }
     if (status == 201) { return "Created"; }
@@ -302,8 +302,50 @@ fn _http_reason(status) {
     if (status == 500) { return "Internal Server Error"; }
     if (status == 501) { return "Not Implemented"; }
     if (status == 502) { return "Bad Gateway"; }
+    if (status == 503) { return "Service Unavailable"; }   # 2.4.1: no room for another agent (agnos)
     if (status == 504) { return "Gateway Timeout"; }   # 2.3.4: a detached call past its bound
     return "Error";
+}
+
+# agnos (2.4.1): daimon writes every answer itself, as the same bytes sandhi
+# would send, through daimon_write_all. sandhi_server_send_response makes one
+# write per part and ignores a short count, which fails there twice over:
+# - a detached call's child answers into a pipe (server_detach), a 4080-byte
+#   ring whose write returns short when full, so an answer over 4 KB lost its
+#   tail. The child names its pipe here (http_answer_into_pipe);
+# - a client's receive ring is 2048 bytes and sock_send#48 holds the CPU while
+#   it waits for room, so one larger write to a local client stopped the
+#   machine. daimon_write_all writes in pieces and yields between them.
+var _http_pipe_fd = 0 - 1;
+var _http_pipe_deadline = 0;
+var HTTP_SEND_MAX_MS = 30000;   # agnos: a socket answer is given up after this
+
+fn http_answer_into_pipe(fd, deadline) {
+    _http_pipe_fd = fd;
+    _http_pipe_deadline = deadline;
+    return 0;
+}
+
+fn _http_send_built(fd, status, body_data, body_len) {
+    var deadline = daimon_now_ms() + HTTP_SEND_MAX_MS;
+    if (fd == _http_pipe_fd) { deadline = _http_pipe_deadline; }
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "HTTP/1.1 ");
+    str_builder_add_int(sb, status);
+    str_builder_add_cstr(sb, " ");
+    str_builder_add_cstr(sb, _http_reason(status));
+    str_builder_add_cstr(sb, "\r\nContent-Type: application/json\r\nContent-Length: ");
+    str_builder_add_int(sb, body_len);
+    str_builder_add_cstr(sb, "\r\n");
+    var extra = trace_response_header();
+    if (extra != 0) { str_builder_add_cstr(sb, extra); }
+    str_builder_add_cstr(sb, "Connection: close\r\n\r\n");
+    var head = str_builder_build(sb);
+    if (daimon_write_all(fd, str_data(head), str_len(head), deadline) != 0) { return 0 - 1; }
+    if (body_len > 0) {
+        if (daimon_write_all(fd, body_data, body_len, deadline) != 0) { return 0 - 1; }
+    }
+    return 0;
 }
 
 # Sandhi-backed shim. Same signature as the pre-sandhi version so
@@ -311,9 +353,17 @@ fn _http_reason(status) {
 # Content-Type: application/json + Connection: close, matching
 # daimon original behaviour.
 fn http_send_response(fd, status, body_data, body_len) {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return _http_send_built(fd, status, body_data, body_len);
+    #else
+    # Linux names no pipe (a detached child's pipe blocks when full); the test
+    # of the agnos writer does.
+    if (fd == _http_pipe_fd) { return _http_send_built(fd, status, body_data, body_len); }
     # extra_headers echoes X-Trace-Id when `serve --trace` is on (else 0).
     sandhi_server_send_response(fd, status, _http_reason(status),
       "application/json", body_data, body_len, trace_response_header());
+    return 0;
+    #endif
 }
 
 fn http_ok(fd, body) {

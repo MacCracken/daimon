@@ -146,6 +146,10 @@ reached again.
 **On AGNOS** (2.4.0, [ADR-007](../adr/007-daimon-on-agnos.md)) the same routes use the agnos
 kernel's primitives. Some things differ until agnos closes the gaps filed with it
 (`docs/development/issues/2026-09-23-*.md` in the agnos repo):
+- **Room**: the machine has 16 process slots and 16 channels. Measured in daimon's guest test,
+  12 agents run at once. A start with no free channel answers **503** ("no room for another
+  agent"), and the agent stays as it was (2.4.1). A start that `spawn_path` refuses answers **500**
+  ("its process table is full, or it cannot load the executable"): agnos does not say which.
 - **Start**: `spawn_path` runs `<exe> --agent-id <id> --agent-name <name>` as one line split on
   spaces, at most 127 bytes. So a name with a space, or a longer line, answers **422**. The
   environment is daimon's (filtered by `--agent-env`), at most 16 entries and 1024 bytes, plus
@@ -158,6 +162,9 @@ kernel's primitives. Some things differ until agnos closes the gaps filed with i
   daimon's whole fd table.
 - **The listener** is on the NIC's address: agnos cannot bind 127.0.0.1. daimon warns and audits
   `http.listen.not_loopback`. Local clients reach it at the box's own address, not 127.0.0.1.
+- **Answers are written 1 KB at a time** (2.4.1). A TCP receive ring on agnos is 2 KB, and the
+  kernel holds the CPU while a send waits for room, so one larger write to a local client stopped the
+  machine. A client that reads keeps up. One that stops reading mid-answer can still stop it.
 
 **Browsers may not control agents.** start / stop / pause / resume / DELETE answer **403** to any
 request carrying an `Origin` header. A web page can send a cross-origin `text/plain` POST with no
@@ -189,7 +196,7 @@ POST /v1/mcp/call
 → {"content":[...],"isError":false}
 # A call to an external tool (like resources/read, prompts/get, web_fetch and
 # web_search) runs in a child process, so daimon keeps serving meanwhile. One
-# that has not finished within 60 s is answered 504 (2.3.4).
+# that has not finished within 60 s is answered 504 (2.3.4; on AGNOS since 2.4.1).
 
 # Deregister
 DELETE /v1/mcp/tools/scan
@@ -349,6 +356,7 @@ See [agent-ipc.md](agent-ipc.md).
 | 500 | Internal Server Error — e.g. an agent's rlimits could not be applied, or its executable could not be run |
 | 501 | Not Implemented — chunked Transfer-Encoding; pause and resume on AGNOS |
 | 502 | Bad Gateway — an MCP endpoint could not be reached or answered wrongly |
+| 503 | Service Unavailable — on AGNOS: no free channel for another agent, or 4 calls to other servers still running |
 | 504 | Gateway Timeout — an MCP call, `web_fetch` or `web_search` did not finish within 60 s |
 
 All errors return `{"error":"message","code":NNN}`.
