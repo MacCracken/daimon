@@ -6,7 +6,7 @@ type: state
 
 # Documentation Health — daimon
 
-> **Last refresh**: 2026-09-22 (2.3.0 — the agent lifecycle on the API: API guide, quickstart, overview, README, BENCHMARKS, SECURITY, roadmap and a new audit report. Rows below that predate 2.3.0 are as last recorded.)
+> **Last refresh**: 2026-09-22 (2.3.1 — task start / complete: API guide, overview, README, quickstart, BENCHMARKS, roadmap, and an addendum to the lifecycle audit. Rows below that predate 2.3.1 are as last recorded.)
 > **Refresh cadence**: when docs are touched, update the affected row. Full re-audit at each minor cut.
 > **Scope**: this repo only (`daimon`) — root-level files plus the entire `docs/` tree.
 
@@ -103,6 +103,23 @@ Daimon is the AGNOS agent orchestrator — every consumer (hoosh, agnoshi, aethe
   open. Its two function names were wrong (`ipc_send`, `complete_task`); they are now
   `agent_ipc_send` and samay's `task_scheduler_complete_task`.
 - ✅ `CHANGELOG.md` / `VERSION` / `src/config.cyr` — 2.3.0 (`scripts/version-bump.sh`).
+
+**Doc work shipped in 2.3.1 (2026-09-22):**
+- ✅ `docs/guides/api.md` — the task start / complete routes, a node's work list, the new task JSON
+  and stats fields, and a task's life through the API. Also a **known-issue** note: request strings
+  keep their JSON escapes until 2.3.2.
+- ✅ `docs/audit/2026-09-22-agent-lifecycle-audit.md` — addendum: VULN-016, any client can report
+  any task's state.
+- ✅ `docs/architecture/overview.md` — `sched.cyr`, and the route count 38 → 41 (counted from
+  `src/router.cyr`).
+- ✅ `README.md`, `docs/guides/quickstart.md` — counts: 797 assertions, 17 suites, 23 + 2 benchmarks.
+  Both still called the binary **181 KB**, the v1.0.1 port-era figure; it is 3,223,048 bytes, of
+  which 1,613,123 are unreachable code the 6.x toolchain NOPs in place (build output, 2.3.1).
+- ✅ `BENCHMARKS.md` — the 2.3.1 benchmark and the 2.3.0 / 2.3.1 A/B; the scheduler, api and
+  coverage rows.
+- ✅ `docs/development/roadmap.md` — 2.3.1 done. 2.3.2 (request-string decoding) is next, then IPC,
+  and VULN-016 sits under identity.
+- ✅ `CHANGELOG.md` / `VERSION` / `src/config.cyr` — 2.3.1 (`scripts/version-bump.sh`).
 
 ⚠ This ledger said "stale set: cleared" through the whole 2.x line while README quoted 1.3-era test
 counts and BENCHMARKS.md called untested modules "Complete". A doc can only be as fresh as the check

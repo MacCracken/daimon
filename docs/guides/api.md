@@ -187,22 +187,47 @@ POST /v1/scheduler/tasks
 GET /v1/scheduler/tasks
 → {"stats":{"total_tasks":1,"queued":1,"running":0,...}}
 
-# Get task
+# Get task — agent_id, node (where it was placed) and fail_reason since 2.3.1
 GET /v1/scheduler/tasks/2
-→ {"task_id":"2","name":"train-model","priority":7,"status":"Queued"}
+→ {"task_id":"2","name":"train-model","priority":7,"status":"Queued","agent_id":"agent-1","node":null,"fail_reason":null}
 
 # Cancel task
 POST /v1/scheduler/tasks/2/cancel
 → {"ok":true}
 
+# An executor's work list: the node's Scheduled and Running tasks (2.3.1)
+GET /v1/scheduler/nodes/worker-1/tasks
+→ {"node_id":"worker-1","tasks":[{"task_id":"2",...,"status":"Scheduled","node":"worker-1",...}],"count":1}
+→ 404 unknown node
+
+# Start — the executor reports it running: Scheduled → Running (2.3.1)
+POST /v1/scheduler/tasks/2/start
+→ {"task_id":"2",...,"status":"Running",...}
+→ 404 · 409 unless Scheduled · 403 from a browser
+
+# Complete — and done: Running → Completed, or Failed with a reason (2.3.1)
+POST /v1/scheduler/tasks/2/complete                                  (no body = completed)
+POST /v1/scheduler/tasks/2/complete {"status":"failed","reason":"disk full"}
+→ {"task_id":"2",...,"status":"Failed",...,"fail_reason":"disk full"}
+→ 400 status not completed/failed · 404 · 409 unless Running · 403 from a browser
+
 # Schedule pending tasks
 POST /v1/scheduler/schedule
 → {"decisions":[{"task_id":"2","assigned_node":"worker-1","reason":"best-fit"}]}
 
-# Scheduler stats
+# Scheduler stats — the averages are 0 until a task has started (2.3.1)
 GET /v1/scheduler/stats
-→ {"total_tasks":1,"queued":0,"running":0,"completed":1,"failed":0}
+→ {"total_tasks":1,"queued":0,"running":0,"completed":1,"failed":0,"average_wait_time_ms":54,"average_run_time_ms":82}
 ```
+
+A task's life through the API: submit → schedule places it on a node (Scheduled, holding that node's
+capacity) → the executor on that node finds it with `GET /v1/scheduler/nodes/{id}/tasks`, reports it
+started (Running), then reports it complete (Completed or Failed). Completing it returns the
+capacity at once, so the next schedule can use it. `status` for complete accepts `completed` /
+`failed` or `Completed` / `Failed`.
+
+Anyone who can reach the API can report any task. Only browsers are refused (the Origin rule, as for
+agents), and executor identity waits for authentication (roadmap 2.5.x).
 
 ## Metrics
 
@@ -216,7 +241,7 @@ GET /v1/metrics
 | Status | Meaning |
 |---|---|
 | 400 | Bad Request — missing/invalid field |
-| 403 | Forbidden — agent control from a browser (a request carrying `Origin`) |
+| 403 | Forbidden — agent or task control from a browser (a request carrying `Origin`) |
 | 404 | Not Found — unknown route or ID |
 | 405 | Method Not Allowed — a route exists, not for this method |
 | 409 | Conflict — the agent's status does not allow the action, a name is taken, or the agent limit is reached |
@@ -241,3 +266,6 @@ All errors return `{"error":"message","code":NNN}`.
 - Content-Length is validated; Transfer-Encoding is rejected.
 - Maximum request size: 64 KB.
 - An agent's executable is chosen by daimon from its type, never by a request. See Agents.
+- **Known issue (until 2.3.2):** string values in request bodies are stored with their JSON escapes
+  undecoded. A name sent as `"say \"hi\""` is kept, and echoed back, as `say \"hi\"`. Plain ASCII
+  without quotes, backslashes or `\u` escapes is unaffected.

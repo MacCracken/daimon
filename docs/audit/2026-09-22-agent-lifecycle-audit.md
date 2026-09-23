@@ -1,4 +1,4 @@
-# Security Audit — 2026-09-22: the agent lifecycle (2.3.0)
+# Security Audit — 2026-09-22: the agent lifecycle (2.3.0, with a 2.3.1 addendum)
 
 2.3.0 connects process control to the HTTP API: an unauthenticated client can now start, stop,
 pause, resume and delete agents. This audit covers that new surface and two older exposures that
@@ -172,6 +172,31 @@ agents without `PATH`. **Remediation option**: an allowlisted environment per ag
 
 ---
 
+### VULN-016: Any client can report any task's state (MEDIUM, integrity) — OPEN, recorded (2.3.1)
+
+**CWE**: [CWE-862](https://cwe.mitre.org/data/definitions/862.html) — Missing Authorization.
+**Reference (class)**: [CVE-2026-48592](https://basefortify.eu/cve_reports/2026/05/cve-2026-48592.html) —
+Oban Web's job-edit handler skipped the authorization check that its sibling handlers made, so a
+read-only user could substitute the worker a job would run.
+
+2.3.1 adds `POST /v1/scheduler/tasks/{id}/start` and `/complete`, which report a task running and
+done. There is no executor identity, so any caller that can reach the API can:
+- mark any RUNNING task COMPLETED or FAILED. That returns its node's capacity while the real work
+  may still be running, so the scheduler can over-commit the node;
+- mark any SCHEDULED task RUNNING although nothing runs it. It then holds its capacity until
+  something completes or cancels it.
+
+**Mitigated by**: the loopback bind (VULN-011), and the Origin guard, which 2.3.1 applies to both
+routes: a cross-site request gets 403 and is recorded as `task.control.origin`. Measured with
+`tests/smoke.sh` ("a browser-originated complete is 403").
+**Not mitigated**: a local process, or a network client when `--listen` widens the bind.
+**Remediation**: per-agent identity (roadmap 2.5.x), so only a task's executor may report it.
+
+`fail_reason` is stored from the request body. It is bounded by the 64 KB request limit, escaped on
+output (`json_escape_str`), and cloned at the retention boundary, so a reused request buffer cannot
+rewrite it (`tests/sched.tcyr`). The new `GET /v1/scheduler/nodes/{id}/tasks` is readable the way
+every GET is, and so falls under VULN-012's open "no Host allowlist" item.
+
 ## Defects fixed in the lifecycle code when it first ran
 
 None of this code had ever executed: it had no caller until 2.3.0. Each fix has a test that fails
@@ -215,3 +240,4 @@ were caught.
 - [CVE-2022-28108 / CVE-2022-28109 — CSRF and DNS-rebinding to RCE in Selenium Server (Grid)](https://www.gabriel.urdhr.fr/2022/02/07/selenium-standalone-server-csrf-dns-rebinding-rce/)
 - [CWE-403](https://cwe.mitre.org/data/definitions/403.html), [CWE-1327](https://cwe.mitre.org/data/definitions/1327.html), [CWE-346](https://cwe.mitre.org/data/definitions/346.html), [CWE-352](https://cwe.mitre.org/data/definitions/352.html), [CWE-400](https://cwe.mitre.org/data/definitions/400.html), [CWE-526](https://cwe.mitre.org/data/definitions/526.html), [CWE-770](https://cwe.mitre.org/data/definitions/770.html)
 - [QEMU `linux-user/syscall.c`](https://gitlab.com/qemu-project/qemu/-/blob/master/linux-user/syscall.c) — the `TARGET_NR_prlimit64` handler
+- [CVE-2026-48592 — Oban Web missing authorization](https://basefortify.eu/cve_reports/2026/05/cve-2026-48592.html); [CWE-862](https://cwe.mitre.org/data/definitions/862.html) (2.3.1 addendum)

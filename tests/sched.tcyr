@@ -1,0 +1,178 @@
+# =========================================================================
+# sched — tests against THE REAL src/sched.cyr and samay (2.3.1)
+#
+# First coverage of task start / complete, the operations 2.3.1 put on the API.
+# Everything below drives a real samay scheduler: a node with room for exactly
+# two default tasks (1 cpu, 256 MB each), three tasks, and the reservation
+# accounting start and complete must keep. The timing checks read samay's own
+# stats, which derive wait and run times from the started_at that
+# sched_task_start stamps — without it both averages stay 0.
+# =========================================================================
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/io.cyr"
+include "lib/hashmap.cyr"
+include "lib/tagged.cyr"
+include "lib/bayan.cyr"
+include "lib/chrono.cyr"
+include "lib/syscalls.cyr"
+include "lib/math.cyr"
+include "lib/assert.cyr"
+
+include "src/sched.cyr"
+
+# samay warns (WARN) for the task that cannot be placed; that is expected here.
+sakshi_set_level(SK_ERROR);
+
+var _nap_ts: i64[2];
+fn _nap_ms(ms) {
+    store64(&_nap_ts, 0);
+    store64(&_nap_ts + 8, ms * 1000000);
+    sys_nanosleep(&_nap_ts, 0);
+    return 0;
+}
+
+fn _task(name) {
+    return scheduled_task_new(str_from(name), str_from("d"), str_from("agent-1"), 5, resource_req_default());
+}
+
+fn _id(t) { return ScheduledTask_task_id(t); }
+
+# --- parsing the status a complete request names ----------------------------
+test_group("sched_parse");
+assert_eq(sched_final_status_parse(str_from("completed")), TASK_COMPLETED, "completed");
+assert_eq(sched_final_status_parse(str_from("Completed")), TASK_COMPLETED, "Completed (the task JSON's form)");
+assert_eq(sched_final_status_parse(str_from("failed")), TASK_FAILED, "failed");
+assert_eq(sched_final_status_parse(str_from("Failed")), TASK_FAILED, "Failed");
+assert_eq(sched_final_status_parse(str_from("running")), 0 - 1, "a non-terminal status is refused");
+assert_eq(sched_final_status_parse(str_from("cancelled")), 0 - 1, "cancel has its own route");
+assert_eq(sched_final_status_parse(str_from("COMPLETED")), 0 - 1, "only the two spellings");
+assert_eq(sched_final_status_parse(str_from("")), 0 - 1, "empty is refused");
+assert_eq(sched_final_status_parse(0), 0 - 1, "missing is refused");
+
+# --- start ------------------------------------------------------------------
+test_group("sched_start");
+var s = task_scheduler_new();
+var node = node_capacity_new(str_from("n1"), f64_from(2), 512, 102400, 0);
+task_scheduler_register_node(s, node);
+var ta = _task("a");
+var tb = _task("b");
+var tc = _task("c");
+task_scheduler_submit_task(s, ta);
+task_scheduler_submit_task(s, tb);
+task_scheduler_submit_task(s, tc);
+task_scheduler_schedule_pending(s);
+
+# Two fit, one waits. Which two is samay's ordering, not this test's business.
+var queued = 0;
+var p1 = 0;
+var p2 = 0;
+var all = vec_new();
+vec_push(all, ta);
+vec_push(all, tb);
+vec_push(all, tc);
+var ai = 0;
+while (ai < 3) {
+    var t = vec_get(all, ai);
+    if (ScheduledTask_status(t) == TASK_QUEUED) { queued = t; }
+    elif (p1 == 0) { p1 = t; }
+    else { p2 = t; }
+    ai = ai + 1;
+}
+assert(queued != 0, "one task could not be placed");
+assert(p1 != 0, "two tasks were placed");
+assert(p2 != 0, "... both of them");
+assert_eq(ScheduledTask_status(p1), TASK_SCHEDULED, "placed = SCHEDULED");
+assert_eq(NodeCapacity_running_tasks(node), 2, "the node holds two reservations");
+assert_eq(NodeCapacity_available_memory_mb(node), 0, "... and has no memory left");
+
+var q_t, q_v = sched_task_start(s, _id(queued));
+assert_eq(is_err_result(q_t), 1, "a QUEUED task cannot start");
+assert_eq(q_v, SCHED_OP_BAD_STATE, "... SCHED_OP_BAD_STATE");
+assert_eq(ScheduledTask_status(queued), TASK_QUEUED, "... and is untouched");
+var u_t, u_v = sched_task_start(s, str_from("no-such-task"));
+assert_eq(u_v, SCHED_OP_NOT_FOUND, "an unknown id is SCHED_OP_NOT_FOUND");
+
+_nap_ms(30);   # wait time: created -> started, read back through samay's stats
+var s1_t, s1_v = sched_task_start(s, _id(p1));
+assert_eq(is_ok(s1_t), 1, "a SCHEDULED task starts");
+assert_eq(s1_v, p1, "... and the task is returned");
+assert_eq(ScheduledTask_status(p1), TASK_RUNNING, "RUNNING");
+assert(ScheduledTask_started_at(p1) > 0, "started_at is stamped (samay sets it nowhere)");
+assert(ScheduledTask_started_at(p1) >= ScheduledTask_created_at(p1), "... not before creation");
+var s2_t, s2_v = sched_task_start(s, _id(p1));
+assert_eq(s2_v, SCHED_OP_BAD_STATE, "a RUNNING task cannot start again");
+assert_eq(NodeCapacity_running_tasks(node), 2, "starting takes no more capacity");
+
+# --- complete ---------------------------------------------------------------
+test_group("sched_complete");
+var b1_t, b1_v = sched_task_complete(s, _id(p1), TASK_RUNNING, 0);
+assert_eq(b1_v, SCHED_OP_BAD_STATUS, "complete refuses a non-terminal status");
+var b2_t, b2_v = sched_task_complete(s, _id(p1), TASK_CANCELLED, 0);
+assert_eq(b2_v, SCHED_OP_BAD_STATUS, "... and CANCELLED (it has its own route)");
+assert_eq(ScheduledTask_status(p1), TASK_RUNNING, "a refused complete leaves the task RUNNING");
+
+var ns_t, ns_v = sched_task_complete(s, _id(p2), TASK_COMPLETED, 0);
+assert_eq(ns_v, SCHED_OP_BAD_STATE, "a task that never started cannot complete");
+assert_eq(ScheduledTask_status(p2), TASK_SCHEDULED, "... it stays SCHEDULED");
+assert(ScheduledTask_reserved_on(p2) != 0, "... and keeps its reservation");
+
+var nf_t, nf_v = sched_task_complete(s, str_from("no-such-task"), TASK_COMPLETED, 0);
+assert_eq(nf_v, SCHED_OP_NOT_FOUND,
+  "an unknown id is NOT_FOUND (samay answers Err(1) for both cases; the lookup tells them apart)");
+
+_nap_ms(30);   # run time: started -> completed
+var c_t, c_v = sched_task_complete(s, _id(p1), TASK_COMPLETED, str_from("ignored"));
+assert_eq(is_ok(c_t), 1, "a RUNNING task completes");
+assert_eq(ScheduledTask_status(p1), TASK_COMPLETED, "COMPLETED");
+assert(ScheduledTask_completed_at(p1) >= ScheduledTask_started_at(p1), "completed_at is after started_at");
+assert_eq(ScheduledTask_fail_reason(p1), 0, "a reason is kept only for FAILED");
+assert_eq(ScheduledTask_reserved_on(p1), 0, "its reservation is released");
+assert_eq(NodeCapacity_running_tasks(node), 1, "the node holds one reservation");
+assert_eq(NodeCapacity_available_memory_mb(node), 256, "... and has one task's memory back");
+var c2_t, c2_v = sched_task_complete(s, _id(p1), TASK_COMPLETED, 0);
+assert_eq(c2_v, SCHED_OP_BAD_STATE, "a COMPLETED task cannot complete again");
+
+# The capacity that came back is usable: the waiting task is placed now.
+task_scheduler_schedule_pending(s);
+assert_eq(ScheduledTask_status(queued), TASK_SCHEDULED, "the freed capacity places the waiting task");
+
+# FAILED keeps its reason, OWNED: the reason arrives as a view into the
+# request buffer, which the next request overwrites.
+sched_task_start(s, _id(p2));
+var rbuf = alloc(32);
+memcpy(rbuf, "disk full", 9);
+var f_t, f_v = sched_task_complete(s, _id(p2), TASK_FAILED, str_new(rbuf, 9));
+assert_eq(is_ok(f_t), 1, "a RUNNING task fails");
+assert_eq(ScheduledTask_status(p2), TASK_FAILED, "FAILED");
+memset(rbuf, 88, 32);                   # the next request reuses the buffer
+assert_eq(str_eq(ScheduledTask_fail_reason(p2), str_from("disk full")), 1,
+  "fail_reason survives the request buffer being reused");
+
+sched_task_start(s, _id(queued));
+var g_t, g_v = sched_task_complete(s, _id(queued), TASK_FAILED, 0);
+assert_eq(is_ok(g_t), 1, "FAILED without a reason");
+assert_eq(ScheduledTask_fail_reason(queued), 0, "... leaves fail_reason unset");
+
+assert_eq(NodeCapacity_running_tasks(node), 0, "every reservation is back");
+assert_eq(NodeCapacity_available_memory_mb(node), 512, "... all the memory");
+assert_eq(f64_eq(NodeCapacity_available_cpu(node), f64_from(2)), 1, "... all the cpu");
+
+# --- samay's stats, now that tasks can run ------------------------------------
+test_group("sched_stats");
+var st = task_scheduler_stats(s);
+assert_eq(SchedulerStats_total_tasks(st), 3, "three tasks");
+assert_eq(SchedulerStats_completed(st), 1, "one completed");
+assert_eq(SchedulerStats_failed(st), 2, "two failed");
+assert_eq(SchedulerStats_running(st), 0, "none running");
+# p1 waited >= 30 ms before starting and ran >= 30 ms; the other two started
+# at once. Run time averages over COMPLETED tasks (p1 only); wait time over
+# every task that started (all three), so its mean is >= 10.
+assert(SchedulerStats_average_run_time_ms(st) >= 30, "average run time reflects started_at");
+assert(SchedulerStats_average_wait_time_ms(st) >= 10, "average wait time reflects started_at");
+
+syscall(SYS_EXIT, assert_summary());

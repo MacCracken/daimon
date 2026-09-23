@@ -10,13 +10,25 @@
 # page without a CORS preflight — and daimon answers any Host header, so a
 # DNS-rebinding page reaches it too. The classes of CVE-2022-28108 (Selenium
 # Grid: CSRF via text/plain) and CVE-2024-28224 (Ollama: DNS rebinding).
-# daimon's own clients send no Origin. Every other route is unchanged until
-# authentication (roadmap 2.5.x). Returns 1 if it answered 403.
-fn _route_refuse_browser(fd, buf, buf_len) {
+# daimon's own clients send no Origin. 2.3.1 applies the same guard to task
+# start / complete — new routes, so no existing client can break. Every other
+# route is unchanged until authentication (roadmap 2.5.x). `what` names the
+# subject ("agent" / "task") in the 403 and in the audit action
+# (`<what>.control.origin`). Returns 1 if it answered 403.
+fn _route_refuse_browser(fd, buf, buf_len, what) {
     if (http_has_origin(buf, buf_len) == 0) { return 0; }
-    daimon_audit(SEV_WARNING, "http", "agent.control.origin",
-      "browser-originated agent control refused");
-    http_error(fd, 403, str_from("agent control does not accept browser-originated requests"));
+    var act = str_builder_new();
+    str_builder_add_cstr(act, what);
+    str_builder_add_cstr(act, ".control.origin");
+    var det = str_builder_new();
+    str_builder_add_cstr(det, "browser-originated ");
+    str_builder_add_cstr(det, what);
+    str_builder_add_cstr(det, " control refused");
+    daimon_audit(SEV_WARNING, "http", str_data(str_builder_build(act)), str_data(str_builder_build(det)));
+    var msg = str_builder_new();
+    str_builder_add_cstr(msg, what);
+    str_builder_add_cstr(msg, " control does not accept browser-originated requests");
+    http_error(fd, 403, str_builder_build(msg));
     return 1;
 }
 
@@ -60,35 +72,35 @@ fn http_route(fd, method, path, buf, buf_len) {
         var aid = _route_id_before(asub, aslen, "/start", 6);
         if (aid != 0) {
             if (route_method(fd, method, 1) == 0) { return 0; }
-            if (_route_refuse_browser(fd, buf, buf_len) == 1) { return 0; }
+            if (_route_refuse_browser(fd, buf, buf_len, "agent") == 1) { return 0; }
             api_agent_start(fd, aid);
             return 0;
         }
         aid = _route_id_before(asub, aslen, "/stop", 5);
         if (aid != 0) {
             if (route_method(fd, method, 1) == 0) { return 0; }
-            if (_route_refuse_browser(fd, buf, buf_len) == 1) { return 0; }
+            if (_route_refuse_browser(fd, buf, buf_len, "agent") == 1) { return 0; }
             api_agent_stop(fd, aid);
             return 0;
         }
         aid = _route_id_before(asub, aslen, "/pause", 6);
         if (aid != 0) {
             if (route_method(fd, method, 1) == 0) { return 0; }
-            if (_route_refuse_browser(fd, buf, buf_len) == 1) { return 0; }
+            if (_route_refuse_browser(fd, buf, buf_len, "agent") == 1) { return 0; }
             api_agent_pause(fd, aid);
             return 0;
         }
         aid = _route_id_before(asub, aslen, "/resume", 7);
         if (aid != 0) {
             if (route_method(fd, method, 1) == 0) { return 0; }
-            if (_route_refuse_browser(fd, buf, buf_len) == 1) { return 0; }
+            if (_route_refuse_browser(fd, buf, buf_len, "agent") == 1) { return 0; }
             api_agent_resume(fd, aid);
             return 0;
         }
         if (aslen > 0) {
             if (method == 0) { api_get_agent(fd, asub); return 0; }
             if (method == 3) {
-                if (_route_refuse_browser(fd, buf, buf_len) == 1) { return 0; }
+                if (_route_refuse_browser(fd, buf, buf_len, "agent") == 1) { return 0; }
                 api_agent_delete(fd, asub);
                 return 0;
             }
@@ -245,6 +257,17 @@ fn http_route(fd, method, path, buf, buf_len) {
         return 0;
     }
 
+    # GET /v1/scheduler/nodes/{id}/tasks — an executor's work list (2.3.1)
+    if (memeq(path, "/v1/scheduler/nodes/", 20) == 1) {
+        var nsub = path + 20;
+        var nid = _route_id_before(nsub, strlen(nsub), "/tasks", 6);
+        if (nid != 0) {
+            if (route_method(fd, method, 0) == 0) { return 0; }
+            api_sched_node_tasks(fd, nid);
+            return 0;
+        }
+    }
+
     # POST /v1/scheduler/nodes
     if (streq(path, "/v1/scheduler/nodes") == 1) {
         # POST only (2.2.2). Every method used to land here, so a GET answered
@@ -269,10 +292,26 @@ fn http_route(fd, method, path, buf, buf_len) {
         return 0;
     }
 
-    # /v1/scheduler/tasks/{id} or /v1/scheduler/tasks/{id}/cancel
+    # /v1/scheduler/tasks/{id}, and .../{id}/cancel | /start | /complete
     if (memeq(path, "/v1/scheduler/tasks/", 20) == 1) {
         var sub = path + 20;
         var sublen = strlen(sub);
+        # 2.3.1: the executor reports a task running, then done. POST only,
+        # and refused from a browser like agent control.
+        var tid = _route_id_before(sub, sublen, "/start", 6);
+        if (tid != 0) {
+            if (route_method(fd, method, 1) == 0) { return 0; }
+            if (_route_refuse_browser(fd, buf, buf_len, "task") == 1) { return 0; }
+            api_sched_start(fd, tid);
+            return 0;
+        }
+        tid = _route_id_before(sub, sublen, "/complete", 9);
+        if (tid != 0) {
+            if (route_method(fd, method, 1) == 0) { return 0; }
+            if (_route_refuse_browser(fd, buf, buf_len, "task") == 1) { return 0; }
+            api_sched_complete(fd, tid, http_parse_body(buf, buf_len));
+            return 0;
+        }
         if (sublen > 7) {
             if (memeq(sub + sublen - 7, "/cancel", 7) == 1) {
                 # ⛔ POST only (2.2.2). A plain GET cancelled the task — measured,

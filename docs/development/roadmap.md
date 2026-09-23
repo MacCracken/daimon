@@ -4,13 +4,17 @@
 >
 > **Severity legend**: **P0** blocking (security / correctness — must-fix before ship) · **P1** high (must-have for the current arc) · **P2** medium (schedule when capacity opens) · **P3 / Low** nice-to-have, no urgency. Upstream-blocker items quote the upstream tracker's own severity.
 
-**Where daimon stands** — `2.3.0`, cyrius 6.6.6, nine dep pins current (samay
-1.1.3). Builds on **three targets**: x86_64, aarch64 and AGNOS. **Agents can be started, stopped,
-paused, resumed and deleted through the API** (2.3.0), under their rlimits, with exit status
-reported. On AGNOS a start answers 501 until 2.4.x. **741 tests** in 16 suites, every one against
-its real `src/` module, plus 43 HTTP smoke checks, 24 benchmarks and 6 fuzz harnesses, all run by
-CI. The API binds 127.0.0.1 unless told otherwise (`--listen`), and agent control refuses
-browser-originated requests. Zero open issue filings.
+**Where daimon stands** — `2.3.1`, cyrius 6.6.6, nine dep pins current (samay
+1.1.3). Builds on **three targets**: x86_64, aarch64 and AGNOS.
+- **Agents can be started, stopped, paused, resumed and deleted through the API** (2.3.0), under
+  their rlimits, with exit status reported. On AGNOS a start answers 501 until 2.4.x.
+- **Scheduled tasks can be started and completed** (2.3.1), and an executor can list its node's
+  work.
+- **797 tests** in 17 suites, every one against its real `src/` module, plus 60 HTTP smoke checks,
+  25 benchmarks and 6 fuzz harnesses, all run by CI.
+- The API binds 127.0.0.1 unless told otherwise (`--listen`), and agent and task control refuse
+  browser-originated requests.
+- Zero open issue filings.
 
 ## The arc to 3.0.0
 
@@ -19,7 +23,7 @@ prerequisites, sequenced. Each line is a release train, not a single release.
 
 | arc | theme | why it must come after the one above |
 |---|---|---|
-| **2.3.x** | **Agent lifecycle** — start / stop / signal / reap through the API | The product gap. **2.3.0 shipped the process half** (start, stop, pause, resume, delete, reaping); task start/complete and IPC remain. |
+| **2.3.x** | **Agent lifecycle** — start / stop / signal / reap through the API | The product gap. **2.3.0** shipped the process half (start, stop, pause, resume, delete, reaping); **2.3.1** task start/complete. **2.3.2** (request-string decoding), then IPC, remain. |
 | **2.4.x** | **AGNOS spawn + IPC** — `sys_spawn_path`, `chan_op` capability channels, `sys_proclist` | Nothing to map until a route actually spawns. Unblocks the moment 2.3.x lands. |
 | **2.5.x** | **Agent identity + MCP authentication** | Prerequisite for un-gating nein's mutating firewall tools, and for any `claims`-based authorisation. Needs 2.3.x, because identity is per-agent. |
 | **3.0.0** | **Per-agent arena isolation** — VULN-007's open half; unlocks multi-tenant hosting, kavach sandboxing, untrusted federation, external MCP callbacks | Major because it changes the allocation model under every agent and flips the gates the P0 below guards. Needs identity (2.5.x) to know what a tenant *is*. |
@@ -43,15 +47,24 @@ cut re-evaluates the P0 below.
 - the API bound to 127.0.0.1;
 - agent control closed to browsers.
 
-**Next — task start and complete.** samay places tasks on nodes, but nothing moves one from
-SCHEDULED to RUNNING, so through the API every task stops at SCHEDULED. samay already has what the
-routes need:
-- `scheduled_task_transition(task, TASK_RUNNING)` accepts SCHEDULED → RUNNING;
-- `task_scheduler_complete_task(s, id, final_status)` finishes a RUNNING task and returns its node
-  reservation.
+**2.3.1 did task start and complete** (CHANGELOG 2.3.1):
+- `POST /v1/scheduler/tasks/{id}/start` and `/complete`, with `started_at` stamped so samay's wait
+  and run times mean something;
+- the node's capacity returned at completion;
+- `GET /v1/scheduler/nodes/{id}/tasks` for an executor to find its work;
+- the Origin guard on both POSTs.
 
-daimon calls neither. Whatever executes an agent on a node is what should report a task running and
-done.
+**Next — 2.3.2: request strings keep their JSON escapes** (P1, correctness). daimon reads request
+bodies with `json_parse` → `bayan_json_parse`, whose own contract says the values are the raw
+source bytes and escapes are NOT decoded. A caller who needs decoded values is told to use the
+tagged-tree parser, `bayan_json_v_parse_str`. daimon stores the raw bytes as if decoded. Measured on
+the 2.3.1 binary: an agent registered as `say "hi" \o/ é` is stored as `say \"hi\" \\o/
+\u00e9`. That is also what reaches the agent's `--agent-name` argv, what RAG chunks and embeds, what
+`callback_url` validation reads, and what a task's `reason` records. Every string field read this
+way is affected: 23 `jget(pairs, "<key>")` call sites across five `src/api_*.cyr` files read
+request fields. The fix decodes JSON string
+values once, where daimon reads them, and leaves the fields that are meant to be raw JSON
+(`inputSchema`, `arguments`) raw. It has its own tests across every endpoint that reads a string.
 
 **Then — IPC.** `agent_ipc_bind`, `agent_ipc_send` and `msg_bus_publish` still have no caller.
 Three defects were found when the socket code first ran (2.2.3) and deliberately left for this step:
@@ -73,7 +86,7 @@ Three defects were found when the socket code first ran (2.2.3) and deliberately
 - **aarch64 RLIMIT_AS is unverified on hardware.** qemu-aarch64 does not apply it: QEMU's user-mode
   `prlimit64` passes RLIMIT_AS / DATA / STACK through as a no-op.
 
-**Sequence**: task start/complete → IPC. One bite each, suite green at every step.
+**Sequence**: 2.3.2 request-string decoding → IPC. One bite each, suite green at every step.
 
 ## 2.4.x · P2 — AGNOS spawn + IPC mapping
 
@@ -129,6 +142,9 @@ Also waiting on identity:
   original had: `list_by_tag` is a substring search over the record today.
 - **Who may replace an external MCP registration.** Re-registering a name replaces it, whoever
   registered it first. (Taking a *builtin's* name is refused since 2.2.3.)
+- **Who may report a task** (VULN-016, 2.3.1). Any caller can mark any task running, completed or
+  failed. Completing a task early returns its capacity while the work may still run. Only the
+  task's executor should be able to.
 
 Needs 2.3.x first — identity is per-agent, and there are no agents until the lifecycle exists.
 

@@ -4,6 +4,79 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.3.1] - 2026-09-22
+
+**A scheduled task can now start and finish.** samay places tasks on nodes, but through the API every
+task stopped at SCHEDULED. Nothing moved it to RUNNING, nothing could complete it, and it held its
+node's capacity until someone cancelled it. 2.3.1 adds the routes an executor uses to report a task
+running and then done, and a way for it to find its work. This is roadmap 2.3.x's third step.
+
+**797 tests** (was 741) across 17 suites. **60 HTTP smoke checks** (was 43), **25 benchmarks** (was
+24) and 6 fuzz harnesses, all green. The scheduler fuzz harness now drives daimon's start and complete
+and checks the node's reservation accounting after every operation. Each fix has a test that fails
+without it: five mutation runs on the unit suite and two on the fuzz harness, all caught. fmt / lint /
+vet clean; x86_64, aarch64 and agnos build.
+
+### Added
+
+| Route | Does | Answers |
+|---|---|---|
+| `POST /v1/scheduler/tasks/{id}/start` | SCHEDULED → RUNNING, stamps `started_at` | 200 task; 404; 409 wrong status; 403 from a browser |
+| `POST /v1/scheduler/tasks/{id}/complete` | RUNNING → COMPLETED, or FAILED with `{"status":"failed","reason":"…"}`; returns the node's capacity at once | 200 task; 400 status not completed/failed; 404; 409; 403 |
+| `GET /v1/scheduler/nodes/{id}/tasks` | the node's SCHEDULED and RUNNING tasks: how an executor finds its work | 200 `{"node_id","tasks":[…],"count"}`; 404 unknown node |
+
+- **No body, or no `status`, completes the task.** `status` accepts `completed` / `failed`, or
+  the task JSON's `Completed` / `Failed`.
+- A task's JSON gains `agent_id`, `node` (where it was placed) and `fail_reason`. `node` and
+  `fail_reason` are null when unset. The existing fields are unchanged and still come first.
+- `GET /v1/scheduler/stats` gains `average_wait_time_ms` and `average_run_time_ms`. samay has always
+  computed both from `started_at`, and nothing set `started_at` until now, so both read 0.
+- Audit events `task.start`, `task.complete` and `task.fail` name the task and record its agent.
+- `src/sched.cyr` holds `sched_task_start` / `sched_task_complete`, the work the routes do. It is kept
+  apart from the HTTP layer so `tests/sched.tcyr` (56 tests) and the fuzz harness drive it against a
+  real samay scheduler.
+
+### Security
+
+- **Task start and complete refuse browser-originated requests**: 403 for any request carrying
+  `Origin`, audited as `task.control.origin`. This is the rule 2.3.0 set for agent control, applied to
+  two new routes, so no existing client changes.
+- **VULN-016 (open, recorded)**: any client that reaches the API can report any task's state. It can
+  complete a RUNNING task early, which returns its capacity while the work may still run, or mark
+  one RUNNING that nothing runs. The loopback bind and the Origin guard limit who can do that.
+  Executor identity arrives with roadmap 2.5.x. CWE-862; for the class, see CVE-2026-48592. The
+  details are in the addendum to [docs/audit/2026-09-22-agent-lifecycle-audit.md](docs/audit/2026-09-22-agent-lifecycle-audit.md).
+- `fail_reason` is cloned where it is kept. It arrives as a view into the request buffer, which the
+  next request overwrites (the 2.2.1 agent-name leak class). A test reuses the buffer and checks the
+  reason survives.
+
+### Fixed
+
+- **samay answers `Err(1)` both for an unknown task and for a refused transition.** So the complete
+  route looks the task up first: an unknown id is 404 and a wrong status is 409. (The existing cancel
+  route still answers 404 for both; see Recorded.)
+- A task's status name was read from a 7-slot array indexed by the status, so a value outside 0..6
+  would have read past it. It is now a lookup that answers `Unknown`.
+
+### Performance
+
+`sched_start_complete`, the work of one start plus one complete including the reservation release,
+takes **3.49 µs** (`tests/daimon.bcyr`). **No regression**: the committed 2.3.0 bench binary and this
+one, run back to back (three runs each, medians), agree within −5.0% … +3.5% on all 22 existing
+benchmarks. None of the changed code is on their path.
+
+### Recorded, not fixed (roadmap)
+
+- **2.3.2 — request strings keep their JSON escapes.** daimon reads bodies with bayan's flat parser,
+  whose contract (`bayan_json_parse`) says the values are the raw source bytes with escapes NOT
+  decoded. daimon stores them as if decoded. Measured: an agent registered as `say "hi" \o/ é` comes
+  back as `say \"hi\" \\o/ \u00e9`. Every string field is affected: names, RAG `text` / `query`,
+  `callback_url`, `agent_id`, the new `reason`, and more. The fix is its own release, next.
+- VULN-016 above.
+- The cancel route still answers 404 for a task in the wrong status. That is left as it is: changing
+  it would change an existing route's answer.
+- The remainder of 2.3.x: IPC, after 2.3.2.
+
 ## [2.3.0] - 2026-09-22
 
 **daimon can start, stop, pause, resume and delete agents through its API.** Until now it could

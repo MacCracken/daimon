@@ -1,0 +1,68 @@
+# =========================================================================
+# sched — task start / complete over samay (2.3.1)
+# =========================================================================
+#
+# samay places tasks (task_scheduler_schedule_pending) and finishes them
+# (task_scheduler_complete_task), but has no scheduler-level START: a consumer
+# moves a SCHEDULED task to RUNNING itself, with scheduled_task_transition.
+# Until 2.3.1 daimon never did, so through the API every task stopped at
+# SCHEDULED, nothing could complete, and a placed task held its node's capacity
+# until someone cancelled it.
+#
+# These are what the routes call. They live here rather than in api_sched.cyr
+# so tests/sched.tcyr and fuzz/scheduler_fsm.fcyr can drive them against a real
+# samay scheduler.
+
+# Why an operation was refused — the Err payload of the two functions below.
+enum SchedOpError {
+    SCHED_OP_NOT_FOUND = 1;    # no task with this id
+    SCHED_OP_BAD_STATE = 2;    # the task's status does not allow it
+    SCHED_OP_BAD_STATUS = 3;   # complete was asked for a status that is not terminal
+}
+
+# SCHEDULED -> RUNNING. Stamps started_at: samay's stats derive the average
+# wait (started - created) and run (completed - started) times from it, and
+# nothing in samay sets it. Returns Ok(task) or Err(SCHED_OP_*).
+fn sched_task_start(s, id) {
+    var task = task_scheduler_get_task(s, id);
+    if (task == 0) { return Err(SCHED_OP_NOT_FOUND); }
+    var r_t, r_v = scheduled_task_transition(task, TASK_RUNNING);
+    if (is_err_result(r_t) == 1) { return Err(SCHED_OP_BAD_STATE); }
+    ScheduledTask_set_started_at(task, dt_now());
+    return Ok(task);
+}
+
+# RUNNING -> COMPLETED or FAILED, returning the task's node reservation at once
+# (task_scheduler_complete_task). `reason` (a Str, or 0) is kept on a FAILED
+# task as its fail_reason and ignored otherwise. Returns Ok(task) or
+# Err(SCHED_OP_*).
+fn sched_task_complete(s, id, final_status, reason) {
+    if (final_status != TASK_COMPLETED) {
+        if (final_status != TASK_FAILED) { return Err(SCHED_OP_BAD_STATUS); }
+    }
+    var task = task_scheduler_get_task(s, id);
+    if (task == 0) { return Err(SCHED_OP_NOT_FOUND); }
+    # complete_task answers Err(1) both for an unknown id and for a refused
+    # transition; the lookup above is what tells the two apart.
+    var r_t, r_v = task_scheduler_complete_task(s, id, final_status);
+    if (is_err_result(r_t) == 1) { return Err(SCHED_OP_BAD_STATE); }
+    if (final_status == TASK_FAILED) {
+        # ⛔ CLONED. `reason` arrives as a jget view into the request buffer,
+        # which sandhi reuses for the next request; samay's setter stores the
+        # pointer it is given. (The 2.2.1 agent-name leak, the same class.)
+        if (reason != 0) { ScheduledTask_set_fail_reason(task, str_clone(reason)); }
+    }
+    return Ok(task);
+}
+
+# The status a complete request names: completed / failed, in daimon's task
+# JSON form ("Completed") or all lower case. -1 for anything else — complete
+# only ever ends a task.
+fn sched_final_status_parse(s) {
+    if (s == 0) { return 0 - 1; }
+    if (str_eq_cstr(s, "Completed") == 1) { return TASK_COMPLETED; }
+    if (str_eq_cstr(s, "completed") == 1) { return TASK_COMPLETED; }
+    if (str_eq_cstr(s, "Failed") == 1) { return TASK_FAILED; }
+    if (str_eq_cstr(s, "failed") == 1) { return TASK_FAILED; }
+    return 0 - 1;
+}

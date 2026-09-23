@@ -18,11 +18,11 @@ cyrius build src/main.cyr build/daimon # build
 ## Testing
 
 ```bash
-cyrius tests                        # every suite in tests/ — 741 assertions, 16 files
+cyrius tests                        # every suite in tests/ — 797 assertions, 17 files
 cyrius fuzz                         # 6 property-based harnesses, ~160,000 generated cases
-cyrius bench tests/daimon.bcyr      # 22 benchmarks (+2 in tests/rag_ingest.bcyr)
+cyrius bench tests/daimon.bcyr      # 23 benchmarks (+2 in tests/rag_ingest.bcyr)
 sh tests/smoke.sh                   # the linked binary over HTTP: libro, tracing, regressions,
-                                    # the agent lifecycle, the bind address
+                                    # the agent lifecycle, the bind address, task start/complete
 sh tests/test.sh                    # all of the above except the benchmarks
 ```
 
@@ -40,7 +40,7 @@ daimon hosts five built-in MCP tools over a hash-linked [libro](https://github.c
 
 ## Status
 
-Ported from Rust (9,724 LOC → 4,141 LOC Cyrius). 181 KB binary.
+Ported from Rust (9,724 LOC → 4,141 LOC Cyrius at the port; 6,528 lines of `src/` at 2.3.1). The binary is 3.2 MB, statically linked (2.3.1). About half of that, 1.6 MB, is unreachable code the 6.x toolchain NOPs in place rather than removing — see CHANGELOG 1.2.4. The 181 KB this line used to give was the v1.0.1 port-era build (cyrius 4.2.0, BENCHMARKS.md).
 
 ## License
 

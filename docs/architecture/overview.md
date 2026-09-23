@@ -25,6 +25,9 @@ main.cyr   Preamble (syscall constants) + module includes + the `main` serve loo
 │   └── agent_spawn_with_limits   fork/exec: closed descriptors, /dev/null stdin, SIGPIPE reset,
 │                                 RLIMIT_AS + RLIMIT_CPU, exec failure reported synchronously
 │
+├── sched.cyr          Task start / complete over samay (2.3.1)
+│   └── sched_task_start / sched_task_complete   SCHEDULED → RUNNING → COMPLETED/FAILED, capacity returned
+│
 ├── supervisor.cyr     Health monitoring
 │   ├── CircuitBreaker     Closed → Open → HalfOpen state machine
 │   ├── OutputCapture      Ring buffer for stdout/stderr
@@ -100,8 +103,8 @@ main.cyr   Preamble (syscall constants) + module includes + the `main` serve loo
 ├── api_mcp.cyr      MCP tool registry + dispatch endpoints
 ├── api_rag.cyr      RAG ingest/query endpoints
 ├── api_edge.cyr     Edge fleet endpoints
-├── api_sched.cyr    Scheduler endpoints  (38 method + path routes in src/router.cyr)
-├── router.cyr       http_route — HTTP method/path dispatch; agent control refuses Origin (403)
+├── api_sched.cyr    Scheduler endpoints, incl. task start/complete + a node's work list  (41 method + path routes in src/router.cyr)
+├── router.cyr       http_route — HTTP method/path dispatch; agent and task control refuse Origin (403)
 ├── server.cyr       Server lifecycle
 │   ├── rate_check         Per-IP 120 req/min sliding window
 │   ├── server_bind_addr   config listen_addr (127.0.0.1 unless serve --listen)

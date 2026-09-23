@@ -74,10 +74,10 @@ cyrius bench tests/daimon.bcyr
 
 ```
 src/                  Source (30 modules, entry src/main.cyr)
-tests/*.tcyr          Test suites, one per module (741 assertions, 16 files)
-tests/daimon.bcyr     Benchmarks (22; tests/rag_ingest.bcyr has 2 more)
+tests/*.tcyr          Test suites, one per module (797 assertions, 17 files)
+tests/daimon.bcyr     Benchmarks (23; tests/rag_ingest.bcyr has 2 more)
 tests/smoke.sh        HTTP smoke checks against the built binary
 fuzz/                 Property-based fuzz harnesses (6), sharing fuzz/rng.cyr
-build/daimon          Binary (181 KB)
+build/daimon          Binary (3.2 MB, static; ~1.6 MB of it NOPed unreachable code)
 docs/                 Architecture, guides, ADRs, audit reports
 ```

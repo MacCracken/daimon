@@ -17,7 +17,7 @@
 #   rag        — text chunking, bag-of-words embedding, retrieval pipeline
 #   mcp        — MCP tool registry and dispatch types
 #   screen     — capture permissions, rate limiting, recording sessions
-#   scheduler  — priority-aware task scheduling, cron triggers
+#   sched      — task start / complete over samay (the scheduler since 2.0.0)
 #   federation — multi-node clustering, Raft-like election, placement
 #   edge       — edge fleet management, heartbeats, OTA, GPU inventory
 #   ipc        — Unix domain sockets, message bus, RPC
@@ -39,6 +39,7 @@ include "src/secmem.cyr"
 include "src/trace.cyr"
 include "src/agent.cyr"
 include "src/supervisor.cyr"
+include "src/sched.cyr"
 include "src/memory.cyr"
 include "src/vector_store.cyr"
 include "src/rag.cyr"

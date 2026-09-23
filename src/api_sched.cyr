@@ -60,19 +60,32 @@ fn api_sched_list(fd) {
     return 0;
 }
 
-# GET /v1/scheduler/tasks/{id}
-fn api_sched_get_task(fd, id_cstr) {
-    var task = task_scheduler_get_task(_scheduler, str_from(id_cstr));
-    if (task == 0) { http_error(fd, 404, str_from("task not found")); return 0; }
-    var status_names: i64[7];
-    store64(&status_names, "Queued");
-    store64(&status_names + 8, "Scheduled");
-    store64(&status_names + 16, "Running");
-    store64(&status_names + 24, "Completed");
-    store64(&status_names + 32, "Failed");
-    store64(&status_names + 40, "Cancelled");
-    store64(&status_names + 48, "Preempted");
-    var sb = str_builder_new();
+# daimon's name for a task status. (Was an array indexed by the status — a
+# value outside 0..6 would have read past it.)
+fn _api_task_status_name(st) {
+    if (st == TASK_QUEUED) { return "Queued"; }
+    if (st == TASK_SCHEDULED) { return "Scheduled"; }
+    if (st == TASK_RUNNING) { return "Running"; }
+    if (st == TASK_COMPLETED) { return "Completed"; }
+    if (st == TASK_FAILED) { return "Failed"; }
+    if (st == TASK_CANCELLED) { return "Cancelled"; }
+    if (st == TASK_PREEMPTED) { return "Preempted"; }
+    return "Unknown";
+}
+
+fn _api_json_str_or_null(sb, s) {
+    if (s == 0) { str_builder_add_cstr(sb, "null"); return 0; }
+    str_builder_add_cstr(sb, "\"");
+    str_builder_add(sb, json_escape_str(s));
+    str_builder_add_cstr(sb, "\"");
+    return 0;
+}
+
+# One task as JSON. task_id / name / priority / status are what GET has always
+# answered; agent_id, node (where it was placed) and fail_reason are 2.3.1
+# additions — an executor needs them to find and report its work. node and
+# fail_reason are null when unset.
+fn _api_task_json(sb, task) {
     str_builder_add_cstr(sb, "{\"task_id\":\"");
     str_builder_add(sb, ScheduledTask_task_id(task));
     str_builder_add_cstr(sb, "\",\"name\":\"");
@@ -80,8 +93,118 @@ fn api_sched_get_task(fd, id_cstr) {
     str_builder_add_cstr(sb, "\",\"priority\":");
     str_builder_add_int(sb, ScheduledTask_priority(task));
     str_builder_add_cstr(sb, ",\"status\":\"");
-    str_builder_add_cstr(sb, load64(&status_names + ScheduledTask_status(task) * 8));
-    str_builder_add_cstr(sb, "\"}");
+    str_builder_add_cstr(sb, _api_task_status_name(ScheduledTask_status(task)));
+    str_builder_add_cstr(sb, "\",\"agent_id\":\"");
+    str_builder_add(sb, json_escape_str(ScheduledTask_agent_id(task)));
+    str_builder_add_cstr(sb, "\",\"node\":");
+    _api_json_str_or_null(sb, ScheduledTask_node_preference(task));
+    str_builder_add_cstr(sb, ",\"fail_reason\":");
+    _api_json_str_or_null(sb, ScheduledTask_fail_reason(task));
+    str_builder_add_cstr(sb, "}");
+    return 0;
+}
+
+fn _api_task_ok(fd, task) {
+    var sb = str_builder_new();
+    _api_task_json(sb, task);
+    http_ok(fd, str_builder_build(sb));
+    return 0;
+}
+
+# A SCHED_OP_* refusal as an HTTP error.
+fn _api_sched_op_error(fd, code) {
+    if (code == SCHED_OP_NOT_FOUND) {
+        http_error(fd, 404, str_from("task not found"));
+    } elif (code == SCHED_OP_BAD_STATUS) {
+        http_bad_request(fd, str_from("status must be completed or failed"));
+    } else {
+        http_error(fd, 409, str_from("the task's status does not allow this"));
+    }
+    return 0;
+}
+
+# GET /v1/scheduler/tasks/{id}
+fn api_sched_get_task(fd, id_cstr) {
+    var task = task_scheduler_get_task(_scheduler, str_from(id_cstr));
+    if (task == 0) { http_error(fd, 404, str_from("task not found")); return 0; }
+    _api_task_ok(fd, task);
+    return 0;
+}
+
+# An audit entry for a task event, naming the task and recording its agent.
+fn _api_task_audit(sev, action, what, task) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, what);
+    str_builder_add_cstr(sb, " ");
+    str_builder_add(sb, ScheduledTask_task_id(task));
+    daimon_audit_agent(sev, "scheduler", action, str_data(str_builder_build(sb)),
+      str_cstr(ScheduledTask_agent_id(task)));
+    return 0;
+}
+
+# POST /v1/scheduler/tasks/{id}/start — whatever runs the task reports it
+# running: SCHEDULED -> RUNNING. 2.3.1.
+fn api_sched_start(fd, id_cstr) {
+    var r_t, r_v = sched_task_start(_scheduler, str_from(id_cstr));
+    if (is_err_result(r_t) == 1) { _api_sched_op_error(fd, r_v); return 0; }
+    _api_task_audit(SEV_INFO, "task.start", "task running:", r_v);
+    _api_task_ok(fd, r_v);
+    return 0;
+}
+
+# POST /v1/scheduler/tasks/{id}/complete — and reports it done: RUNNING ->
+# COMPLETED, or FAILED with {"status":"failed","reason":"..."}. No body, or no
+# status, means completed. The node's capacity is returned at once. 2.3.1.
+fn api_sched_complete(fd, id_cstr, body) {
+    var final_status = TASK_COMPLETED;
+    var reason = 0;
+    if (body != 0) {
+        var pairs = json_parse(body);
+        var st = jget(pairs, "status");
+        if (st != 0) {
+            final_status = sched_final_status_parse(st);
+            if (final_status < 0) {
+                http_bad_request(fd, str_from("status must be completed or failed"));
+                return 0;
+            }
+        }
+        reason = jget(pairs, "reason");
+    }
+    var r_t, r_v = sched_task_complete(_scheduler, str_from(id_cstr), final_status, reason);
+    if (is_err_result(r_t) == 1) { _api_sched_op_error(fd, r_v); return 0; }
+    if (final_status == TASK_FAILED) {
+        _api_task_audit(SEV_WARNING, "task.fail", "task failed:", r_v);
+    } else {
+        _api_task_audit(SEV_INFO, "task.complete", "task completed:", r_v);
+    }
+    _api_task_ok(fd, r_v);
+    return 0;
+}
+
+# GET /v1/scheduler/nodes/{id}/tasks — the tasks placed on a node that are
+# SCHEDULED or RUNNING: how an executor on that node finds its work. 2.3.1.
+# (Before this, the API had no way to list tasks at all: GET
+# /v1/scheduler/tasks answers counts.)
+fn api_sched_node_tasks(fd, node_cstr) {
+    var node_id = str_from(node_cstr);
+    if (map_get(TaskScheduler_nodes(_scheduler), node_id) == 0) {
+        http_error(fd, 404, str_from("node not found"));
+        return 0;
+    }
+    var tasks = task_scheduler_tasks_for_node(_scheduler, node_id);
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"node_id\":\"");
+    str_builder_add(sb, json_escape_str(node_id));
+    str_builder_add_cstr(sb, "\",\"tasks\":[");
+    var i = 0;
+    while (i < vec_len(tasks)) {
+        if (i > 0) { str_builder_add_cstr(sb, ","); }
+        _api_task_json(sb, vec_get(tasks, i));
+        i = i + 1;
+    }
+    str_builder_add_cstr(sb, "],\"count\":");
+    str_builder_add_int(sb, vec_len(tasks));
+    str_builder_add_cstr(sb, "}");
     http_ok(fd, str_builder_build(sb));
     return 0;
 }
@@ -148,6 +271,12 @@ fn api_sched_stats(fd) {
     str_builder_add_int(sb, load64(st + 24));
     str_builder_add_cstr(sb, ",\"failed\":");
     str_builder_add_int(sb, load64(st + 32));
+    # 2.3.1: meaningful now that a task can start — samay derives both from
+    # started_at, which the start route stamps (0 until a task has run).
+    str_builder_add_cstr(sb, ",\"average_wait_time_ms\":");
+    str_builder_add_int(sb, SchedulerStats_average_wait_time_ms(st));
+    str_builder_add_cstr(sb, ",\"average_run_time_ms\":");
+    str_builder_add_int(sb, SchedulerStats_average_run_time_ms(st));
     str_builder_add_cstr(sb, "}");
     http_ok(fd, str_builder_build(sb));
     return 0;

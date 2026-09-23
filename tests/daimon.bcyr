@@ -47,6 +47,7 @@ include "src/secmem.cyr"
 include "src/trace.cyr"
 include "src/agent.cyr"
 include "src/supervisor.cyr"
+include "src/sched.cyr"
 include "src/vector_store.cyr"
 include "src/rag.cyr"
 include "src/mcp.cyr"
@@ -256,6 +257,24 @@ fn bench_agent_reap_live() {
     return 0;
 }
 
+# 2.3.1 — task start + complete, the work of POST .../start and .../complete:
+# lookup, SCHEDULED -> RUNNING with started_at, RUNNING -> COMPLETED with the
+# node's capacity returned. The task is then put back as schedule_pending
+# leaves a placed task (three stores and a reserve, included in the time), so
+# every iteration measures the same work.
+var _bench_sched = 0;
+var _bench_node = 0;
+var _bench_task = 0;
+fn bench_sched_start_complete() {
+    var id = ScheduledTask_task_id(_bench_task);
+    sched_task_start(_bench_sched, id);
+    sched_task_complete(_bench_sched, id, TASK_COMPLETED, 0);
+    ScheduledTask_set_status(_bench_task, TASK_SCHEDULED);
+    node_capacity_reserve(_bench_node, ScheduledTask_resource_requirements(_bench_task));
+    ScheduledTask_set_reserved_on(_bench_task, NodeCapacity_node_id(_bench_node));
+    return 0;
+}
+
 # ================================================================
 # Main
 # ================================================================
@@ -449,6 +468,19 @@ fn main() {
 
     daimon_signal(sl_pid, SIGKILL);
     daimon_reap_within(sl_pid, 1000);
+
+    # 2.3.1 — one placed task on a node with room for it.
+    _bench_sched = task_scheduler_new();
+    _bench_node = node_capacity_new(str_from("bench-n1"), f64_from(64), 1048576, 1048576, 0);
+    task_scheduler_register_node(_bench_sched, _bench_node);
+    _bench_task = scheduled_task_new(str_from("bench"), str_from("d"), str_from("agent-1"), 5,
+      resource_req_default());
+    task_scheduler_submit_task(_bench_sched, _bench_task);
+    task_scheduler_schedule_pending(_bench_sched);
+
+    var b22 = bench_new("sched_start_complete");
+    bench_run(b22, &bench_sched_start_complete, 100000);
+    vec_push(benches, b22);
 
     bench_report_all(benches);
     return 0;

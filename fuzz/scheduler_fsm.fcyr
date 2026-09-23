@@ -11,6 +11,15 @@
 #   * COMPLETED, FAILED and CANCELLED are terminal — nothing leaves them;
 #   * the status is always one of the seven states;
 #   * the scheduler's stats account for every task it holds.
+# 2.3.1: the random-operation run starts and completes tasks through daimon's
+# own sched_task_start / sched_task_complete (src/sched.cyr) — the functions
+# the new routes call — and checks after EVERY operation that the node's
+# reservations are exactly the tasks holding one:
+#   * running_tasks = the number of tasks with reserved_on set, and the node's
+#     free cpu / memory = its total minus theirs;
+#   * a task holding a reservation is SCHEDULED or RUNNING, never terminal;
+#   * a RUNNING task has a started_at (samay's stats depend on it);
+#   * a refused start / complete leaves the task's status untouched.
 include "lib/alloc.cyr"
 include "lib/string.cyr"
 include "lib/fmt.cyr"
@@ -25,6 +34,7 @@ include "lib/chrono.cyr"
 include "lib/syscalls.cyr"
 
 include "fuzz/rng.cyr"
+include "src/sched.cyr"
 
 alloc_init();
 # samay logs every task that cannot be placed at WARN; the random-operation run
@@ -129,6 +139,8 @@ task_scheduler_register_node(s, node_capacity_new(str_from("w1"), f64_from(64), 
 var ids = vec_new();
 var did_cancel = 0;
 var did_finish = 0;
+var did_start = 0;
+var did_refuse = 0;
 var NS = 2000;
 var o = 0;
 while (o < NS) {
@@ -144,23 +156,56 @@ while (o < NS) {
         if (op == 2) {
             if (is_ok(task_scheduler_cancel_task(s, pick)) == 1) { did_cancel = did_cancel + 1; }
         }
+        var tk = task_scheduler_get_task(s, pick);
+        var before_st = ScheduledTask_status(tk);
         if (op == 4) {
-            # Start it. samay has no scheduler-level "start" (neither does
-            # daimon's API — see the roadmap): a consumer transitions a
-            # SCHEDULED task to RUNNING itself, and only then can it complete.
-            var tk = task_scheduler_get_task(s, pick);
-            if (tk != 0) { scheduled_task_transition(tk, TASK_RUNNING); }
+            # Start it the way POST /v1/scheduler/tasks/{id}/start does.
+            var st_t, st_v = sched_task_start(s, pick);
+            if (is_ok(st_t) == 1) { did_start = did_start + 1; }
+            else {
+                if (ScheduledTask_status(tk) != before_st) { sys_exit(60); }  # refused, untouched
+                did_refuse = did_refuse + 1;
+            }
         }
         if (op == 3) {
+            # ...and complete it the way .../complete does; now and then with a
+            # status complete must refuse.
             var fin = TASK_COMPLETED;
-            if (fz_below(2) == 0) { fin = TASK_FAILED; }
-            if (is_ok(task_scheduler_complete_task(s, pick, fin)) == 1) { did_finish = did_finish + 1; }
+            var roll = fz_below(8);
+            if (roll < 4) { fin = TASK_FAILED; }
+            if (roll == 7) { fin = TASK_RUNNING; }
+            var cp_t, cp_v = sched_task_complete(s, pick, fin, str_from("fuzz"));
+            if (is_ok(cp_t) == 1) { did_finish = did_finish + 1; }
+            else {
+                if (ScheduledTask_status(tk) != before_st) { sys_exit(61); }  # refused, untouched
+                if (fin == TASK_RUNNING) { if (cp_v != SCHED_OP_BAD_STATUS) { sys_exit(62); } }
+                did_refuse = did_refuse + 1;
+            }
         }
     }
     var stt = task_scheduler_stats(s);
     var accounted = SchedulerStats_queued(stt) + SchedulerStats_running(stt)
     + SchedulerStats_completed(stt) + SchedulerStats_failed(stt);
     if (accounted != SchedulerStats_total_tasks(stt)) { sys_exit(50); }
+
+    # Reservation accounting (2.3.1): every default task is 1 cpu / 256 MB.
+    var alltk = map_values(TaskScheduler_tasks(s));
+    var held = 0;
+    var ti = 0;
+    while (ti < vec_len(alltk)) {
+        var tt = vec_get(alltk, ti);
+        var tst = ScheduledTask_status(tt);
+        if (ScheduledTask_reserved_on(tt) != 0) {
+            held = held + 1;
+            if (tst != TASK_SCHEDULED) { if (tst != TASK_RUNNING) { sys_exit(63); } }
+        }
+        if (tst == TASK_RUNNING) { if (ScheduledTask_started_at(tt) == 0) { sys_exit(64); } }
+        ti = ti + 1;
+    }
+    var w1 = map_get(TaskScheduler_nodes(s), str_from("w1"));
+    if (NodeCapacity_running_tasks(w1) != held) { sys_exit(65); }
+    if (NodeCapacity_available_memory_mb(w1) != 1048576 - held * 256) { sys_exit(66); }
+    if (f64_eq(NodeCapacity_available_cpu(w1), f64_from(64 - held)) != 1) { sys_exit(67); }
     cases = cases + 1;
     o = o + 1;
 }
@@ -169,5 +214,7 @@ while (o < NS) {
 # above held vacuously.
 if (did_cancel == 0) { sys_exit(51); }
 if (did_finish == 0) { sys_exit(52); }
+if (did_start == 0) { sys_exit(53); }
+if (did_refuse == 0) { sys_exit(54); }
 
 fz_done("scheduler_fsm", cases);

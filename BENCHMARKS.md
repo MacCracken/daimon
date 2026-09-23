@@ -40,6 +40,16 @@ those numbers are not comparable.
 
 `tests/rag_ingest.bcyr` (real since 2.1.6): `rag_ingest_real_5k` 133.1µs, `rag_chunk_only_5k` 508ns.
 
+### 2.3.1 — task start / complete
+
+| Benchmark | avg | min | iters |
+|---|---:|---:|---:|
+| sched_start_complete — start + complete one task, the node's capacity returned (+ a reset to Scheduled) | 3.49 µs | 3.23 µs | 100000 |
+
+No regression. The committed 2.3.0 bench binary and the 2.3.1 one were run back to back, three runs
+each, compared by median. All 22 benchmarks they share agree within −5.0% … +3.5%, and none of the
+code 2.3.1 changed is on their path.
+
 ### 2.3.0 — the agent lifecycle
 
 Three benchmarks for the code 2.3.0 put on the API. Every agent route runs the reap sweep first,
@@ -213,11 +223,11 @@ Scheduler scheduling (1.5x), supervisor registration (2.5x), MCP registration (1
 | rag | Complete | Complete | Chunk, embed, ingest, query, context format |
 | mcp | Complete | Complete | Registry + types; external forwarding via sandhi_rpc_mcp_call (1.2.1); bote libro-tool re-exports being wired (1.3.0) |
 | screen | Complete | Complete | Permissions, rate limiting, recording sessions |
-| scheduler | Complete | Complete | NodeCapacity, scheduling, cron, preemption, stats |
+| scheduler | Complete | Complete (2.3.1) | samay since 2.0.0. Tasks can start and complete through the API since 2.3.1 (`src/sched.cyr`); before that every task stopped at Scheduled |
 | federation | Complete | Complete | Cluster, election, scoring, placement, vector store |
 | edge | Complete | Complete | Register, heartbeat, health, decommission, stats |
 | ipc | Complete | Partial | Message bus + RPC registry tested; the Unix-socket half first ran at 2.2.3 (`agent_ipc_new` crashed, `agent_ipc_bind` made a directory at the socket path). No route wires it yet (the last step of roadmap 2.3.x) |
-| api | Complete | Complete | 38 method + path routes (the Rust original had no agent control; 2.3.0 added 5) |
+| api | Complete | Complete | 41 method + path routes (the Rust original had no agent or task control; 2.3.0 added 5, 2.3.1 added 3) |
 | logging | Complete | Complete | sakshi integration |
 | firewall | Complete | Integrated (2.1.8) | nein's MCP tools; the mutating half is gated shut until caller authentication (roadmap 2.5.x) |
 | http-forward | Complete | Complete | External MCP forwarding via sandhi_rpc_mcp_call (1.2.1) |
@@ -227,8 +237,8 @@ Scheduler scheduling (1.5x), supervisor registration (2.5x), MCP registration (1
 | | Rust | Cyrius |
 |---|---|---|
 | Unit tests | 305 | — (inline in test groups) |
-| Integration tests | 28 | 741 assertions / 16 suites, each against its real `src/` module (2.3.0) |
-| Benchmarks | 19 | 24, against the real code (2.3.0) |
+| Integration tests | 28 | 797 assertions / 17 suites, each against its real `src/` module (2.3.1) |
+| Benchmarks | 19 | 25, against the real code (2.3.1) |
 | Fuzz harnesses | 0 | 6, property-based, run in CI (2.2.3) |
-| HTTP smoke | — | tests/smoke.sh, 43 checks, run in CI (2.3.0) |
-| Security audit | — | 15 findings (2026-04-13: 10; 2026-09-22 lifecycle: 5) — see docs/audit/ |
+| HTTP smoke | — | tests/smoke.sh, 60 checks, run in CI (2.3.1) |
+| Security audit | — | 16 findings (2026-04-13: 10; 2026-09-22 lifecycle: 6) — see docs/audit/ |

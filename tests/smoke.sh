@@ -247,4 +247,57 @@ kill $BSRV2 2>/dev/null || true
 bind_check "a malformed --listen exits 1" "$?" "1"
 if [ $BIND_OK -ne 1 ]; then echo "  bind smoke FAILED"; SMOKE_EXIT=1; fi
 
+echo ""
+echo "=== 2.3.1 task start / complete ==="
+# A node with room for exactly one default task (1 cpu, 256 MB) and two tasks:
+# the second can only be placed once the first has completed and its
+# reservation is back — which is what complete has to do.
+TK_PORT=18085
+TK_OK=1
+./build/daimon serve $TK_PORT >/dev/null 2>&1 &
+TK_SRV=$!
+i=0
+while [ $i -lt 25 ]; do
+    if curl -s --max-time 1 "http://127.0.0.1:$TK_PORT/v1/health" >/dev/null 2>&1; then break; fi
+    i=$((i + 1)); sleep 0.1
+done
+K="http://127.0.0.1:$TK_PORT"
+tk_check() {
+    printf "  %s: " "$1"
+    if [ "$2" = "$3" ]; then echo "PASS"; else echo "FAIL (got '$2', want '$3')"; TK_OK=0; fi
+}
+tfield() { grep -o "\"$1\":[^,}]*" | head -1 | cut -d: -f2 | tr -d '"'; }
+tcode() { curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$@"; }
+curl -s -o /dev/null --max-time 10 -X POST "$K/v1/scheduler/nodes" -d '{"node_id":"smoke-n1","total_cpu":1,"total_memory_mb":256}'
+T1=$(curl -s --max-time 10 -X POST "$K/v1/scheduler/tasks" -d '{"name":"first","agent_id":"agent-7"}' | tfield task_id)
+sleep 0.01
+T2=$(curl -s --max-time 10 -X POST "$K/v1/scheduler/tasks" -d '{"name":"second","agent_id":"agent-8"}' | tfield task_id)
+curl -s -o /dev/null --max-time 10 -X POST "$K/v1/scheduler/schedule"
+tk_check "the node lists its placed task"  "$(curl -s --max-time 10 "$K/v1/scheduler/nodes/smoke-n1/tasks" | tfield task_id)" "$T1"
+tk_check "an unknown node is 404"          "$(tcode "$K/v1/scheduler/nodes/nope/tasks")"          "404"
+tk_check "a QUEUED task cannot start (409)" "$(tcode -X POST "$K/v1/scheduler/tasks/$T2/start")"  "409"
+tk_check "complete before start is 409"    "$(tcode -X POST "$K/v1/scheduler/tasks/$T1/complete")" "409"
+tk_check "start: Running"                  "$(curl -s --max-time 10 -X POST "$K/v1/scheduler/tasks/$T1/start" | tfield status)" "Running"
+tk_check "start again is 409"              "$(tcode -X POST "$K/v1/scheduler/tasks/$T1/start")"   "409"
+tk_check "GET .../start is 405"            "$(tcode "$K/v1/scheduler/tasks/$T1/start")"           "405"
+tk_check "a browser-originated complete is 403" \
+  "$(tcode -X POST -H 'Origin: https://attacker.example' "$K/v1/scheduler/tasks/$T1/complete")" "403"
+tk_check "a non-terminal status is 400" \
+  "$(tcode -X POST "$K/v1/scheduler/tasks/$T1/complete" -d '{"status":"running"}')" "400"
+tk_check "stats count it running"          "$(curl -s --max-time 10 "$K/v1/scheduler/stats" | tfield running)" "1"
+tk_check "complete (no body): Completed" \
+  "$(curl -s --max-time 10 -X POST "$K/v1/scheduler/tasks/$T1/complete" | tfield status)" "Completed"
+tk_check "the freed capacity places the waiting task" \
+  "$(curl -s --max-time 10 -X POST "$K/v1/scheduler/schedule" | tfield task_id)" "$T2"
+curl -s -o /dev/null --max-time 10 -X POST "$K/v1/scheduler/tasks/$T2/start"
+FAILED=$(curl -s --max-time 10 -X POST "$K/v1/scheduler/tasks/$T2/complete" -d '{"status":"failed","reason":"disk full"}')
+tk_check "complete {status:failed}: Failed" "$(printf '%s' "$FAILED" | tfield status)"      "Failed"
+tk_check "... with its reason"             "$(printf '%s' "$FAILED" | tfield fail_reason)" "disk full"
+STATS=$(curl -s --max-time 10 "$K/v1/scheduler/stats")
+tk_check "stats: one completed"            "$(printf '%s' "$STATS" | tfield completed)"    "1"
+tk_check "stats: one failed"               "$(printf '%s' "$STATS" | tfield failed)"       "1"
+tk_check "an unknown task is 404"          "$(tcode -X POST "$K/v1/scheduler/tasks/no-such-task/start")" "404"
+kill $TK_SRV 2>/dev/null || true
+if [ $TK_OK -ne 1 ]; then echo "  task smoke FAILED"; SMOKE_EXIT=1; fi
+
 exit $SMOKE_EXIT
