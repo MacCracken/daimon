@@ -11,6 +11,8 @@ mkdir -p build
 cyrius build src/main.cyr build/daimon >/dev/null 2>&1 || { echo "smoke: build failed"; exit 1; }
 echo ""
 echo "=== libro MCP tools integration smoke ==="
+# 127.0.0.1, not localhost, throughout: curl tries ::1 first and daimon binds
+# IPv4 only (the trace section below learned that first).
 # The .tcyr suites include src/ modules, not the linked binary; the bote/libro
 # audit tools only exist in the linked binary, so this exercises the real
 # HTTP path: /v1/mcp/tools must advertise the 5 builtins, and dispatching
@@ -21,18 +23,18 @@ LIBRO_OK=1
 LIBRO_SRV=$!
 i=0
 while [ $i -lt 25 ]; do
-    if curl -s --max-time 1 "http://localhost:$LIBRO_PORT/v1/mcp/tools" >/dev/null 2>&1; then break; fi
+    if curl -s --max-time 1 "http://127.0.0.1:$LIBRO_PORT/v1/mcp/tools" >/dev/null 2>&1; then break; fi
     i=$((i + 1)); sleep 0.1
 done
-LIBRO_MANIFEST=$(curl -s --max-time 2 "http://localhost:$LIBRO_PORT/v1/mcp/tools" || true)
-LIBRO_EXPORT=$(curl -s --max-time 2 -X POST "http://localhost:$LIBRO_PORT/v1/mcp/call" -d '{"name":"libro_export","arguments":{}}' || true)
-LIBRO_VERIFY=$(curl -s --max-time 2 -X POST "http://localhost:$LIBRO_PORT/v1/mcp/call" -d '{"name":"libro_verify","arguments":{}}' || true)
-LIBRO_QUERY=$(curl -s --max-time 2 -X POST "http://localhost:$LIBRO_PORT/v1/mcp/call" -d '{"name":"libro_query","arguments":{"min_severity":1}}' || true)
+LIBRO_MANIFEST=$(curl -s --max-time 2 "http://127.0.0.1:$LIBRO_PORT/v1/mcp/tools" || true)
+LIBRO_EXPORT=$(curl -s --max-time 2 -X POST "http://127.0.0.1:$LIBRO_PORT/v1/mcp/call" -d '{"name":"libro_export","arguments":{}}' || true)
+LIBRO_VERIFY=$(curl -s --max-time 2 -X POST "http://127.0.0.1:$LIBRO_PORT/v1/mcp/call" -d '{"name":"libro_verify","arguments":{}}' || true)
+LIBRO_QUERY=$(curl -s --max-time 2 -X POST "http://127.0.0.1:$LIBRO_PORT/v1/mcp/call" -d '{"name":"libro_query","arguments":{"min_severity":1}}' || true)
 # Audit feed: an SSRF-rejected registration (file:// callback_url) must be
 # recorded on the chain as action "mcp.register.reject" — proves daimon's own
 # events reach the libro tools, not just the genesis entry.
-curl -s --max-time 2 -X POST "http://localhost:$LIBRO_PORT/v1/mcp/tools" -d '{"name":"evil","description":"x","callback_url":"file:///etc/passwd"}' >/dev/null 2>&1 || true
-LIBRO_AUDIT=$(curl -s --max-time 2 -X POST "http://localhost:$LIBRO_PORT/v1/mcp/call" -d '{"name":"libro_export","arguments":{}}' || true)
+curl -s --max-time 2 -X POST "http://127.0.0.1:$LIBRO_PORT/v1/mcp/tools" -d '{"name":"evil","description":"x","callback_url":"file:///etc/passwd"}' >/dev/null 2>&1 || true
+LIBRO_AUDIT=$(curl -s --max-time 2 -X POST "http://127.0.0.1:$LIBRO_PORT/v1/mcp/call" -d '{"name":"libro_export","arguments":{}}' || true)
 kill $LIBRO_SRV 2>/dev/null || true
 # Fixed-string matches (-F). Two of these checks had been failing unnoticed —
 # nothing in CI ran them — until 2.2.3 ran them again:

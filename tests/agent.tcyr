@@ -43,12 +43,20 @@ include "src/error.cyr"
 include "src/audit.cyr"
 include "src/agent.cyr"
 
-# Keeps a second thread alive long enough for count_threads to observe it.
+# A second thread that stays alive until the main thread has counted it —
+# released by a flag, not a fixed sleep, so no scheduling delay can make it
+# exit early. Bounded at ~10 s so a broken release cannot hang the suite.
+var _agent_test_release = 0;
 fn _agent_test_sleeper(arg) {
     var ts: i64[2];
     store64(&ts, 0);
-    store64(&ts + 8, 300000000);   # 300 ms
-    sys_nanosleep(&ts, 0);
+    store64(&ts + 8, 1000000);     # 1 ms
+    var waited = 0;
+    while (_agent_test_release == 0) {
+        if (waited >= 10000) { return 0; }
+        sys_nanosleep(&ts, 0);
+        waited = waited + 1;
+    }
     return 0;
 }
 
@@ -120,20 +128,29 @@ assert_eq(vec_len(dir_list(str_data(tmp_s))), 0,
 assert(count_fds(me) > 0, "count_fds reads a real open-fd count (was always 0)");
 assert_eq(count_threads(me), 1, "count_threads: this test process has one thread");
 
-# count_threads must COUNT, not fall back: with a second thread alive it reads 2.
-# (Single-threaded, the bug's fallback of 1 and the right answer coincide — so
-# only a live second thread can tell them apart.)
-var t2 = thread_create(&_agent_test_sleeper, 0);
-assert(t2 != 0, "second thread started");
-assert_eq(count_threads(me), 2, "count_threads sees a second live thread (was stuck at 1)");
-thread_join(t2);
-
-# agent_update_resources writes the three fields it owns.
+# agent_update_resources writes the three fields it owns — measured while this
+# process is single-threaded, so the thread count it stores is exactly 1.
 agent_set_pid(h, me);
 agent_update_resources(h);
 assert(agent_mem_used(h) > 0, "agent_update_resources populated mem_used");
 assert(agent_fds_used(h) > 0, "agent_update_resources stores a real fds count");
 assert_eq(agent_threads(h), 1, "agent_update_resources stores the thread count");
+
+# count_threads must COUNT, not fall back: with a second thread alive it reads 2.
+# (Single-threaded, the bug's fallback of 1 and the right answer coincide — so
+# only a live second thread can tell them apart.)
+#
+# ⚠ Nothing may count threads AFTER thread_join. The join returns when the
+# kernel clears the thread's tid (CLONE_CHILD_CLEARTID), which happens BEFORE
+# the exiting thread is removed from /proc/<pid>/task — so for a moment the
+# dead thread is still listed. 2.2.3 first shipped the resource check after
+# the join: green on a fast machine, and on the CI runner it read 2 (reproduced
+# locally 3 in 100 runs pinned to one busy CPU).
+var t2 = thread_create(&_agent_test_sleeper, 0);
+assert(t2 != 0, "second thread started");
+assert_eq(count_threads(me), 2, "count_threads sees a second live thread (was stuck at 1)");
+_agent_test_release = 1;
+thread_join(t2);
 
 # --- liveness ------------------------------------------------------------
 assert_eq(agent_is_alive(agent_handle_new(99, str_from("x"))), 0,
