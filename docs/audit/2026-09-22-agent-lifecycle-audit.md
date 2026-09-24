@@ -1,4 +1,4 @@
-# Security Audit — 2026-09-22: the agent lifecycle (2.3.0, with 2.3.1, 2.3.2, 2.3.3 and 2.3.4 addenda)
+# Security Audit — 2026-09-22: the agent lifecycle (2.3.0, with 2.3.1, 2.3.2, 2.3.3, 2.3.4 and 2.4.2 addenda)
 
 2.3.0 connects process control to the HTTP API: an unauthenticated client can now start, stop,
 pause, resume and delete agents. This audit covers that new surface and two older exposures that
@@ -532,7 +532,9 @@ were caught.
   emulator cannot show whether daimon's RLIMIT_AS call works on aarch64. That was not verified on
   aarch64 hardware. *(2.4.2: verified under a real aarch64 kernel in a VM, `tests/aarch64/run.sh`,
   all 212 agent checks. See the 2.4.2 addendum.)*
-- **AGNOS**: the build compiles. A start answers 501 until 2.4.x maps `sys_spawn_path`.
+- **AGNOS**: the build compiles. A start answers 501 until 2.4.x maps `sys_spawn_path`. *(2.4.0:
+  agents start on AGNOS, tested on its kernel under QEMU. See ADR-007 and
+  [the AGNOS audit](2026-09-23-agnos-platform-audit.md).)*
 
 ## Sources
 

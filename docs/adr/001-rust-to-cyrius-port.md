@@ -1,8 +1,15 @@
 # ADR-001: Rust to Cyrius Port
 
-**Status**: Accepted
+**Status**: Accepted. Its figures are the port's (0.7.0); what has changed since is listed below.
 **Date**: 2026-04-13
 **Context**: Daimon v0.6.0 was implemented in Rust with 193 crate dependencies, 9,724 LOC, and a 4.0 MB binary.
+
+**Since then** (2.4.3):
+- the blocked features ship: bote's MCP hosting since 1.3.0, and nein's firewall tools since 2.1.8;
+- daimon runs its own event loop, so a slow client holds only its own connection (ADR-006, 2.3.4);
+- the toolchain pin is `cyrius.cyml`'s `[package].cyrius`, not `.cyrius-toolchain`;
+- daimon depends on nine first-party git libraries, and still on no third-party code;
+- the binary is 3.3 MB, about half of it unreachable code the toolchain NOPs in place (`README.md`).
 
 ## Decision
 

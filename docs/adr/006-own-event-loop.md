@@ -1,7 +1,9 @@
 # ADR-006: daimon Owns Its Event Loop
 
-**Status**: Accepted. Supersedes ADR-005 §2 (the channel service thread); ADR-005's other decisions
-(one socketpair per agent on fd 3, identity by construction, the bounds) stand.
+**Status**: Accepted. Supersedes ADR-005 §2 (the channel service thread) and ADR-002 (the sync
+and async serve modes); ADR-005's other decisions (one socketpair per agent on fd 3, identity by
+construction, the bounds) stand. Its "AGNOS keeps sandhi's loop" was superseded at 2.4.0 by
+[ADR-007](007-daimon-on-agnos.md): the same loop runs there, polled.
 **Date**: 2026-09-22 (2.3.4)
 **Context**: through 2.3.3 daimon served HTTP from inside sandhi's serve loops
 (`sandhi_server_run_opts` / `sandhi_server_run_async`). Those loops own the accept loop and give the
@@ -50,7 +52,8 @@ answered identically on 2.3.3 (sandhi's loop) and 2.3.4 (this one). What changes
 open. The tick's scans are over in-memory records.
 
 **AGNOS keeps sandhi's loop.** It has no agent processes or channels until 2.4.x, and its sockets are
-driven differently (`lib/net.cyr`).
+driven differently (`lib/net.cyr`). *(Superseded at 2.4.0: this loop runs on agnos too, polled,
+because nothing there can be waited on with epoll. See ADR-007, decision 2.)*
 
 ## Rejected
 

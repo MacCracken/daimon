@@ -6,103 +6,61 @@ type: state
 
 # Documentation Health — daimon
 
-> **Last refresh**: 2026-09-23 (2.4.3 — the QEMU round: the aarch64 VM runs every suite and a smoke of the binary; the agnos stall caught with QEMU's monitor and the writer's pacing changed, in ADR-007's addendum, audit AG-14, CLAUDE.md, the API guide, overview, roadmap and SECURITY; ai-hwaccel 2.4.0. Before that, 2.4.2 — 2.3.x's last items: ADR-008, new (a cgroup per agent); ADR-006's addendum on full slots; the lifecycle audit's 2.4.2 addendum; the API guide, overview, README, BENCHMARKS, SECURITY, CONTRIBUTING, CLAUDE.md, quickstart and roadmap updated.)
+> **Last refresh**: 2026-09-23 (after 2.4.3 — a full sweep, riding the next release: every guide read against the running binary, the README rewritten, the module map, ADR status lines, CLAUDE.md's sandhi row. Before that, 2.4.3 — the QEMU round.)
 > **Refresh cadence**: when docs are touched, update the affected row. Full re-audit at each minor cut.
 > **Scope**: this repo only (`daimon`) — root-level files plus the entire `docs/` tree.
 
 This is a **ledger**, not a one-time audit. Rewrite-in-place as docs change. Pattern lifted from [agnosys/docs/doc-health.md](https://github.com/MacCracken/agnosys/blob/main/docs/doc-health.md) and [cyrius/docs/doc-health.md](https://github.com/MacCracken/cyrius/blob/main/docs/doc-health.md) — same buckets, daimon-shaped tiers.
 
-Daimon is the AGNOS agent orchestrator — every consumer (hoosh, agnoshi, aethersafha, the agent fleet) depends on the HTTP API surface and the supervisor / scheduler / federation primitives. Stale endpoint docs propagate downstream, so doc currency carries weight even though the doc surface is modest today (~15 files).
+Daimon is the AGNOS agent orchestrator — every consumer (hoosh, agnoshi, aethersafha, the agent fleet) depends on the HTTP API surface and the supervisor / scheduler / federation primitives. Stale endpoint docs propagate downstream, so doc currency carries weight: 33 markdown files today.
 
 ---
 
-## At a glance — 2026-07-03 inventory
+## At a glance — 2026-09-23 inventory
 
-**~15 markdown files** total (7 root + 8 under `docs/`). Bucket counts after the 1.3.1 doc sweep:
+**33 markdown files**: 7 at the root (plus `LICENSE`) and 26 under `docs/`.
 
 | Bucket | Count | What it means |
 |---|---|---|
-| ✅ **Fresh — refreshed in the 1.3.0 / 1.3.1 cycle** | ~13 | CHANGELOG (1.3.1 cut), VERSION (1.3.1), CLAUDE.md (6.3.43 / sandhi 1.7.0 / sakshi 2.4.3 / sigil / bote-libro rows), README (expanded), CONTRIBUTING, architecture/overview.md, guides/quickstart.md, guides/api.md (verified current), BENCHMARKS.md (re-baselined under 6.3.43), roadmap (trimmed to open-work-only), SECURITY.md (supported-versions rolled), this file. |
-| 🟡 **Stale — refresh in place** | 0 | Cleared — the v1.2.x doc-refresh backlog is drained and the 1.3.1 sweep caught the roadmap / README / SECURITY drift. |
-| 🔵 **Probably evergreen** | 2 | `CODE_OF_CONDUCT.md`, `LICENSE`. No version-tied claims. Re-read pass annually. |
-| 📦 **Archive / frozen by design** | ~4 | The 3 ADRs (point-in-time decisions); audit/2026-04-13 + audit/2026-04-27 reports (frozen by audit convention). |
-| ❓ **Open strategic question** | 0 | None outstanding. See [Open questions](#open-strategic-questions) below for what would re-open it. |
+| ✅ **Fresh — checked against the code on 2026-09-23** | 22 | The root six (README, CHANGELOG, CLAUDE.md, CONTRIBUTING, SECURITY, BENCHMARKS); the overview, roadmap and this file; the three guides; the eight ADRs; the lifecycle and AGNOS audits, which take addenda. |
+| 🟡 **Stale — refresh in place** | 0 | None known after the sweep. See **Stale set** below. |
+| 🔵 **Probably evergreen** | 1 (+ `LICENSE`) | `CODE_OF_CONDUCT.md`. No version-tied claims. Re-read yearly. |
+| 📦 **Frozen by design** | 10 | The 2026-04-13 and 2026-04-27 audits, and the eight filings in `development/issues/archive/`. |
+| ❓ **Open strategic question** | 0 | None outstanding. See [Open questions](#open-strategic-questions). |
 
-**Doc work shipped in 1.2.0:**
-- ✅ `CHANGELOG.md` — 1.2.0 entry recording the cyrius 5.10.34 / sakshi 2.2.3 bump + CI/release rewrite + `/lib/` gitignored.
-- ✅ `CLAUDE.md` — cyrius pin reference refreshed 5.7.12 → 5.10.34; sakshi line refreshed 2.0.0 → 2.2.3; sandhi note remains "in use".
-- ✅ `docs/development/roadmap.md` — 1.1.5 items rescoped to 1.2.1 / 1.2.2; "Future (v1.2.0+)" renamed to "Future (v1.3.0+)".
-- ✅ `docs/doc-health.md` — this file (initial scaffold; agnosys convention).
-
-**Doc work shipped in 1.2.1:**
-- ✅ `CHANGELOG.md` — 1.2.1 entry for external MCP forwarding (sandhi_rpc_mcp_call dispatch, validate_callback_url enforced at register boundary, +13 test assertions, +1 360 bytes binary).
-- ✅ `docs/development/roadmap.md` — 1.2.1 marked complete; rescoping note on the original `McpToolDescription.endpoint_url` plan (rescoped to use the existing external-wrapper struct + `mcp_find_external_url` accessor).
-- ✅ `docs/doc-health.md` — last-refresh date rolled.
-
-**Doc work shipped in 1.2.2:**
-- ✅ `CHANGELOG.md` — 1.2.2 entry: sync `serve` threads sandhi opts with `idle_ms = 5000`; `serve_async` applies SO_RCVTIMEO per accepted cfd (closes VULN-async-slowloris); `serve_async` collapse stays deferred (max_conns upstream).
-- ✅ `docs/development/roadmap.md` — idle_ms half marked shipped; collapse half kept open with upstream pointer.
-- ✅ `docs/doc-health.md` — last-refresh date rolled.
-
-**Post-1.2.2 housekeeping (2026-05-10):**
-- ✅ Daimon-side blocker trackers migrated upstream per the "blockers live where they're fixed" rule. Two files removed from `daimon/docs/development/issues/`; replaced with upstream pointers in roadmap + CHANGELOG (severity tagged in both).
-- ✅ Daimon roadmap current-arc items now carry explicit severity markers.
-
-**Doc work shipped in 1.3.0 (2026-07-03):**
-- ✅ `CHANGELOG.md` — 1.3.0 entry: cyrius 6.2.11 → 6.3.43, sandhi 1.6.2 → 1.7.0, sakshi 2.3.0 → 2.4.3, sigil declared in `[deps].stdlib`; VERSION single-source-of-truth; doc refresh.
-- ✅ `CLAUDE.md` — Cyrius pin 6.2.11 → 6.3.43; stdlib table refreshed (sandhi 1.7.0, sigil added, sakshi 2.4.3 row).
-- ✅ `README.md`, `CONTRIBUTING.md`, `docs/architecture/overview.md`, `docs/guides/quickstart.md` — the v1.2.x stale-doc backlog drained: cyrius pin, `cyrius lib sync` + `cyrius deps` workflow, `lib/` gitignored, `[deps].stdlib` list (incl. sigil), 225-test count, sync+async HTTP correction.
-- ✅ `BENCHMARKS.md` — re-baselined under cyrius 6.3.43 (current-baseline table added; frozen v1.0.1 port comparison preserved).
-- ✅ `docs/guides/api.md` — verified current (24-endpoint reference carries no version-tied claims; no change needed).
-- ✅ `VERSION` — 1.2.9 → 1.3.0.
-
-**Doc work shipped in 1.3.1 (2026-07-03):**
-- ✅ `docs/development/roadmap.md` — **trimmed to open-work-only**: all completed (`[x]`) sections removed (they live in CHANGELOG), the met v1.0-criteria block dropped, and the overlapping "Blocked on Upstream Ports" / current-arc sections consolidated. Now holds just the VULN-007 security gate, the nein firewall-MCP blocker, and the v1.4.0+ backlog, under a lean status header.
-- ✅ `README.md` — expanded: intro notes the libro audit trail; deps example lists sakshi/bote/libro/majra; benchmark count 16 → 17; added an "MCP audit tools" section and a "Documentation" link block. (Footprint line left as-is.)
-- ✅ `SECURITY.md` — supported-versions table rolled `1.0.x` → `1.3.x` (+ `< 1.3` unsupported).
-- ✅ `CHANGELOG.md` / `VERSION` — 1.3.1 cut (`## [1.3.1] - Unreleased` opened; VERSION 1.3.0 → 1.3.1).
-
-**Doc work shipped in 2.2.3 (2026-09-22):**
-- ✅ `README.md`, `docs/guides/quickstart.md` — test commands and counts were 1.3-era (`225 assertions`,
-  one suite, 17 benchmarks); now `cyrius tests` / `cyrius fuzz` / `tests/smoke.sh`, 645 assertions in
-  16 suites, 21 benchmarks, 6 fuzz harnesses.
-- ✅ `CONTRIBUTING.md` — "add tests in `tests/daimon.tcyr`" steered new work back into the copied-code
-  suite the 2.2.x arc removed; now: a per-module suite that includes the real `src/` file, and fuzz
-  harnesses on `fuzz/rng.cyr` with portable exits.
-- ✅ `BENCHMARKS.md` — current baseline replaced with numbers from the REAL code (the old one timed
-  local copies); the frozen port-era comparison kept but corrected (its two "Cyrius wins" were
-  measured on copies); the correctness table's "Complete" rows for the memory store and IPC — never
-  true, both crashed on first call — and "firewall: Blocked" (integrated since 2.1.8) corrected.
-- ✅ `docs/development/roadmap.md` — 2.2.x closed and removed; the gaps 2.2.3 found recorded under
-  2.3.x (tasks never start; IPC items), 2.5.x (memory API, registration ownership) and a P3.
-- ✅ `SECURITY.md` — supported versions rolled `1.3.x` → `2.2.x` (+ `< 2.2` unsupported); it had
-  named 1.3.x as the supported line through the whole 2.x series.
-- ✅ `CHANGELOG.md` / `VERSION` / `src/config.cyr` — 2.2.3 cut (`scripts/version-bump.sh`).
-
-**Doc work shipped in 2.3.0 (2026-09-22):**
-- ✅ `docs/audit/2026-09-22-agent-lifecycle-audit.md` — new. VULN-011 (bound every interface),
-  VULN-012 (cross-site requests / DNS rebinding), VULN-013 (descriptors leaked into agents),
-  VULN-014 (a stop holds the server), VULN-015 (inherited environment). Each has observed evidence and
-  CVE / CWE references.
-- ✅ `docs/adr/004-agent-process-control.md` — new. The four decisions behind process control on an
-  unauthenticated API: the executable is chosen by type and never by a request, loopback bind,
-  browser-originated agent control refused, and a synchronous bounded stop. Rejected alternatives
-  are recorded with their reasons.
-- ✅ `docs/guides/api.md` — the lifecycle routes, `type` / `exit_code`, what runs and how the child
-  is set up, the Origin rule, the bind address, and 403 / 405 / 409 / 500 / 501 in the error table.
-- ✅ `docs/guides/quickstart.md` — a start / stop walk-through, the bind address, and counts
-  (741 assertions, 22 + 2 benchmarks).
-- ✅ `docs/architecture/overview.md` — agent.cyr and server.cyr entries, and CLI flags. The route
-  count read "24 endpoints", which was already stale; it is now 38, counted from `src/router.cyr`.
-- ✅ `README.md` — bind address, counts, and what the smoke script covers.
-- ✅ `BENCHMARKS.md` — a 2.3.0 section: 3 lifecycle benchmarks and a back-to-back 2.2.3 / 2.3.0 A/B
-  of the 19 existing ones. The correctness and coverage rows are updated.
-- ✅ `SECURITY.md` — supported versions `2.2.x` → `2.3.x`.
-- ✅ `docs/development/roadmap.md` — 2.3.x narrowed to task start/complete then IPC, with the
-  lifecycle follow-ups. 2.4.x is unblocked; 2.5.x says what 2.2.2 and 2.3.0 closed and what is still
-  open. Its two function names were wrong (`ipc_send`, `complete_task`); they are now
-  `agent_ipc_send` and samay's `task_scheduler_complete_task`.
-- ✅ `CHANGELOG.md` / `VERSION` / `src/config.cyr` — 2.3.0 (`scripts/version-bump.sh`).
+**Doc work for the next release (2026-09-23, unreleased — a full sweep after 2.4.3):**
+- ✅ Method: every route in `src/router.cyr` driven against the 2.4.3 binary with curl, and every
+  answer in the guides compared with what came back. Counts measured (`cyrius fuzz`, the builds,
+  the lock). Read in full: the root docs but the CHANGELOG, the guides, the overview, the roadmap,
+  this file and the eight ADRs. BENCHMARKS.md, the audits and the CHANGELOG were checked where they
+  summarise the present (titles, status lines, summary tables, the newest entries), not re-read
+  through their dated history.
+- ✅ `README.md` — rewritten. It named five builtin MCP tools (there are 13), none of the resource
+  and prompt routes, and 2.3.1's sizes, and listed federation and screen capture as features
+  (neither has a route).
+- ✅ `docs/guides/api.md` — the MCP section (builtins, manifest, resources and prompts), scheduler
+  ids (samay's UUIDs), task listing (counts only), schedule decisions (`score`), health and metrics
+  (every field), error bodies (404 / 405 / 429 without `code`, framing refusals without a body),
+  the rate limit (a fixed window; one shared bucket on AGNOS), AGNOS's 5 connection slots, the edge
+  list's numeric status.
+- ✅ `docs/guides/quickstart.md` — the 6.6.6 pin (was 6.3.43), the real answers, 28 benchmarks (was
+  27), sizes.
+- ✅ `docs/architecture/overview.md` — the module map now lists the 29 included modules. It named
+  `scheduler.cyr` / `cron.cyr` (gone since 2.0.0) and missed `syscalls.cyr`, `secmem.cyr` and
+  `trace.cyr`. It had `json_escape_str` in the wrong file, a "sliding" rate window, "SSRF
+  protection" for a scheme check, and 2026-07 dependency versions.
+- ✅ ADRs — 002 marked superseded by 006. 001, 004, 006 and 007 say what later releases changed.
+- ✅ `CLAUDE.md` — the sandhi, tls and async rows (daimon's own loop since 2.3.4; sandhi's MCP
+  client is in use), the ADR-002 note, the ADR list.
+- ✅ `CONTRIBUTING.md` — `cyrius deps` alone; the lock workflow; the `path` pins of samay and nein.
+- ✅ `BENCHMARKS.md` — retitled and laid out (baseline, per-release sections, frozen port era); the
+  mcp and api rows; 30 benchmarks, 143 smoke checks, 33 audit findings.
+- ✅ Audits — the lifecycle audit names its 2.4.2 addendum and says agents start on AGNOS; the AGNOS
+  audit gains 2.4.3 and corrects 2.4.1's check count (85 → 92).
+- ✅ `docs/development/roadmap.md` — routes for the federation and screen-capture modules, unsequenced.
+- ✅ This file — the inventory, the blocks newest first, the stale set, the tracker rows, the open
+  questions.
+- ✅ `CHANGELOG.md` — an `[Unreleased]` entry.
 
 **Doc work shipped in 2.4.3 (2026-09-23):**
 - ✅ `docs/adr/007-daimon-on-agnos.md` — addendum: the writer's pacing (512 bytes, 1 ms apart, never two
@@ -276,12 +234,92 @@ Daimon is the AGNOS agent orchestrator — every consumer (hoosh, agnoshi, aethe
   and VULN-016 sits under identity.
 - ✅ `CHANGELOG.md` / `VERSION` / `src/config.cyr` — 2.3.1 (`scripts/version-bump.sh`).
 
+**Doc work shipped in 2.3.0 (2026-09-22):**
+- ✅ `docs/audit/2026-09-22-agent-lifecycle-audit.md` — new. VULN-011 (bound every interface),
+  VULN-012 (cross-site requests / DNS rebinding), VULN-013 (descriptors leaked into agents),
+  VULN-014 (a stop holds the server), VULN-015 (inherited environment). Each has observed evidence and
+  CVE / CWE references.
+- ✅ `docs/adr/004-agent-process-control.md` — new. The four decisions behind process control on an
+  unauthenticated API: the executable is chosen by type and never by a request, loopback bind,
+  browser-originated agent control refused, and a synchronous bounded stop. Rejected alternatives
+  are recorded with their reasons.
+- ✅ `docs/guides/api.md` — the lifecycle routes, `type` / `exit_code`, what runs and how the child
+  is set up, the Origin rule, the bind address, and 403 / 405 / 409 / 500 / 501 in the error table.
+- ✅ `docs/guides/quickstart.md` — a start / stop walk-through, the bind address, and counts
+  (741 assertions, 22 + 2 benchmarks).
+- ✅ `docs/architecture/overview.md` — agent.cyr and server.cyr entries, and CLI flags. The route
+  count read "24 endpoints", which was already stale; it is now 38, counted from `src/router.cyr`.
+- ✅ `README.md` — bind address, counts, and what the smoke script covers.
+- ✅ `BENCHMARKS.md` — a 2.3.0 section: 3 lifecycle benchmarks and a back-to-back 2.2.3 / 2.3.0 A/B
+  of the 19 existing ones. The correctness and coverage rows are updated.
+- ✅ `SECURITY.md` — supported versions `2.2.x` → `2.3.x`.
+- ✅ `docs/development/roadmap.md` — 2.3.x narrowed to task start/complete then IPC, with the
+  lifecycle follow-ups. 2.4.x is unblocked; 2.5.x says what 2.2.2 and 2.3.0 closed and what is still
+  open. Its two function names were wrong (`ipc_send`, `complete_task`); they are now
+  `agent_ipc_send` and samay's `task_scheduler_complete_task`.
+- ✅ `CHANGELOG.md` / `VERSION` / `src/config.cyr` — 2.3.0 (`scripts/version-bump.sh`).
+
+**Doc work shipped in 2.2.3 (2026-09-22):**
+- ✅ `README.md`, `docs/guides/quickstart.md` — test commands and counts were 1.3-era (`225 assertions`,
+  one suite, 17 benchmarks); now `cyrius tests` / `cyrius fuzz` / `tests/smoke.sh`, 645 assertions in
+  16 suites, 21 benchmarks, 6 fuzz harnesses.
+- ✅ `CONTRIBUTING.md` — "add tests in `tests/daimon.tcyr`" steered new work back into the copied-code
+  suite the 2.2.x arc removed; now: a per-module suite that includes the real `src/` file, and fuzz
+  harnesses on `fuzz/rng.cyr` with portable exits.
+- ✅ `BENCHMARKS.md` — current baseline replaced with numbers from the REAL code (the old one timed
+  local copies); the frozen port-era comparison kept but corrected (its two "Cyrius wins" were
+  measured on copies); the correctness table's "Complete" rows for the memory store and IPC — never
+  true, both crashed on first call — and "firewall: Blocked" (integrated since 2.1.8) corrected.
+- ✅ `docs/development/roadmap.md` — 2.2.x closed and removed; the gaps 2.2.3 found recorded under
+  2.3.x (tasks never start; IPC items), 2.5.x (memory API, registration ownership) and a P3.
+- ✅ `SECURITY.md` — supported versions rolled `1.3.x` → `2.2.x` (+ `< 2.2` unsupported); it had
+  named 1.3.x as the supported line through the whole 2.x series.
+- ✅ `CHANGELOG.md` / `VERSION` / `src/config.cyr` — 2.2.3 cut (`scripts/version-bump.sh`).
+
+**Doc work shipped in 1.3.1 (2026-07-03):**
+- ✅ `docs/development/roadmap.md` — **trimmed to open-work-only**: all completed (`[x]`) sections removed (they live in CHANGELOG), the met v1.0-criteria block dropped, and the overlapping "Blocked on Upstream Ports" / current-arc sections consolidated. Now holds just the VULN-007 security gate, the nein firewall-MCP blocker, and the v1.4.0+ backlog, under a lean status header.
+- ✅ `README.md` — expanded: intro notes the libro audit trail; deps example lists sakshi/bote/libro/majra; benchmark count 16 → 17; added an "MCP audit tools" section and a "Documentation" link block. (Footprint line left as-is.)
+- ✅ `SECURITY.md` — supported-versions table rolled `1.0.x` → `1.3.x` (+ `< 1.3` unsupported).
+- ✅ `CHANGELOG.md` / `VERSION` — 1.3.1 cut (`## [1.3.1] - Unreleased` opened; VERSION 1.3.0 → 1.3.1).
+
+**Doc work shipped in 1.3.0 (2026-07-03):**
+- ✅ `CHANGELOG.md` — 1.3.0 entry: cyrius 6.2.11 → 6.3.43, sandhi 1.6.2 → 1.7.0, sakshi 2.3.0 → 2.4.3, sigil declared in `[deps].stdlib`; VERSION single-source-of-truth; doc refresh.
+- ✅ `CLAUDE.md` — Cyrius pin 6.2.11 → 6.3.43; stdlib table refreshed (sandhi 1.7.0, sigil added, sakshi 2.4.3 row).
+- ✅ `README.md`, `CONTRIBUTING.md`, `docs/architecture/overview.md`, `docs/guides/quickstart.md` — the v1.2.x stale-doc backlog drained: cyrius pin, `cyrius lib sync` + `cyrius deps` workflow, `lib/` gitignored, `[deps].stdlib` list (incl. sigil), 225-test count, sync+async HTTP correction.
+- ✅ `BENCHMARKS.md` — re-baselined under cyrius 6.3.43 (current-baseline table added; frozen v1.0.1 port comparison preserved).
+- ✅ `docs/guides/api.md` — verified current (24-endpoint reference carries no version-tied claims; no change needed).
+- ✅ `VERSION` — 1.2.9 → 1.3.0.
+
+**Post-1.2.2 housekeeping (2026-05-10):**
+- ✅ Daimon-side blocker trackers migrated upstream per the "blockers live where they're fixed" rule. Two files removed from `daimon/docs/development/issues/`; replaced with upstream pointers in roadmap + CHANGELOG (severity tagged in both).
+- ✅ Daimon roadmap current-arc items now carry explicit severity markers.
+
+**Doc work shipped in 1.2.2:**
+- ✅ `CHANGELOG.md` — 1.2.2 entry: sync `serve` threads sandhi opts with `idle_ms = 5000`; `serve_async` applies SO_RCVTIMEO per accepted cfd (closes VULN-async-slowloris); `serve_async` collapse stays deferred (max_conns upstream).
+- ✅ `docs/development/roadmap.md` — idle_ms half marked shipped; collapse half kept open with upstream pointer.
+- ✅ `docs/doc-health.md` — last-refresh date rolled.
+
+**Doc work shipped in 1.2.1:**
+- ✅ `CHANGELOG.md` — 1.2.1 entry for external MCP forwarding (sandhi_rpc_mcp_call dispatch, validate_callback_url enforced at register boundary, +13 test assertions, +1 360 bytes binary).
+- ✅ `docs/development/roadmap.md` — 1.2.1 marked complete; rescoping note on the original `McpToolDescription.endpoint_url` plan (rescoped to use the existing external-wrapper struct + `mcp_find_external_url` accessor).
+- ✅ `docs/doc-health.md` — last-refresh date rolled.
+
+**Doc work shipped in 1.2.0:**
+- ✅ `CHANGELOG.md` — 1.2.0 entry recording the cyrius 5.10.34 / sakshi 2.2.3 bump + CI/release rewrite + `/lib/` gitignored.
+- ✅ `CLAUDE.md` — cyrius pin reference refreshed 5.7.12 → 5.10.34; sakshi line refreshed 2.0.0 → 2.2.3; sandhi note remains "in use".
+- ✅ `docs/development/roadmap.md` — 1.1.5 items rescoped to 1.2.1 / 1.2.2; "Future (v1.2.0+)" renamed to "Future (v1.3.0+)".
+- ✅ `docs/doc-health.md` — this file (initial scaffold; agnosys convention).
+
 ⚠ This ledger said "stale set: cleared" through the whole 2.x line while README quoted 1.3-era test
 counts and BENCHMARKS.md called untested modules "Complete". A doc can only be as fresh as the check
 that reads it: the rows below are what was last *recorded*, not a guarantee.
 
-**Stale set:** none recorded. `CLAUDE.md` was refreshed on 2026-09-22 at the maintainer's request.
-Each change was checked against `cyrius.cyml`, the source or the tool's own help:
+**Stale set:** none known after the 2026-09-23 sweep. Its block above lists the drift it found, and
+how each doc was checked. The frozen audits, the archived filings and the ledger blocks were left
+alone: they record what was true when they were written.
+
+**2026-09-22**: `CLAUDE.md` was refreshed at the maintainer's request. Each change was checked
+against `cyrius.cyml`, the source or the tool's own help:
 - pins: cyrius 6.6.6, samay 1.1.3, bote 3.3.13, libro 2.10.3, majra 2.9.1, with bayan 1.5.6 and
   nein 1.7.0 added;
 - the `bayan` row: request bodies are read with `http_body_json` / `http_json_*`, and
@@ -298,13 +336,13 @@ Each change was checked against `cyrius.cyml`, the source or the tool's own help
 
 | File | Last touched | Status | Notes |
 |---|---|---|---|
-| `README.md` | 2026-09-23 | ✅ Fresh | 2.4.3: the aarch64 VM runs every suite and the binary's smoke. 2.4.2: the aarch64 VM, containment and connection slots in the smoke line. 2.4.1: `run.sh --release` (CI), 92 guest checks, detached calls on AGNOS. 2.4.0: 1038 assertions; the agnos guest test; an "On AGNOS" paragraph. |
-| `CHANGELOG.md` | 2026-09-23 | ✅ Fresh | 2.4.3 entry: QEMU findings (every suite and a smoke on aarch64, the stall caught with the monitor, the version_sync crash), ai-hwaccel 2.4.0. Source of truth for shipped work. 2.4.2 entry: containment, slot eviction, the aarch64 VM, ai-hwaccel 2.3.29. 2.4.1 entry: detached calls, the clock and 1 KB writes on AGNOS, the 503, the guest test in CI, the lock verified, four filings. |
-| `CLAUDE.md` | 2026-09-23 | ✅ Fresh | 2.4.3: 512-byte, 1 ms pacing on agnos; the monitor on a guest timeout; the aarch64 smoke; ai-hwaccel 2.4.0. Durable rules. 2.4.2: `_agent_spawn` / `_agent_signal_all`, exact-match markers, no allocation on the tick, the aarch64 VM, ai-hwaccel 2.3.29. 2.4.1: `daimon_now_ms`, 1 KB writes, the kernel's room, `run.sh --release`, the lock rebuild, ai-hwaccel 2.3.27. 2.4.0: never sleep_ms, the foreground slot, file gaps with agnos. |
-| `CONTRIBUTING.md` | 2026-09-23 | ✅ Fresh | 2.4.3: the aarch64 VM runs every suite and the smoke. 2.4.2: `tests/aarch64/run.sh`; changes to starting and stopping agents are run contained. 2.4.1: `run.sh --release`; the clock and write shims. 2.4.0: the agnos guest test and testing agnos arms; the six endpoint rules; the 6.6.6 pin and the real gate. |
-| `SECURITY.md` | 2026-09-23 | ✅ Fresh | 2.4.3: on agnos a local client that falls behind, not only one that stops, can stop the machine. Supported versions `2.4.x`. 2.4.2: agent containment and connection slots in scope, with their known limits. 2.4.1: detached calls and large answers in the AGNOS scope. 2.4.0: AGNOS scope and the platform audit. |
+| `README.md` | 2026-09-23 | ✅ Fresh | Sweep (unreleased, 2026-09-23): rewritten: what daimon does (13 MCP builtins, resources and prompts, containment, tracing), security, platforms, release assets, 2.4.3's sizes, the modules with no route. 2.4.3: the aarch64 VM runs every suite and the binary's smoke. 2.4.2: the aarch64 VM, containment and connection slots in the smoke line. 2.4.1: `run.sh --release` (CI), 92 guest checks, detached calls on AGNOS. 2.4.0: 1038 assertions; the agnos guest test; an "On AGNOS" paragraph. |
+| `CHANGELOG.md` | 2026-09-23 | ✅ Fresh | Sweep (unreleased, 2026-09-23): an `[Unreleased]` entry for it. 2.4.3 entry: QEMU findings (every suite and a smoke on aarch64, the stall caught with the monitor, the version_sync crash), ai-hwaccel 2.4.0. Source of truth for shipped work. 2.4.2 entry: containment, slot eviction, the aarch64 VM, ai-hwaccel 2.3.29. 2.4.1 entry: detached calls, the clock and 1 KB writes on AGNOS, the 503, the guest test in CI, the lock verified, four filings. |
+| `CLAUDE.md` | 2026-09-23 | ✅ Fresh | Sweep (unreleased, 2026-09-23): the sandhi, tls and async rows; ADR-002 superseded; the ADR list. 2.4.3: 512-byte, 1 ms pacing on agnos; the monitor on a guest timeout; the aarch64 smoke; ai-hwaccel 2.4.0. Durable rules. 2.4.2: `_agent_spawn` / `_agent_signal_all`, exact-match markers, no allocation on the tick, the aarch64 VM, ai-hwaccel 2.3.29. 2.4.1: `daimon_now_ms`, 1 KB writes, the kernel's room, `run.sh --release`, the lock rebuild, ai-hwaccel 2.3.27. 2.4.0: never sleep_ms, the foreground slot, file gaps with agnos. |
+| `CONTRIBUTING.md` | 2026-09-23 | ✅ Fresh | Sweep (unreleased, 2026-09-23): `cyrius deps` alone; the lock workflow; the `path` pins; the writer's pacing. 2.4.3: the aarch64 VM runs every suite and the smoke. 2.4.2: `tests/aarch64/run.sh`; changes to starting and stopping agents are run contained. 2.4.1: `run.sh --release`; the clock and write shims. 2.4.0: the agnos guest test and testing agnos arms; the six endpoint rules; the 6.6.6 pin and the real gate. |
+| `SECURITY.md` | 2026-09-23 | ✅ Fresh | Sweep (unreleased, 2026-09-23): read, unchanged. 2.4.3: on agnos a local client that falls behind, not only one that stops, can stop the machine. Supported versions `2.4.x`. 2.4.2: agent containment and connection slots in scope, with their known limits. 2.4.1: detached calls and large answers in the AGNOS scope. 2.4.0: AGNOS scope and the platform audit. |
 | `CODE_OF_CONDUCT.md` | (initial) | 🔵 Evergreen | Standard. |
-| `BENCHMARKS.md` | 2026-09-23 | ✅ Fresh | 2.4.3: coverage row (every suite and the smoke in the aarch64 VM). A section per release with its A/B; 2.4.2: the contained start's cost and the Linux A/B; 2.4.1 and 2.4.0: Linux A/B, no AGNOS performance claim. Frozen v1.0.1 port comparison kept. |
+| `BENCHMARKS.md` | 2026-09-23 | ✅ Fresh | Sweep (unreleased, 2026-09-23): retitled; the layout said up front; the mcp and api rows; 30 benchmarks, 143 smoke checks, 33 audit findings. 2.4.3: coverage row (every suite and the smoke in the aarch64 VM). A section per release with its A/B; 2.4.2: the contained start's cost and the Linux A/B; 2.4.1 and 2.4.0: Linux A/B, no AGNOS performance claim. Frozen v1.0.1 port comparison kept. |
 | `VERSION` | 2026-09-23 | ✅ Fresh | `2.4.3`, written with `src/config.cyr` by `scripts/version-bump.sh`; `tests/version_sync.tcyr` checks they agree. |
 | `LICENSE` | (initial) | 🔵 Evergreen | GPL-3.0-only. |
 
@@ -314,7 +352,7 @@ Each change was checked against `cyrius.cyml`, the source or the tool's own help
 
 | File | Last touched | Status | Notes |
 |---|---|---|---|
-| `overview.md` | 2026-09-23 | ✅ Fresh | 2.4.3: 512-byte pieces on agnos. 2.4.2: containment; `_srv_slot_for_new`. 2.4.1: `server_detach` on agnos, the clock, paced writes. 2.4.0: the agnos arms; the data flow no longer draws 2.3.3's channel thread. |
+| `overview.md` | 2026-09-23 | ✅ Fresh | Sweep (unreleased, 2026-09-23): the module map is the 29 included modules (it had `scheduler.cyr` / `cron.cyr`, and lacked `syscalls` / `secmem` / `trace`); `json_escape_str`'s file; the rate window; the scheme check; the dependency paragraph. 2.4.3: 512-byte pieces on agnos. 2.4.2: containment; `_srv_slot_for_new`. 2.4.1: `server_detach` on agnos, the clock, paced writes. 2.4.0: the agnos arms; the data flow no longer draws 2.3.3's channel thread. |
 
 ---
 
@@ -322,15 +360,15 @@ Each change was checked against `cyrius.cyml`, the source or the tool's own help
 
 | File | Last touched | Status | Notes |
 |---|---|---|---|
-| `roadmap.md` | 2026-09-23 | ✅ Fresh | 2.4.3: ai-hwaccel 2.4.0; every suite in the aarch64 VM; the pacing in the agnos table. Open work only. 2.4.2: 2.3.x closed; 1087 tests; the aarch64 VM. 2.4.1: daimon's own agnos items closed; twelve agnos filings and one cyrius filing, and what daimon changes when each closes; 2.5.x. |
+| `roadmap.md` | 2026-09-23 | ✅ Fresh | Sweep (unreleased, 2026-09-23): routes for the federation and screen-capture modules, unsequenced; the rest checked. 2.4.3: ai-hwaccel 2.4.0; every suite in the aarch64 VM; the pacing in the agnos table. Open work only. 2.4.2: 2.3.x closed; 1087 tests; the aarch64 VM. 2.4.1: daimon's own agnos items closed; twelve agnos filings and one cyrius filing, and what daimon changes when each closes; 2.5.x. |
 
-**Missing today (file in 1.2.x cleanup):**
-- `development/state.md` — agnosys convention for the live volatile state file (pin / build sizes / test count / consumer table / recent releases / slot ledger). Daimon's roadmap.md partially covers this; consider splitting in 1.2.x if scope grows.
-- `development/capability-map.md` — auto-generated per-module kernel-surface map. Daimon's surface is mostly userland (HTTP API + IPC over Unix sockets), so the security value is smaller than for agnosys; flag as nice-to-have, not P1.
+**Suggested at 1.2.x, not written:**
+- `development/state.md` — agnosys convention for the live volatile state file (pin / build sizes / test count / consumer table / recent releases / slot ledger). The roadmap's status header and README's **Status** carry most of it today.
+- `development/capability-map.md` — auto-generated per-module kernel-surface map. On Linux daimon's surface is userland (the HTTP API, agent channels, /proc, cgroups); on agnos, ADR-007's table and `src/syscalls.cyr` list the syscalls it uses. Nice-to-have, not P1.
 
 **Tier — Engineering issues (upstream trackers)**
 
-⚠ **Corrected 2.1.7.** This line read *"Daimon does not carry its own `docs/development/issues/` directory"* — false since 1.2.x. Daimon carries `docs/development/issues/` for filings it owns or co-owns, with resolved ones moved to `issues/archive/`. As of **2.3.4** there are **no open filings** and **eight archived** (the 2.1.7 count named one open filing that was already in `archive/`). The table below tracks filings that live in an UPSTREAM repo's tracker.
+⚠ **Corrected 2.1.7.** This line read *"Daimon does not carry its own `docs/development/issues/` directory"* — false since 1.2.x. Daimon carries `docs/development/issues/` for filings it owns or co-owns, with resolved ones moved to `issues/archive/`. As of **2.4.3** there are **no open filings** and **eight archived** (the 2.1.7 count named one open filing that was already in `archive/`). The table below tracks filings that live in an UPSTREAM repo's tracker.
 
 | Tracker | Severity | Filed | Status | Notes |
 |---|---|---|---|---|
@@ -344,12 +382,12 @@ Each change was checked against `cyrius.cyml`, the source or the tool's own help
 | agnos `2026-09-23-sleep-ms-holds-the-cpu.md` | Low | 2026-09-23 | 🟠 Open upstream | daimon waits with `daimon_yield_ms`. |
 | agnos `2026-09-23-sock-recv-never-reports-eof-after-peer-fin.md` | Low | 2026-09-23 | 🟠 Open upstream | CLOSE_WAIT reads as "nothing yet". |
 | agnos `2026-09-23-spawn-path-args-cannot-contain-spaces.md` | Low | 2026-09-23 | 🟠 Open upstream | 422 for a name with a space. |
-| agnos `2026-09-23-sock-send-and-connect-hold-the-cpu.md` (2.4.1) | **High** (daimon's view) | 2026-09-23 | 🟠 Open upstream | A send over 2 KB to a local process stops the machine; a connect holds the CPU up to ~8 s. daimon writes 1 KB at a time (AG-14). |
+| agnos `2026-09-23-sock-send-and-connect-hold-the-cpu.md` (2.4.1) | **High** (daimon's view) | 2026-09-23 | 🟠 Open upstream | A send over 2 KB to a local process stops the machine, and so can a receiver that falls behind; a connect holds the CPU up to ~8 s. daimon writes 512 bytes at a time, 1 ms apart (2.4.3; AG-14). |
 | agnos `2026-09-23-tsc-calibration-refused-stops-the-us-clock.md` (2.4.1) | Medium | 2026-09-23 | 🟠 Open upstream | One calibration at boot, refused or wrong under a CPU quota. daimon falls back to the tick (AG-12). |
 | agnos `2026-09-23-spawn-path-failure-gives-no-reason.md` (2.4.1) | Low | 2026-09-23 | 🟠 Open upstream | A full process table and a bad executable both answer -1 (AG-11). |
 | cyrius `2026-09-23-daimon-agnos-clock-stands-still-when-tsc-calibration-refused.md` (2.4.1) | Medium | 2026-09-23 | 🟠 Open upstream | `clock_now_ns` on agnos does not check `#95`'s -1. daimon uses `daimon_now_ms`. |
 | cyrius `2026-09-23-daimon-agnos-socket-read-gives-up-after-a-second.md` (2.4.2) | Medium-high | 2026-09-23 | 🟠 Open upstream | `_agnos_sock_recv_block`'s 6000-pause bound ran out in ~1 s: a forwarded call to a server slower than that was answered 502, and CI's guest test failed on it. daimon lifts the bound (`daimon_agnos_recv_bound`). |
-| [sandhi § daimon-server-max-conns](https://github.com/MacCracken/sandhi/blob/main/docs/development/issues/archive/2026-05-10-daimon-server-max-conns.md) | **Low** | 2026-05-10 | ✅ **RESOLVED both sides — corrected 2.1.7** | ⛔ This row read "Open upstream / no daimon-side action", which was wrong on both halves. Sandhi shipped the epoll-cooperative `max_conns` enforcement in **`sandhi_server_run_async` at 1.4.9** (hardened 1.4.10) and ARCHIVED its filing; daimon collapsed `serve_async` onto that call at **1.2.6** (`src/server.cyr:224-244`). Nothing is open on either side. The `"reserved for 0.8.0+"` text still in `lib/sandhi.cyr` is a stale doc comment on the **sync** options struct (`sandhi_server_run_opts`), not the async path daimon uses. |
+| [sandhi § daimon-server-max-conns](https://github.com/MacCracken/sandhi/blob/main/docs/development/issues/archive/2026-05-10-daimon-server-max-conns.md) | **Low** | 2026-05-10 | ✅ **RESOLVED both sides — corrected 2.1.7** | ⛔ This row read "Open upstream / no daimon-side action", which was wrong on both halves. Sandhi shipped the epoll-cooperative `max_conns` enforcement in **`sandhi_server_run_async` at 1.4.9** (hardened 1.4.10) and ARCHIVED its filing; daimon collapsed `serve_async` onto that call at **1.2.6** (`src/server.cyr:224-244`). Nothing is open on either side. The `"reserved for 0.8.0+"` text still in `lib/sandhi.cyr` is a stale doc comment on the **sync** options struct (`sandhi_server_run_opts`), not the async path daimon used. Since 2.3.4 daimon runs its own loop (ADR-006) and calls neither. |
 
 ---
 
@@ -357,16 +395,16 @@ Each change was checked against `cyrius.cyml`, the source or the tool's own help
 
 | File | Last touched | Status | Notes |
 |---|---|---|---|
-| `001-rust-to-cyrius-port.md` | 2026-04-13 | 📦 Frozen | Accepted (0.7.0). Rust → Cyrius port rationale. Historical record. |
-| `002-synchronous-http.md` | 2026-04-13 | 📦 Frozen | Accepted, then partially superseded by 1.1.0 (async via lib/async.cyr) and again by 1.1.4 (sandhi adoption). The ADR's "invalid" note is captured in CLAUDE.md; re-read at v2.0 to decide whether to revise or supersede with a new ADR. |
+| `001-rust-to-cyrius-port.md` | 2026-09-23 | ✅ Accepted | 0.7.0. Rust → Cyrius port rationale. Sweep (unreleased, 2026-09-23): a **Since then** list: the blocked features ship, the event loop, the `cyrius.cyml` pin, nine first-party deps, today's size. |
+| `002-synchronous-http.md` | 2026-09-23 | 📦 Superseded | Superseded by ADR-006 (2.3.4), and marked so in the sweep: neither of its modes exists; `serve --async` runs the one loop. It had been amended by 1.1.0 (async) and overtaken by 1.1.4 (sandhi). |
 | `003-security-audit-process.md` | 2026-04-13 | 📦 Frozen | Accepted (0.7.0). P(-1) + Work-Loop audit cadence. Verified by every release since; the rule holds. |
-| `004-agent-process-control.md` | 2026-09-22 | ✅ Accepted | 2.3.0. Process control on an unauthenticated API: executable by type, loopback bind, browser control refused, bounded stop. |
+| `004-agent-process-control.md` | 2026-09-23 | ✅ Accepted, decision 4 superseded | 2.3.0. Process control on an unauthenticated API: executable by type, loopback bind, browser control refused, bounded stop. Sweep (unreleased, 2026-09-23): a **Since then** list: decision 3 extended and decision 4 superseded at 2.3.4 (ADR-006); agents start on AGNOS since 2.4.0. |
 | `005-agent-channels.md` | 2026-09-22 | ✅ Accepted, §2 superseded | 2.3.3. A socketpair per agent on fd 3; §2 (the service thread) superseded by ADR-006 at 2.3.4. |
-| `006-own-event-loop.md` | 2026-09-23 | ✅ Accepted | 2.3.4. daimon's own epoll loop over sandhi's HTTP; the serving model since 2.3.4. 2.4.2 addendum: when every slot is taken. |
-| `007-daimon-on-agnos.md` | 2026-09-23 | ✅ Accepted | 2.4.3 addendum: the writer's pacing (512 bytes, 1 ms, never back to back), measured under a throttled QEMU. 2.4.0. The agnos kernel's primitives behind daimon's seams; the polled loop; gaps filed with agnos. 2.4.1 addendum: capacity, the clock, CI, 1 KB writes, detached calls, and the corrected fork claim. 2.4.2 addendum: a detached call's read waits for the RTC (`daimon_agnos_recv_bound`). |
+| `006-own-event-loop.md` | 2026-09-23 | ✅ Accepted | Sweep (unreleased, 2026-09-23): its status names ADR-002 as superseded too, and its "AGNOS keeps sandhi's loop" as superseded by ADR-007. 2.3.4. daimon's own epoll loop over sandhi's HTTP; the serving model since 2.3.4. 2.4.2 addendum: when every slot is taken. |
+| `007-daimon-on-agnos.md` | 2026-09-23 | ✅ Accepted | Sweep (unreleased, 2026-09-23): the status names the addenda; twelve filings since 2.4.1; 92 checks; the 1 KB pieces point to 2.4.3. 2.4.3 addendum: the writer's pacing (512 bytes, 1 ms, never back to back), measured under a throttled QEMU. 2.4.0. The agnos kernel's primitives behind daimon's seams; the polled loop; gaps filed with agnos. 2.4.1 addendum: capacity, the clock, CI, 1 KB writes, detached calls, and the corrected fork claim. 2.4.2 addendum: a detached call's read waits for the RTC (`daimon_agnos_recv_bound`). |
 | `008-agent-containment-cgroup.md` | 2026-09-23 | ✅ Accepted | 2.4.2. A cgroup per agent where daimon's cgroup is its own; uncontained, warned and audited elsewhere. |
 
-**ADR posture**: low decision-velocity. Only architecturally significant calls earn an ADR — minor decisions ride CHANGELOG + design comments. 1.1.4 sandhi adoption was a candidate but rode the CHANGELOG entry; the migration audit at `docs/audit/2026-04-27-sandhi-migration.md` carries the deep rationale. Re-evaluate at v2.0.0 cut.
+**ADR posture**: low decision-velocity. Only architecturally significant calls earn an ADR — minor decisions ride CHANGELOG + design comments. 1.1.4 sandhi adoption was a candidate but rode the CHANGELOG entry; the migration audit at `docs/audit/2026-04-27-sandhi-migration.md` carries the deep rationale. An ADR that a later one overtakes says so in its **Status** line, and keeps its text.
 
 ---
 
@@ -378,8 +416,8 @@ Date-stamped, frozen by design. Each P(-1) hardening pass per CLAUDE.md cadence 
 |---|---|---|---|
 | `2026-04-13-security-audit.md` | 2026-04-13 | 📦 Frozen | 0.7.0 P(-1) security audit. 10 findings, 9 fixed at 0.7.0, VULN-007 gated. |
 | `2026-04-27-sandhi-migration.md` | 2026-04-27 | 📦 Frozen | 1.1.4 sandhi adoption — VULN-001 strengthened, VULN-008 trade-off documented (sandhi's 30s SO_RCVTIMEO replaces no-timeout), 1.1.5 sandhi follow-ups (now 1.2.1 / 1.2.2). |
-| `2026-09-22-agent-lifecycle-audit.md` | 2026-09-23 | ✅ Open (addenda per 2.3.x release) | VULN-011 – VULN-018. 2.4.2 addendum: the three residuals closed, four containment faults found in review and fixed, what is left. 2.3.4 addendum: VULN-012 remainder, VULN-014 and VULN-018 fixed; VULN-015 an operator option; VULN-016 waits for 2.5.x identity. |
-| `2026-09-23-agnos-platform-audit.md` | 2026-09-23 | ✅ Open | 2.4.3: AG-14 caught with QEMU's monitor (a receiver that falls behind). AG-1 – AG-15: the agnos kernel's (and, AG-12 and AG-15, cyrius's agnos code's) gaps as they reach daimon, each filed upstream, with daimon's interim. 2.4.2 fixed AG-15 in daimon. 2.4.1 fixed AG-12 and AG-13 in daimon, and mitigates AG-14. |
+| `2026-09-22-agent-lifecycle-audit.md` | 2026-09-23 | ✅ Open (addenda per release) | VULN-011 – VULN-018. Sweep (unreleased, 2026-09-23): the title names the 2.4.2 addendum; the AGNOS verification limit notes 2.4.0. 2.4.2 addendum: the three residuals closed, four containment faults found in review and fixed, what is left. 2.3.4 addendum: VULN-012 remainder, VULN-014 and VULN-018 fixed; VULN-015 an operator option; VULN-016 waits for 2.5.x identity. |
+| `2026-09-23-agnos-platform-audit.md` | 2026-09-23 | ✅ Open | Sweep (unreleased, 2026-09-23): "What 2.4.3 changed" and its verification line; 2.4.1's guest checks corrected to 92 (it said 85). 2.4.3: AG-14 caught with QEMU's monitor (a receiver that falls behind). AG-1 – AG-15: the agnos kernel's (and, AG-12 and AG-15, cyrius's agnos code's) gaps as they reach daimon, each filed upstream, with daimon's interim. 2.4.2 fixed AG-15 in daimon. 2.4.1 fixed AG-12 and AG-13 in daimon, and mitigates AG-14. |
 
 Next audit slot: the CLAUDE.md cadence sets the trigger (security-touching work, or a CVE pattern in daimon's surfaces: its event loop and sandhi's HTTP framing, bayan's JSON parser, the agent channels, /proc scrape paths, the bump allocator).
 
@@ -389,24 +427,23 @@ Next audit slot: the CLAUDE.md cadence sets the trigger (security-touching work,
 
 | File | Last touched | Status | Notes |
 |---|---|---|---|
-| `api.md` | 2026-09-23 | ✅ Fresh | 2.4.3: answers on agnos 512 bytes at a time, 1 ms apart. 2.4.2: slot eviction, `contained`, Containment, `http_evicted`. 2.4.1: room and the 503, 1 KB answers, detached calls on AGNOS. 2.4.0: "On AGNOS" (start, limits, stop, capture, listener); limits_enforced. 2.3.4: who may call, the loop, stops, messages, output. |
-| `quickstart.md` | 2026-09-23 | ✅ Fresh | 2.4.2: 1087 assertions. 2.4.1: 1050 assertions; `run.sh --release`. 2.4.0: tests/agnos. |
-| `agent-ipc.md` | 2026-09-23 | ✅ Fresh | 2.3.3, new: the fd-3 wire protocol. 2.3.4: reply 4, names, the HTTP message routes. 2.4.0: the AGNOS channel. 2.4.1: the machine's 16 channels, the 503. |
+| `api.md` | 2026-09-23 | ✅ Fresh | Sweep (unreleased, 2026-09-23): checked route by route against the binary: the MCP section (builtins, manifest, resources and prompts), scheduler UUIDs and counts, every health and metrics field, error bodies, the fixed rate window and AGNOS's shared bucket, AGNOS's 5 slots, the edge list's numeric status. 2.4.3: answers on agnos 512 bytes at a time, 1 ms apart. 2.4.2: slot eviction, `contained`, Containment, `http_evicted`. 2.4.1: room and the 503, 1 KB answers, detached calls on AGNOS. 2.4.0: "On AGNOS" (start, limits, stop, capture, listener); limits_enforced. 2.3.4: who may call, the loop, stops, messages, output. |
+| `quickstart.md` | 2026-09-23 | ✅ Fresh | Sweep (unreleased, 2026-09-23): the 6.6.6 pin, `cyrius deps`, the real answers, 28 benchmarks, sizes. 2.4.2: 1087 assertions. 2.4.1: 1050 assertions; `run.sh --release`. 2.4.0: tests/agnos. |
+| `agent-ipc.md` | 2026-09-23 | ✅ Fresh | Sweep (unreleased, 2026-09-23): read, and its limits checked against `src/ipc.cyr`; unchanged. 2.3.3, new: the fd-3 wire protocol. 2.3.4: reply 4, names, the HTTP message routes. 2.4.0: the AGNOS channel. 2.4.1: the machine's 16 channels, the 503. |
 
 ---
 
 ## Open strategic questions
 
-None outstanding. The following are tracked elsewhere (issue tickets / roadmap), not strategic questions:
-
-- **External MCP forwarding** via `sandhi_rpc_mcp_call` — sequenced into 1.2.1 per the working-loop discipline. Replaces the `api_mcp_call` "tool dispatch not available in sync mode" stub.
-- **Sandhi `idle_ms` tuning + `serve_async` collapse** — sequenced into 1.2.2; predicated on whether stdlib `sandhi_server_options_max_conns` enforcement landed by 6.3.43 (premise-check first).
-- **jnana / gRPC / WebSocket / distributed tracing / agent migration** — deferred to v1.3.0+ per the roadmap.
+None outstanding. The three this section once listed are settled: external MCP forwarding shipped
+in 1.2.1, the `idle_ms` tuning in 1.2.2 (the `serve_async` collapse in 1.2.6), and distributed
+tracing in 1.3.3. jnana, gRPC, WebSocket and
+agent migration are under the roadmap's **Beyond the arc**.
 
 Reopen the strategic-questions bucket if:
 - A new consumer (hoosh, agnoshi, aethersafha) drives a transport choice we haven't made.
-- The federation / scheduler primitives need a multi-host coherence story (cross-node agent migration is in v1.3.0+; if a consumer asks for it sooner, that's a strategic question).
-- A CVE class hits daimon's attack surface (HTTP + Unix-socket IPC + /proc scrape + bump-allocator memory zeroing).
+- The federation / scheduler primitives need a multi-host coherence story (agent migration between nodes is unsequenced on the roadmap; if a consumer asks for it, that's a strategic question).
+- A CVE class hits daimon's attack surface (its event loop and sandhi's HTTP framing, the agent channels, /proc and cgroup paths, outbound MCP calls and `web_fetch`, bump-allocator memory).
 
 ---
 
@@ -418,6 +455,7 @@ When you touch a doc:
 3. If a bucket count shifts, update the at-a-glance summary.
 
 When a release ships:
-1. Roll the "doc work shipped in X.Y.Z" block in this file's at-a-glance summary.
+1. Roll the "doc work shipped in X.Y.Z" block (newest first, below the inventory). A block written
+   before the cut, such as "Doc work for the next release", takes the release's number.
 2. Re-audit the **Stale** bucket: anything that should have been refreshed during the release cycle but wasn't carries forward as a 1.X.(Y+1) doc cleanup pass.
 3. Renumber the "Last refresh" line at the top.

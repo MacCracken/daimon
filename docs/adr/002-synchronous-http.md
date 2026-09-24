@@ -1,8 +1,11 @@
 # ADR-002: HTTP Server — Synchronous with Async Option
 
-**Status**: Amended (2026-04-13)
+**Status**: **Superseded by [ADR-006](006-own-event-loop.md)** (2.3.4). Neither mode below exists
+any more. daimon runs one event loop of its own over epoll, which it polls on AGNOS (ADR-007).
+`serve --async` is still accepted, and runs that loop. From 1.1.4 to 2.3.3 both modes ran on sandhi's
+serve loops, not `lib/async.cyr`. Kept as the record of the first serving model.
 **Date**: 2026-04-13
-**Amendment**: Original assumed Cyrius had no async runtime. `lib/async.cyr` provides epoll-based cooperative async. Both sync and async modes should be supported.
+**Amendment** (2026-04-13): Original assumed Cyrius had no async runtime. `lib/async.cyr` provides epoll-based cooperative async. Both sync and async modes should be supported.
 
 ## Decision
 

@@ -1,11 +1,16 @@
-# Benchmarks — Rust v0.6.0 vs Cyrius v1.0.1
+# Benchmarks
 
-- **Rust**: v0.6.0, rustc 1.89, criterion, x86_64. Final benchmark run before port.
-- **Cyrius**: v1.0.1, cyrius 4.2.0 (cc3 compiler, single-pass, no LLVM), lib/bench.cyr, `tests/daimon.bcyr`. Same machine.
+daimon's benchmarks call its real code: 28 in `tests/daimon.bcyr` (`./scripts/bench-history.sh`)
+and 2 in `tests/rag_ingest.bcyr` (`cyrius bench tests/rag_ingest.bcyr`). The file is laid out as
+follows:
+- **The baseline** is daimon 2.2.3's, the first release whose benchmarks called daimon's own
+  functions.
+- **A section per release** follows it, newest first, for each release that touched a measured path.
+  Each has an A/B against the release before it. A performance claim in the CHANGELOG cites one of
+  these sections.
+- **The port-era comparison** at the end, Rust v0.6.0 against Cyrius v1.0.1, is frozen.
 
-> The Rust-vs-Cyrius tables below are the **frozen v1.0.1 port-era snapshot** (cyrius 4.2.0). The current toolchain baseline is captured separately just below.
-
-## Current baseline — daimon 2.2.3 / cyrius 6.6.6 (2026-09-22) — THE REAL CODE
+## Baseline — daimon 2.2.3 / cyrius 6.6.6 (2026-09-22) — THE REAL CODE
 
 `./scripts/bench-history.sh` → `tests/daimon.bcyr`. Averages over the iteration counts shown; no
 microbenchmark touches HTTP.
@@ -350,6 +355,9 @@ scoring — same results, order included (a differential test over 3,000 random 
 
 ## Port-era comparison (frozen, v1.0.1)
 
+- **Rust**: v0.6.0, rustc 1.89, criterion, x86_64. Final benchmark run before port.
+- **Cyrius**: v1.0.1, cyrius 4.2.0 (cc3 compiler, single-pass, no LLVM), lib/bench.cyr, `tests/daimon.bcyr`. Same machine.
+
 ⛔ **Correction (2.2.3).** Every Cyrius number in the frozen tables below was measured against the
 benchmark file's local COPIES, not daimon's source (see the note above), so where the copy did less
 work than the Rust benchmark the comparison flatters Cyrius. The two recorded "wins" were artifacts
@@ -462,13 +470,13 @@ Scheduler scheduling (1.5x), supervisor registration (2.5x), MCP registration (1
 | memory | Complete | Complete (2.2.3) | ⛔ Listed "Complete" since the port and never run: the first call of any kind killed the process until 2.2.3. No route reaches it yet; no `tags` field, so `list_by_tag` is a substring search |
 | vector_store | Complete | Complete | Cosine similarity, search, normalize |
 | rag | Complete | Complete | Chunk, embed, ingest, query, context format |
-| mcp | Complete | Complete | Registry + types; external forwarding via sandhi_rpc_mcp_call (1.2.1); bote libro-tool re-exports being wired (1.3.0) |
+| mcp | Complete | Complete | Registry + types; external forwarding via sandhi_rpc_mcp_call (1.2.1); resources and prompts (2.1.0); 13 builtin tools: libro's five (1.3.0), bote's web tools, nein's six (2.1.8) |
 | screen | Complete | Complete | Permissions, rate limiting, recording sessions |
 | scheduler | Complete | Complete (2.3.1) | samay since 2.0.0. Tasks can start and complete through the API since 2.3.1 (`src/sched.cyr`); before that every task stopped at Scheduled |
 | federation | Complete | Complete | Cluster, election, scoring, placement, vector store |
 | edge | Complete | Complete | Register, heartbeat, health, decommission, stats |
 | ipc | Complete | Complete (2.3.4) | Agents send on a channel (a socketpair, their fd 3), read by daimon's event loop; HTTP clients send and take messages; messages are freed, names first-wins (2.3.4). The socket-file endpoint was removed at 2.3.3 |
-| api | Complete | Complete | 41 method + path routes (the Rust original had no agent or task control; 2.3.0 added 5, 2.3.1 added 3) |
+| api | Complete | Complete | 44 method + path routes (the Rust original had no agent or task control; 2.3.0 added 5, 2.3.1 added 3, 2.3.4 added 3) |
 | logging | Complete | Complete | sakshi integration |
 | firewall | Complete | Integrated (2.1.8) | nein's MCP tools; the mutating half is gated shut until caller authentication (roadmap 2.5.x) |
 | http-forward | Complete | Complete | External MCP forwarding via sandhi_rpc_mcp_call (1.2.1) |
@@ -479,7 +487,7 @@ Scheduler scheduling (1.5x), supervisor registration (2.5x), MCP registration (1
 |---|---|---|
 | Unit tests | 305 | — (inline in test groups) |
 | Integration tests | 28 | 1087 assertions / 17 suites, each against its real `src/` module (2.4.3); AGNOS guest test 92 checks (tests/agnos/run.sh --release, in CI); aarch64 VM, every suite (1087 assertions) and a 20-check smoke of the binary under a real kernel (tests/aarch64/run.sh, in CI) |
-| Benchmarks | 19 | 29, against the real code (2.3.4) |
+| Benchmarks | 19 | 30, against the real code (2.4.2) |
 | Fuzz harnesses | 0 | 7, property-based, run in CI (2.3.2) |
-| HTTP smoke | — | tests/smoke.sh, 131 checks, run in CI (2.4.0) |
-| Security audit | — | 28 findings (2026-04-13: 10; 2026-09-22 lifecycle: 8; 2026-09-23 AGNOS platform: 10, filed with agnos) — see docs/audit/ |
+| HTTP smoke | — | tests/smoke.sh, 143 checks, run in CI (2.4.2) |
+| Security audit | — | 33 findings (2026-04-13: 10; 2026-09-22 lifecycle: 8; 2026-09-23 AGNOS platform: 15, most filed with agnos) — see docs/audit/ |

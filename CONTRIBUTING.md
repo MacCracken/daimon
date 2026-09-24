@@ -13,8 +13,7 @@ to get involved.
 
 ```bash
 export CYRIUS_NO_WARN_SHADOW_LIB=1 CYRIUS_DCE=1   # what CI sets
-cyrius lib sync                      # Vendor the stdlib subset from the pin
-cyrius deps                          # Resolve git dependencies (e.g. sakshi)
+cyrius deps                          # Vendor the stdlib subset and the git deps (every build runs it first)
 cyrius build src/main.cyr build/daimon  # Build (also --agnos, --aarch64)
 cyrius vet src/main.cyr              # Include dependencies
 cyrius fmt <file> --check            # Formatting (without --check it rewrites the file)
@@ -23,7 +22,7 @@ cyrius tests                         # Run every test suite
 cyrius fuzz                          # Run the fuzz harnesses
 cyrius bench tests/daimon.bcyr       # Run benchmarks
 sh tests/test.sh                     # Tests + fuzz + HTTP smoke (tests/smoke.sh)
-./scripts/bench-history.sh           # Append benchmark baseline
+./scripts/bench-history.sh           # Benchmarks, appended to bench-history.csv
 sh tests/agnos/run.sh --release      # AGNOS guest test on the released kernel (what CI runs)
 sh tests/agnos/run.sh                # ... on a built ../agnos kernel and ../gnoboot
 sh tests/aarch64/run.sh              # every suite, then the binary's smoke, in an aarch64 VM
@@ -38,10 +37,14 @@ A change to an agnos arm (`#ifdef CYRIUS_TARGET_AGNOS`) is tested on agnos:
 `tests/agnos/run.sh` boots the kernel under QEMU and runs `tests/agnos/guest.cyr` and the real
 daimon, driven over HTTP by `tests/agnos/http_client.cyr`. On agnos, wait with `daimon_yield_ms`,
 never `sleep_ms`, which holds the CPU. Read the clock with `daimon_now_ms`, and write through
-`daimon_write_all` (2.4.1; ADR-007).
+`daimon_write_all`, which sends 512 bytes at a time, 1 ms apart (2.4.1, 2.4.3; ADR-007).
 
-`lib/` is gitignored — it is repopulated by `cyrius lib sync` (stdlib subset from
-the pin) and `cyrius deps` (git deps like sakshi). Run both after cloning.
+`lib/` is gitignored. `cyrius deps` fills it with the stdlib subset from the pin and each git
+dependency at its tag, then rewrites `cyrius.lock` from what `lib/` holds. CI verifies the committed
+lock (`cyrius deps --verify`). If the lock names files a clean checkout does not vendor, rebuild it
+with `rm -rf lib && cyrius deps`. samay and nein also name a sibling checkout (`path = "../samay"`,
+`"../nein"`). When one is present, `cyrius deps` copies it instead of the tag, so a checkout in the
+middle of a change ends up in your build and your lock.
 
 ## Pull Requests
 

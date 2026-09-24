@@ -244,14 +244,22 @@ the test's server went on sending into its connection. That is not measured.
 
 - **A detached call's read gave up after about a second** (AG-15).
 
+## What 2.4.3 changed in daimon itself
+
+- **daimon's writer on agnos** (AG-14): 512-byte pieces, 1 ms apart, never two back to back, and
+  the same gap between the reads `_srv_relay` relays. It mitigates the hold. Only agnos can fix it.
+
 ## Verification
 
+- 2.4.3: with QEMU held to 30% of a CPU, the guest stood still in 0 runs of 9, against 1 in 6 with
+  2.4.2's pacing (AG-14). A run that times out now prints where the guest is, from QEMU's monitor
+  (`tests/agnos/monitor.py`).
 - 2.4.2: the guest test's MCP server answers after 5 s (AG-15). A check that fails prints 240 bytes
   of the response and its length: printing the whole 9 KB answer, at about 65 ms a console line,
   outlasted the launcher's wait in CI. The launcher prints each exit code once its wait is over.
   Before, CI's "-2" (the client still running after 120 s) read as the client's response.
 - 2.4.1: the guest test runs in CI on the released agnos 1.57.5 and gnoboot 0.7.2, pinned by SHA-256
-  (`tests/agnos/run.sh --release`), with 85 checks. Measured locally, it passes unrestricted, with
+  (`tests/agnos/run.sh --release`), with 92 checks. Measured locally, it passes unrestricted, with
   QEMU held to 50% of a CPU, and at 25%, where the kernel refused its TSC calibration.
 - The guest test passes 44 + 20 checks on agnos 1.57.5 under QEMU (57 s; 2.4.0).
 - The Linux suites, smoke (131) and fuzz are unchanged and green.

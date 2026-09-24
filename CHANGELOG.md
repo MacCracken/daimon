@@ -4,6 +4,46 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+**A documentation sweep: every guide checked against the running 2.4.3 binary.** Documentation
+only; no code, test or CI file changed.
+
+### Changed — documentation
+
+- **README** rewritten around what daimon does today:
+  - the 13 builtin MCP tools (it named five), MCP resources and prompts, containment and tracing;
+  - the security posture, the platforms and the release assets;
+  - the sizes at 2.4.3 (it gave 2.3.1's);
+  - that the federation, screen-capture and memory modules have no route.
+- **The API guide**, checked route by route against the binary:
+  - MCP: the builtins, `GET /v1/mcp/manifest`, and the eight resource and prompt routes (2.1.0),
+    none of which it documented. A builtin's result is an MCP tool result: the guide showed libro's
+    bare `{"ok":true}`.
+  - Scheduler task ids are samay's UUIDs, not `"2"`. `GET /v1/scheduler/tasks` gives counts, not
+    tasks. A schedule decision carries a `score`.
+  - Health and metrics now show every field. `federation_nodes` is always 0.
+  - Errors: 404, 405 and 429 carry no `code`, and a request refused before it is read (400, 413,
+    501) has no body. The guide said every error carried both.
+  - The rate limit's window is fixed, not sliding. On AGNOS every client shares one bucket, and 5
+    connections are served at once, not 128.
+  - The edge list gives a node's status as a number.
+- **Quickstart**: the 6.6.6 pin (it said 6.3.43), `cyrius deps` alone, the health and start answers
+  as they are, 28 benchmarks (it said 27) and the binary's size.
+- **Architecture overview**: the module map lists the 29 modules `main.cyr` includes. It named
+  `scheduler.cyr` and `cron.cyr`, gone since 2.0.0, and missed `syscalls.cyr`, `secmem.cyr` and
+  `trace.cyr`. Its dependency paragraph named sandhi 1.7.0, sigil 3.10.0, sakshi 2.4.3 and 61 lock
+  entries (there are 83), and it called a scheme check "SSRF protection".
+- **ADRs**: ADR-002 is marked superseded by ADR-006. ADR-001, ADR-004, ADR-006 and ADR-007 say what
+  later releases changed.
+- **CLAUDE.md**: the sandhi row described the serve loops daimon left at 2.3.4, and said daimon uses
+  none of sandhi's RPC module, whose MCP client forwards every external call. daimon does not use
+  `lib/async.cyr`.
+- **BENCHMARKS.md, CONTRIBUTING.md, the audits, the roadmap and `docs/doc-health.md`**:
+  - counts: 44 routes, 30 benchmarks, 143 smoke checks, 33 audit findings, 92 guest checks at 2.4.1;
+  - the lock workflow, and what the `path` pins of samay and nein do when a sibling checkout is present;
+  - on the roadmap, routes for the federation and screen-capture modules.
+
 ## [2.4.3] - 2026-09-23
 
 **QEMU found three things this round.** Every suite, and the daimon binary itself, now run on a real

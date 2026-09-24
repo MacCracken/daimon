@@ -1,6 +1,7 @@
 # ADR-007: daimon on AGNOS — the kernel's own primitives, a polled loop, and gaps filed rather than designed around
 
-**Status**: Accepted
+**Status**: Accepted, with addenda for 2.4.1, 2.4.2 and 2.4.3 below. The 2.4.1 addendum corrects
+decision 2, and the 2.4.3 addendum replaces the 2.4.1 writer's 1 KB pieces.
 **Date**: 2026-09-23 (2.4.0)
 **Context**: AGNOS is daimon's primary target, but through 2.3.4 daimon only *built* for it. There an
 agent start answered 501, and the HTTP API ran on sandhi's sync loop. Mapping daimon's agent lifecycle
@@ -51,7 +52,7 @@ peer's receive deadline, because sandhi's `idle_ms` sets an `SO_RCVTIMEO` agnos 
 On 2026-09-23 the operator ruled on the first of these: *"file issue with AGNOS — YOU ACT LIKE THESE
 THINGS CAN'T BE CHANGED!"* agnos is changeable, so daimon does not design around a gap as if it were
 permanent. Each gap has a filing in the agnos repo (`docs/development/issues/2026-09-23-*.md`, nine
-of them), and a stated interim:
+of them at 2.4.0 and twelve since 2.4.1), and a stated interim:
 
 | gap | daimon until it is fixed |
 |---|---|
@@ -83,7 +84,7 @@ background process, as daimon would in service.
 ## Consequences
 
 - An agent on agnos is started, stopped, collected, heard on its channel and measured. It is checked
-  on the real kernel, 64 checks.
+  on the real kernel, 64 checks (92 since 2.4.1).
 - daimon's HTTP API on agnos works for local clients on the guest's own address. It is unreachable
   from the network until the SYN filing is fixed, and exposed to other processes on the box until
   the connection-owner filing is.
@@ -130,7 +131,7 @@ with three differences:
 - **At most 4 children are alive at once** (`SERVE_DETACH_CHILDREN_MAX`). One past that answers 503.
   The machine has 16 process slots, and the agents need them.
 
-**daimon writes its answers in 1 KB pieces on agnos.** A TCP connection's receive ring there is 2048
+**daimon writes its answers in 1 KB pieces on agnos** (512 bytes since 2.4.3; see its addendum). A TCP connection's receive ring there is 2048
 bytes, and `sock_send`#48 holds the CPU while it waits for room. So one write of more than that to a
 process on the same machine never finishes, because the receiver cannot run to drain its ring.
 Measured: a `GET /v1/agents` with a 2389-byte body stopped the guest. On agnos, `http_send_response`

@@ -163,6 +163,9 @@ prerequisite. (Both shipped halves are in the CHANGELOG.)
 
 Severity assigned when the arc's shape is chosen.
 
+- [ ] Routes for the federation and screen-capture modules. Both came with the port and have their
+  own tests, but no route reaches them, so `federation_nodes` in `/v1/metrics` is always 0. (The
+  memory store's route waits for identity, 2.5.x.)
 - [ ] jnana integration — grounded knowledge queries backed by verified AGNOS science data
 - [ ] gRPC transport option alongside HTTP
 - [ ] WebSocket streaming for real-time agent events

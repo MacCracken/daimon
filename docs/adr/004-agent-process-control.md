@@ -1,12 +1,22 @@
 # ADR-004: Agent Process Control on an Unauthenticated API
 
-**Status**: Accepted
+**Status**: Accepted. Decision 4 is superseded by [ADR-006](006-own-event-loop.md); see
+**Since then** below.
 **Date**: 2026-09-22 (2.3.0)
 **Context**: 2.3.0 lets HTTP clients start, stop, pause, resume and delete agent processes. daimon
 has no authentication until roadmap 2.5.x, and no process-control route existed in the Rust
 original to copy. Four decisions follow from putting process control on an API that anyone who can
 reach it may call. The evidence behind them is in
 [docs/audit/2026-09-22-agent-lifecycle-audit.md](../audit/2026-09-22-agent-lifecycle-audit.md).
+
+**Since then**:
+- Decisions 1 and 2 stand.
+- Decision 3's guard was extended at 2.3.4. While daimon listens on loopback, a request must name a
+  loopback host, and a state change from another site's page is refused on every route.
+- Decision 4 is superseded by ADR-006 (2.3.4). A stop is answered when the agent is gone, and the
+  loop advances it meanwhile, so it no longer holds other requests (VULN-014).
+- The last consequence ended at 2.4.0, when agents started on AGNOS
+  ([ADR-007](007-daimon-on-agnos.md)).
 
 ## Decisions
 

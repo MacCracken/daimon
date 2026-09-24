@@ -5,7 +5,8 @@ address with `serve --listen ADDR`. Through 2.2.3 daimon bound every interface; 
 loopback unless told otherwise. `--listen 0.0.0.0` opens every interface. The API has no
 authentication, so do that only behind a firewall.
 
-All responses are JSON. All POST bodies are JSON. Connection is closed after each response.
+Answers are JSON, except the few refusals that have no body (see Error Responses). POST bodies are
+JSON. The connection is closed after each answer.
 
 **Who may call it** (2.3.4, VULN-012):
 - While daimon listens on loopback (the default), a request must name a loopback host (`Host:
@@ -21,7 +22,7 @@ All responses are JSON. All POST bodies are JSON. Connection is closed after eac
 **One client does not hold the server** (2.3.4): daimon runs its own event loop and reads requests
 without blocking, so a slow client holds only its own connection:
 - a connection that sends nothing for 5 s, or has no whole request after 30 s, is closed;
-- at most 128 connections are open at once, and more wait in the kernel's queue;
+- at most 128 connections are open at once (5 on AGNOS), and more wait in the kernel's queue;
 - when all 128 are taken and another is waiting, the oldest request still arriving gives way, once
   it is 1 s old (2.4.2). It is closed unanswered and counted (`http_evicted`). One client trickling
   in 128 requests held every slot for 30 s before.
@@ -57,7 +58,7 @@ every request:
   trace.
 
 ```
-curl -i -H "traceparent: 00-<32hex trace-id>-<16hex span-id>-01" http://localhost:8090/v1/health
+curl -i -H "traceparent: 00-<32hex trace-id>-<16hex span-id>-01" http://127.0.0.1:8090/v1/health
 → ... X-Trace-Id: <32-hex trace-id>
 ```
 
@@ -67,8 +68,10 @@ Tracing is off by default (no `X-Trace-Id`, no span emission).
 
 ```
 GET /v1/health
-→ {"status":"ok","agents":0,"mcp_tools":0,"edge_nodes":0}
+→ {"status":"ok","agents":0,"mcp_tools":13,"mcp_resources":0,"mcp_prompts":0,"edge_nodes":0}
 ```
+
+`mcp_tools` counts the 13 builtins as well as registered tools.
 
 ## Agents
 
@@ -115,7 +118,8 @@ GET /v1/agents/1/output
 
 Agent status values: 0=Pending, 1=Starting, 2=Running, 3=Paused, 4=Stopping, 5=Stopped, 6=Failed.
 A process that exits on its own is collected within 100 ms (daimon's upkeep tick, 2.3.4). Exit 0 leaves the agent
-Stopped; a non-zero exit, or death by a signal, leaves it Failed. A Failed agent can be started
+Stopped; a non-zero exit, or death by a signal, leaves it Failed. A stop through the API leaves it
+Stopped, whatever its exit code (143 when the SIGTERM killed it). A Failed agent can be started
 again. `exit_code` is null until a process has exited, and 128 + the signal number if a signal
 killed it (137 = SIGKILL).
 
@@ -185,6 +189,10 @@ kernel's primitives. Some things differ until agnos closes the gaps filed with i
   daimon's whole fd table.
 - **The listener** is on the NIC's address: agnos cannot bind 127.0.0.1. daimon warns and audits
   `http.listen.not_loopback`. Local clients reach it at the box's own address, not 127.0.0.1.
+- **5 connections at once**, not 128. The kernel has 8 TCP slots for the whole machine: the
+  listener takes one, and daimon's own calls to other servers need theirs.
+- **The rate limit is shared.** agnos gives no peer address, so every client draws on one bucket of
+  960 requests a minute (120 for each of 8 connections).
 - **Answers are written 512 bytes at a time, 1 ms apart** (2.4.1; 512 bytes and the 1 ms since
   2.4.3, where it had been 1 KB and one yield). A TCP receive ring on agnos is 2 KB, and the
   kernel holds the CPU while a send waits for room, so a write a local client has no room for stops
@@ -201,56 +209,118 @@ channel and gets a one-byte reply for each. daimon puts accepted messages on its
 each registered agent has a queue. The wire format, the limits and what closes a channel are in
 [agent-ipc.md](agent-ipc.md). The channel's traffic shows in `/v1/metrics`.
 
-## MCP Tools
+## MCP
+
+daimon is an MCP host. It lists and calls its own 13 builtin tools, and the tools, resources and
+prompts that external MCP servers register with it. A call to an external one is forwarded to the
+server's `callback_url` as JSON-RPC 2.0 (`tools/call`, `resources/read`, `prompts/get`), with the
+request body as its params.
+
+### Built-in tools
+
+| tools | what they do |
+|---|---|
+| `libro_query`, `libro_verify`, `libro_export`, `libro_proof`, `libro_retention` | daimon's audit chain (libro's tools, through bote): search it, verify its hash links, export it, prove an entry's inclusion, apply a retention policy |
+| `web_fetch`, `web_search` | bote's web tools: a page's readable text (`{url}`, http or https only), and results from the SearXNG instance at `BOTE_SEARXNG_URL` (`{query, count?}`). Unset, `web_search` says so |
+| `nein_status`, `nein_list`, `nein_validate`, `nein_diff` | nein's read-only firewall tools |
+| `nein_allow`, `nein_deny` | nein's tools that change the live firewall. **Refused** until callers are authenticated (roadmap 2.5.x): `"access denied: tool gated by host policy"`, audited `nein.gate.deny` |
+
+Every builtin answers with an MCP tool result. libro's tools return bare JSON, which daimon wraps
+as the text of one content block, with `isError` true when that JSON says `"ok":false`. bote's and
+nein's tools return their own content blocks, which pass through as they are. Every nein tool but
+`nein_validate` runs `nft`, so it needs root and nftables. Without them, or on AGNOS, which has no
+nftables, it answers `"isError":true`. No external registration may take a builtin's name (409).
+
+### Tools
 
 ```
-# List tools (inputSchema is raw JSON Schema; {} / {"type":"object"} when unset)
+# List tools, the builtins included (inputSchema is raw JSON Schema; {} / {"type":"object"} when unset).
+# GET /v1/mcp/manifest answers the same.
 GET /v1/mcp/tools
-→ {"tools":[{"name":"scan","description":"port scanner","inputSchema":{"type":"object","properties":{"target":{"type":"string"}},"required":["target"]}}],"count":1}
+→ {"tools":[{"name":"libro_verify","description":"Verify the libro chain's hash-link integrity","inputSchema":{"type":"object"}},...],"count":13}
 
-# Register external tool — inputSchema is optional (alias: input_schema),
-# stored verbatim, defaults to {} when omitted (back-compatible).
+# Register an external tool. inputSchema is optional (alias: input_schema), stored verbatim, {} when
+# omitted. callback_url must be http:// or https:// (a scheme check, not a host allowlist).
 POST /v1/mcp/tools
 {"name":"scan","description":"port scanner","callback_url":"http://localhost:9000",
  "inputSchema":{"type":"object","properties":{"target":{"type":"string"}},"required":["target"]}}
-→ 201 {"ok":true}
+→ 201 {"ok":true} · 400 no name or callback_url, or not http(s) · 409 a builtin's name
+# Registering a name again replaces it, whoever registered it first (roadmap 2.5.x).
 
-# Call tool
+# Call a tool: MCP tools/call params
 POST /v1/mcp/call
-{"name":"scan"}
-→ {"content":[...],"isError":false}
-# A call to an external tool (like resources/read, prompts/get, web_fetch and
-# web_search) runs in a child process, so daimon keeps serving meanwhile. One
-# that has not finished within 60 s is answered 504 (2.3.4; on AGNOS since 2.4.1).
-# On AGNOS a server that sends nothing for 30 s is taken to have closed (502).
-# Through 2.4.1 that was about a second whenever the guest was busy (2.4.2).
+{"name":"libro_verify","arguments":{}}
+→ {"content":[{"type":"text","text":"{\"ok\":true}"}],"isError":false}
+{"name":"scan","arguments":{"target":"10.0.0.1"}}
+→ the external server's result, verbatim
+→ 400 unknown tool · 502 the server could not be reached, or answered wrongly · 504 no answer in 60 s
 
 # Deregister
 DELETE /v1/mcp/tools/scan
 → {"ok":true}
-
-# Built-in tools — five libro audit-chain tools ship as builtins
-# (libro_query / libro_verify / libro_export / libro_proof / libro_retention),
-# listed by GET /v1/mcp/tools alongside any external tools. They dispatch
-# in-process over daimon's audit chain and return the tool's JSON verbatim.
-POST /v1/mcp/call
-{"name":"libro_verify","arguments":{}}
-→ {"ok":true}
 ```
+
+A call that waits on another server runs in a child process, so daimon keeps serving meanwhile.
+That covers a forwarded call, `resources/read`, `prompts/get`, `web_fetch` and `web_search`. One
+that has not finished within 60 s is answered 504 (2.3.4; on AGNOS since 2.4.1). On AGNOS a server
+that sends nothing for 30 s is taken to have closed (502). Through 2.4.1 that was about a second
+whenever the guest was busy (2.4.2). A JSON-RPC error from the server answers 200 with
+`"isError":true` and its `code`.
+
+### Resources and prompts (2.1.0)
+
+A resource URI contains `://` and more slashes, so it travels in the body, never in the path.
+
+```
+# Register an external resource (mimeType, or mime_type; text/plain when omitted)
+POST /v1/mcp/resources
+{"uri":"file:///etc/motd","name":"motd","description":"message of the day","mimeType":"text/plain","callback_url":"http://localhost:9000"}
+→ {"registered":"file:///etc/motd","count":1}
+
+GET /v1/mcp/resources
+→ {"resources":[{"uri":"file:///etc/motd","name":"motd","description":"message of the day","mimeType":"text/plain"}],"count":1}
+
+# Read it: forwards resources/read to the server that registered it
+POST /v1/mcp/resources/read     {"uri":"file:///etc/motd"}
+→ the server's result, verbatim · 400 unknown uri · 502 · 504
+
+POST /v1/mcp/resources/deregister     {"uri":"file:///etc/motd"}
+→ {"deregistered":true}
+
+# Prompts: the same shape, keyed by name. arguments is the prompt's argument list.
+POST /v1/mcp/prompts
+{"name":"greet","description":"say hello","arguments":[{"name":"who","required":true}],"callback_url":"http://localhost:9000"}
+→ {"registered":"greet","count":1}
+
+GET /v1/mcp/prompts
+→ {"prompts":[{"name":"greet","description":"say hello","arguments":[{"name":"who","required":true}]}],"count":1}
+
+POST /v1/mcp/prompts/get     {"name":"greet","arguments":{"who":"agnos"}}
+→ the server's result, verbatim · 400 unknown prompt · 502 · 504
+
+POST /v1/mcp/prompts/deregister     {"name":"greet"}
+→ {"deregistered":true}
+```
+
+A forwarded read or get that the server answers with a JSON-RPC error is answered 502, with the
+server's message and code.
 
 ## RAG Pipeline
 
 ```
-# Ingest text
+# Ingest text: chunked, embedded and indexed (a longer text gives more chunk ids)
 POST /v1/rag/ingest
 {"text":"Rust is a systems programming language","metadata":"source1"}
-→ 201 {"chunk_ids":[1,2]}
+→ 201 {"chunk_ids":[1]}
 
-# Query
+# Query: the best-matching chunks, formatted as context for a model
 POST /v1/rag/query
 {"query":"rust safety"}
-→ {"formatted_context":"Use the following context..."}
+→ {"formatted_context":"Use the following context to answer the question.\n\n---\n[1] Rust is a systems programming language\n\n---\n\nQuestion: rust safety"}
 ```
+
+The index is in memory, so it starts empty each time daimon starts. `vector_entries` in
+`/v1/metrics` counts it.
 
 ## Edge Fleet
 
@@ -260,9 +330,10 @@ POST /v1/edge/nodes
 {"name":"edge-1","arch":"aarch64","cpu_cores":4,"memory_mb":8192,"disk_mb":65536,"has_gpu":true}
 → 201 {"id":"1"} · 400 name taken · 422 an invalid capability
 
-# List nodes (optional ?status=online|suspect|offline|updating|decommissioned)
+# List nodes (optional ?status=online|suspect|offline|updating|decommissioned; any other value lists all).
+# Here status is a number: 0 Online, 1 Suspect, 2 Offline, 3 Updating, 4 Decommissioned.
 GET /v1/edge/nodes
-→ {"nodes":[...]}
+→ {"nodes":[{"id":"1","name":"edge-1","status":0}]}
 
 # Get node
 GET /v1/edge/nodes/1
@@ -284,6 +355,9 @@ GET /v1/edge/stats
    "tasks_completed":0,"cpu_cores":4,"memory_mb":8192,"gpu_nodes":1}
 ```
 
+A node's health is worked out whenever the fleet is read. A node with no heartbeat for 30 s is
+Suspect, and after 90 s it is Offline.
+
 Edge node ids have their own sequence since 2.3.4. Before, they came from the agent counter, so
 after five agents the first node was `"6"`. `cpu_cores`, `memory_mb` and `gpu_nodes` in the stats
 total the nodes that can take work (not offline, not decommissioned). `arch` is 1–32 characters of
@@ -297,46 +371,46 @@ POST /v1/scheduler/nodes
 {"node_id":"worker-1","total_cpu":"8","total_memory_mb":"16384"}
 → 201 {"ok":true}
 
-# Submit task
+# Submit task. The id is samay's, a UUID.
 POST /v1/scheduler/tasks
 {"name":"train-model","agent_id":"agent-1","priority":"7"}
-→ 201 {"task_id":"2"}
+→ 201 {"task_id":"21cecebe-6079-4fe7-9618-e533df976a7d"}
 
-# List tasks
+# Task counts. This route lists no tasks: find a node's with its work list, below.
 GET /v1/scheduler/tasks
-→ {"stats":{"total_tasks":1,"queued":1,"running":0,...}}
+→ {"stats":{"total_tasks":1,"queued":1,"running":0,"completed":0,"failed":0}}
 
 # Get task — agent_id, node (where it was placed) and fail_reason since 2.3.1
-GET /v1/scheduler/tasks/2
-→ {"task_id":"2","name":"train-model","priority":7,"status":"Queued","agent_id":"agent-1","node":null,"fail_reason":null}
+GET /v1/scheduler/tasks/21cecebe-6079-4fe7-9618-e533df976a7d
+→ {"task_id":"21cecebe-6079-4fe7-9618-e533df976a7d","name":"train-model","priority":7,"status":"Queued","agent_id":"agent-1","node":null,"fail_reason":null}
 
 # Cancel task
-POST /v1/scheduler/tasks/2/cancel
-→ {"ok":true}
+POST /v1/scheduler/tasks/{id}/cancel
+→ {"ok":true} · 404 unknown, or its status does not allow a cancel
+
+# Schedule pending tasks: best fit over the registered nodes
+POST /v1/scheduler/schedule
+→ {"decisions":[{"task_id":"21cecebe-…","assigned_node":"worker-1","reason":"best-fit selection","score":1.0}]}
 
 # An executor's work list: the node's Scheduled and Running tasks (2.3.1)
 GET /v1/scheduler/nodes/worker-1/tasks
-→ {"node_id":"worker-1","tasks":[{"task_id":"2",...,"status":"Scheduled","node":"worker-1",...}],"count":1}
+→ {"node_id":"worker-1","tasks":[{"task_id":"21cecebe-…","name":"train-model","priority":7,"status":"Scheduled","agent_id":"agent-1","node":"worker-1","fail_reason":null}],"count":1}
 → 404 unknown node
 
 # Start — the executor reports it running: Scheduled → Running (2.3.1)
-POST /v1/scheduler/tasks/2/start
-→ {"task_id":"2",...,"status":"Running",...}
+POST /v1/scheduler/tasks/{id}/start
+→ {"task_id":"21cecebe-…",...,"status":"Running","node":"worker-1",...}
 → 404 · 409 unless Scheduled · 403 from a browser
 
 # Complete — and done: Running → Completed, or Failed with a reason (2.3.1)
-POST /v1/scheduler/tasks/2/complete                                  (no body = completed)
-POST /v1/scheduler/tasks/2/complete {"status":"failed","reason":"disk full"}
-→ {"task_id":"2",...,"status":"Failed",...,"fail_reason":"disk full"}
+POST /v1/scheduler/tasks/{id}/complete                                  (no body = completed)
+POST /v1/scheduler/tasks/{id}/complete {"status":"failed","reason":"disk full"}
+→ {"task_id":"21cecebe-…",...,"status":"Failed",...,"fail_reason":"disk full"}
 → 400 status not completed/failed · 404 · 409 unless Running · 403 from a browser
-
-# Schedule pending tasks
-POST /v1/scheduler/schedule
-→ {"decisions":[{"task_id":"2","assigned_node":"worker-1","reason":"best-fit"}]}
 
 # Scheduler stats — the averages are 0 until a task has started (2.3.1)
 GET /v1/scheduler/stats
-→ {"total_tasks":1,"queued":0,"running":0,"completed":1,"failed":0,"average_wait_time_ms":54,"average_run_time_ms":82}
+→ {"total_tasks":1,"queued":0,"running":0,"completed":0,"failed":1,"average_wait_time_ms":15,"average_run_time_ms":0}
 ```
 
 A task's life through the API: submit → schedule places it on a node (Scheduled, holding that node's
@@ -353,8 +427,11 @@ agents), and executor identity waits for authentication (roadmap 2.5.x).
 ```
 GET /v1/metrics
 → {"agents":1,"mcp_tools":13,"mcp_resources":0,"mcp_prompts":0,"vector_entries":5,"edge_nodes":3,
-   "federation_nodes":0,"ipc_messages":42,"ipc_refused":1,"bus_dropped":0}
+   "federation_nodes":0,"ipc_messages":42,"ipc_refused":1,"bus_dropped":0,"ipc_channels":1,
+   "bus_bytes":2048,"http_evicted":0}
 ```
+
+`federation_nodes` is always 0 for now: no route adds a federation node.
 
 Since 2.3.3:
 - `ipc_messages` counts agent messages put on the bus;
@@ -388,11 +465,17 @@ See [agent-ipc.md](agent-ipc.md).
 | 503 | Service Unavailable — on AGNOS: no free channel for another agent, or 4 calls to other servers still running |
 | 504 | Gateway Timeout — an MCP call, `web_fetch` or `web_search` did not finish within 60 s |
 
-All errors return `{"error":"message","code":NNN}`.
+A handler's error answers `{"error":"message","code":NNN}`. Four answers are shorter:
+- an unknown route: `{"error":"not found"}`;
+- a wrong method: `{"error":"method not allowed"}`;
+- the rate limit: `{"error":"too many requests"}`;
+- a request refused before it is read (400 for an ambiguous length, 413, 501 for chunked): no body.
 
 ## Rate Limiting
 
-120 requests per minute per source IP. Sliding window. Returns 429 when exceeded.
+120 requests a minute from each source IP, counted in a fixed 60 s window that starts with its first
+request. Past that, 429. A client whose address daimon cannot learn draws on one shared bucket of 960
+a minute. That is every client on AGNOS, which gives no peer address.
 
 ## Security
 
