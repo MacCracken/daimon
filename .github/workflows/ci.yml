@@ -255,7 +255,22 @@ jobs:
         # release fixed (CSRF-by-GET, builtin hijack, metrics, RAG JSON, heartbeat
         # bounds). Until 2.2.3 these lived in tests/test.sh, which CI never ran,
         # and two of them had been failing unnoticed.
-        run: sh tests/smoke.sh
+        #
+        # 2.4.2: tests/containment.sh (run by smoke.sh) needs a cgroup daimon may
+        # divide, and the runner's is not delegated. So this step moves its own
+        # shell into one it makes, owned by the runner user (cgroup v2: the owner
+        # of a cgroup's files may move its processes between its descendants).
+        # If that fails, the containment checks are skipped, and the warning says
+        # so rather than letting a green run hide it.
+        run: |
+          CG=/sys/fs/cgroup/daimon-ci
+          if sudo mkdir -p "$CG" && sudo chown -R "$(id -u):$(id -g)" "$CG" \
+             && echo $$ | sudo tee "$CG/cgroup.procs" > /dev/null; then
+            echo "smoke runs in $CG, a cgroup daimon may divide"
+          else
+            echo "::warning::no delegated cgroup: tests/containment.sh will skip its checks"
+          fi
+          sh tests/smoke.sh
 
       - name: Bench
         run: |
@@ -318,6 +333,54 @@ jobs:
         with:
           name: agnos-guest-serial-log
           path: build/agnos-guest/serial.log
+          if-no-files-found: ignore
+
+  aarch64-vm:
+    # 2.4.2. daimon's agent and syscall-portability suites, built for aarch64, in
+    # a VM running a real aarch64 Linux kernel (tests/aarch64/run.sh: Alpine
+    # 3.24.2's netboot kernel and minirootfs, pinned by SHA-256), as an ordinary
+    # user. The "Syscall portability under qemu-aarch64" step above cannot check
+    # RLIMIT_AS: user-mode QEMU passes prlimit64's RLIMIT_AS through as a no-op
+    # and runs a thread of its own, so six agent checks fail there (206 of 212,
+    # measured). Under the real kernel all 212 pass, the containment checks on
+    # the contained path (the VM hands the suites a cgroup of their own).
+    name: aarch64 VM test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Cyrius toolchain
+        # Same installer and pin as the build job.
+        run: |
+          set -e
+          CYRIUS_VERSION="$(grep '^cyrius = ' cyrius.cyml | head -1 | sed 's/cyrius = "\(.*\)"/\1/')"
+          echo "Installing Cyrius $CYRIUS_VERSION"
+          curl -sSf https://raw.githubusercontent.com/MacCracken/cyrius/main/scripts/install.sh | \
+            CYRIUS_VERSION="$CYRIUS_VERSION" sh
+          echo "$HOME/.cyrius/bin" >> "$GITHUB_PATH"
+
+      - name: Resolve dependencies
+        run: cyrius deps --no-lock
+
+      - name: Install QEMU and cpio
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends qemu-system-arm cpio
+
+      - name: aarch64 suites under a real kernel
+        run: |
+          if [ ! -x "$HOME/.cyrius/bin/cycc_aarch64" ]; then
+            echo "::warning::cycc_aarch64 not shipped with this Cyrius toolchain — skipping"
+            exit 0
+          fi
+          VM_TIMEOUT=1200 sh tests/aarch64/run.sh
+
+      - name: Keep the serial log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aarch64-vm-serial-log
+          path: build/aarch64-vm/serial.log
           if-no-files-found: ignore
 
   security:

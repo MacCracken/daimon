@@ -4,6 +4,138 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.4.2] - 2026-09-23
+
+**2.3.x's last three items, closed.**
+- **A stop reaches every process an agent started**, where daimon's cgroup is its own: each agent
+  runs in a cgroup of its own. Through 2.4.1 a process that called `setsid` outlived its agent's
+  stop.
+- **One client can no longer hold every connection slot.** Through 2.4.1, 128 connections
+  trickling in requests kept a health check waiting 28.6 s; it is now answered in 1 ms.
+- **RLIMIT_AS on aarch64 is verified under a real kernel**, in a VM that CI now runs. User-mode QEMU
+  never applied it.
+
+ai-hwaccel 2.3.29.
+
+**1087 tests** (was 1050) across 17 suites, **143 HTTP smoke checks** (was 131), 30 benchmarks (one
+only where agents are contained) and 7 fuzz harnesses, all green on Linux. The AGNOS guest test
+passes its 92 checks. The aarch64 VM passes all 212 agent checks and 46 portability checks. fmt /
+lint / vet clean; x86_64, aarch64 and agnos build.
+
+### Added
+
+- **Agent containment** ([ADR-008](docs/adr/008-agent-containment-cgroup.md)). Where daimon's own
+  cgroup (cgroup v2) is its to divide, each start of an agent runs in
+  `<daimon's cgroup>/daimon-<pid>/agent-<id>-<run>`. That means a systemd service with
+  `Delegate=yes`, anything the user's systemd runs (`systemd-run --user`), or a cgroup handed to
+  daimon's user.
+  - The agent moves itself in between fork and exec, so nothing it starts is ever outside. daimon
+    then checks where it is from `/proc/<pid>/cgroup`, which still names the cgroup of an agent that
+    has already exited.
+  - A stop, pause or resume signals everything in the cgroup; SIGKILL is `cgroup.kill`.
+  - When the agent's own process is collected, anything it left gets SIGTERM, the 5 s grace, then
+    `cgroup.kill`. The cgroup is then removed, with any cgroups the agent made inside it.
+  - The next daimon started in the same cgroup ends what a daimon killed outright left, and removes
+    its cgroups.
+  - The agent's JSON says `"contained":true|false` while it has a process.
+
+  Where daimon cannot make cgroups, or may not move a process out of its own (a login session's
+  scope is root's; cgroup v1; agnos), agents run as before. daimon warns and audits once at startup
+  (`agent.cgroup.unavailable`). New audit events: `agent.cgroup.fail`, `agent.cgroup.leftover` and
+  `agent.cgroup.kill`.
+
+  Containment holds processes that detach (`setsid`, a double fork, a daemon). It is not a boundary
+  against an agent: an agent runs as daimon's user, and may move its own processes to another cgroup
+  that user may write.
+- **When every connection slot is taken**, the oldest request still arriving gives way to a waiting
+  connection, once it is 1 s old ([ADR-006's 2.4.2 addendum](docs/adr/006-own-event-loop.md)). It
+  is closed unanswered, and counted in `/v1/metrics` as `http_evicted`. Deferred and detached answers
+  never give way. On agnos too, at its 5 slots.
+- **`tests/aarch64/run.sh`**: daimon's agent and syscall-portability suites, built for aarch64, run
+  in a VM with a real aarch64 kernel. They run as `nobody`, in a cgroup handed to it, so the agent
+  suite's containment checks take the contained path. The kernel is Alpine 3.24.2's netboot
+  `vmlinuz-virt` (6.18.52) and the userland its minirootfs, both pinned by SHA-256. It runs under
+  `qemu-system-aarch64`. CI runs it (the `aarch64-vm` job).
+- **`tests/containment.sh`**: 10 checks, run by `tests/smoke.sh` in a cgroup daimon may divide. CI's
+  smoke step makes one with sudo, and a failure to make it is a warning, not a silent skip.
+
+### Changed
+
+- **An agent's processes end with it** where it is contained: an agent that exits no longer leaves
+  what it started running. This is systemd's `KillMode=control-group`.
+- **ai-hwaccel 2.3.29** (was 2.3.27): integrated GPUs through Vulkan. daimon calls nothing in it. The
+  binary grows 12.5 KB on x86_64 and agnos, and 216 bytes on aarch64. No build warning changed on any
+  target, measured by building both pins (a build re-resolves deps first, so the old pin was built in
+  a scratch copy).
+- The agent handle grows from 120 to 136 bytes (its cgroup, and whether it is in it).
+- CLAUDE.md: the agent-process rule names `_agent_spawn` and `_agent_signal_all`. A new rule: upkeep
+  on the loop's tick must not allocate, since `alloc` has no free. Measured: `agents_tick` allocates
+  nothing, idle or with a live agent.
+
+### Fixed
+
+- **A process that left its agent's process group (`setsid`) outlived the agent's stop.** Measured
+  on 2.4.1: the stop answered status 5 with the `setsid sleep` still running. Now it is gone.
+  `tests/containment.sh` checks this, and that a leftover ignoring SIGTERM is ended after the grace
+  period.
+- **One local client could hold every connection slot for 30 s.** A request may trickle in for 30 s,
+  and every loopback client shares 127.0.0.1, so no per-IP cap could tell them apart. Measured on
+  2.4.1: 128 connections each sending a byte every 2 s kept a new client's health check waiting
+  28.6 s. Now 1 ms, and one held connection gave way.
+- **RLIMIT_AS on aarch64 was unverified.** `qemu-aarch64` passes prlimit64's RLIMIT_AS through as a
+  no-op. In the VM, all 212 agent checks pass, including RLIMIT_AS applied and an address-space limit
+  that cannot be applied refusing the start. The same binary under `qemu-aarch64` passes 206, failing
+  three RLIMIT_AS checks and three thread counts.
+
+### Performance
+
+- **A contained start costs 0.25 ms more.** `agent_spawn_reap_contained` (new) took 1.616 ms and
+  `agent_spawn_reap` 1.362 ms: medians of five runs under `systemd-run --user --scope`, both in the
+  same process each time, at a load average under 2. The difference is the `mkdir`, the move, the
+  check of where the agent is, and the `rmdir`.
+- **A new client is answered in 1 ms while 128 connections trickle in requests.** 2.4.1 took
+  28.634 s.
+- **The loop's upkeep allocates nothing on a tick.** Measured across 1000 ticks, idle and with a live
+  agent: 0 bytes.
+- **The rest of Linux is unchanged.** 2.4.1 against 2.4.2, ten interleaved runs of
+  `tests/daimon.bcyr`, medians, at a load average under 2. What 2.4.2 reaches is within ±1%:
+  - `agent_spawn_reap` −0.9%;
+  - `agent_reap_live` +0.1%;
+  - `ipc_frame_roundtrip` −0.2%;
+  - `bus_broadcast_take_100` +0.2%.
+
+  The rest are within ±3.5%, except `mcp_find_tool_in_100` (−15.8%, spreads 49–59%: noise) and
+  `config_default`. That one is +8.9% (84.5 → 92.0 ns, spreads 8–10%) in code 2.4.2 did not change.
+  It showed the same +8% in an earlier 20-run A/B, and its cause was not measured. See
+  BENCHMARKS.md.
+
+### Tests
+
+- `tests/agent.tcyr` (212, was 175): containment. The parts are checked on plain directories and
+  files standing in for cgroups, and the whole on real cgroups where agents are contained:
+  - where a process is, from `/proc/<pid>/cgroup`, including one that has exited and is not yet
+    collected;
+  - SIGKILL to each member where there is no `cgroup.kill`;
+  - the removal queue waiting for an empty cgroup, and removing the cgroups an agent made inside its
+    own;
+  - the queue's upkeep allocating nothing on a tick, past its three tries at that removal;
+  - `contained` exactly when daimon can make cgroups.
+
+  It passes both where agents are contained and where they are not. Review before release found
+  three faults in the first version, and the checks for them fail on it:
+  - an agent that exited before daimon checked where it was was taken for one that never entered.
+    The check read `cgroup.procs`, which lists live processes only, and what the agent left was out
+    of reach;
+  - a cgroup holding cgroups the agent made inside it stayed queued for removal for good;
+  - when that agent's process was collected, those empty cgroups were audited as processes left
+    behind.
+- `tests/smoke.sh` (143, was 131): the connection-slot check (2), and `tests/containment.sh` (10).
+  Two of those failed once, when the shell running the script had the marker text in its own command
+  line. A substring match counted that shell as the agent's process. The script now matches a
+  process's whole command line.
+- `tests/aarch64/run.sh`: the agent (212) and syscall-portability (46) suites in the aarch64 VM.
+- `tests/daimon.bcyr`: `agent_spawn_reap_contained`, where daimon can make cgroups.
+
 ## [2.4.1] - 2026-09-23
 
 **On AGNOS, a call to another server no longer holds daimon, and neither does a stopped clock or a

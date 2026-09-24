@@ -45,7 +45,7 @@ External (non-stdlib) deps used by daimon:
 | `majra` (2.9.1) | Event-sink dep of bote's bundle (`events_majra.cyr`). Present for compile-time resolution of the full bote bundle; daimon does not use it at runtime today. **Owns `ERR_IPC = 4`** — historically daimon renamed its own IPC error `ERR_IPC_FAULT` (1.3.0) to dodge this collision; at 1.4.2 every daimon error constant was namespaced `DAIMON_ERR_*` (now `DAIMON_ERR_IPC_FAULT`), so no daimon constant can collide with a vendored `ERR_*` and the rename satisfies cyrlint's `lint_error_enum_namespace` rule (6.4.51). |
 | `samay` (1.1.3) | Task scheduler — the extraction of daimon's own `scheduler.cyr`/`cron.cyr`, which daimon 2.0.0 replaced with this library. `[deps.samay]` carries both a `path = "../samay"` (local dev checkout) and a `tag` (the release pin). samay has no scheduler-level "start": daimon's task start / complete live in `src/sched.cyr` (2.3.1). ⚠ `task_scheduler_complete_task` answers `Err(1)` both for an unknown id and for a refused transition, so look the task up first. |
 | `nein` (1.7.0) | Firewall MCP tools (2.1.8, `dist/nein-mcp.cyr`). It is declared after `bote` and `sigil` in `cyrius.cyml` because its bundle leaves their symbols for the host to supply. The mutating half (`nein_allow` / `nein_deny`) is **gated shut** until caller authentication (roadmap 2.5.x). |
-| `ai-hwaccel` (2.3.27) | samay's hardware-acceleration dependency (samay's own `[deps.ai-hwaccel]`), declared here since 2.0.0 so the full `dist/samay.cyr` bundle resolves at compile time. daimon calls nothing in it directly. Resolved from its tag with no `path` (2.4.0): with a `path`, the tag is inert and every build re-copies the sibling checkout, which leaked one mid-change into the lock at 2.3.4. |
+| `ai-hwaccel` (2.3.29) | samay's hardware-acceleration dependency (samay's own `[deps.ai-hwaccel]`), declared here since 2.0.0 so the full `dist/samay.cyr` bundle resolves at compile time. daimon calls nothing in it directly. Resolved from its tag with no `path` (2.4.0): with a `path`, the tag is inert and every build re-copies the sibling checkout, which leaked one mid-change into the lock at 2.3.4. |
 
 **ADR-002 is invalid** — `lib/async.cyr` provides epoll-based cooperative async:
 ```cyrius
@@ -119,7 +119,7 @@ Every AGNOS agent, every consumer app, hoosh, agnoshi, aethersafha.
 - **Fixed local arrays: use element-typed `var a: i64[N]` for slot arrays** (and `u8[N]` / `i32[N]` / `u32[N]` for sized byte/scalar buffers). Since cyrius 6.2.1, bare `var a[N]` is **N bytes in a function** (N i64 slots only at top level) — an address-taken `var a[N]` written via `store64(&a + i*8)` under-reserves and silently corrupts adjacent memory. This caused the 1.2.6 routing-404 bug; swept in 1.2.7. Before re-testing any "fixed" compiler footgun, **read the cyrius language CHANGELOG** — fixes there are often language changes, not silent codegen patches.
 - Original Rust implementations are in git history at tags `0.5.0` / `0.6.0` (e.g. `git show 0.6.0:src/agent.rs`). The Cyrius port starts at `0.7.0`.
 
-## Commands (verified at 2.4.1)
+## Commands (verified at 2.4.2)
 
 ```sh
 export CYRIUS_NO_WARN_SHADOW_LIB=1 CYRIUS_DCE=1   # what CI sets
@@ -134,6 +134,8 @@ cyrius lint <file>                               # CI fails on any `warn`
 sh tests/agnos/run.sh --release                  # AGNOS guest test on the released kernel, SHA-256 pinned (CI runs this)
 sh tests/agnos/run.sh                            # ... on the sibling builds ../agnos/build/agnos, ../gnoboot/build/BOOTX64.EFI
 rm -rf lib && cyrius deps                        # when cyrius.lock names files a clean checkout does not vendor (CI fails on it)
+sh tests/aarch64/run.sh                          # agent + portability suites in an aarch64 VM, real kernel (RLIMIT_AS; CI runs this)
+systemd-run --user --scope -q sh tests/containment.sh   # containment checks alone (smoke.sh runs them this way)
 ```
 
 `cyrius fmt <file>` without `--check` rewrites the file in place. `cyrius check` is only a syntax check.
@@ -167,8 +169,12 @@ that names a file a clean checkout does not vendor fails there.
   decoded, owned copies.
 - **Retention**: anything a struct keeps from a request must be owned (`str_clone`). sandhi reuses the
   request buffer, and this caused the 1.2.5 / 2.1.6 / 2.2.1 leaks.
-- **Agent processes**: only through `agent_spawn_with_limits` (`src/agent.cyr`), which:
+- **Agent processes**: only through `_agent_spawn` (`src/agent.cyr`; `agent_spawn_with_limits` is it
+  with no cgroup), which:
   - makes the child lead its own process group, and die with daimon (PDEATHSIG);
+  - moves the child into the agent's own cgroup before exec, where daimon can make one (2.4.2,
+    ADR-008; `agent_start` passes it, and `_agent_cg_confirm` reports whether it took, from
+    `/proc/<pid>/cgroup`: `cgroup.procs` does not list a process that has exited);
   - closes inherited descriptors (`lib/net.cyr` sockets are not close-on-exec), except the channel
     on fd 3 and, with `--agent-output capture`, the output pipe on fds 1 and 2;
   - gives the child stdin from `/dev/null`;
@@ -176,7 +182,10 @@ that names a file a clean checkout does not vendor fails there.
   - applies checked rlimits, and daimon's original descriptor limit;
   - reports exec failure synchronously.
 
-  Signal an agent with `daimon_signal_tree` (its whole group).
+  Signal an agent with `_agent_signal_all(h, sig)`: its group, and every process in its cgroup
+  when it is contained. When its process is collected, `_agent_cg_release` ends what it left.
+  In a test, find a marker process by its whole command line from `/proc` (`tests/containment.sh`
+  `ct_pids`), never a substring or `pgrep -f`: those also match the shell that runs the test.
 
   The executable comes from the agent's TYPE (`agnos-agent-<type>-agent` in `/usr/lib/agnos/agents`,
   `/opt/agnos/agents` or `serve --agents-dir`), **never from a request**.
@@ -201,6 +210,12 @@ that names a file a clean checkout does not vendor fails there.
     done before detaching. The child answers through `http_send_response` on the fd it is given.
   - **Every deadline reads `daimon_now_ms`**, never `clock_now_ms` (2.4.1). On agnos, a refused TSC
     calibration stops `clock_now_ms` for the whole boot; `daimon_now_ms` falls back to the tick.
+  - **Upkeep on the tick must not allocate.** `alloc` is a bump allocator with no free
+    (`lib/alloc.cyr`), so an allocation on every tick grows daimon for as long as it runs.
+    Measured at 2.4.2: `agents_tick` allocates nothing, idle or with a live agent (the gap between
+    two `alloc(8)` across 1000 ticks). `agent_cgroups_tick` reads `cgroup.events` into a buffer it
+    keeps, and bounds the one walk that allocates (`AGENT_CG_PRUNE_TRIES`; `tests/agent.tcyr`
+    checks it).
   - End a program or suite with `sys_exit_group` / `syscall(SYS_EXIT_GROUP, …)`, the epilogue
     `lib/syscalls.cyr` prescribes (`sys_exit` ends only the calling thread).
   - The fork child (`_agent_child`) must not allocate: it runs only syscalls and stack buffers.

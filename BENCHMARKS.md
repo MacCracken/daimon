@@ -40,6 +40,54 @@ those numbers are not comparable.
 
 `tests/rag_ingest.bcyr` (real since 2.1.6): `rag_ingest_real_5k` 133.1µs, `rag_chunk_only_5k` 508ns.
 
+### 2.4.2 — 2.3.x's last items
+
+**A contained start costs 0.25 ms more.** `agent_spawn_reap_contained` (new in 2.4.2) is
+`agent_spawn_reap` through a cgroup of the agent's own: the `mkdir`, the child's move into it, the
+check of where it is, and the `rmdir` after the reap. Five runs of `tests/daimon.bcyr` under
+`systemd-run --user --scope`, both benchmarks in each run's process, at a load average under 2:
+
+| Benchmark | median | the five runs |
+|---|---:|---|
+| agent_spawn_reap | 1.362 ms | 1.362, 1.362, 1.366, 1.424, 1.362 |
+| agent_spawn_reap_contained | 1.616 ms | 1.616, 1.616, 1.592, 1.788, 1.587 |
+
+Five runs earlier, at a load average of 13, gave 1.411 and 1.690 ms (0.28 ms). Where daimon cannot
+make cgroups the contained benchmark is left out, and a note after the report says so.
+
+**One client holding every slot.** Measured over HTTP: 128 connections, each sending one more byte
+of an unfinished request every 2 s, then a new client's `/v1/health`. 2.4.1: 28.634 s. 2.4.2:
+0.001 s, with one held connection closed (`http_evicted` 1) and the other 127 still open.
+(`tests/smoke.sh` checks the same with a byte every 0.5 s.)
+
+**The upkeep allocates nothing on a tick.** Measured, not benchmarked: the gap between two `alloc(8)`
+across 1000 calls of `agents_tick` is 0 bytes, idle and with a live agent. A cgroup the queue cannot
+remove costs its three walks (17,032 bytes over the first ten ticks, then nothing).
+
+**The rest of Linux is unchanged.** 2.4.1 against 2.4.2, `tests/daimon.bcyr`, ten interleaved runs
+with the order alternating, medians, at a load average of 1.7–2.0. Spread is (max − min) over the
+median. On the benchmarked paths 2.4.2 changed the spawn (the cgroup it is handed, none here) and
+the agent handle (120 → 136 bytes). Everything it reaches is within ±1%:
+
+| Benchmark | 2.4.1 | 2.4.2 | change | spread 2.4.1 | spread 2.4.2 |
+|---|---:|---:|---:|---:|---:|
+| agent_spawn_reap | 1.446 ms | 1.433 ms | −0.9% | 7% | 8% |
+| agent_reap_sweep_100_idle | 973.5 ns | 972.0 ns | −0.2% | 2% | 4% |
+| agent_reap_live | 496.0 ns | 496.5 ns | +0.1% | 7% | 10% |
+| ipc_frame_roundtrip | 12.01 µs | 11.99 µs | −0.2% | 5% | 8% |
+| ipc_poll_100_idle | 9.386 µs | 9.383 µs | −0.0% | 5% | 5% |
+| bus_broadcast_take_100 | 14.11 µs | 14.14 µs | +0.2% | 18% | 8% |
+| config_default (untouched) | 84.5 ns | 92.0 ns | +8.9% | 8% | 10% |
+
+The other benchmarks are within ±3.5%, except two:
+- `mcp_find_tool_in_100` −15.8%, with spreads of 49% and 59%: noise.
+- `config_default` +8.9%, in code 2.4.2 did not change: `src/config.cyr` differs only in its version
+  string. An earlier A/B of twenty runs, on the tree before review, showed the same +8%, so it is
+  not noise. Its cause was not measured: there is no `perf` on this machine.
+
+A first A/B at a load average of 9–11 was discarded: its spreads were 12–251%, and untouched code
+moved by as much as 39%.
+
 ### 2.4.1 — AGNOS follow-ups
 
 **No performance claim for AGNOS.** On agnos, 2.4.1 writes each answer 1 KB at a time with a yield
@@ -406,7 +454,7 @@ Scheduler scheduling (1.5x), supervisor registration (2.5x), MCP registration (1
 | | Rust | Cyrius |
 |---|---|---|
 | Unit tests | 305 | — (inline in test groups) |
-| Integration tests | 28 | 1050 assertions / 17 suites, each against its real `src/` module (2.4.1); AGNOS guest test 92 checks (tests/agnos/run.sh --release, in CI) |
+| Integration tests | 28 | 1087 assertions / 17 suites, each against its real `src/` module (2.4.2); AGNOS guest test 92 checks (tests/agnos/run.sh --release, in CI); aarch64 VM, agent 212 + portability 46 under a real kernel (tests/aarch64/run.sh, in CI) |
 | Benchmarks | 19 | 29, against the real code (2.3.4) |
 | Fuzz harnesses | 0 | 7, property-based, run in CI (2.3.2) |
 | HTTP smoke | — | tests/smoke.sh, 131 checks, run in CI (2.4.0) |

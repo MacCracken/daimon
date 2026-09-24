@@ -431,6 +431,63 @@ fn _srv_free_slot() {
     return 0 - 1;
 }
 
+# 2.4.2 — one local client could take every slot. A request may trickle in for
+# SERVE_REQUEST_MAX_MS, and every loopback client shares 127.0.0.1, so no per-IP
+# cap can tell a local attacker from its neighbours. Measured on 2.4.1: with 128
+# connections each sending a byte every 2 s, a health check from a new client
+# waited 28.6 s. Now, when every slot is taken and a connection is waiting, the
+# oldest request still being read gives way to it, once it is
+# SERVE_EVICT_MIN_MS old. A request that arrives at once, as a local client's
+# does, is answered long before then: only one still trickling in can be oldest.
+# The one that gives way is closed without an answer (writing to a client that
+# is not reading could hold the loop for SO_SNDTIMEO), and counted
+# (http_evicted in /v1/metrics). Answers being deferred or relayed never give way.
+var SERVE_EVICT_MIN_MS = 1000;
+var _srv_evicted = 0;
+fn server_evicted_count() { return _srv_evicted; }
+
+# The slot that gives way to a waiting connection: the oldest one still reading
+# its request, at least SERVE_EVICT_MIN_MS old; -1 if none. A reading slot's
+# total deadline is SERVE_REQUEST_MAX_MS after it opened.
+fn _srv_evictable(now) {
+    var best = 0 - 1;
+    var best_open = 0;
+    var i = 0;
+    while (i < SERVE_MAX_CONNS) {
+        var slot = _srv_slot(i);
+        if (load64(slot) == SRV_READING) {
+            var opened = load64(slot + 48) - SERVE_REQUEST_MAX_MS;
+            if (now - opened >= SERVE_EVICT_MIN_MS) {
+                if (best < 0 || opened < best_open) {
+                    best = i;
+                    best_open = opened;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return best;
+}
+
+# 1 if a connection could be taken now: a slot is free, or one can give way.
+fn _srv_room(now) {
+    if (_srv_free_slot() >= 0) { return 1; }
+    if (_srv_evictable(now) >= 0) { return 1; }
+    return 0;
+}
+
+# The slot for a connection just accepted: a free one, or the one that gives
+# way (closed here). -1 if neither (not reached: accept runs only with room).
+fn _srv_slot_for_new(now) {
+    var i = _srv_free_slot();
+    if (i >= 0) { return i; }
+    i = _srv_evictable(now);
+    if (i < 0) { return 0 - 1; }
+    _srv_close(_srv_slot(i));
+    _srv_evicted = _srv_evicted + 1;
+    return i;
+}
+
 # SO_SNDTIMEO: a response write that makes no progress for SERVE_IDLE_MS
 # fails rather than holding the loop.
 fn _srv_send_timeout(fd) {
@@ -596,18 +653,28 @@ fn _srv_accept(lfd, now) {
     # lib/net's accept: accept#57, never blocking, wrapped as a tagged fd. Its
     # errors are "nothing pending" or a full fd table (it closes the connection
     # then): the loop polls again on its next pass either way.
-    while (_srv_free_slot() >= 0) {
+    while (_srv_room(now) == 1) {
         var a_t, a_fd = sock_accept(lfd);
         if (is_err_result(a_t) == 1) { return 1; }
-        _srv_open(_srv_free_slot(), a_fd, now);
+        var ai = _srv_slot_for_new(now);
+        if (ai < 0) {
+            sys_close(a_fd);
+            return 1;
+        }
+        _srv_open(ai, a_fd, now);
     }
     return 1;
     #else
-    while (_srv_free_slot() >= 0) {
+    while (_srv_room(now) == 1) {
         var cfd = sys_accept4(lfd, 0, 0, _SRV_SOCK_CLOEXEC);
         if (cfd >= 0) {
             _srv_accept_backoff = 0;
-            _srv_open(_srv_free_slot(), cfd, now);
+            var si = _srv_slot_for_new(now);
+            if (si < 0) {
+                sys_close(cfd);
+                return 1;
+            }
+            _srv_open(si, cfd, now);
         } else {
             var e = 0 - cfd;
             if (e == _SRV_EAGAIN) { return 1; }
@@ -672,7 +739,7 @@ fn _srv_arm_listener(now) {
     return 0;   # polled: nothing to arm
     #else
     var want = 1;
-    if (_srv_free_slot() < 0) { want = 0; }
+    if (_srv_room(now) == 0) { want = 0; }   # full, and nothing old enough to give way (2.4.2)
     if (_srv_accept_resume > now) { want = 0; }
     if (want == _srv_listening) { return 0; }
     if (want == 1) { _srv_epoll(EPOLL_CTL_ADD, _srv_lfd, _SRV_TOKEN_LISTEN); }
@@ -1122,6 +1189,7 @@ fn serve(port) {
     return server_loop(server_bind_addr(), port);
     #else
     server_banner(port, "event loop");
+    agent_cgroup_init();   # says at startup whether agents will be contained (2.4.2)
     # Room for every agent's channel plus the connections (agent_nofile_raise;
     # four per agent leaves room for more than the channel).
     var want = config_max_agents(_config) * 4 + SERVE_MAX_CONNS + 64;

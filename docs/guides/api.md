@@ -21,7 +21,10 @@ All responses are JSON. All POST bodies are JSON. Connection is closed after eac
 **One client does not hold the server** (2.3.4): daimon runs its own event loop and reads requests
 without blocking, so a slow client holds only its own connection:
 - a connection that sends nothing for 5 s, or has no whole request after 30 s, is closed;
-- at most 128 connections are open at once, and more wait in the kernel's queue.
+- at most 128 connections are open at once, and more wait in the kernel's queue;
+- when all 128 are taken and another is waiting, the oldest request still arriving gives way, once
+  it is 1 s old (2.4.2). It is closed unanswered and counted (`http_evicted`). One client trickling
+  in 128 requests held every slot for 30 s before.
 
 ## Request bodies
 
@@ -86,7 +89,7 @@ GET /v1/agents/1
 
 # Start — runs the agent's process (2.3.0)
 POST /v1/agents/1/start
-→ {"id":1,"name":"my-agent","type":"User","status":2,"pid":4242,"exit_code":null,"limits_enforced":true}
+→ {"id":1,"name":"my-agent","type":"User","status":2,"pid":4242,"exit_code":null,"limits_enforced":true,"contained":true}
 → 409 not Pending/Stopped/Failed · 422 no executable for its type (on AGNOS also: a name with a space)
 
 # Stop — SIGTERM, up to 5 s to exit, then SIGKILL; always 200, once the agent is gone
@@ -134,6 +137,26 @@ meanwhile. A GET in between shows the agent at status 4 (Stopping). A stop, paus
 the processes the agent started too: each agent leads its own process group. An agent is killed if
 daimon itself dies (`PR_SET_PDEATHSIG`); daimon's registry is in memory, so it could never be
 reached again.
+
+**Containment** (2.4.2, [ADR-008](../adr/008-agent-containment-cgroup.md)). A process that calls
+`setsid` leaves its agent's process group, and through 2.4.1 it outlived the agent's stop. Where
+daimon's own cgroup is its to divide, each agent runs in a cgroup of its own, and its JSON says
+`"contained":true` while it has a process. That means a systemd service with `Delegate=yes`, anything
+the user's systemd runs (`systemd-run --user`), or a cgroup handed to daimon's user. Then:
+- a stop, pause or resume reaches every process in the cgroup;
+- when the agent's own process is collected, anything left in it gets SIGTERM, 5 s, then SIGKILL.
+  **An agent's processes end with it**. Its cgroup is then removed, with any the agent made inside
+  it;
+- a daimon that was killed outright left its agents' leftovers running, and the next daimon started
+  in the same cgroup ends them.
+
+This holds processes that detach (`setsid`, a double fork, a daemon). It does not hold an agent that
+acts against daimon: an agent runs as daimon's user, and may move its own processes into another
+cgroup that user may write.
+
+Elsewhere, agents run as before, and `"contained":false`. That covers daimon started from a login
+shell (the session's cgroup is root's), and a cgroup whose `cgroup.procs` daimon may not write.
+daimon warns once at startup, and audits `agent.cgroup.unavailable`.
 
 **Environment and output** (2.3.4):
 - `serve --agent-env minimal` gives agents only PATH, HOME, USER, LOGNAME, SHELL, TERM, TMPDIR, TZ,
@@ -338,6 +361,8 @@ Since 2.3.3:
 Since 2.3.4:
 - `ipc_channels` is the number of open agent channels;
 - `bus_bytes` is the bytes of messages the bus holds (freed as they are taken).
+
+Since 2.4.2, `http_evicted` counts connections closed to make room while every slot was taken.
 
 See [agent-ipc.md](agent-ipc.md).
 

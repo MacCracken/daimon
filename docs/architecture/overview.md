@@ -27,6 +27,11 @@ main.cyr   Preamble (syscall constants) + module includes + the `main` serve loo
 │   │                             fd 3 the channel, optional output pipe, /dev/null stdin, SIGPIPE
 │   │                             reset, RLIMIT_AS + RLIMIT_CPU + daimon's original NOFILE,
 │   │                             exec failure reported synchronously
+│   ├── containment    (2.4.2, ADR-008) a cgroup per agent where daimon's cgroup is its own:
+│   │                  _agent_spawn moves the child in; _agent_cg_confirm checks it is there
+│   │                  (/proc/<pid>/cgroup); _agent_signal_all reaches it all; _agent_cg_release
+│   │                  ends what an agent left; agent_cgroups_tick removes the emptied cgroups,
+│   │                  with any made inside them
 │   └── _agent_start_agnos   (2.4.0) spawn_path#43 with a channel endowed (CH_ENDOW); no limits
 │                            (agnos has none: audited, limits_enforced false)
 │
@@ -122,6 +127,8 @@ main.cyr   Preamble (syscall constants) + module includes + the `main` serve loo
 │   │                      listener, connections (non-blocking reads) and agent channels; a tick
 │   │                      for deadlines, deferred answers (server_defer) and agents_tick.
 │   │                      AGNOS (2.4.0): the same loop, polled, yielding with pause#14
+│   ├── _srv_slot_for_new  (2.4.2) a free slot, or the oldest request still arriving gives way
+│   │                      (1 s old at least) when every slot is taken; http_evicted in /v1/metrics
 │   └── server_detach      (2.3.4) a handler's work in a child process (MCP forwards, web_fetch);
 │                          the loop relays its answer, 504 after 60 s. AGNOS (2.4.1): fork#96 and
 │                          a pipe; the child writes its answer whole (http_answer_into_pipe)

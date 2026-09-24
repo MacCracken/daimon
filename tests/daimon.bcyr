@@ -255,6 +255,25 @@ fn bench_agent_spawn_reap() {
     return 0;
 }
 
+# 2.4.2 — the same start through a cgroup of its own (containment): the mkdir,
+# the child's move into it, the check of where it is, and the rmdir after the
+# reap. Only where daimon can make cgroups; elsewhere a note after the report
+# says it was left out. Run it with
+# `systemd-run --user --scope -q ./scripts/bench-history.sh`.
+var _bench_cg_agent = 0;
+fn bench_agent_spawn_reap_contained() {
+    var procs = _agent_cg_prepare(_bench_cg_agent);
+    var r_t, r_v = _agent_spawn("/bin/true", _bench_true_argv, 0, 0, 0, 0 - 1, 0 - 1, procs);
+    if (is_ok(r_t) == 1) {
+        _agent_cg_confirm(_bench_cg_agent, r_v);
+        daimon_reap_within(r_v, 5000);
+    } else {
+        _agent_cg_confirm(_bench_cg_agent, 0);
+    }
+    _agent_cg_release(_bench_cg_agent);
+    return 0;
+}
+
 # The reap sweep every agent route now runs first, over 100 agents with no
 # process — the common case, a load and a compare each.
 fn bench_agent_reap_sweep_100_idle() {
@@ -515,6 +534,13 @@ fn main() {
     bench_run(b19, &bench_agent_spawn_reap, 200);
     vec_push(benches, b19);
 
+    if (agent_cgroup_init() == 1) {
+        _bench_cg_agent = agent_handle_new(1001, str_from("contained"));
+        var b19c = bench_new("agent_spawn_reap_contained");
+        bench_run(b19c, &bench_agent_spawn_reap_contained, 200);
+        vec_push(benches, b19c);
+    }
+
     var b20 = bench_new("agent_reap_sweep_100_idle");
     bench_run(b20, &bench_agent_reap_sweep_100_idle, 100000);
     vec_push(benches, b20);
@@ -592,6 +618,9 @@ fn main() {
     vec_push(benches, b26);
 
     bench_report_all(benches);
+    if (_bench_cg_agent == 0) {
+        println("  [agent_spawn_reap_contained left out: daimon cannot make cgroups here]");
+    }
     return 0;
 }
 

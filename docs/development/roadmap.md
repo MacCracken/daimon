@@ -4,8 +4,8 @@
 >
 > **Severity legend**: **P0** blocking (security / correctness — must-fix before ship) · **P1** high (must-have for the current arc) · **P2** medium (schedule when capacity opens) · **P3 / Low** nice-to-have, no urgency. Upstream-blocker items quote the upstream tracker's own severity.
 
-**Where daimon stands** — `2.4.1`, cyrius 6.6.6, nine dep pins current (samay 1.1.3, ai-hwaccel
-2.3.27). Builds on **three targets**: x86_64, aarch64 and AGNOS.
+**Where daimon stands** — `2.4.2`, cyrius 6.6.6, nine dep pins current (samay 1.1.3, ai-hwaccel
+2.3.29). Builds on **three targets**: x86_64, aarch64 and AGNOS.
 - **Agents can be started, stopped, paused, resumed and deleted through the API** (2.3.0), under
   their rlimits, with exit status reported.
 - **On AGNOS too** (2.4.0, [ADR-007](../adr/007-daimon-on-agnos.md)): agents are started, stopped,
@@ -23,10 +23,13 @@
 - **daimon runs its own event loop** (2.3.4, [ADR-006](../adr/006-own-event-loop.md)): one thread,
   one epoll set. A slow client holds only its own connection, a stop waits for its agent and not
   for the server, and agents are collected as they exit. Agents lead their own process groups and
-  die with daimon.
-- **1043 tests** in 17 suites, every one against its real `src/` module, plus 131 HTTP smoke checks,
-  29 benchmarks, 7 fuzz harnesses and the AGNOS guest test's 85 checks, all run by CI. CI also
-  verifies the committed `cyrius.lock` (2.4.1).
+  die with daimon. Where daimon's cgroup is its own, each agent runs in a cgroup of its own, so a
+  stop reaches everything it started (2.4.2, [ADR-008](../adr/008-agent-containment-cgroup.md)); and
+  one client cannot hold every connection slot.
+- **1087 tests** in 17 suites, every one against its real `src/` module, plus 143 HTTP smoke checks,
+  30 benchmarks, 7 fuzz harnesses, the AGNOS guest test's 92 checks, and the agent and
+  portability suites in an aarch64 VM with a real kernel (2.4.2), all run by CI. CI also verifies
+  the committed `cyrius.lock` (2.4.1).
 - The API binds 127.0.0.1 unless told otherwise (`--listen`). While it does, a request must name a
   loopback host, and no route accepts a write from another site's page.
 - Zero open issue filings of daimon's own. Twelve agnos filings and one cyrius filing are open
@@ -39,8 +42,8 @@ prerequisites, sequenced. Each line is a release train, not a single release.
 
 | arc | theme | why it must come after the one above |
 |---|---|---|
-| **2.3.x** | **Agent lifecycle** — start / stop / signal / reap through the API | The product gap. **2.3.0** shipped the process half (start, stop, pause, resume, delete, reaping); **2.3.1** task start/complete; **2.3.2** request-string decoding; **2.3.3** agent channels; **2.3.4** message routes, daimon's own event loop, and the lifecycle follow-ups. What remains is below. |
-| **2.4.x** | **AGNOS spawn + IPC** — `sys_spawn_path`, `chan_op` capability channels, `sys_proclist` | Nothing to map until a route actually spawns. **2.4.0** shipped the mapping (spawn, signal, reap, channels, the polled loop, proclist); **2.4.1** the guest test in CI, capacity, and a clock that survives a refused TSC calibration. What remains waits on agnos filings; see below. |
+| **2.3.x** | **Agent lifecycle** — start / stop / signal / reap through the API | The product gap. **2.3.0** shipped the process half (start, stop, pause, resume, delete, reaping); **2.3.1** task start/complete; **2.3.2** request-string decoding; **2.3.3** agent channels; **2.3.4** message routes, daimon's own event loop, and the lifecycle follow-ups. Its last three items shipped in **2.4.2**. Closed. |
+| **2.4.x** | **AGNOS spawn + IPC** — `sys_spawn_path`, `chan_op` capability channels, `sys_proclist` | Nothing to map until a route actually spawns. **2.4.0** shipped the mapping (spawn, signal, reap, channels, the polled loop, proclist); **2.4.1** the guest test in CI, capacity, and a clock that survives a refused TSC calibration; **2.4.2** closed 2.3.x's last items. What remains waits on agnos filings; see below. |
 | **2.5.x** | **Agent identity + MCP authentication** | Prerequisite for un-gating nein's mutating firewall tools, and for any `claims`-based authorisation. Needs 2.3.x, because identity is per-agent. |
 | **3.0.0** | **Per-agent arena isolation** — VULN-007's open half; unlocks multi-tenant hosting, kavach sandboxing, untrusted federation, external MCP callbacks | Major because it changes the allocation model under every agent and flips the gates the P0 below guards. Needs identity (2.5.x) to know what a tenant *is*. |
 
@@ -52,17 +55,16 @@ cut re-evaluates the P0 below.
 
 ## 2.3.x · P1 — Wire the agent lifecycle to the API
 
-Shipped in 2.3.0 – 2.3.4: the CHANGELOG entries, ADR-004 – ADR-006 and the addenda to
-[docs/audit/2026-09-22-agent-lifecycle-audit.md](../audit/2026-09-22-agent-lifecycle-audit.md).
+Shipped in 2.3.0 – 2.3.4 and 2.4.2: the CHANGELOG entries, ADR-004 – ADR-006, ADR-008 and the addenda
+to [docs/audit/2026-09-22-agent-lifecycle-audit.md](../audit/2026-09-22-agent-lifecycle-audit.md).
+Nothing is open. 2.4.2 closed the last three items:
+- agents contained by a cgroup of their own;
+- the oldest trickling request giving way when every slot is taken;
+- RLIMIT_AS verified on aarch64 under a real kernel.
 
-**Still open in 2.3.x:**
-- **Agents that leave their process group (P3).** A child that calls `setsid` is out of reach of a
-  stop. A cgroup per agent would hold it on Linux. agnos has no process groups at all; reaching an
-  agent's descendants is part of the 2026-09-23 filing on ending a process.
-- **One local client can take all 128 connection slots (P3)**, each for up to 30 s. All loopback
-  clients share 127.0.0.1, so a per-IP cap would be global; a per-connection rate would bound it.
-- **aarch64 RLIMIT_AS is unverified on hardware.** qemu-aarch64 does not apply it: QEMU's user-mode
-  `prlimit64` passes RLIMIT_AS / DATA / STACK through as a no-op.
+What those leave (agents uncontained where daimon's cgroup is not its own; an agent that moves its own
+processes to another cgroup, as it may, being daimon's user; a connection flood; a VM, not hardware)
+is in the audit's 2.4.2 addendum.
 
 **Sequence**: the 2.4.x items below as their agnos filings land, and 2.5.x. One bite at a time,
 suite green at every step.

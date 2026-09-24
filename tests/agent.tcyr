@@ -929,6 +929,193 @@ xunlink(chan_exe);
 xrmdir(cdir);
 agent_set_agents_dir(adir);
 
+# --- 2.4.2: containment, a cgroup per agent -----------------------------------
+# Where this suite usually runs, daimon's cgroup is not its own to divide (a login
+# session's scope is root's; CI's runner is not delegated), so agents start
+# uncontained here. tests/containment.sh checks the whole behaviour inside a
+# cgroup daimon may divide. These check the parts, on plain directories and files
+# standing in for cgroups.
+test_group("agent_containment");
+
+# 1 if `body`, written to <dir>/<name>, names cgroup `want`.
+fn _t_cg_of_is(dir, name, body, want) {
+    var at = _agent_cg_of(_t_script(dir, name, body));
+    if (at == 0) { return 0; }
+    return streq(at, want);
+}
+
+var cg_state = agent_cgroup_init();
+assert(cg_state == 1 || cg_state == 2, "containment: decided once, available (1) or not (2)");
+assert_eq(agent_cgroup_init(), cg_state, "... and the same answer after");
+var cg_own = _agent_cg_own();
+assert(cg_own != 0, "containment: daimon's cgroup is read from /proc/self/cgroup (cgroup v2)");
+if (cg_own != 0) {
+    assert_eq(memeq(cg_own, "/sys/fs/cgroup", 14), 1, "... as a directory under /sys/fs/cgroup");
+}
+var cgh = agent_handle_new(agent_next_id(), str_from("contain"));
+var cgs_t, cgs_pid = agent_start(cgh, 0, 0);
+assert_eq(is_ok(cgs_t), 1, "containment: an agent starts either way");
+var cg_want = 0;
+if (cg_state == 1) { cg_want = 1; }
+assert_eq(agent_contained(cgh), cg_want, "... contained exactly when daimon can make cgroups");
+agent_stop(cgh, STOP_USER);
+assert_eq(agent_contained(cgh), 0, "... and its cgroup is let go when its process is collected");
+xunlink(_t_ready(user_exe, cgs_pid));
+
+# A process's cgroup is the cgroup v2 line ("0::<path>") of its /proc/<pid>/cgroup.
+var fcg = _t_path(adir, "fakecg");
+xmkdir_p(fcg, 448);
+assert_eq(_t_cg_of_is(fcg, "cg1", "0::/a/b\n", "/sys/fs/cgroup/a/b"), 1,
+  "containment: a cgroup is read from its cgroup v2 line");
+assert_eq(_t_cg_of_is(fcg, "cg2", "12:cpuset:/x\n1:name=systemd:/y\n0::/z\n", "/sys/fs/cgroup/z"), 1,
+  "... past the cgroup v1 lines of a hybrid hierarchy");
+assert_eq(_t_cg_of_is(fcg, "cg3", "0::/\n", "/sys/fs/cgroup"), 1, "... the root as /sys/fs/cgroup itself");
+assert_eq(_agent_cg_of(_t_script(fcg, "cg4", "12:cpuset:/x\n")), 0, "... and none from cgroup v1 alone");
+xunlink(_t_path(fcg, "cg1"));
+xunlink(_t_path(fcg, "cg2"));
+xunlink(_t_path(fcg, "cg3"));
+xunlink(_t_path(fcg, "cg4"));
+
+# An agent that exits before daimon checks where it is. A process that has exited
+# and is not yet collected is not in cgroup.procs, and /proc/<pid>/cgroup still
+# names its cgroup. Until the 2.4.2 review daimon read cgroup.procs: such an agent
+# was judged never to have entered, audited as a failure, and what it left in its
+# cgroup was out of reach.
+var true_argv = alloc(16);
+store64(true_argv, "/bin/true");
+store64(true_argv + 8, 0);
+if (cg_own != 0) {
+    assert_eq(_agent_cg_in(cg_own, sys_getpid()), 1, "containment: a process is found in its cgroup");
+    var zt_t, zt_pid = agent_spawn_with_limits("/bin/true", true_argv, 0, 0, 0, 0 - 1, 0 - 1);
+    assert_eq(_t_wait_state(zt_pid, 90, 1), 1, "... and one that has exited and is not yet collected");
+    assert_eq(_agent_cg_in(cg_own, zt_pid), 1, "... is found there too");
+    daimon_reap_within(zt_pid, 3000);
+    assert_eq(_agent_cg_in(cg_own, 1073741823), 0, "... and a process that does not exist is in none");
+}
+# The same through a start's own cgroup, where agents are contained.
+var zh = agent_handle_new(agent_next_id(), str_from("exits-at-once"));
+var zprocs = _agent_cg_prepare(zh);
+var zmade = 0;
+if (zprocs != 0) { zmade = 1; }
+assert_eq(zmade, cg_want, "containment: a start gets a cgroup exactly when daimon can make them");
+var zc_t, zc_pid = _agent_spawn("/bin/true", true_argv, 0, 0, 0, 0 - 1, 0 - 1, zprocs);
+assert_eq(_t_wait_state(zc_pid, 90, 1), 1, "... an agent that exits at once");
+assert_eq(_agent_cg_confirm(zh, zc_pid), cg_want, "... is found in its cgroup, when it has one");
+var zdir = agent_cgroup_dir(zh);
+daimon_reap_within(zc_pid, 3000);
+_agent_cg_release(zh);
+var zgone = 1;
+if (zdir != 0) {
+    if (is_dir(str_from(zdir)) == 1) { zgone = 0; }
+}
+assert_eq(zgone, 1, "... and the cgroup is removed once the agent is collected");
+
+# Without cgroup.kill (a kernel before 5.14; here, a plain directory) SIGKILL
+# goes to each member in turn.
+var slp_argv = alloc(24);
+store64(slp_argv, "/bin/sleep");
+store64(slp_argv + 8, "30");
+store64(slp_argv + 16, 0);
+var slp_t, slp_pid = agent_spawn_with_limits("/bin/sleep", slp_argv, 0, 0, 0, 0 - 1, 0 - 1);
+assert_eq(is_ok(slp_t), 1, "containment: a process to end");
+var slb = str_builder_new();
+str_builder_add_int(slb, slp_pid);
+str_builder_add_cstr(slb, "\n");
+_t_script(fcg, "cgroup.procs", str_data(str_builder_build(slb)));
+_agent_cg_signal(fcg, SIGKILL);
+assert_eq(daimon_reap_within(slp_pid, 3000), 137, "... SIGKILL reaches each member of cgroup.procs");
+xunlink(_t_path(fcg, "cgroup.procs"));
+xrmdir(fcg);
+
+# A cgroup queued for removal stays queued while it is not empty.
+var dq = _t_path(adir, "drain");
+xmkdir_p(dq, 448);
+var dq_busy = _t_script(dq, "busy", "x");
+# Where agents are contained, cgroups of the agents above may still be queued:
+# let them go first (bounded by a stop's grace, 7 s), so the count is this one's.
+var dqi = 0;
+while (dqi < 700 && agent_cgroups_pending() > 0) {
+    agent_cgroups_tick(daimon_now_ms());
+    _t_nap_ms(10);
+    dqi = dqi + 1;
+}
+var pend0 = agent_cgroups_pending();
+_agent_cg_queue(dq, 0);
+agent_cgroups_tick(daimon_now_ms());
+assert_eq(agent_cgroups_pending(), pend0 + 1, "containment: a cgroup that is not empty stays queued");
+xunlink(dq_busy);
+agent_cgroups_tick(daimon_now_ms());
+assert_eq(agent_cgroups_pending(), pend0, "... and is removed once it is empty");
+assert_eq(is_dir(str_from(dq)), 0, "... from disk");
+
+# A cgroup holding cgroups the agent made inside it cannot be removed. Once
+# nothing runs in it or below (cgroup.events), they are removed, deepest first.
+var ev = _t_path(adir, "events");
+xmkdir_p(ev, 448);
+_t_script(ev, "cgroup.events", "populated 1\nfrozen 0\n");
+assert_eq(_agent_cg_populated(ev), 1, "containment: a cgroup where something runs is populated");
+_t_script(ev, "cgroup.events", "populated 0\nfrozen 0\n");
+assert_eq(_agent_cg_populated(ev), 0, "... and one where nothing does is not");
+xunlink(_t_path(ev, "cgroup.events"));
+assert_eq(_agent_cg_populated(ev), 1, "... and one whose state cannot be read counts as populated");
+xrmdir(ev);
+var tr = _t_path(adir, "tree");
+xmkdir_p(_t_path(_t_path(tr, "a"), "b"), 448);
+xmkdir_p(_t_path(tr, "c"), 448);
+assert_eq(_agent_cg_remove_tree(tr, 1), 0, "containment: cgroups deeper than the walk goes are left");
+assert_eq(is_dir(str_from(_t_path(_t_path(tr, "a"), "b"))), 1, "... all of them");
+assert_eq(_agent_cg_remove_tree(tr, AGENT_CG_PRUNE_DEPTH), 1, "... and within it, every one is removed");
+assert_eq(is_dir(str_from(tr)), 0, "... the cgroup itself too");
+# Where agents are contained, through the queue, on a real cgroup.
+var nest_gone = 1;
+if (cg_state == 1) {
+    var nd = _t_path(_agent_cg_base, "agent-nested");
+    sys_mkdir(nd, 493);
+    sys_mkdir(_t_path(nd, "made-by-the-agent"), 493);
+    _agent_cg_queue(nd, 0);
+    agent_cgroups_tick(daimon_now_ms());
+    if (is_dir(str_from(nd)) == 1) { nest_gone = 0; }
+}
+assert_eq(nest_gone, 1, "containment: the queue removes a cgroup with the cgroups made inside it");
+assert_eq(agent_cgroups_pending(), pend0, "... and lets it go");
+# When the agent's process is collected and nothing runs in its cgroup, the
+# cgroups it made inside are removed then, not reported as processes left behind.
+var rel_gone = 1;
+if (cg_state == 1) {
+    var rh = agent_handle_new(agent_next_id(), str_from("nests"));
+    _agent_cg_prepare(rh);
+    var rd = agent_cgroup_dir(rh);
+    sys_mkdir(_t_path(rd, "made-by-the-agent"), 493);
+    _agent_cg_release(rh);
+    if (is_dir(str_from(rd)) == 1) { rel_gone = 0; }
+}
+assert_eq(rel_gone, 1, "containment: an agent's cgroup goes when it does, with the empty cgroups it made");
+assert_eq(agent_cgroups_pending(), pend0, "... without waiting in the queue");
+
+# The upkeep runs on every tick, and alloc has no free: a tick that allocated
+# would grow daimon for as long as it runs. Only the walk allocates, at most
+# AGENT_CG_PRUNE_TRIES times for a cgroup it cannot remove (here a plain
+# directory holding a file, whose cgroup.events says nothing runs in it).
+var st = _t_path(adir, "stuck");
+xmkdir_p(st, 448);
+var st_ev = _t_script(st, "cgroup.events", "populated 0\n");
+_agent_cg_queue(st, 0);
+var sti = 0;
+while (sti < AGENT_CG_PRUNE_TRIES) {
+    agent_cgroups_tick(daimon_now_ms());
+    sti = sti + 1;
+}
+var st_a0 = alloc(8);
+sti = 0;
+while (sti < 100) {
+    agent_cgroups_tick(daimon_now_ms());
+    sti = sti + 1;
+}
+assert_eq(alloc(8) - st_a0 - 8, 0, "containment: past its tries, the queue's upkeep allocates nothing");
+xunlink(st_ev);
+agent_cgroups_tick(daimon_now_ms());
+assert_eq(agent_cgroups_pending(), pend0, "... and the cgroup goes once it can");
+
 # Clean up the fixtures (ready markers carry pids; remove what we know).
 xunlink(_t_ready(user_exe, s_pid));
 xunlink(_t_ready(user_exe, s2_pid));

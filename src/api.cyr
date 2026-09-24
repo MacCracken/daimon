@@ -60,6 +60,9 @@ fn api_metrics(fd) {
     str_builder_add_int(sb, ipc_channel_count());
     str_builder_add_cstr(sb, ",\"bus_bytes\":");
     str_builder_add_int(sb, msg_bus_bytes());
+    # 2.4.2: connections closed to make room while every slot was taken.
+    str_builder_add_cstr(sb, ",\"http_evicted\":");
+    str_builder_add_int(sb, server_evicted_count());
     str_builder_add_cstr(sb, "}");
     http_ok(fd, str_builder_build(sb));
 }

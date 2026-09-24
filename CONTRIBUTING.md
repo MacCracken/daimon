@@ -26,7 +26,13 @@ sh tests/test.sh                     # Tests + fuzz + HTTP smoke (tests/smoke.sh
 ./scripts/bench-history.sh           # Append benchmark baseline
 sh tests/agnos/run.sh --release      # AGNOS guest test on the released kernel (what CI runs)
 sh tests/agnos/run.sh                # ... on a built ../agnos kernel and ../gnoboot
+sh tests/aarch64/run.sh              # agent + portability suites in an aarch64 VM (a real kernel)
 ```
+
+A change to how agents are started or stopped is also run contained: `tests/smoke.sh` runs
+`tests/containment.sh` in a cgroup daimon may divide (a `systemd-run --user` scope locally; CI
+makes one). On aarch64, `qemu-aarch64` applies no RLIMIT_AS; `tests/aarch64/run.sh` checks it
+under a real kernel.
 
 A change to an agnos arm (`#ifdef CYRIUS_TARGET_AGNOS`) is tested on agnos:
 `tests/agnos/run.sh` boots the kernel under QEMU and runs `tests/agnos/guest.cyr` and the real

@@ -48,7 +48,7 @@ enum AgentOpError {
 # 12 fields x 8 bytes = 96 bytes (type + exit_code added at 2.3.0)
 
 fn agent_handle_new(id, name) {
-    var h = alloc(120);
+    var h = alloc(136);
     store64(h, id);                # id (integer counter)
     # ⛔ str_clone THE NAME — copy at the RETENTION boundary. 2.2.1.
     #
@@ -82,6 +82,8 @@ fn agent_handle_new(id, name) {
     store64(h + 96, 0);            # a stop's SIGKILL deadline, ms (0 = no stop under way; 2.3.4)
     store64(h + 104, 0);           # when that stop sent SIGKILL, ms (0 = not yet)
     store64(h + 112, 0);           # 1 if its process runs under its limits (2.4.0; agnos cannot)
+    store64(h + 120, 0);           # its cgroup's directory, a cstr, or 0 (2.4.2)
+    store64(h + 128, 0);           # 1 if its process is in that cgroup (2.4.2)
     return h;
 }
 
@@ -104,6 +106,10 @@ fn agent_exit_code(h) { return load64(h + 88); }
 # start whose rlimits fail is refused), never on agnos, which has no limits yet
 # (2.4.0; filed with agnos 2026-09-23).
 fn agent_limits_enforced(h) { return load64(h + 112); }
+# 1 if the agent's process runs in a cgroup of its own, so a stop reaches every
+# process it starts, even one that left its process group (2.4.2).
+fn agent_contained(h) { return load64(h + 128); }
+fn agent_cgroup_dir(h) { return load64(h + 120); }
 
 fn agent_set_status(h, s) { store64(h + 16, s); }
 fn agent_set_pid(h, pid) { store64(h + 40, pid); }
@@ -457,6 +463,12 @@ fn agent_nofile_raise(want) {
 # Before 2.3.0 a missing executable looked like a successful start, and only a
 # later exit status of 127 told the difference.
 fn agent_spawn_with_limits(exe, argv, envp, mem_limit, cpu_limit, ipc_fd, out_fd) {
+    return _agent_spawn(exe, argv, envp, mem_limit, cpu_limit, ipc_fd, out_fd, 0);
+}
+
+# agent_spawn_with_limits, plus `cg_procs`: the cgroup.procs of a cgroup the child
+# moves itself into before it execs (2.4.2; 0 for none). agent_start's path.
+fn _agent_spawn(exe, argv, envp, mem_limit, cpu_limit, ipc_fd, out_fd, cg_procs) {
     #ifdef CYRIUS_TARGET_AGNOS
     return Err(AGENT_OP_UNSUPPORTED);
     #else
@@ -487,7 +499,7 @@ fn agent_spawn_with_limits(exe, argv, envp, mem_limit, cpu_limit, ipc_fd, out_fd
         return Err(AGENT_OP_NO_PROCESS);
     }
     if (pid == 0) {
-        _agent_child(exe, argv, envp, rlim_as, mem_limit, rlim_cpu, cpu_limit, rfd, wfd, ipc_fd, out_fd);
+        _agent_child(exe, argv, envp, rlim_as, mem_limit, rlim_cpu, cpu_limit, rfd, wfd, ipc_fd, out_fd, cg_procs);
     }
 
     sys_close(wfd);
@@ -514,7 +526,7 @@ var _agent_daimon_pid = 0;
 # The child's half, from fork to execve. It never returns: it execs, or writes
 # {reason, errno} to the report pipe and exits 126 (limits) / 127 (exec) — the
 # codes that still tell the two apart if the report is ever lost.
-fn _agent_child(exe, argv, envp, rlim_as, mem_limit, rlim_cpu, cpu_limit, rfd, wfd, ipc_fd, out_fd) {
+fn _agent_child(exe, argv, envp, rlim_as, mem_limit, rlim_cpu, cpu_limit, rfd, wfd, ipc_fd, out_fd, cg_procs) {
     sys_close(rfd);
 
     # 2.3.4 — the agent leads its own process group, so a stop, pause or resume
@@ -526,6 +538,18 @@ fn _agent_child(exe, argv, envp, rlim_as, mem_limit, rlim_cpu, cpu_limit, rfd, w
     syscall(_DAIMON_SYS_SETPGID, 0, 0);
     sys_prctl(_DAIMON_PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
     if (sys_getppid() != _agent_daimon_pid) { sys_exit(127); }
+
+    # 2.4.2 — into the agent's own cgroup, before anything it starts can exist, so
+    # a stop reaches a process that leaves the group (setsid). "0" moves the
+    # writer. A failure is not fatal: the parent checks where the agent is, and
+    # reports it (agent_contained).
+    if (cg_procs != 0) {
+        var cgf = sys_open(cg_procs, 1, 0);   # O_WRONLY
+        if (cgf >= 0) {
+            sys_write(cgf, "0", 1);
+            sys_close(cgf);
+        }
+    }
 
     # The agent's channel (2.3.3) becomes fd AGENT_IPC_FD, and its output pipe
     # (2.3.4) fds 1 and 2. The report pipe, the channel and the output pipe are
@@ -631,6 +655,385 @@ fn _agent_close_inherited(first, keep) {
     return 0;
 }
 #endif
+
+# --- containment: a cgroup per agent (2.4.2) ----------------------------------
+#
+# A stop reaches the agent's process group (2.3.4), and a process that calls
+# setsid leaves the group. Measured on 2.4.1: an agent's `setsid sleep` was still
+# running after its stop answered. Where daimon's own cgroup (cgroup v2) is its to
+# divide, each start of an agent runs in a cgroup of its own:
+#     /sys/fs/cgroup<daimon's cgroup>/daimon-<pid>/agent-<id>-<run>
+# Examples are a systemd service with Delegate=yes, or anything the user's systemd
+# runs (`systemd-run --user`).
+# - The agent moves itself in between fork and exec, so nothing it starts is ever
+#   outside.
+# - A stop, pause or resume signals every process in it. SIGKILL is cgroup.kill.
+# - When the agent's process is collected, whatever it left gets a stop's
+#   courtesy: SIGTERM, AGENT_STOP_GRACE_MS, then cgroup.kill. The cgroup is then
+#   removed (agent_cgroups_tick).
+# - A daimon that died left its daimon-<pid>; the next daimon in the same cgroup
+#   ends what is in it and removes it.
+# Where daimon cannot make cgroups (its cgroup is root's, cgroup v1, agnos),
+# agents run as before. That is audited once (agent.cgroup.unavailable), and an
+# agent's JSON says "contained":false.
+
+var _agent_cg_state = 0;   # 0 not tried, 1 available, 2 unavailable
+var _agent_cg_base = 0;    # cstr "/sys/fs/cgroup<daimon's cgroup>/daimon-<pid>"
+var _agent_cg_run = 0;     # a new cgroup per start: agent-<id>-<run>
+
+# Cgroups waiting to be removed: {directory cstr, the time its members get
+# cgroup.kill (0 once they have), tries at removing the cgroups an agent made
+# inside it}. agent_cgroups_tick works through them.
+var AGENT_CG_DRAIN_MAX = 256;
+#ifndef CYRIUS_TARGET_AGNOS
+var _agent_cg_drain: i64[768];   # agnos has no cgroups
+#endif
+var _agent_cg_drain_n = 0;
+var AGENT_CG_PRUNE_TRIES = 3;    # each walk allocates: bounded
+var AGENT_CG_PRUNE_DEPTH = 16;   # levels of cgroups inside an agent's
+
+# Whether agents are contained here: 1 yes, 2 no. The first call decides and
+# says so; serve calls it at startup.
+fn agent_cgroup_init() {
+    if (_agent_cg_state != 0) { return _agent_cg_state; }
+    _agent_cg_state = 2;
+    #ifndef CYRIUS_TARGET_AGNOS
+    var own = _agent_cg_own();
+    if (own == 0) { return _agent_cg_unavailable("daimon is not in a cgroup v2 hierarchy"); }
+    _agent_cg_sweep(own);
+    # Moving the agent needs write access to the cgroup.procs of daimon's cgroup
+    # (the common ancestor of where it is and where it goes), not only a mkdir.
+    if (sys_access(_agent_cg_path(own, "cgroup.procs"), 2) != 0) {   # W_OK
+        return _agent_cg_unavailable("daimon may not move processes out of its cgroup");
+    }
+    var bb = str_builder_new();
+    str_builder_add_cstr(bb, own);
+    str_builder_add_cstr(bb, "/daimon-");
+    str_builder_add_int(bb, sys_getpid());
+    var base = str_data(str_builder_build(bb));
+    var r = sys_mkdir(base, 493);   # 0755
+    if (r != 0 && r != 0 - EEXIST) { return _agent_cg_unavailable("daimon cannot make cgroups in its own"); }
+    _agent_cg_base = base;
+    _agent_cg_state = 1;
+    #endif
+    return _agent_cg_state;
+}
+
+fn _agent_cg_unavailable(why) {
+    sakshi_warn("agents are not contained: a process an agent starts can outlive its stop", 72);
+    daimon_audit(SEV_WARNING, "agent", "agent.cgroup.unavailable", why);
+    return 2;
+}
+
+# The agent's cgroup is left to be removed (its process has been collected).
+# What is still in it gets SIGTERM now and cgroup.kill after AGENT_STOP_GRACE_MS.
+fn _agent_cg_release(h) {
+    var dir = agent_cgroup_dir(h);
+    store64(h + 120, 0);
+    store64(h + 128, 0);
+    if (dir == 0) { return 0; }
+    #ifndef CYRIUS_TARGET_AGNOS
+    if (sys_rmdir(dir) == 0) { return 0; }
+    # Nothing runs there, but the agent made cgroups inside it: those go first.
+    if (_agent_cg_populated(dir) == 0) {
+        if (_agent_cg_remove_tree(dir, AGENT_CG_PRUNE_DEPTH) == 1) { return 0; }
+    }
+    daimon_audit_agent(SEV_INFO, "agent", "agent.cgroup.leftover",
+      "the agent's process is gone and it left processes behind: they are being stopped",
+      str_data(agent_name(h)));
+    _agent_cg_signal(dir, SIGTERM);
+    _agent_cg_queue(dir, daimon_now_ms() + AGENT_STOP_GRACE_MS);
+    #endif
+    return 0;
+}
+
+# The event loop's upkeep: remove the cgroups whose members are gone, and give
+# cgroup.kill to those past their grace. It allocates only to remove cgroups an
+# agent made inside its own, at most AGENT_CG_PRUNE_TRIES times per cgroup.
+fn agent_cgroups_tick(now) {
+    #ifndef CYRIUS_TARGET_AGNOS
+    var i = 0;
+    while (i < _agent_cg_drain_n) {
+        var e = &_agent_cg_drain + i * 24;
+        var dir = load64(e);
+        var at = load64(e + 8);
+        var gone = 0;
+        var r = sys_rmdir(dir);
+        if (r == 0 || r == 0 - ENOENT) {
+            gone = 1;
+        } elif (load64(e + 16) < AGENT_CG_PRUNE_TRIES && _agent_cg_populated(dir) == 0) {
+            # Nothing runs in it or below it, and it cannot be removed: it holds
+            # cgroups the agent made. Those go first.
+            store64(e + 16, load64(e + 16) + 1);
+            gone = _agent_cg_remove_tree(dir, AGENT_CG_PRUNE_DEPTH);
+        }
+        if (gone == 1) {
+            _agent_cg_drain_n = _agent_cg_drain_n - 1;
+            var last = &_agent_cg_drain + _agent_cg_drain_n * 24;
+            store64(e, load64(last));
+            store64(e + 8, load64(last + 8));
+            store64(e + 16, load64(last + 16));
+        } else {
+            if (at != 0 && now >= at) {
+                _agent_cg_signal(dir, SIGKILL);
+                store64(e + 8, 0);
+                daimon_audit(SEV_WARNING, "agent", "agent.cgroup.kill",
+                  "processes an agent left did not stop within the grace period: cgroup.kill");
+            }
+            i = i + 1;
+        }
+    }
+    #endif
+    return 0;
+}
+
+# Cgroups waiting to be removed.
+fn agent_cgroups_pending() { return _agent_cg_drain_n; }
+
+#ifndef CYRIUS_TARGET_AGNOS
+# "<dir>/<name>", a new cstr.
+fn _agent_cg_path(dir, name) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, dir);
+    str_builder_add_cstr(sb, "/");
+    str_builder_add_cstr(sb, name);
+    return str_data(str_builder_build(sb));
+}
+
+var _agent_cg_buf = 0;   # a cgroup.procs or a /proc/<pid>/cgroup, read (16 KiB)
+
+# daimon's own cgroup as "/sys/fs/cgroup<path>" (a cstr); 0 when there is none.
+fn _agent_cg_own() { return _agent_cg_of("/proc/self/cgroup"); }
+
+# The cgroup that `file` (a /proc/<pid>/cgroup) names on its cgroup v2 line
+# ("0::<path>"), as "/sys/fs/cgroup<path>" (a cstr); 0 when there is none.
+fn _agent_cg_of(file) {
+    if (_agent_cg_buf == 0) { _agent_cg_buf = alloc(16384); }
+    var buf = _agent_cg_buf;
+    var n = file_read_all(file, buf, 16383);
+    if (n <= 0) { return 0; }
+    store8(buf + n, 0);
+    var i = 0;
+    while (i + 3 <= n) {
+        if (memeq(buf + i, "0::", 3) == 1) {
+            var e = i + 3;
+            while (e < n && load8(buf + e) != 10) { e = e + 1; }
+            var sb = str_builder_new();
+            str_builder_add_cstr(sb, "/sys/fs/cgroup");
+            var k = i + 3;
+            while (k < e) {
+                str_builder_add_byte(sb, load8(buf + k));
+                k = k + 1;
+            }
+            var at = str_data(str_builder_build(sb));
+            if (e - (i + 3) == 1) { at = "/sys/fs/cgroup"; }   # "/": the namespace's root
+            return at;
+        }
+        while (i < n && load8(buf + i) != 10) { i = i + 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Signal every process in cgroup `dir`. SIGKILL is cgroup.kill (Linux 5.14+,
+# atomic, and it reaches processes forked meanwhile), or one kill per member.
+fn _agent_cg_signal(dir, sig) {
+    if (sig == SIGKILL) {
+        var kf = sys_open(_agent_cg_path(dir, "cgroup.kill"), 1, 0);   # O_WRONLY
+        if (kf >= 0) {
+            var w = sys_write(kf, "1", 1);
+            sys_close(kf);
+            if (w == 1) { return 0; }
+        }
+    }
+    if (_agent_cg_buf == 0) { _agent_cg_buf = alloc(16384); }
+    var n = file_read_all(_agent_cg_path(dir, "cgroup.procs"), _agent_cg_buf, 16383);
+    if (n <= 0) { return 0; }
+    var self = sys_getpid();
+    var i = 0;
+    var pid = 0;
+    while (i < n) {
+        var c = load8(_agent_cg_buf + i);
+        if (c >= 48 && c <= 57) {
+            pid = pid * 10 + c - 48;
+        } else {
+            if (pid > 1 && pid != self) { sys_kill(pid, sig); }
+            pid = 0;
+        }
+        i = i + 1;
+    }
+    if (pid > 1 && pid != self) { sys_kill(pid, sig); }
+    return 0;
+}
+
+# 1 if process `pid` is in cgroup `dir`, read from /proc/<pid>/cgroup. That
+# still names the cgroup after the process exits, until it is collected, and
+# cgroup.procs does not: an agent that exited before daimon looked was taken
+# for one that never entered, and what it left there was out of reach.
+fn _agent_cg_in(dir, pid) {
+    var pb = str_builder_new();
+    str_builder_add_cstr(pb, "/proc/");
+    str_builder_add_int(pb, pid);
+    str_builder_add_cstr(pb, "/cgroup");
+    var at = _agent_cg_of(str_data(str_builder_build(pb)));
+    if (at == 0) { return 0; }
+    return streq(at, dir);
+}
+
+fn _agent_cg_queue(dir, kill_at) {
+    if (_agent_cg_drain_n >= AGENT_CG_DRAIN_MAX) {
+        _agent_cg_signal(dir, SIGKILL);   # no room to wait: end them now
+        return 0;
+    }
+    var e = &_agent_cg_drain + _agent_cg_drain_n * 24;
+    store64(e, dir);
+    store64(e + 8, kill_at);
+    store64(e + 16, 0);
+    _agent_cg_drain_n = _agent_cg_drain_n + 1;
+    return 0;
+}
+
+# 0 once nothing runs in cgroup `dir` or below it (cgroup.events says
+# "populated 0"); 1 while something does, or when it cannot be read. It
+# allocates nothing: the loop's upkeep reads it.
+fn _agent_cg_populated(dir) {
+    if (_agent_cg_buf == 0) { _agent_cg_buf = alloc(16384); }
+    var n = strlen(dir);
+    if (n + 15 > 4096) { return 1; }
+    memcpy(_agent_cg_buf, dir, n);
+    memcpy(_agent_cg_buf + n, "/cgroup.events", 15);   # with its NUL
+    var ev = _agent_cg_buf + 4096;
+    var m = file_read_all(_agent_cg_buf, ev, 4095);
+    var i = 0;
+    while (i + 11 <= m) {
+        if (memeq(ev + i, "populated 0", 11) == 1) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# Remove cgroup `dir` and the cgroups inside it, deepest first, down to `depth`
+# levels. 1 once it is gone. An agent may make cgroups inside its own, and a
+# cgroup holding one cannot be removed.
+fn _agent_cg_remove_tree(dir, depth) {
+    var r = sys_rmdir(dir);
+    if (r == 0 || r == 0 - ENOENT) { return 1; }
+    if (depth <= 0) { return 0; }
+    var names = dir_list(str_from(dir));
+    var i = 0;
+    while (i < vec_len(names)) {
+        var nm = str_data(vec_get(names, i));
+        if (memeq(nm, "cgroup.", 7) == 0) {   # not one of the cgroup's own files
+            var sub = _agent_cg_path(dir, nm);
+            if (is_dir(str_from(sub)) == 1) { _agent_cg_remove_tree(sub, depth - 1); }
+        }
+        i = i + 1;
+    }
+    r = sys_rmdir(dir);
+    if (r == 0 || r == 0 - ENOENT) { return 1; }
+    return 0;
+}
+
+# A cgroup for one start of agent `id`: its cgroup.procs path, for the child, or
+# 0 if none could be made. The directory is stored in the handle.
+fn _agent_cg_prepare(h) {
+    if (agent_cgroup_init() != 1) { return 0; }
+    _agent_cg_run = _agent_cg_run + 1;
+    var db = str_builder_new();
+    str_builder_add_cstr(db, _agent_cg_base);
+    str_builder_add_cstr(db, "/agent-");
+    str_builder_add_int(db, agent_id(h));
+    str_builder_add_cstr(db, "-");
+    str_builder_add_int(db, _agent_cg_run);
+    var dir = str_data(str_builder_build(db));
+    if (sys_mkdir(dir, 493) != 0) {
+        daimon_audit_agent(SEV_WARNING, "agent", "agent.cgroup.fail",
+          "no cgroup could be made for the agent: it runs uncontained", str_data(agent_name(h)));
+        return 0;
+    }
+    store64(h + 120, dir);
+    return _agent_cg_path(dir, "cgroup.procs");
+}
+
+# After the start (`pid`, or 0 when there was none): is the agent's process in
+# its cgroup?
+fn _agent_cg_confirm(h, pid) {
+    var dir = agent_cgroup_dir(h);
+    if (dir == 0) { return 0; }
+    if (pid > 0) {
+        if (_agent_cg_in(dir, pid) == 1) {
+            store64(h + 128, 1);
+            return 1;
+        }
+        daimon_audit_agent(SEV_WARNING, "agent", "agent.cgroup.fail",
+          "the agent did not enter its cgroup: it runs uncontained", str_data(agent_name(h)));
+        # Removed if empty. If not, the agent moved out after entering, and what
+        # it left there goes when it does (_agent_cg_release).
+        if (sys_rmdir(dir) == 0) { store64(h + 120, 0); }
+        return 0;
+    }
+    # No start. Its child has been collected; one still exiting is waited for.
+    store64(h + 120, 0);
+    if (sys_rmdir(dir) != 0) { _agent_cg_queue(dir, daimon_now_ms() + AGENT_STOP_GRACE_MS); }
+    return 0;
+}
+
+# The cgroups a daimon that is gone left in `own` (daimon-<pid>, the pid dead or
+# ours): their members are ended and the cgroups queued for removal.
+fn _agent_cg_sweep(own) {
+    var names = dir_list(str_from(own));
+    var self = sys_getpid();
+    var i = 0;
+    while (i < vec_len(names)) {
+        var nm = str_data(vec_get(names, i));
+        if (memeq(nm, "daimon-", 7) == 1) {
+            var p = 0;
+            var k = 7;
+            var digits = 1;
+            while (load8(nm + k) != 0) {
+                var c = load8(nm + k);
+                if (c < 48 || c > 57) { digits = 0; }
+                else { p = p * 10 + c - 48; }
+                k = k + 1;
+            }
+            if (digits == 1 && k > 7) {
+                var stale = 0;
+                if (p == self) { stale = 1; }
+                elif (sys_kill(p, 0) == 0 - ESRCH) { stale = 1; }
+                if (stale == 1) {
+                    var dd = _agent_cg_path(own, nm);
+                    var kids = dir_list(str_from(dd));
+                    var j = 0;
+                    while (j < vec_len(kids)) {
+                        var kn = str_data(vec_get(kids, j));
+                        if (memeq(kn, "agent-", 6) == 1) {
+                            var kd = _agent_cg_path(dd, kn);
+                            _agent_cg_signal(kd, SIGKILL);
+                            _agent_cg_queue(kd, 0);
+                        }
+                        j = j + 1;
+                    }
+                    # Our own pid's (a dead daimon's, reused) is the base we are about
+                    # to use: its agent cgroups go, it stays.
+                    if (p != self) { _agent_cg_queue(dd, 0); }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+#endif
+
+# Signal the agent: its process and group (daimon_signal_tree), and, when it is
+# contained, every process in its cgroup (2.4.2). Returns the process's result.
+fn _agent_signal_all(h, sig) {
+    var r = daimon_signal_tree(agent_pid(h), sig);
+    #ifndef CYRIUS_TARGET_AGNOS
+    if (agent_contained(h) == 1) { _agent_cg_signal(agent_cgroup_dir(h), sig); }
+    #endif
+    return r;
+}
 
 # daimon's environment as an envp for execve. Agents inherit it, as they did in
 # the Rust original (tokio's Command passes the parent's environment). Read
@@ -903,13 +1306,15 @@ fn agent_start(h, mem_limit, cpu_secs) {
 
     agent_set_status(h, AGENT_STARTING);
     sakshi_info("starting agent", 14);
-    var r_t, r_v = agent_spawn_with_limits(exe, argv, agent_environ_ipc(), mem_limit, cpu_secs,
-      agent_end, out_w);
+    var cg_procs = _agent_cg_prepare(h);   # its own cgroup, where daimon can make one (2.4.2)
+    var r_t, r_v = _agent_spawn(exe, argv, agent_environ_ipc(), mem_limit, cpu_secs,
+      agent_end, out_w, cg_procs);
     sys_close(agent_end);   # the child has its copy; daimon never keeps this end
     if (out_w >= 0) { sys_close(out_w); }   # likewise: at EOF, every writer is gone
     if (is_err_result(r_t) == 1) {
         sys_close(own_end);
         if (out_r >= 0) { sys_close(out_r); }
+        _agent_cg_confirm(h, 0);   # removes the unused cgroup
         agent_set_status(h, AGENT_FAILED);
         daimon_audit_agent(SEV_WARNING, "agent", "agent.spawn.fail", "agent process failed to start",
           str_data(agent_name(h)));
@@ -920,6 +1325,7 @@ fn agent_start(h, mem_limit, cpu_secs) {
     agent_set_started_at(h, clock_epoch_secs());
     agent_set_status(h, AGENT_RUNNING);
     agent_set_limits_enforced(h, 1);   # the child applied them, or it would not have exec'd
+    _agent_cg_confirm(h, r_v);
     daimon_audit_agent(SEV_INFO, "agent", "agent.spawn", "agent process started", str_data(agent_name(h)));
     # daimon's end joins the channels the event loop polls (src/ipc.cyr), which
     # own it from here on, replacing any channel left from an earlier run; the
@@ -1143,8 +1549,8 @@ fn agent_stop_begin(h, reason) {
     var paused = 0;
     if (agent_status(h) == AGENT_PAUSED) { paused = 1; }
     agent_set_status(h, AGENT_STOPPING);
-    daimon_signal_tree(pid, SIGTERM);
-    if (paused == 1) { daimon_signal_tree(pid, 18); }   # SIGCONT
+    _agent_signal_all(h, SIGTERM);
+    if (paused == 1) { _agent_signal_all(h, 18); }   # SIGCONT
     store64(h + 96, daimon_now_ms() + AGENT_STOP_GRACE_MS);
     store64(h + 104, 0);
     return 0;
@@ -1170,6 +1576,7 @@ fn agent_stop_step(h, now) {
             agent_set_pid(h, 0);
             agent_set_exit_code(h, code);
             ipc_service_remove(str_from_int(agent_id(h)));   # its channel goes with it
+            _agent_cg_release(h);                             # and its cgroup (2.4.2)
             pid = 0;
         }
     }
@@ -1182,7 +1589,7 @@ fn agent_stop_step(h, now) {
     var killed = load64(h + 104);
     if (killed == 0) {
         if (now >= load64(h + 96)) {
-            daimon_signal_tree(pid, SIGKILL);
+            _agent_signal_all(h, SIGKILL);
             store64(h + 104, now);
         }
         return 0;
@@ -1210,7 +1617,7 @@ fn agent_pause(h) {
     #ifdef CYRIUS_TARGET_AGNOS
     return Err(AGENT_OP_UNSUPPORTED);   # SIGSTOP stops nothing there yet (filed with agnos 2026-09-23)
     #endif
-    if (daimon_signal_tree(agent_pid(h), 19) != 0) { return Err(AGENT_OP_SIGNAL); }   # SIGSTOP
+    if (_agent_signal_all(h, 19) != 0) { return Err(AGENT_OP_SIGNAL); }   # SIGSTOP
     agent_set_status(h, AGENT_PAUSED);
     return Ok(0);
 }
@@ -1221,7 +1628,7 @@ fn agent_resume(h) {
     #ifdef CYRIUS_TARGET_AGNOS
     return Err(AGENT_OP_UNSUPPORTED);
     #endif
-    if (daimon_signal_tree(agent_pid(h), 18) != 0) { return Err(AGENT_OP_SIGNAL); }   # SIGCONT
+    if (_agent_signal_all(h, 18) != 0) { return Err(AGENT_OP_SIGNAL); }   # SIGCONT
     agent_set_status(h, AGENT_RUNNING);
     return Ok(0);
 }
@@ -1239,6 +1646,7 @@ fn agent_reap(h) {
     agent_set_pid(h, 0);
     agent_set_exit_code(h, code);      # -1: there was no such child to reap
     ipc_service_remove(str_from_int(agent_id(h)));   # its channel goes with it
+    _agent_cg_release(h);                             # and its cgroup (2.4.2)
     var was = agent_status(h);
     if (was == AGENT_STOPPING) {
         # A stop's process, collected by the sweep before agent_stop_step saw

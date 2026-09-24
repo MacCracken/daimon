@@ -19,18 +19,19 @@ cyrius build src/main.cyr build/daimon # build
 ## Testing
 
 ```bash
-cyrius tests                        # every suite in tests/ — 1050 assertions, 17 files
+cyrius tests                        # every suite in tests/ — 1087 assertions, 17 files
 cyrius fuzz                         # 7 property-based harnesses, 176,349 generated cases
-cyrius bench tests/daimon.bcyr      # 27 benchmarks (+2 in tests/rag_ingest.bcyr)
+cyrius bench tests/daimon.bcyr      # 28 benchmarks, one only where agents are contained (+2 in tests/rag_ingest.bcyr)
 sh tests/smoke.sh                   # the linked binary over HTTP: libro, tracing, regressions,
                                     # the agent lifecycle, the bind address, task start/complete,
                                     # request-string decoding, agent channels and messages,
                                     # the event loop, hosts and origins, captured output,
-                                    # detached MCP calls
+                                    # detached MCP calls, connection slots, agent containment
 sh tests/test.sh                    # all of the above except the benchmarks
 sh tests/agnos/run.sh --release     # on AGNOS: boots the released agnos kernel under QEMU and runs
                                     # daimon's agent lifecycle, channels and API there (92 checks;
                                     # CI runs it on every push). Without --release: ../agnos's build
+sh tests/aarch64/run.sh             # the agent + portability suites in an aarch64 VM, real kernel
 ```
 
 **On AGNOS** (2.4.0) daimon starts, stops and hears its agents with the kernel's own primitives, and

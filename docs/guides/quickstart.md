@@ -81,7 +81,7 @@ cyrius bench tests/daimon.bcyr
 
 ```
 src/                  Source (30 modules, entry src/main.cyr)
-tests/*.tcyr          Test suites, one per module (1050 assertions, 17 files)
+tests/*.tcyr          Test suites, one per module (1087 assertions, 17 files)
 tests/agnos/          The AGNOS guest test: sh tests/agnos/run.sh --release boots agnos under QEMU
 tests/daimon.bcyr     Benchmarks (27; tests/rag_ingest.bcyr has 2 more)
 tests/smoke.sh        HTTP smoke checks against the built binary

@@ -669,4 +669,78 @@ else
 fi
 if [ $DT_OK -ne 1 ]; then echo "  detached-call smoke FAILED"; SMOKE_EXIT=1; fi
 
+echo "=== 2.4.2 one client cannot take every connection slot ==="
+# A request may trickle in for 30 s, and every local client shares 127.0.0.1.
+# Through 2.4.1, 128 connections each sending a byte every 2 s held every slot,
+# and a health check from a new client waited 28.6 s. Now the oldest request
+# still being read gives way to a waiting connection, once it is 1 s old.
+SL_OK=1
+sl_check() {
+    printf "  %s: " "$1"
+    if [ "$2" = "$3" ]; then echo "PASS"; else echo "FAIL (got '$2', want '$3')"; SL_OK=0; fi
+}
+if command -v python3 >/dev/null 2>&1; then
+    SL_PORT=18095
+    ./build/daimon serve $SL_PORT >/dev/null 2>&1 &
+    SL_SRV=$!
+    i=0
+    while [ $i -lt 25 ]; do
+        if curl -s --max-time 1 "http://127.0.0.1:$SL_PORT/v1/health" >/dev/null 2>&1; then break; fi
+        i=$((i + 1)); sleep 0.1
+    done
+    SL_RES=$(python3 - "$SL_PORT" <<'PY'
+import socket, sys, time, threading, http.client
+port = int(sys.argv[1])
+held = []
+for _ in range(128):
+    s = socket.create_connection(("127.0.0.1", port))
+    s.sendall(b"GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\n")
+    held.append(s)
+stop = False
+def trickle():
+    while not stop:
+        time.sleep(0.5)
+        for s in list(held):
+            try: s.sendall(b"X")
+            except OSError: held.remove(s)
+threading.Thread(target=trickle, daemon=True).start()
+time.sleep(1.5)   # every held request is now older than the 1 s bound
+t0 = time.time()
+try:
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=40)
+    c.request("GET", "/v1/health", headers={"Host": "127.0.0.1"})
+    r = c.getresponse(); r.read(); st = r.status
+except Exception:
+    st = 0
+ms = (time.time() - t0) * 1000
+print("%d %s" % (st, "fast" if ms < 1000 else "slow:%dms" % ms))
+stop = True
+PY
+)
+    sl_check "health answers within 1 s while 128 connections trickle in requests" "$SL_RES" "200 fast"
+    sl_check "... because one of them gave way (http_evicted)" \
+      "$(curl -s --max-time 10 "http://127.0.0.1:$SL_PORT/v1/metrics" | field http_evicted)" "1"
+    kill $SL_SRV 2>/dev/null; wait $SL_SRV 2>/dev/null
+else
+    echo "  SKIP: python3 is not installed"
+fi
+if [ $SL_OK -ne 1 ]; then echo "  slot smoke FAILED"; SMOKE_EXIT=1; fi
+
+echo "=== 2.4.2 agent containment (a cgroup per agent) ==="
+# tests/containment.sh: a stop reaches a process that left the agent's group, an
+# agent's leftovers are ended, and a dead daimon's are ended by the next. It needs
+# a cgroup daimon may divide: this shell's when it and its cgroup.procs are
+# writable, as daimon checks (CI delegates one), else a scope of the user's
+# systemd. Without either it checks the agent is reported uncontained, and skips
+# the rest.
+CT_OWN="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)"
+if [ -w "$CT_OWN" ] && [ -w "$CT_OWN/cgroup.procs" ]; then
+    sh tests/containment.sh; CT_RC=$?
+elif systemd-run --user --scope -q true >/dev/null 2>&1; then
+    systemd-run --user --scope -q sh tests/containment.sh; CT_RC=$?
+else
+    sh tests/containment.sh; CT_RC=$?
+fi
+if [ $CT_RC -ne 0 ]; then echo "  containment smoke FAILED"; SMOKE_EXIT=1; fi
+
 exit $SMOKE_EXIT

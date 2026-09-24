@@ -80,3 +80,32 @@ driven differently (`lib/net.cyr`).
 - The loop is daimon's code, not sandhi's. A sandhi release that changes its accept or refusal
   policy has to be mirrored here. The parts it relies on (`sandhi_server_recv_request`'s completeness
   rule, the smuggling checks, the senders) are sandhi's public API.
+
+## Addendum — 2.4.2: when every slot is taken
+
+The loop keeps up to 128 connections (5 on agnos), and a request may take up to 30 s to arrive,
+however it trickles. So one local client holding 128 slow connections held every slot, and every
+loopback client shares 127.0.0.1, so no per-IP cap could tell it from its neighbours. Measured on
+2.4.1: with 128 connections each sending a byte every 2 s, a health check from a new client waited
+28.6 s, for the held connections' 30 s deadline.
+
+**Decision**: when every slot is taken and a connection is waiting, the oldest request still being
+read gives way to it, once it is `SERVE_EVICT_MIN_MS` (1 s) old.
+- A request that arrives at once, as a local client's does, is answered long before then. Only one
+  still trickling in can be the oldest.
+- The one that gives way is closed without an answer. Writing to a client that is not reading could
+  hold the loop for `SO_SNDTIMEO`. Each one is counted (`http_evicted` in `/v1/metrics`).
+- Answers being deferred (a stop) or relayed (a detached call) never give way.
+- The listener stays armed while a slot could give way.
+
+Measured: with the same 128 connections, the health check is answered in 1 ms, and one held
+connection gave way.
+
+*Rejected*:
+- **A per-IP cap**: every local client is 127.0.0.1.
+- **A shorter request deadline**: the attacker reconnects, and a slow legitimate upload is cut
+  whether or not anyone is waiting.
+- **A minimum data rate per connection**: it bounds how long each slot is held, not whether all of
+  them are.
+
+Eviction acts only under pressure, and only on the request least likely to be anyone's real one.

@@ -429,6 +429,73 @@ attack surface:
 added for it). aarch64 under qemu: the loop served health, an agent start, its channel's frame (the
 aarch64 `epoll_event` layout), take, captured output, a stop, the Host check and a detached MCP call.
 
+## 2.4.2 addendum — the three residuals
+
+**A child that leaves its agent's process group** (the 2.3.4 residual above). Measured on 2.4.1: an
+agent's `setsid sleep` was still running after its stop answered. 2.4.2 runs each agent in a cgroup
+of its own wherever daimon's cgroup (cgroup v2) is its to divide ([ADR-008](../adr/008-agent-containment-cgroup.md)):
+- a systemd service with `Delegate=yes`, or anything the user's systemd runs;
+- a cgroup made for daimon's user, which CI does.
+
+The agent moves itself in before exec. A stop signals everything in the cgroup, and SIGKILL is
+`cgroup.kill`. When the agent's process is collected, what it left gets SIGTERM, the grace period and
+`cgroup.kill`, and the cgroup is removed. The next daimon ends what a daimon that was killed outright
+left.
+- Measured with `tests/containment.sh`, 10 checks: the `setsid sleep` is gone after the stop. A
+  leftover that ignores SIGTERM is gone once the grace is over. What an agent left when daimon was
+  killed with SIGKILL is ended by the next daimon started in the same cgroup.
+- The same checks passed as an ordinary user in a cgroup handed to that user, as CI does it,
+  rehearsed in a privileged `ubuntu:24.04` container.
+- **Found in review, fixed before release**:
+  - The first version checked that an agent had entered its cgroup by reading the cgroup's
+    `cgroup.procs`, which lists live processes only. An agent that exited before daimon looked was
+    judged never to have entered. It was audited as a failure, and what it had started stayed in a
+    cgroup daimon no longer tracked. The check now reads `/proc/<pid>/cgroup`, which names the
+    cgroup until the process is collected. Measured on the kernel first: a zombie is absent from
+    `cgroup.procs` and present in `/proc/<pid>/cgroup`.
+  - A cgroup holding cgroups the agent made inside it could never be removed, and stayed queued.
+    Once nothing runs in it or below it (`cgroup.events`), they are now removed, deepest first.
+  - When an agent's process was collected, a cgroup holding only the empty cgroups it had made was
+    audited as processes left behind (`agent.cgroup.leftover`), and waited out the grace period. It
+    is now removed then.
+  - daimon decided it could contain agents from a `mkdir` alone. Moving a process also needs write
+    access to the `cgroup.procs` of the cgroup it leaves, which is now checked at startup.
+
+  The removal allocates, and the loop's upkeep runs every 100 ms under a bump allocator with no
+  free. So the queue tries it at most three times per cgroup, and a check measures that the upkeep
+  then allocates nothing. Every fault above but the last has a check in `tests/agent.tcyr` that fails
+  on the code before its fix. That was run: the lookup through `cgroup.procs` failed 1 check
+  uncontained and 2 contained. The queue without the removal failed 2, the release without it 2,
+  and the removal without its bound 1.
+- **Residual**: where daimon's cgroup is not its own (a login session's scope is root's, cgroup v1),
+  agents are not contained. That is warned and audited at startup (`agent.cgroup.unavailable`), and
+  the agent's JSON says `"contained":false`. Containment is not a security boundary between an agent
+  and daimon: they run as the same user, so an agent can write its own processes into another cgroup
+  that user may write, and take them out of reach.
+
+**One local client could take all 128 slots** (the 2.3.4 residual above). Measured on 2.4.1: with 128
+connections each sending a byte every 2 s, a health check from a new client waited 28.6 s. In 2.4.2,
+when every slot is taken and a connection is waiting, the oldest request still being read gives way
+once it is 1 s old. It is closed unanswered and counted (`http_evicted`). Measured: the same health
+check is answered in 1 ms, and one held connection gave way ([ADR-006's 2.4.2 addendum](../adr/006-own-event-loop.md)).
+**Residual**: a client that floods new connections can keep every slot younger than a second and fill
+the kernel's backlog, and so still delay others. Slow requests no longer hold slots for 30 s, but a
+connection flood is not prevented (not measured).
+
+**RLIMIT_AS on aarch64** (the verification limit below). `tests/aarch64/run.sh` boots a real aarch64
+Linux kernel (Alpine 3.24.2, 6.18.52) under `qemu-system-aarch64`. It runs the agent and
+syscall-portability suites in it as `nobody`, in a cgroup handed to `nobody`, so the containment
+checks take the contained path. All 212 agent checks pass there, and all 46 portability checks,
+including RLIMIT_AS applied to the child, and an address-space limit that cannot be applied refusing
+the start. The same binary under user-mode `qemu-aarch64`: 206 of 212, with the six failures being
+the three RLIMIT_AS checks and three thread counts. CI runs the VM test (the
+`aarch64-vm` job). This is a VM, not hardware, but the rlimit code it exercises is the kernel's, which
+is what the user-mode emulator replaced.
+
+**Sources**: [Linux cgroup v2](https://docs.kernel.org/admin-guide/cgroup-v2.html) (delegation
+containment, `cgroup.kill`, the no-internal-process rule); [systemd.kill(5)](https://www.freedesktop.org/software/systemd/man/latest/systemd.kill.html)
+(`KillMode=control-group`); [CVE-2007-6750](https://www.cve.org/CVERecord?id=CVE-2007-6750) (Slowloris).
+
 ## Defects fixed in the lifecycle code when it first ran
 
 None of this code had ever executed: it had no caller until 2.3.0. Each fix has a test that fails
@@ -452,6 +519,8 @@ were caught.
 - ~~An agent's own children are not signalled~~ — process groups (2.3.4).
 - ~~Agents outlive a daimon crash~~ — `PR_SET_PDEATHSIG` (2.3.4).
 - ~~stdout and stderr are inherited, not captured~~ — `--agent-output capture` (2.3.4).
+- ~~A child that leaves its agent's group is out of reach~~ — a cgroup per agent (2.4.2).
+- ~~One local client can take all 128 slots~~ — the oldest trickling request gives way (2.4.2).
 
 ## Verification limits
 
@@ -461,7 +530,8 @@ were caught.
   (`TARGET_NR_prlimit64`) passes a new limit through only when the resource is not RLIMIT_AS,
   RLIMIT_DATA or RLIMIT_STACK, and reports success for those three without applying them. So the
   emulator cannot show whether daimon's RLIMIT_AS call works on aarch64. That was not verified on
-  aarch64 hardware.
+  aarch64 hardware. *(2.4.2: verified under a real aarch64 kernel in a VM, `tests/aarch64/run.sh`,
+  all 212 agent checks. See the 2.4.2 addendum.)*
 - **AGNOS**: the build compiles. A start answers 501 until 2.4.x maps `sys_spawn_path`.
 
 ## Sources
