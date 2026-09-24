@@ -277,6 +277,24 @@ fn daimon_clock_source() { return _daimon_clock_src; }
 # still stop the machine; only agnos can fix that.
 var DAIMON_WRITE_PIECE = 1024;
 
+# agnos (2.4.2): how long a blocking socket read waits. A read on an agnos socket
+# (sandhi's client, in a detached call's child) polls sock_recv#49 and pauses
+# between polls, in the stdlib's _agnos_sock_recv_block. It is bounded by the RTC
+# (AGNOS_SOCK_RECV_TIMEOUT_S, 30 s) and by AGNOS_SOCK_RECV_MAX_SPINS (6000) pauses,
+# "a hlt-count backstop for when the RTC is unreadable". But pause#14 halts only
+# when no other process is ready. With daimon's loop and its agents ready, it
+# yields and is back at once: in the guest test 6000 pauses took 1.08 s. So a call
+# whose server took more than about a second to answer read EOF and was answered
+# 502, and a server still sending into the abandoned connection could hold the
+# machine (sock_send#48). Where the RTC reads, its bound decides, as the stdlib
+# intends; the backstop stays where it does not. Filed with cyrius, 2026-09-23.
+fn daimon_agnos_recv_bound() {
+    #ifdef CYRIUS_TARGET_AGNOS
+    if (sys_time_unix() != 0) { AGNOS_SOCK_RECV_MAX_SPINS = 0x3FFFFFFFFFFFFFFF; }
+    #endif
+    return 0;
+}
+
 fn daimon_write_all(fd, buf, n, deadline) {
     var off = 0;
     while (off < n) {

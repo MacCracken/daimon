@@ -235,6 +235,13 @@ that names a file a clean checkout does not vendor fails there.
     and `sock_send`#48 holds the CPU while it waits for room, so one larger write to a local process
     stops the machine. A pipe is a 4080-byte ring that returns short writes. Write with
     `daimon_write_all` (1 KB pieces, a yield between); `http_send_response` already does.
+  - **A blocking socket read waits 30 s, by the RTC, because daimon says so** (2.4.2). It is the
+    stdlib's `_agnos_sock_recv_block`, whose other bound, 6000 pauses, ran out in 1.08 s in the
+    guest: a pause yields whenever anything else is ready. `daimon_agnos_recv_bound`, at the start
+    of `serve`, lifts that bound where the RTC reads, and detached children inherit it (filed with
+    cyrius; agnos audit AG-15).
+  - **The guest's console costs about 65 ms a line.** A guest program prints a bounded excerpt,
+    never a whole answer.
   - **Room is the kernel's**: 16 process slots and 16 channels for the machine, 32 fds per process,
     8 TCP slots for every end of every connection (one inside the machine takes two). `kill`#16 only
     sets a pending bit, so a child daimon forks or spawns cannot be made to exit.

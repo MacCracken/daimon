@@ -24,6 +24,9 @@ fn _c_put(s) {
     return 0;
 }
 
+# A failed check prints the response's first 240 bytes and its length, not the
+# whole of it: every line on this console costs about 65 ms (2.4.2), and a 9 KB
+# answer printed whole outlasted the launcher's wait in CI.
 fn _c_check(cond, name) {
     _c_total = _c_total + 1;
     if (cond == 1) { return 0; }
@@ -31,7 +34,11 @@ fn _c_check(cond, name) {
     _c_put("CLIENT FAIL: ");
     _c_put(name);
     _c_put("\n    response: ");
-    if (_c_resp_n > 0) { _c_put(_c_resp); }
+    fmt_int(_c_resp_n);
+    _c_put(" bytes: ");
+    var show = _c_resp_n;
+    if (show > 240) { show = 240; }
+    if (show > 0) { syscall(SYS_WRITE, 1, _c_resp, show); }
     _c_put("\n");
     return 0;
 }
@@ -389,18 +396,25 @@ var lid = syscall(SYS_SOCK_LISTEN, 8091);
 _c_check(lid >= 0 && _c_req("POST", "/v1/mcp/tools", str_data(str_builder_build(ub))) == 201,
   "an MCP server in the guest is registered");
 var call_body = "{\"name\":\"remote\",\"arguments\":{}}";
-# (1) An answer longer than an agnos pipe holds (4080 bytes) comes back whole.
+# (1) An answer longer than an agnos pipe holds (4080 bytes) comes back whole,
+# from a server that takes 5 s to give it. Until 2.4.2 daimon's child gave up
+# waiting after 6000 pauses of the stdlib's read (_agnos_sock_recv_block), about
+# a second here while other processes were ready, and answered 502. CI failed on
+# that, intermittently; this wait makes it certain (agnos audit AG-15).
 var ca = _c_open("POST", "/v1/mcp/call", call_body);
 var up = _c_accept(lid, 20000);
 var rid = 0 - 1;
 if (up >= 0) { rid = _c_upstream_request(up, 20000); }
 _c_check(rid >= 0, "the forwarded call reaches the MCP server");
-if (rid >= 0) { _c_upstream_answer(up, rid, 9000); }
+if (rid >= 0) {
+    _c_wait_ms(5000);
+    _c_upstream_answer(up, rid, 9000);
+}
 if (up >= 0) { syscall(SYS_SOCK_CLOSE, up); }
 var s1 = 0 - 1;
 if (ca >= 0) { s1 = _c_finish(ca); }
 _c_check(s1 == 200 && _c_resp_n > 9000 && _c_has("xxxxEND") == 1,
-  "a 9 KB answer comes back whole through the child's pipe");
+  "a 9 KB answer, 5 s in coming, comes back whole through the child's pipe");
 # (2) While the MCP server holds its answer, daimon answers others.
 var ca2 = _c_open("POST", "/v1/mcp/call", call_body);
 var up2 = _c_accept(lid, 20000);

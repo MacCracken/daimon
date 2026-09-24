@@ -220,6 +220,8 @@ POST /v1/mcp/call
 # A call to an external tool (like resources/read, prompts/get, web_fetch and
 # web_search) runs in a child process, so daimon keeps serving meanwhile. One
 # that has not finished within 60 s is answered 504 (2.3.4; on AGNOS since 2.4.1).
+# On AGNOS a server that sends nothing for 30 s is taken to have closed (502).
+# Through 2.4.1 that was about a second whenever the guest was busy (2.4.2).
 
 # Deregister
 DELETE /v1/mcp/tools/scan

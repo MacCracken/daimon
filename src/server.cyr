@@ -1178,6 +1178,7 @@ fn server_detach(work, arg) {
 fn serve(port) {
     #ifdef CYRIUS_TARGET_AGNOS
     server_banner(port, "event loop");
+    daimon_agnos_recv_bound();   # a detached call's read waits for the RTC's 30 s (2.4.2)
     # agnos's sock_listen#56 has no address: the listener takes the NIC's, and
     # the API is reachable from the network even with the default 127.0.0.1
     # (filed with agnos, 2026-09-23). The Host check still applies.

@@ -50,19 +50,24 @@ fn _l_run(line) {
 }
 
 _l_put("LAUNCHER start\n");
-var g = _l_run("/bin/guest");
-if (g >= 0) {
-    _l_put("LAUNCHER guest exited ");
-    fmt_int(_l_wait_exit(g, 120000));
+# The line is printed once the wait is over. Printed before the wait, the exit
+# code landed amid the child's own output: in CI (2.4.2) the launcher's "-2"
+# read as the client's response.
+fn _l_report(name, code) {
+    _l_put("LAUNCHER ");
+    _l_put(name);
+    _l_put(" exited ");
+    fmt_int(code);
+    if (code == 0 - 2) { _l_put(" (still running after 120 s)"); }
     _l_put("\n");
+    return 0;
 }
+
+var g = _l_run("/bin/guest");
+if (g >= 0) { _l_report("guest", _l_wait_exit(g, 120000)); }
 var d = _l_run("/bin/daimon serve 8090 --agents-dir /agents");
 _l_wait_ms(1500);
 var c = _l_run("/bin/client");
-if (c >= 0) {
-    _l_put("LAUNCHER client exited ");
-    fmt_int(_l_wait_exit(c, 120000));
-    _l_put("\n");
-}
+if (c >= 0) { _l_report("client", _l_wait_exit(c, 120000)); }
 _l_put("LAUNCHER DONE\n");
 while (1 == 1) { sys_pause(); }

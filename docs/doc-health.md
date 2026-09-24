@@ -126,6 +126,10 @@ Daimon is the AGNOS agent orchestrator — every consumer (hoosh, agnoshi, aethe
   agent-process rule (`_agent_spawn`, `_agent_signal_all`, exact-match markers); upkeep on the tick
   must not allocate; the ai-hwaccel row (2.3.29).
 - ✅ `CHANGELOG.md` / `VERSION` / `src/config.cyr` — 2.4.2 (`scripts/version-bump.sh`).
+- ✅ After CI's AGNOS guest test failed on 2.4.2: `docs/audit/2026-09-23-agnos-platform-audit.md` AG-15
+  (and AG-13's 30 s corrected), the CHANGELOG's Fixed entry, CLAUDE.md's agnos conventions (the
+  read bound, the console's cost), the roadmap's cyrius filings, ADR-007's 2.4.2 addendum, the API
+  guide's note on forwarded calls; a second cyrius filing recorded under the upstream trackers.
 
 **Doc work shipped in 2.4.1 (2026-09-23):**
 - ✅ `docs/adr/007-daimon-on-agnos.md` — a 2.4.1 addendum: capacity (`max_agents` stays), the clock
@@ -334,6 +338,7 @@ Each change was checked against `cyrius.cyml`, the source or the tool's own help
 | agnos `2026-09-23-tsc-calibration-refused-stops-the-us-clock.md` (2.4.1) | Medium | 2026-09-23 | 🟠 Open upstream | One calibration at boot, refused or wrong under a CPU quota. daimon falls back to the tick (AG-12). |
 | agnos `2026-09-23-spawn-path-failure-gives-no-reason.md` (2.4.1) | Low | 2026-09-23 | 🟠 Open upstream | A full process table and a bad executable both answer -1 (AG-11). |
 | cyrius `2026-09-23-daimon-agnos-clock-stands-still-when-tsc-calibration-refused.md` (2.4.1) | Medium | 2026-09-23 | 🟠 Open upstream | `clock_now_ns` on agnos does not check `#95`'s -1. daimon uses `daimon_now_ms`. |
+| cyrius `2026-09-23-daimon-agnos-socket-read-gives-up-after-a-second.md` (2.4.2) | Medium-high | 2026-09-23 | 🟠 Open upstream | `_agnos_sock_recv_block`'s 6000-pause bound ran out in ~1 s: a forwarded call to a server slower than that was answered 502, and CI's guest test failed on it. daimon lifts the bound (`daimon_agnos_recv_bound`). |
 | [sandhi § daimon-server-max-conns](https://github.com/MacCracken/sandhi/blob/main/docs/development/issues/archive/2026-05-10-daimon-server-max-conns.md) | **Low** | 2026-05-10 | ✅ **RESOLVED both sides — corrected 2.1.7** | ⛔ This row read "Open upstream / no daimon-side action", which was wrong on both halves. Sandhi shipped the epoll-cooperative `max_conns` enforcement in **`sandhi_server_run_async` at 1.4.9** (hardened 1.4.10) and ARCHIVED its filing; daimon collapsed `serve_async` onto that call at **1.2.6** (`src/server.cyr:224-244`). Nothing is open on either side. The `"reserved for 0.8.0+"` text still in `lib/sandhi.cyr` is a stale doc comment on the **sync** options struct (`sandhi_server_run_opts`), not the async path daimon uses. |
 
 ---
@@ -348,7 +353,7 @@ Each change was checked against `cyrius.cyml`, the source or the tool's own help
 | `004-agent-process-control.md` | 2026-09-22 | ✅ Accepted | 2.3.0. Process control on an unauthenticated API: executable by type, loopback bind, browser control refused, bounded stop. |
 | `005-agent-channels.md` | 2026-09-22 | ✅ Accepted, §2 superseded | 2.3.3. A socketpair per agent on fd 3; §2 (the service thread) superseded by ADR-006 at 2.3.4. |
 | `006-own-event-loop.md` | 2026-09-23 | ✅ Accepted | 2.3.4. daimon's own epoll loop over sandhi's HTTP; the serving model since 2.3.4. 2.4.2 addendum: when every slot is taken. |
-| `007-daimon-on-agnos.md` | 2026-09-23 | ✅ Accepted | 2.4.0. The agnos kernel's primitives behind daimon's seams; the polled loop; gaps filed with agnos. 2.4.1 addendum: capacity, the clock, CI, 1 KB writes, detached calls, and the corrected fork claim. |
+| `007-daimon-on-agnos.md` | 2026-09-23 | ✅ Accepted | 2.4.0. The agnos kernel's primitives behind daimon's seams; the polled loop; gaps filed with agnos. 2.4.1 addendum: capacity, the clock, CI, 1 KB writes, detached calls, and the corrected fork claim. 2.4.2 addendum: a detached call's read waits for the RTC (`daimon_agnos_recv_bound`). |
 | `008-agent-containment-cgroup.md` | 2026-09-23 | ✅ Accepted | 2.4.2. A cgroup per agent where daimon's cgroup is its own; uncontained, warned and audited elsewhere. |
 
 **ADR posture**: low decision-velocity. Only architecturally significant calls earn an ADR — minor decisions ride CHANGELOG + design comments. 1.1.4 sandhi adoption was a candidate but rode the CHANGELOG entry; the migration audit at `docs/audit/2026-04-27-sandhi-migration.md` carries the deep rationale. Re-evaluate at v2.0.0 cut.
@@ -364,7 +369,7 @@ Date-stamped, frozen by design. Each P(-1) hardening pass per CLAUDE.md cadence 
 | `2026-04-13-security-audit.md` | 2026-04-13 | 📦 Frozen | 0.7.0 P(-1) security audit. 10 findings, 9 fixed at 0.7.0, VULN-007 gated. |
 | `2026-04-27-sandhi-migration.md` | 2026-04-27 | 📦 Frozen | 1.1.4 sandhi adoption — VULN-001 strengthened, VULN-008 trade-off documented (sandhi's 30s SO_RCVTIMEO replaces no-timeout), 1.1.5 sandhi follow-ups (now 1.2.1 / 1.2.2). |
 | `2026-09-22-agent-lifecycle-audit.md` | 2026-09-23 | ✅ Open (addenda per 2.3.x release) | VULN-011 – VULN-018. 2.4.2 addendum: the three residuals closed, four containment faults found in review and fixed, what is left. 2.3.4 addendum: VULN-012 remainder, VULN-014 and VULN-018 fixed; VULN-015 an operator option; VULN-016 waits for 2.5.x identity. |
-| `2026-09-23-agnos-platform-audit.md` | 2026-09-23 | ✅ Open | AG-1 – AG-14: the agnos kernel's gaps as they reach daimon, each filed with agnos, with daimon's interim. 2.4.1 fixed AG-12 and AG-13 in daimon, and mitigates AG-14. |
+| `2026-09-23-agnos-platform-audit.md` | 2026-09-23 | ✅ Open | AG-1 – AG-15: the agnos kernel's (and, AG-12 and AG-15, cyrius's agnos code's) gaps as they reach daimon, each filed upstream, with daimon's interim. 2.4.2 fixed AG-15 in daimon. 2.4.1 fixed AG-12 and AG-13 in daimon, and mitigates AG-14. |
 
 Next audit slot: the CLAUDE.md cadence sets the trigger (security-touching work, or a CVE pattern in daimon's surfaces: its event loop and sandhi's HTTP framing, bayan's JSON parser, the agent channels, /proc scrape paths, the bump allocator).
 

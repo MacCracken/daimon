@@ -152,7 +152,8 @@ run in a child process (`server_detach`, 2.3.4), and the loop keeps serving. Thr
 in place on agnos, because `server_detach` had no agnos arm. 2.4.0 put that down to agnos having no
 fork. It has one: `fork`#96, since 1.56.54. So a slow upstream held every other client, every agent
 channel and every stop. The peer bounds each receive at 30 s by the RTC, so that could be up to 30 s
-for each receive that got nothing. External MCP registration is unauthenticated (2.5.x), so any local
+for each receive that got nothing. (That is the documented bound. In practice a receive gave up after
+about a second until 2.4.2: AG-15.) External MCP registration is unauthenticated (2.5.x), so any local
 client could point daimon at such an upstream.
 **Fixed** (2.4.1): `server_detach` forks on agnos too. Measured in the guest: with a forwarded call
 waiting on its server, `GET /v1/health` is answered in 2 ms, and a 9 KB answer comes back whole
@@ -179,6 +180,35 @@ yield between them (`daimon_write_all`). A client that reads keeps up: the same 
 whole. A local client that stops reading can still stop the machine from inside daimon's `#48`, and
 only agnos can fix that.
 
+### AG-15: A detached call's read gave up after about a second (MEDIUM, availability) — fixed in daimon; cyrius filing (2.4.2)
+
+A blocking socket read on agnos is the stdlib's `_agnos_sock_recv_block` (cyrius
+`lib/syscalls_x86_64_agnos.cyr`). It polls `sock_recv`#49 with a `pause`#14 between polls. It is
+bounded by the RTC (30 s), and by 6000 pauses, which its comment calls "a hlt-count backstop for when
+the RTC is unreadable". But that bound is applied whether the RTC reads or not. And on agnos a pause
+halts only when nothing else is ready; otherwise it yields and comes back. Measured in the guest
+test: 6000 pauses took 1.08 s. So a detached call's child, reading through sandhi's HTTP client, took
+a server that had not answered within about a second for one that had closed, and daimon answered
+502.
+- CI's guest test failed on it (the 9 KB answer). The step took 13.7 min against 1.3 min for 2.4.1,
+  because after the failure the guest stood still until the launcher's wait was long past.
+- So did one of three local runs. There the guest stood still before the check could report, and
+  the harness gave up at 240 s.
+- Measured: with the test's MCP server answering after 3 s, the call was answered 502. A second run,
+  with a 5 s server and no fix, failed the same way.
+
+**Filed**: cyrius `2026-09-23-daimon-agnos-socket-read-gives-up-after-a-second.md`.
+**daimon**: `daimon_agnos_recv_bound` (`src/syscalls.cyr`), at the start of `serve` on agnos, lifts the
+spin bound when the RTC reads, so the RTC's 30 s decides. Detached children inherit it. The guest
+test's MCP server now answers after 5 s. Without the fix that failed (502) in both runs made. With it
+the test passed 9 runs of 9 unrestricted (one of them CI's own job steps in a fresh container), and
+with QEMU held to half a CPU. Held to 30%, where the kernel
+refused its TSC calibration and its tick ran at about a third of its rate, one of two runs passed.
+The other stood still after the forwarded calls, idle (under 2% of its quota), until the harness gave
+up at 1500 s. 2.4.1 passed its one run there.
+**Not captured**: where the guest stood still. AG-14 fits it: the reader stopped mid-answer while
+the test's server went on sending into its connection. That is not measured.
+
 ---
 
 ## What 2.4.0 fixed in daimon itself
@@ -201,8 +231,16 @@ only agnos can fix that.
   carried 36 entries that a clean resolution does not vendor: leftovers from a local `lib/`,
   identical to the 6.6.6 stdlib's own files and included by nothing. They are gone.
 
+## What 2.4.2 fixed in daimon itself
+
+- **A detached call's read gave up after about a second** (AG-15).
+
 ## Verification
 
+- 2.4.2: the guest test's MCP server answers after 5 s (AG-15). A check that fails prints 240 bytes
+  of the response and its length: printing the whole 9 KB answer, at about 65 ms a console line,
+  outlasted the launcher's wait in CI. The launcher prints each exit code once its wait is over.
+  Before, CI's "-2" (the client still running after 120 s) read as the client's response.
 - 2.4.1: the guest test runs in CI on the released agnos 1.57.5 and gnoboot 0.7.2, pinned by SHA-256
   (`tests/agnos/run.sh --release`), with 85 checks. Measured locally, it passes unrestricted, with
   QEMU held to 50% of a CPU, and at 25%, where the kernel refused its TSC calibration.

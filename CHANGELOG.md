@@ -15,7 +15,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - **RLIMIT_AS on aarch64 is verified under a real kernel**, in a VM that CI now runs. User-mode QEMU
   never applied it.
 
-ai-hwaccel 2.3.29.
+On AGNOS, a forwarded MCP call no longer fails when its server takes more than about a second to
+answer. CI's guest test failed on that, intermittently. ai-hwaccel 2.3.29.
 
 **1087 tests** (was 1050) across 17 suites, **143 HTTP smoke checks** (was 131), 30 benchmarks (one
 only where agents are contained) and 7 fuzz harnesses, all green on Linux. The AGNOS guest test
@@ -82,6 +83,27 @@ lint / vet clean; x86_64, aarch64 and agnos build.
   and every loopback client shares 127.0.0.1, so no per-IP cap could tell them apart. Measured on
   2.4.1: 128 connections each sending a byte every 2 s kept a new client's health check waiting
   28.6 s. Now 1 ms, and one held connection gave way.
+- **On AGNOS, a forwarded MCP call whose server took more than about a second was answered 502.** It
+  failed the AGNOS guest test in CI, intermittently, and one of three local runs.
+  - A detached call's child reads its server through sandhi. On agnos that read is the stdlib's
+    `_agnos_sock_recv_block`. It is bounded by the RTC (30 s), and by 6000 pauses, "a backstop for
+    when the RTC is unreadable", which is applied whether the RTC reads or not.
+  - An agnos pause halts only when nothing else is ready. So in the guest, 6000 pauses took 1.08 s,
+    and a server that had not answered within that was taken for one that had closed.
+  - After such a failure the guest could stand still: CI's step took 13.7 min against 1.3 min for
+    2.4.1. Where it stood still was not captured.
+
+  daimon now leaves the bound to the RTC where the RTC reads (`daimon_agnos_recv_bound`, at the start
+  of `serve` on agnos). The guest test's MCP server answers after 5 s. Without the fix the call failed
+  (502) both times it was run: with a 3 s server, and with this one. With the fix the test passed 9
+  runs of 9, one of them CI's own job steps in a fresh container, and with QEMU held to half a CPU.
+  Filed with cyrius (`2026-09-23-daimon-agnos-socket-read-gives-up-after-a-second.md`); agnos audit
+  AG-15.
+
+  Held to 30% of a CPU, where the kernel refuses its TSC calibration and its tick runs slow, one of two
+  runs passed. The other stood still after the forwarded calls, idle, until the harness gave up.
+  2.4.1 passed its one run there. Where it stood still was not captured; a send holding the CPU into
+  a full receive ring (AG-14, filed with agnos) fits it.
 - **RLIMIT_AS on aarch64 was unverified.** `qemu-aarch64` passes prlimit64's RLIMIT_AS through as a
   no-op. In the VM, all 212 agent checks pass, including RLIMIT_AS applied and an address-space limit
   that cannot be applied refusing the start. The same binary under `qemu-aarch64` passes 206, failing
@@ -135,6 +157,11 @@ lint / vet clean; x86_64, aarch64 and agnos build.
   process's whole command line.
 - `tests/aarch64/run.sh`: the agent (212) and syscall-portability (46) suites in the aarch64 VM.
 - `tests/daimon.bcyr`: `agent_spawn_reap_contained`, where daimon can make cgroups.
+- `tests/agnos/`: the MCP server in the guest answers after 5 s (above).
+  - A check that fails prints the first 240 bytes of the response and its length. In CI the whole
+    9 KB answer was printed, at about 65 ms a console line, and that outlasted the launcher's wait.
+  - The launcher prints each exit code once its wait is over. Printed before, CI's "-2" (the client
+    still running after 120 s) landed after "response:" and read as the client's.
 
 ## [2.4.1] - 2026-09-23
 

@@ -32,7 +32,7 @@
   the committed `cyrius.lock` (2.4.1).
 - The API binds 127.0.0.1 unless told otherwise (`--listen`). While it does, a request must name a
   loopback host, and no route accepts a write from another site's page.
-- Zero open issue filings of daimon's own. Twelve agnos filings and one cyrius filing are open
+- Zero open issue filings of daimon's own. Twelve agnos filings and two cyrius filings are open
   upstream (2.4.x).
 
 ## The arc to 3.0.0
@@ -96,6 +96,11 @@ When each closes, daimon's interim changes:
 in the cyrius repo: `clock_now_ms` on agnos stands still when the kernel refused its TSC calibration.
 daimon's own timing reads `daimon_now_ms`, which falls back; the vendored libraries' reads of
 `clock_now_ms` wait on this. When it closes, `daimon_now_ms` can become `clock_now_ms` again.
+
+**Waiting on cyrius** (2.4.2) — `2026-09-23-daimon-agnos-socket-read-gives-up-after-a-second.md`:
+a blocking socket read on agnos gave up after 6000 pauses, about a second in the guest, though its RTC
+bound is 30 s. daimon lifts that bound at startup (`daimon_agnos_recv_bound`, agnos audit AG-15).
+When it closes, and daimon's cyrius pin includes the fix, that call goes.
 
 **daimon's own, on agnos:** nothing open.
 

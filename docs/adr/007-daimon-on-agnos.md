@@ -145,3 +145,23 @@ byte-identical to the builds 2.4.0 was measured on. It runs under QEMU TCG, and 
 deadline poll. Measured locally with 2.4.1's final code, all 92 checks pass: unrestricted in 77 s,
 with QEMU held to 50% of a CPU in 136 s (the kernel accepted a calibration 2.6× too large there), and
 at 25% in 295 s, where the kernel refused its calibration and daimon ran on the tick.
+
+## Addendum — 2.4.2
+
+**A detached call's read waits for the RTC, not for 6000 pauses.** A child's blocking read on a
+socket is the stdlib's `_agnos_sock_recv_block` (cyrius, `lib/syscalls_x86_64_agnos.cyr`). It pauses
+between polls, and gives up at the RTC's 30 s or after 6000 pauses, which its comment calls "a
+hlt-count backstop for when the RTC is unreadable". But a pause halts only when nothing else is
+ready. With daimon's loop and its agents ready, 6000 pauses took 1.08 s in the guest. So a server
+slower than that was taken for one that had closed, and the call was answered 502. CI's guest test
+failed on it, intermittently.
+
+daimon now sets the stdlib's `AGNOS_SOCK_RECV_MAX_SPINS` beyond reach at `serve`'s start, when
+`sys_time_unix()` reads (`daimon_agnos_recv_bound`). The RTC's bound then decides, as the stdlib
+intends, and detached children inherit the setting. It is the stdlib's own knob, not a copy of its
+read, so the fix upstream (filed with cyrius, agnos audit AG-15) replaces it with nothing else to
+change. Rejected:
+- a read loop of daimon's own for the children: sandhi's client would have to take it as a
+  transport, and it would fork the emulation;
+- a larger fixed count: a pause lasts anything from under a millisecond to a tick, so no count of
+  them is a time.
