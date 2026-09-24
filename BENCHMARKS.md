@@ -40,6 +40,30 @@ those numbers are not comparable.
 
 `tests/rag_ingest.bcyr` (real since 2.1.6): `rag_ingest_real_5k` 133.1µs, `rag_chunk_only_5k` 508ns.
 
+### 2.4.3 — the QEMU round
+
+**Linux is unchanged.** 2.4.2 against 2.4.3, `tests/daimon.bcyr`, ten interleaved runs with the
+order alternating, medians, at a load average of 1.4–2.0. What this round changed in `src/` runs on
+agnos only, and ai-hwaccel 2.4.0 moves the binary's layout by 4 KB:
+
+| Benchmark | 2.4.2 | 2.4.3 | change | spread 2.4.2 | spread 2.4.3 |
+|---|---:|---:|---:|---:|---:|
+| agent_spawn_reap | 1.452 ms | 1.452 ms | −0.0% | 2% | 1% |
+| agent_reap_live | 495.0 ns | 498.5 ns | +0.7% | 7% | 6% |
+| ipc_frame_roundtrip | 11.71 µs | 11.77 µs | +0.5% | 5% | 5% |
+| bus_broadcast_take_100 | 14.10 µs | 13.93 µs | −1.2% | 6% | 8% |
+| http_body_read3 | 1.255 µs | 1.249 µs | −0.4% | 5% | 6% |
+| config_default | 88.0 ns | 84.0 ns | −4.5% | 7% | 7% |
+| trace_id_hex | 47.0 ns | 45.0 ns | −4.3% | 6% | 7% |
+
+The rest are within ±1.5% (`mcp_find_tool_in_100`, +1.0%, has spreads of 98–121%).
+`config_default` moved +8.9% in 2.4.2 and −4.5% here without its code changing. Its cause was not
+measured.
+
+**No performance claim for AGNOS.** daimon now writes answers there 512 bytes at a time with at
+least 1 ms between pieces, so an answer goes at 512 KB/s at most: that is the design, not a
+measurement. It trades speed for not stopping the machine (ADR-007's addendum).
+
 ### 2.4.2 — 2.3.x's last items
 
 **A contained start costs 0.25 ms more.** `agent_spawn_reap_contained` (new in 2.4.2) is
@@ -454,7 +478,7 @@ Scheduler scheduling (1.5x), supervisor registration (2.5x), MCP registration (1
 | | Rust | Cyrius |
 |---|---|---|
 | Unit tests | 305 | — (inline in test groups) |
-| Integration tests | 28 | 1087 assertions / 17 suites, each against its real `src/` module (2.4.2); AGNOS guest test 92 checks (tests/agnos/run.sh --release, in CI); aarch64 VM, agent 212 + portability 46 under a real kernel (tests/aarch64/run.sh, in CI) |
+| Integration tests | 28 | 1087 assertions / 17 suites, each against its real `src/` module (2.4.3); AGNOS guest test 92 checks (tests/agnos/run.sh --release, in CI); aarch64 VM, every suite (1087 assertions) and a 20-check smoke of the binary under a real kernel (tests/aarch64/run.sh, in CI) |
 | Benchmarks | 19 | 29, against the real code (2.3.4) |
 | Fuzz harnesses | 0 | 7, property-based, run in CI (2.3.2) |
 | HTTP smoke | — | tests/smoke.sh, 131 checks, run in CI (2.4.0) |

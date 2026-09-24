@@ -63,7 +63,7 @@ modules = ["dist/sakshi.cyr"]
 # (2.3.4). Resolved from the tag, the lock also records its commit.
 [deps.ai-hwaccel]
 git = "https://github.com/MacCracken/ai-hwaccel.git"
-tag = "2.3.29"
+tag = "2.4.0"
 modules = ["dist/ai-hwaccel.cyr"]
 
 # samay — task scheduler. daimon 2.0.0 REPLACES its own duplicated

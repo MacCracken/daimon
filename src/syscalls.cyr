@@ -273,9 +273,17 @@ fn daimon_clock_source() { return _daimon_clock_src; }
 #   GET /v1/agents with a 2389-byte body stopped the guest (filed with agnos,
 #   2026-09-23).
 # So on agnos it writes at most DAIMON_WRITE_PIECE bytes at a time and yields
-# between writes: a receiver that is reading keeps up. One that is not can
-# still stop the machine; only agnos can fix that.
-var DAIMON_WRITE_PIECE = 1024;
+# for DAIMON_WRITE_GAP_MS between writes: a receiver that is reading keeps up.
+# One that is not can still stop the machine; only agnos can fix that.
+# Through 2.4.2 the pieces were 1 KB with one pause between them, and a slow guest
+# outran that: with QEMU held to 30% of a CPU, the QEMU monitor caught daimon in
+# sock_send's wait (hlt-paced, preemption held) with the first 1 KB piece of a
+# relayed answer, the test client not having drained the one before. One pause
+# gives each ready process one turn, and the relay sent its next read at once.
+# 512 bytes a piece leaves the 2048-byte ring room for four; the gap is several
+# rounds of the scheduler, not one; and the relay waits it between reads too.
+var DAIMON_WRITE_PIECE = 512;
+var DAIMON_WRITE_GAP_MS = 1;
 
 # agnos (2.4.2): how long a blocking socket read waits. A read on an agnos socket
 # (sandhi's client, in a detached call's child) polls sock_recv#49 and pauses
@@ -307,7 +315,7 @@ fn daimon_write_all(fd, buf, n, deadline) {
         if (w > 0) {
             off = off + w;
             #ifdef CYRIUS_TARGET_AGNOS
-            if (off < n) { sys_pause(); }   # the receiver's turn
+            if (off < n) { daimon_yield_ms(DAIMON_WRITE_GAP_MS); }   # the receiver's turns
             #endif
         } elif (w == 0) {
             if (daimon_now_ms() > deadline) { return 0 - 1; }

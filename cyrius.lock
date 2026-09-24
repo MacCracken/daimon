@@ -1,5 +1,5 @@
 commit	119698f783991114ab9561f4a9991231b8049da3	sakshi	https://github.com/MacCracken/sakshi.git	2.5.2
-commit	028b1e1b1caa6f86980ce4de717d7301f07b4e0f	ai-hwaccel	https://github.com/MacCracken/ai-hwaccel.git	2.3.29
+commit	ae4f9a15d77d088b3bb6f7027521713784bde28a	ai-hwaccel	https://github.com/MacCracken/ai-hwaccel.git	2.4.0
 commit	fd46aa927f81a5a522458592db8367180fe3f3a0	bayan	https://github.com/MacCracken/bayan.git	1.5.6
 commit	eb6b92240ab0d6ae8a0509baa75d74984dc03630	sigil	https://github.com/MacCracken/sigil.git	3.12.18
 commit	c95f296093f04272b186f2ff05c5d5b6232720fc	libro	https://github.com/MacCracken/libro.git	2.10.3
@@ -7,7 +7,7 @@ commit	baca558bc178e86c8a1fa57d3c6bfaa1bc1ded29	majra	https://github.com/MacCrac
 commit	d0e8d868eb8b69ad98feb0a8d8c7850310c2ca0f	bote	https://github.com/MacCracken/bote.git	3.3.13
 commit	b9d3cf8c9e8a6ff14cf169c2f1ce336113beef5a	patra	https://github.com/MacCracken/patra.git	1.14.3
 commit	d0e8d868eb8b69ad98feb0a8d8c7850310c2ca0f	bote-core	https://github.com/MacCracken/bote.git	3.3.13
-06c57d7c27904f89e524f12e5ee1d5076f97bc48b240b6c49e6cefd45b798cd3  lib/ai-hwaccel.cyr
+8b8d93a378faf91ceaa84e9a30a3ea962e3748b0fc269eba5bf03e0efead9963  lib/ai-hwaccel.cyr
 417031acfb92b8f018315ebf375a410c7aecafecd1175c2e691097bb3373a0ee  lib/alloc.cyr
 69e92cc4b67f1a936f94c92ce8a4c66673758b84dba385e96fbeaa46fa692b4c  lib/alloc_agnos.cyr
 c3b7f80d39f39610f44bebf34ba8f31c82eb85b1a7b7ff5327ef5a81e4945889  lib/alloc_cx.cyr

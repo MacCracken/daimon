@@ -179,6 +179,15 @@ a 9 KB answer sent to daimon's detached child.
 yield between them (`daimon_write_all`). A client that reads keeps up: the same `GET` now arrives
 whole. A local client that stops reading can still stop the machine from inside daimon's `#48`, and
 only agnos can fix that.
+**Caught (2.4.3)**: the hold was not only for a receiver that stops.
+- With QEMU held to 30% of a CPU, a watchdog on QEMU's monitor caught the guest standing still
+  twice. The vCPU was halted in ring 0 with interrupts on and CR3 unchanged across six samples, and
+  the kernel stack read `arch_wait` ← `net_wait_backoff` ← `tcp_send`'s ACK wait ← the `#48` arm.
+- Once the sender was daimon relaying a 1 KB piece, once the test client sending one. Neither
+  receiver had stopped reading; both had fallen behind one pause.
+- daimon now writes 512 bytes at a time with a 1 ms yield between pieces, and between the reads it
+  relays (ADR-007's addendum). The test client pauses 20 ms between 512-byte pieces.
+- The evidence is added to the agnos filing.
 
 ### AG-15: A detached call's read gave up after about a second (MEDIUM, availability) — fixed in daimon; cyrius filing (2.4.2)
 

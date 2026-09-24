@@ -26,7 +26,7 @@ sh tests/test.sh                     # Tests + fuzz + HTTP smoke (tests/smoke.sh
 ./scripts/bench-history.sh           # Append benchmark baseline
 sh tests/agnos/run.sh --release      # AGNOS guest test on the released kernel (what CI runs)
 sh tests/agnos/run.sh                # ... on a built ../agnos kernel and ../gnoboot
-sh tests/aarch64/run.sh              # agent + portability suites in an aarch64 VM (a real kernel)
+sh tests/aarch64/run.sh              # every suite, then the binary's smoke, in an aarch64 VM
 ```
 
 A change to how agents are started or stopped is also run contained: `tests/smoke.sh` runs

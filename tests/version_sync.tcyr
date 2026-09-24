@@ -36,7 +36,12 @@ test_group("version_sync");
 var vbuf = alloc(64);
 var vn = file_read_all("VERSION", vbuf, 63);
 assert(vn > 0, "VERSION file is readable from the repo root");
-if (load8(vbuf + vn - 1) == 10) { vn = vn - 1; }
+# Unreadable (a negative errno): compare an empty string, which fails below.
+# The suite used to go on with the negative count, write before vbuf and die of
+# SIGSEGV (exit 139) in str_new, so no failure count was reported. The aarch64
+# VM, which ran it without a VERSION file in its directory, found that.
+if (vn < 0) { vn = 0; }
+if (vn > 0 && load8(vbuf + vn - 1) == 10) { vn = vn - 1; }
 store8(vbuf + vn, 0);
 
 var file_ver = str_new(vbuf, vn);

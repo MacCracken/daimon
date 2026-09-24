@@ -5,7 +5,11 @@
 # qemu-aarch64, which CI's "Syscall portability under qemu-aarch64" step uses,
 # passes prlimit64's RLIMIT_AS through as a no-op and runs a thread of its own,
 # so six of the agent suite's checks fail there whatever daimon does. Under a
-# real kernel every one must pass.
+# real kernel every one must pass. It runs every suite in tests/ (2.4.2 ran two:
+# the other fifteen had never run on aarch64 in CI).
+# The suites run in /tmp, holding a copy of VERSION (version_sync reads it).
+# Then tests/aarch64/smoke.sh drives the aarch64 daimon binary over TCP there:
+# its loop, an agent's start, channel frame and stop, its cgroup, the Host check.
 #
 #   sh tests/aarch64/run.sh      # exit 0 = every suite passed in the VM
 #
@@ -16,7 +20,8 @@
 # netboot kernel it publishes none, so its pin is the hash recorded at 2.4.2
 # from Alpine's CDN over HTTPS.
 # Needs qemu-system-aarch64, cpio, gzip, curl and sha256sum. VM_SUITES picks the
-# suites (default: agent syscall_portability), VM_TIMEOUT the seconds allowed.
+# suites (default: every tests/*.tcyr), VM_SMOKE=0 skips the smoke, VM_TIMEOUT
+# gives the seconds allowed.
 set -u
 cd "$(dirname "$0")/../.."
 ROOT=$(pwd)
@@ -26,7 +31,7 @@ KERNEL_SHA256=e45e1f6083d1ed45db6647b422e32b6ae6dc54de7b8190b7b97744fb293412e3
 ROOTFS_SHA256=9bf70a7f18ea44094cbb5f70c58f9af129c8214745743db0e68e5502cc2ce773
 REL=$ROOT/build/aarch64-release
 WORK=$ROOT/build/aarch64-vm
-SUITES=${VM_SUITES:-"agent syscall_portability"}
+SUITES=${VM_SUITES:-$(ls tests/*.tcyr | sed 's|^tests/||; s|\.tcyr$||' | tr '\n' ' ')}
 TIMEOUT=${VM_TIMEOUT:-900}
 URL=https://dl-cdn.alpinelinux.org/alpine/$ALPINE_BRANCH/releases/aarch64
 
@@ -49,12 +54,20 @@ ROOTFS=$REL/alpine-minirootfs-$ALPINE-aarch64.tar.gz
 fetch "$URL/netboot-$ALPINE/vmlinuz-virt" "$KERNEL" "$KERNEL_SHA256" || exit 2
 fetch "$URL/alpine-minirootfs-$ALPINE-aarch64.tar.gz" "$ROOTFS" "$ROOTFS_SHA256" || exit 2
 
-rm -rf "$WORK"; mkdir -p "$WORK/root/daimon"
+rm -rf "$WORK"; mkdir -p "$WORK/root/daimon" "$WORK/root/daimon-files"
 tar -xzf "$ROOTFS" -C "$WORK/root" 2>/dev/null || { echo "aarch64-vm: cannot unpack the minirootfs"; exit 2; }
+cp VERSION "$WORK/root/daimon-files/"
 for s in $SUITES; do
     cyrius build --aarch64 "tests/$s.tcyr" "$WORK/root/daimon/$s" > "$WORK/$s.build" 2>&1 \
         || { echo "aarch64-vm: build of tests/$s.tcyr failed:"; tail -5 "$WORK/$s.build"; exit 2; }
 done
+if [ "${VM_SMOKE:-1}" = "1" ]; then
+    mkdir -p "$WORK/root/daimon-bin"
+    cyrius build --aarch64 src/main.cyr "$WORK/root/daimon-bin/daimon" > "$WORK/daimon.build" 2>&1 \
+        || { echo "aarch64-vm: build of daimon failed:"; tail -5 "$WORK/daimon.build"; exit 2; }
+    cp tests/aarch64/smoke.sh "$WORK/root/daimon-bin/smoke.sh"
+    chmod 755 "$WORK/root/daimon-bin" "$WORK/root/daimon-bin"/*
+fi
 # PID 1. The initramfs has no /dev/console for the kernel to open, so init's
 # output goes to the console only once devtmpfs is mounted. The suites run in a
 # cgroup handed to nobody, as CI's smoke step hands one to its user, so the agent
@@ -66,6 +79,8 @@ mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
 exec > /dev/console 2>&1 < /dev/console
 mount -t tmpfs tmp /tmp
+cp /daimon-files/* /tmp/
+ip link set lo up
 mount -t cgroup2 cgroup2 /sys/fs/cgroup
 mkdir /sys/fs/cgroup/suites
 chown -R nobody /sys/fs/cgroup/suites
@@ -81,6 +96,13 @@ for s in /daimon/*; do
     echo "VM SUITE $n exit $r"
     [ $r -eq 0 ] || rc=1
 done
+if [ -x /daimon-bin/daimon ]; then
+    su -s /bin/sh nobody -c "export PATH=/usr/bin:/bin; cd /tmp && exec sh /daimon-bin/smoke.sh /daimon-bin/daimon" > /tmp/smoke.out 2>&1
+    r=$?
+    sed "s/^/VM smoke | /" /tmp/smoke.out
+    echo "VM SUITE smoke exit $r"
+    [ $r -eq 0 ] || rc=1
+fi
 echo "VM DONE $rc"
 poweroff -f
 INIT

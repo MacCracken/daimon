@@ -4,6 +4,89 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.4.3] - 2026-09-23
+
+**QEMU found three things this round.** Every suite, and the daimon binary itself, now run on a real
+aarch64 kernel in CI, and that found a suite that crashed. QEMU's monitor caught the AGNOS guest's
+rare stall in the act: a send holding the CPU while a receiver that had only fallen behind could not
+run to drain. Both daimon and the test's own client did it. And the guest test, when it times out,
+now says where the guest is. ai-hwaccel 2.4.0.
+
+**1087 tests** across 17 suites, **143 HTTP smoke checks**, 30 benchmarks and 7 fuzz harnesses, all
+green on Linux. On a real aarch64 kernel: all 1087 checks, and a 20-check smoke of the binary (new).
+The AGNOS guest test passes its 92 checks, and 9 runs of 9 with QEMU held to 30% of a CPU. fmt / lint
+/ vet clean; x86_64, aarch64 and agnos build; CI's three jobs rehearsed in fresh `ubuntu:24.04`
+containers.
+
+### Added
+
+- **The aarch64 binary is smoke-tested on a real aarch64 kernel** (`tests/aarch64/smoke.sh`, 20 checks,
+  run in `tests/aarch64/run.sh`'s VM after the suites). It serves over TCP, driven with busybox's `nc`:
+  health, an agent's start under its limits and in its own cgroup, its frame on fd 3 taken by an
+  HTTP client, its stop and exit code, a System agent's exit 3, the Host check, metrics and a delete.
+  Until now the aarch64 binary had only been run by hand under user-mode QEMU (2.3.4).
+- **A guest test that does not finish says where the guest is.** `tests/agnos/run.sh` attaches QEMU's
+  monitor. On a timeout, `tests/agnos/monitor.py` takes three samples of the vCPU (RIP, halted or
+  not, ring, CR3) and follows the kernel stack's return addresses, before QEMU is stopped. CI keeps
+  it with the serial log (`monitor.txt`). The 2.4.2 failure in CI said only that the run did not
+  finish.
+
+### Changed
+
+- **The aarch64 VM runs every suite** (`tests/aarch64/run.sh`, CI's `aarch64-vm` job): 1087 checks
+  under a real aarch64 kernel, all passing, then the smoke. 2.4.2 ran two suites there, agent and
+  syscall portability. The other fifteen had never run on aarch64 in CI, whose user-mode QEMU step
+  runs syscall portability only. The VM brings up loopback, and gives the suites a copy of `VERSION`.
+- **On agnos, daimon writes 512 bytes at a time, 1 ms apart, and never two pieces back to back** (was
+  1 KB with one pause; [ADR-007](docs/adr/007-daimon-on-agnos.md)'s addendum). `_srv_relay` waits the
+  same gap between the reads it relays. An answer goes at 512 KB/s at most.
+- **ai-hwaccel 2.4.0** (was 2.3.29): a GPU that both Vulkan and CUDA or ROCm report is listed once.
+  daimon calls nothing in it. The binary grows 4,168 bytes on x86_64 and agnos, and 72 bytes on
+  aarch64. No build warning changed on any target: the warning sets of both pins' builds were
+  compared line by line.
+
+### Fixed
+
+- **On AGNOS, a local client that fell behind could leave the machine standing still, in daimon's
+  send.** agnos's `sock_send`#48 holds the CPU while it waits for each segment's ACK, and a full
+  receive ring means none comes until the receiver runs, which it cannot.
+  - daimon's 1 KB pieces with one pause between gave the receiver one turn to drain. The relay sent
+    the next pipe read's first piece straight after the last one's final piece.
+  - With QEMU held to 30% of a CPU, a watchdog on the monitor caught it: the vCPU halted in ring 0,
+    CR3 unchanged across six samples, the kernel stack `arch_wait` ← `net_wait_backoff` ←
+    `tcp_send`'s ACK wait ← the `#48` arm, sending a 1 KB piece of a relayed answer.
+  - Measured at 30%: with the old pacing the guest stood still in 1 run of 6; with this release's, 0
+    of 9.
+
+  Added to the agnos filing `2026-09-23-sock-send-and-connect-hold-the-cpu.md` (audit AG-14): the hold
+  does not need a receiver that stops, only one that falls behind.
+- **The guest test's own MCP server did the same** (`tests/agnos/http_client.cyr`): the monitor
+  caught it sending the second 1 KB piece of its 9 KB answer to daimon's child. It now sends 512 bytes
+  every 20 ms.
+- **`tests/version_sync.tcyr` crashed when it could not read `VERSION`.** It recorded the failed read,
+  then went on with the negative count, wrote before its buffer and died of SIGSEGV (exit 139), so
+  it reported no failure count. The aarch64 VM found it, having run the suite in a directory without
+  the file. It now fails its two checks and exits 2.
+
+### Performance
+
+- **Linux is unchanged.** 2.4.2 against 2.4.3, `tests/daimon.bcyr`, ten interleaved runs with
+  the order alternating, medians, at a load average under 2. Everything is within ±1.5%, except
+  `config_default` −4.5% (88 → 84 ns) and `trace_id_hex` −4.3% (47 → 45 ns), spreads 6–7%, in code
+  this release did not change. What it changed in `src/` runs on agnos only.
+- **No performance claim for AGNOS.** The pacing bounds an answer there at 512 KB/s (512 bytes per
+  1 ms or more), traded for not stopping the machine. The guest test, builds included, took 82 s and
+  93 s in two quiet runs, and 2.4.2's 82 s the same day; measuring daimon under QEMU would measure
+  QEMU.
+
+### Tests
+
+- `tests/aarch64/run.sh`: every suite by default (`VM_SUITES` still picks), then `smoke.sh`
+  (`VM_SMOKE=0` skips it).
+- `tests/agnos/`: `monitor.py`, run on a timeout; the client's 512-byte, 20 ms pacing.
+- The AGNOS guest test with QEMU held to 30% of a CPU, where the kernel refuses its TSC calibration
+  and its tick runs at about a third of its rate: 9 runs of 9, as above.
+
 ## [2.4.2] - 2026-09-23
 
 **2.3.x's last three items, closed.**

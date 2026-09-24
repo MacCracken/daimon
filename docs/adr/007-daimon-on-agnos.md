@@ -165,3 +165,23 @@ change. Rejected:
   transport, and it would fork the emulation;
 - a larger fixed count: a pause lasts anything from under a millisecond to a tick, so no count of
   them is a time.
+
+## Addendum — 2.4.3: the writer's pacing
+
+**512 bytes a piece, 1 ms apart, and never two pieces back to back.** 2.4.1 wrote answers in 1 KB
+pieces with one `pause` between them. That gives each ready process one turn. It assumed the
+receiver drains its ring in that turn. With QEMU held to 30% of a CPU, a watchdog on QEMU's monitor
+caught the guest standing still twice. Each time one process sat in `tcp_send`'s wait for an ACK,
+halted with preemption held and the same CR3 in every sample. Once it was daimon relaying a detached
+call's answer, a 1 KB piece. Once it was the test client sending that answer to daimon's child. The
+receivers had not stopped. They had only fallen behind, and the relay also sent the next pipe read's
+first piece straight after the last read's final one.
+
+So `daimon_write_all` writes `DAIMON_WRITE_PIECE` (512) bytes, and waits `DAIMON_WRITE_GAP_MS` (1 ms)
+between pieces with `daimon_yield_ms`: many rounds of the scheduler, not one. The 2048-byte ring then
+holds four pieces, not two. `_srv_relay` waits the same gap between the reads it relays, so no two
+pieces go out together. An answer goes at 512 KB/s at most, which is the trade. Measured with QEMU
+held to 30% of a CPU: the guest stood still in 1 run of 6 with the old pacing, 1 of 6 with only the
+client's fixed, and 0 of 9 with both. Rejected: waiting until the receiver has drained, which agnos
+gives a sender no way to see (the filing's ask); a longer gap, which would slow every answer for a
+hazard the measurement no longer shows.

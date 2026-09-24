@@ -45,7 +45,7 @@ External (non-stdlib) deps used by daimon:
 | `majra` (2.9.1) | Event-sink dep of bote's bundle (`events_majra.cyr`). Present for compile-time resolution of the full bote bundle; daimon does not use it at runtime today. **Owns `ERR_IPC = 4`** — historically daimon renamed its own IPC error `ERR_IPC_FAULT` (1.3.0) to dodge this collision; at 1.4.2 every daimon error constant was namespaced `DAIMON_ERR_*` (now `DAIMON_ERR_IPC_FAULT`), so no daimon constant can collide with a vendored `ERR_*` and the rename satisfies cyrlint's `lint_error_enum_namespace` rule (6.4.51). |
 | `samay` (1.1.3) | Task scheduler — the extraction of daimon's own `scheduler.cyr`/`cron.cyr`, which daimon 2.0.0 replaced with this library. `[deps.samay]` carries both a `path = "../samay"` (local dev checkout) and a `tag` (the release pin). samay has no scheduler-level "start": daimon's task start / complete live in `src/sched.cyr` (2.3.1). ⚠ `task_scheduler_complete_task` answers `Err(1)` both for an unknown id and for a refused transition, so look the task up first. |
 | `nein` (1.7.0) | Firewall MCP tools (2.1.8, `dist/nein-mcp.cyr`). It is declared after `bote` and `sigil` in `cyrius.cyml` because its bundle leaves their symbols for the host to supply. The mutating half (`nein_allow` / `nein_deny`) is **gated shut** until caller authentication (roadmap 2.5.x). |
-| `ai-hwaccel` (2.3.29) | samay's hardware-acceleration dependency (samay's own `[deps.ai-hwaccel]`), declared here since 2.0.0 so the full `dist/samay.cyr` bundle resolves at compile time. daimon calls nothing in it directly. Resolved from its tag with no `path` (2.4.0): with a `path`, the tag is inert and every build re-copies the sibling checkout, which leaked one mid-change into the lock at 2.3.4. |
+| `ai-hwaccel` (2.4.0) | samay's hardware-acceleration dependency (samay's own `[deps.ai-hwaccel]`), declared here since 2.0.0 so the full `dist/samay.cyr` bundle resolves at compile time. daimon calls nothing in it directly. Resolved from its tag with no `path` (2.4.0): with a `path`, the tag is inert and every build re-copies the sibling checkout, which leaked one mid-change into the lock at 2.3.4. |
 
 **ADR-002 is invalid** — `lib/async.cyr` provides epoll-based cooperative async:
 ```cyrius
@@ -119,7 +119,7 @@ Every AGNOS agent, every consumer app, hoosh, agnoshi, aethersafha.
 - **Fixed local arrays: use element-typed `var a: i64[N]` for slot arrays** (and `u8[N]` / `i32[N]` / `u32[N]` for sized byte/scalar buffers). Since cyrius 6.2.1, bare `var a[N]` is **N bytes in a function** (N i64 slots only at top level) — an address-taken `var a[N]` written via `store64(&a + i*8)` under-reserves and silently corrupts adjacent memory. This caused the 1.2.6 routing-404 bug; swept in 1.2.7. Before re-testing any "fixed" compiler footgun, **read the cyrius language CHANGELOG** — fixes there are often language changes, not silent codegen patches.
 - Original Rust implementations are in git history at tags `0.5.0` / `0.6.0` (e.g. `git show 0.6.0:src/agent.rs`). The Cyrius port starts at `0.7.0`.
 
-## Commands (verified at 2.4.2)
+## Commands (verified at 2.4.3)
 
 ```sh
 export CYRIUS_NO_WARN_SHADOW_LIB=1 CYRIUS_DCE=1   # what CI sets
@@ -134,7 +134,7 @@ cyrius lint <file>                               # CI fails on any `warn`
 sh tests/agnos/run.sh --release                  # AGNOS guest test on the released kernel, SHA-256 pinned (CI runs this)
 sh tests/agnos/run.sh                            # ... on the sibling builds ../agnos/build/agnos, ../gnoboot/build/BOOTX64.EFI
 rm -rf lib && cyrius deps                        # when cyrius.lock names files a clean checkout does not vendor (CI fails on it)
-sh tests/aarch64/run.sh                          # agent + portability suites in an aarch64 VM, real kernel (RLIMIT_AS; CI runs this)
+sh tests/aarch64/run.sh                          # every suite + the binary's smoke in an aarch64 VM, real kernel (CI runs this)
 systemd-run --user --scope -q sh tests/containment.sh   # containment checks alone (smoke.sh runs them this way)
 ```
 
@@ -149,6 +149,9 @@ kernel (`AGNOS_KERNEL`, `GNOBOOT_EFI`; read, never written) under QEMU with its 
 `build/agnos-guest/`, and reads `GUEST DONE` / `CLIENT DONE` from the serial log. `--release` (2.4.1)
 downloads the agnos and gnoboot releases pinned in the script instead, into `build/agnos-release/`,
 and refuses them unless their SHA-256 matches. Move a pin by changing the version and hash together.
+A run that does not finish prints where the guest is, from QEMU's monitor (2.4.3;
+`tests/agnos/monitor.py` says how to read it). The rare stalls under a slow QEMU were found that way, with a watchdog that
+sampled the monitor once the serial log went quiet.
 Do not run the agnos repo's own harnesses from daimon: they write into `../agnos/build`, and a
 sibling checkout may be another session's work in progress.
 `cyrius deps` (and every build, which runs it first) rewrites `cyrius.lock` from what `lib/` holds,
@@ -231,10 +234,14 @@ that names a file a clean checkout does not vendor fails there.
   - **Never `sleep_ms` / `sys_nanosleep` on agnos**: both are `sleep_ms`#41, which disables
     preemption for the whole sleep, so the agents daimon waits for do not run. Wait with
     `daimon_yield_ms` (`pause`#14 until the deadline).
-  - **Never write more than 1 KB at once on agnos** (2.4.1). A TCP receive ring there is 2048 bytes
-    and `sock_send`#48 holds the CPU while it waits for room, so one larger write to a local process
-    stops the machine. A pipe is a 4080-byte ring that returns short writes. Write with
-    `daimon_write_all` (1 KB pieces, a yield between); `http_send_response` already does.
+  - **Never write more than 512 bytes at once on agnos**, and never two pieces back to back (2.4.1;
+    512 and the timed gap since 2.4.3). A TCP receive ring there is 2048 bytes and
+    `sock_send`#48 holds the CPU while it waits for room, so a write the receiver has no room for
+    stops the machine: the receiver cannot run to drain. A receiver that is only slow is enough: with
+    QEMU held to 30%, the monitor caught daimon and the test client each in that wait, with 1 KB
+    pieces one pause apart. A pipe is a 4080-byte ring that returns short writes. Write with
+    `daimon_write_all` (512-byte pieces, `DAIMON_WRITE_GAP_MS` between); `http_send_response`
+    already does, and `_srv_relay` waits the gap between the reads it relays.
   - **A blocking socket read waits 30 s, by the RTC, because daimon says so** (2.4.2). It is the
     stdlib's `_agnos_sock_recv_block`, whose other bound, 6000 pauses, ran out in 1.08 s in the
     guest: a pause yields whenever anything else is ready. `daimon_agnos_recv_bound`, at the start

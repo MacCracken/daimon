@@ -185,9 +185,11 @@ kernel's primitives. Some things differ until agnos closes the gaps filed with i
   daimon's whole fd table.
 - **The listener** is on the NIC's address: agnos cannot bind 127.0.0.1. daimon warns and audits
   `http.listen.not_loopback`. Local clients reach it at the box's own address, not 127.0.0.1.
-- **Answers are written 1 KB at a time** (2.4.1). A TCP receive ring on agnos is 2 KB, and the
-  kernel holds the CPU while a send waits for room, so one larger write to a local client stopped the
-  machine. A client that reads keeps up. One that stops reading mid-answer can still stop it.
+- **Answers are written 512 bytes at a time, 1 ms apart** (2.4.1; 512 bytes and the 1 ms since
+  2.4.3, where it had been 1 KB and one yield). A TCP receive ring on agnos is 2 KB, and the
+  kernel holds the CPU while a send waits for room, so a write a local client has no room for stops
+  the machine. A client that reads keeps up. One that stops reading mid-answer can still stop it, and
+  so, rarely, can one on a very slow machine. An answer goes at 512 KB/s at most.
 
 **Browsers may not control agents.** start / stop / pause / resume / DELETE answer **403** to any
 request carrying an `Origin` header. A web page can send a cross-origin `text/plain` POST with no

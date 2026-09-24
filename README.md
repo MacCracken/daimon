@@ -31,7 +31,7 @@ sh tests/test.sh                    # all of the above except the benchmarks
 sh tests/agnos/run.sh --release     # on AGNOS: boots the released agnos kernel under QEMU and runs
                                     # daimon's agent lifecycle, channels and API there (92 checks;
                                     # CI runs it on every push). Without --release: ../agnos's build
-sh tests/aarch64/run.sh             # the agent + portability suites in an aarch64 VM, real kernel
+sh tests/aarch64/run.sh             # every suite, then the binary's smoke, in an aarch64 VM
 ```
 
 **On AGNOS** (2.4.0) daimon starts, stops and hears its agents with the kernel's own primitives, and

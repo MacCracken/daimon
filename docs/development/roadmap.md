@@ -4,8 +4,8 @@
 >
 > **Severity legend**: **P0** blocking (security / correctness — must-fix before ship) · **P1** high (must-have for the current arc) · **P2** medium (schedule when capacity opens) · **P3 / Low** nice-to-have, no urgency. Upstream-blocker items quote the upstream tracker's own severity.
 
-**Where daimon stands** — `2.4.2`, cyrius 6.6.6, nine dep pins current (samay 1.1.3, ai-hwaccel
-2.3.29). Builds on **three targets**: x86_64, aarch64 and AGNOS.
+**Where daimon stands** — `2.4.3`, cyrius 6.6.6, nine dep pins current (samay 1.1.3, ai-hwaccel
+2.4.0). Builds on **three targets**: x86_64, aarch64 and AGNOS.
 - **Agents can be started, stopped, paused, resumed and deleted through the API** (2.3.0), under
   their rlimits, with exit status reported.
 - **On AGNOS too** (2.4.0, [ADR-007](../adr/007-daimon-on-agnos.md)): agents are started, stopped,
@@ -27,8 +27,8 @@
   stop reaches everything it started (2.4.2, [ADR-008](../adr/008-agent-containment-cgroup.md)); and
   one client cannot hold every connection slot.
 - **1087 tests** in 17 suites, every one against its real `src/` module, plus 143 HTTP smoke checks,
-  30 benchmarks, 7 fuzz harnesses, the AGNOS guest test's 92 checks, and the agent and
-  portability suites in an aarch64 VM with a real kernel (2.4.2), all run by CI. CI also verifies
+  30 benchmarks, 7 fuzz harnesses, the AGNOS guest test's 92 checks, and every suite in an
+  aarch64 VM with a real kernel, all run by CI. CI also verifies
   the committed `cyrius.lock` (2.4.1).
 - The API binds 127.0.0.1 unless told otherwise (`--listen`). While it does, a request must name a
   loopback host, and no route accepts a write from another site's page.
@@ -43,7 +43,7 @@ prerequisites, sequenced. Each line is a release train, not a single release.
 | arc | theme | why it must come after the one above |
 |---|---|---|
 | **2.3.x** | **Agent lifecycle** — start / stop / signal / reap through the API | The product gap. **2.3.0** shipped the process half (start, stop, pause, resume, delete, reaping); **2.3.1** task start/complete; **2.3.2** request-string decoding; **2.3.3** agent channels; **2.3.4** message routes, daimon's own event loop, and the lifecycle follow-ups. Its last three items shipped in **2.4.2**. Closed. |
-| **2.4.x** | **AGNOS spawn + IPC** — `sys_spawn_path`, `chan_op` capability channels, `sys_proclist` | Nothing to map until a route actually spawns. **2.4.0** shipped the mapping (spawn, signal, reap, channels, the polled loop, proclist); **2.4.1** the guest test in CI, capacity, and a clock that survives a refused TSC calibration; **2.4.2** closed 2.3.x's last items. What remains waits on agnos filings; see below. |
+| **2.4.x** | **AGNOS spawn + IPC** — `sys_spawn_path`, `chan_op` capability channels, `sys_proclist` | Nothing to map until a route actually spawns. **2.4.0** shipped the mapping (spawn, signal, reap, channels, the polled loop, proclist); **2.4.1** the guest test in CI, capacity, and a clock that survives a refused TSC calibration; **2.4.2** closed 2.3.x's last items; **2.4.3** ran every suite on a real aarch64 kernel and caught the AGNOS stall with QEMU's monitor. What remains waits on agnos filings; see below. |
 | **2.5.x** | **Agent identity + MCP authentication** | Prerequisite for un-gating nein's mutating firewall tools, and for any `claims`-based authorisation. Needs 2.3.x, because identity is per-agent. |
 | **3.0.0** | **Per-agent arena isolation** — VULN-007's open half; unlocks multi-tenant hosting, kavach sandboxing, untrusted federation, external MCP callbacks | Major because it changes the allocation model under every agent and flips the gates the P0 below guards. Needs identity (2.5.x) to know what a tenant *is*. |
 
@@ -90,7 +90,7 @@ When each closes, daimon's interim changes:
 | `sock-recv-never-reports-eof-after-peer-fin` | the guest client reads to `Content-Length` | nothing to change in daimon |
 | `spawn-path-failure-gives-no-reason` (2.4.1) | a failed spawn is answered "the process table is full, or it cannot load the executable" (500) | answer a full table as capacity (503), like a full channel table |
 | `tsc-calibration-refused-stops-the-us-clock` (2.4.1) | `daimon_now_ms` falls back to `uptime_ms`#40 | nothing to change; the fallback stays for older kernels |
-| `sock-send-and-connect-hold-the-cpu` (2.4.1, P1 for daimon) | answers are written in 1 KB pieces with a yield between; a local client that stops reading can still stop the machine | one write per answer again (sandhi's path, as on Linux) |
+| `sock-send-and-connect-hold-the-cpu` (2.4.1, P1 for daimon) | answers are written in 512-byte pieces 1 ms apart; a local client that stops reading, or rarely one on a very slow machine, can still stop the machine (caught with QEMU's monitor) | one write per answer again (sandhi's path, as on Linux) |
 
 **Waiting on cyrius** — `docs/development/issues/2026-09-23-daimon-agnos-clock-stands-still-when-tsc-calibration-refused.md`
 in the cyrius repo: `clock_now_ms` on agnos stands still when the kernel refused its TSC calibration.

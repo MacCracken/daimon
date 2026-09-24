@@ -6,7 +6,7 @@ type: state
 
 # Documentation Health — daimon
 
-> **Last refresh**: 2026-09-23 (2.4.2 — 2.3.x's last items: ADR-008, new (a cgroup per agent); ADR-006's addendum on full slots; the lifecycle audit's 2.4.2 addendum; the API guide, overview, README, BENCHMARKS, SECURITY, CONTRIBUTING, CLAUDE.md, quickstart and roadmap updated.)
+> **Last refresh**: 2026-09-23 (2.4.3 — the QEMU round: the aarch64 VM runs every suite and a smoke of the binary; the agnos stall caught with QEMU's monitor and the writer's pacing changed, in ADR-007's addendum, audit AG-14, CLAUDE.md, the API guide, overview, roadmap and SECURITY; ai-hwaccel 2.4.0. Before that, 2.4.2 — 2.3.x's last items: ADR-008, new (a cgroup per agent); ADR-006's addendum on full slots; the lifecycle audit's 2.4.2 addendum; the API guide, overview, README, BENCHMARKS, SECURITY, CONTRIBUTING, CLAUDE.md, quickstart and roadmap updated.)
 > **Refresh cadence**: when docs are touched, update the affected row. Full re-audit at each minor cut.
 > **Scope**: this repo only (`daimon`) — root-level files plus the entire `docs/` tree.
 
@@ -103,6 +103,16 @@ Daimon is the AGNOS agent orchestrator — every consumer (hoosh, agnoshi, aethe
   open. Its two function names were wrong (`ipc_send`, `complete_task`); they are now
   `agent_ipc_send` and samay's `task_scheduler_complete_task`.
 - ✅ `CHANGELOG.md` / `VERSION` / `src/config.cyr` — 2.3.0 (`scripts/version-bump.sh`).
+
+**Doc work shipped in 2.4.3 (2026-09-23):**
+- ✅ `docs/adr/007-daimon-on-agnos.md` — addendum: the writer's pacing (512 bytes, 1 ms apart, never two
+  pieces back to back), with the throttled-QEMU measurement (1 stall in 6 runs before, 0 in 9 after).
+- ✅ `docs/audit/2026-09-23-agnos-platform-audit.md` — AG-14: the hold caught with QEMU's monitor, twice.
+- ✅ `docs/guides/api.md`, `docs/architecture/overview.md`, `docs/development/roadmap.md`,
+  `SECURITY.md`, `CLAUDE.md` — the pacing; the roadmap's status (ai-hwaccel 2.4.0, every suite in the
+  aarch64 VM).
+- ✅ `README.md`, `CONTRIBUTING.md`, `BENCHMARKS.md` — the aarch64 VM runs every suite and the smoke.
+- ✅ `CHANGELOG.md` / `VERSION` / `src/config.cyr` — 2.4.3 (`scripts/version-bump.sh`).
 
 **Doc work shipped in 2.4.2 (2026-09-23):**
 - ✅ `docs/adr/008-agent-containment-cgroup.md` — **new**: a cgroup per agent where daimon's cgroup
@@ -288,14 +298,14 @@ Each change was checked against `cyrius.cyml`, the source or the tool's own help
 
 | File | Last touched | Status | Notes |
 |---|---|---|---|
-| `README.md` | 2026-09-23 | ✅ Fresh | 2.4.2: the aarch64 VM, containment and connection slots in the smoke line. 2.4.1: `run.sh --release` (CI), 92 guest checks, detached calls on AGNOS. 2.4.0: 1038 assertions; the agnos guest test; an "On AGNOS" paragraph. |
-| `CHANGELOG.md` | 2026-09-23 | ✅ Fresh | Source of truth for shipped work. 2.4.2 entry: containment, slot eviction, the aarch64 VM, ai-hwaccel 2.3.29. 2.4.1 entry: detached calls, the clock and 1 KB writes on AGNOS, the 503, the guest test in CI, the lock verified, four filings. |
-| `CLAUDE.md` | 2026-09-23 | ✅ Fresh | Durable rules. 2.4.2: `_agent_spawn` / `_agent_signal_all`, exact-match markers, no allocation on the tick, the aarch64 VM, ai-hwaccel 2.3.29. 2.4.1: `daimon_now_ms`, 1 KB writes, the kernel's room, `run.sh --release`, the lock rebuild, ai-hwaccel 2.3.27. 2.4.0: never sleep_ms, the foreground slot, file gaps with agnos. |
-| `CONTRIBUTING.md` | 2026-09-23 | ✅ Fresh | 2.4.2: `tests/aarch64/run.sh`; changes to starting and stopping agents are run contained. 2.4.1: `run.sh --release`; the clock and write shims. 2.4.0: the agnos guest test and testing agnos arms; the six endpoint rules; the 6.6.6 pin and the real gate. |
-| `SECURITY.md` | 2026-09-23 | ✅ Fresh | Supported versions `2.4.x`. 2.4.2: agent containment and connection slots in scope, with their known limits. 2.4.1: detached calls and large answers in the AGNOS scope. 2.4.0: AGNOS scope and the platform audit. |
+| `README.md` | 2026-09-23 | ✅ Fresh | 2.4.3: the aarch64 VM runs every suite and the binary's smoke. 2.4.2: the aarch64 VM, containment and connection slots in the smoke line. 2.4.1: `run.sh --release` (CI), 92 guest checks, detached calls on AGNOS. 2.4.0: 1038 assertions; the agnos guest test; an "On AGNOS" paragraph. |
+| `CHANGELOG.md` | 2026-09-23 | ✅ Fresh | 2.4.3 entry: QEMU findings (every suite and a smoke on aarch64, the stall caught with the monitor, the version_sync crash), ai-hwaccel 2.4.0. Source of truth for shipped work. 2.4.2 entry: containment, slot eviction, the aarch64 VM, ai-hwaccel 2.3.29. 2.4.1 entry: detached calls, the clock and 1 KB writes on AGNOS, the 503, the guest test in CI, the lock verified, four filings. |
+| `CLAUDE.md` | 2026-09-23 | ✅ Fresh | 2.4.3: 512-byte, 1 ms pacing on agnos; the monitor on a guest timeout; the aarch64 smoke; ai-hwaccel 2.4.0. Durable rules. 2.4.2: `_agent_spawn` / `_agent_signal_all`, exact-match markers, no allocation on the tick, the aarch64 VM, ai-hwaccel 2.3.29. 2.4.1: `daimon_now_ms`, 1 KB writes, the kernel's room, `run.sh --release`, the lock rebuild, ai-hwaccel 2.3.27. 2.4.0: never sleep_ms, the foreground slot, file gaps with agnos. |
+| `CONTRIBUTING.md` | 2026-09-23 | ✅ Fresh | 2.4.3: the aarch64 VM runs every suite and the smoke. 2.4.2: `tests/aarch64/run.sh`; changes to starting and stopping agents are run contained. 2.4.1: `run.sh --release`; the clock and write shims. 2.4.0: the agnos guest test and testing agnos arms; the six endpoint rules; the 6.6.6 pin and the real gate. |
+| `SECURITY.md` | 2026-09-23 | ✅ Fresh | 2.4.3: on agnos a local client that falls behind, not only one that stops, can stop the machine. Supported versions `2.4.x`. 2.4.2: agent containment and connection slots in scope, with their known limits. 2.4.1: detached calls and large answers in the AGNOS scope. 2.4.0: AGNOS scope and the platform audit. |
 | `CODE_OF_CONDUCT.md` | (initial) | 🔵 Evergreen | Standard. |
-| `BENCHMARKS.md` | 2026-09-23 | ✅ Fresh | A section per release with its A/B; 2.4.2: the contained start's cost and the Linux A/B; 2.4.1 and 2.4.0: Linux A/B, no AGNOS performance claim. Frozen v1.0.1 port comparison kept. |
-| `VERSION` | 2026-09-23 | ✅ Fresh | `2.4.2`, written with `src/config.cyr` by `scripts/version-bump.sh`; `tests/version_sync.tcyr` checks they agree. |
+| `BENCHMARKS.md` | 2026-09-23 | ✅ Fresh | 2.4.3: coverage row (every suite and the smoke in the aarch64 VM). A section per release with its A/B; 2.4.2: the contained start's cost and the Linux A/B; 2.4.1 and 2.4.0: Linux A/B, no AGNOS performance claim. Frozen v1.0.1 port comparison kept. |
+| `VERSION` | 2026-09-23 | ✅ Fresh | `2.4.3`, written with `src/config.cyr` by `scripts/version-bump.sh`; `tests/version_sync.tcyr` checks they agree. |
 | `LICENSE` | (initial) | 🔵 Evergreen | GPL-3.0-only. |
 
 ---
@@ -304,7 +314,7 @@ Each change was checked against `cyrius.cyml`, the source or the tool's own help
 
 | File | Last touched | Status | Notes |
 |---|---|---|---|
-| `overview.md` | 2026-09-23 | ✅ Fresh | 2.4.2: containment; `_srv_slot_for_new`. 2.4.1: `server_detach` on agnos, the clock, paced writes. 2.4.0: the agnos arms; the data flow no longer draws 2.3.3's channel thread. |
+| `overview.md` | 2026-09-23 | ✅ Fresh | 2.4.3: 512-byte pieces on agnos. 2.4.2: containment; `_srv_slot_for_new`. 2.4.1: `server_detach` on agnos, the clock, paced writes. 2.4.0: the agnos arms; the data flow no longer draws 2.3.3's channel thread. |
 
 ---
 
@@ -312,7 +322,7 @@ Each change was checked against `cyrius.cyml`, the source or the tool's own help
 
 | File | Last touched | Status | Notes |
 |---|---|---|---|
-| `roadmap.md` | 2026-09-23 | ✅ Fresh | Open work only. 2.4.2: 2.3.x closed; 1087 tests; the aarch64 VM. 2.4.1: daimon's own agnos items closed; twelve agnos filings and one cyrius filing, and what daimon changes when each closes; 2.5.x. |
+| `roadmap.md` | 2026-09-23 | ✅ Fresh | 2.4.3: ai-hwaccel 2.4.0; every suite in the aarch64 VM; the pacing in the agnos table. Open work only. 2.4.2: 2.3.x closed; 1087 tests; the aarch64 VM. 2.4.1: daimon's own agnos items closed; twelve agnos filings and one cyrius filing, and what daimon changes when each closes; 2.5.x. |
 
 **Missing today (file in 1.2.x cleanup):**
 - `development/state.md` — agnosys convention for the live volatile state file (pin / build sizes / test count / consumer table / recent releases / slot ledger). Daimon's roadmap.md partially covers this; consider splitting in 1.2.x if scope grows.
@@ -353,7 +363,7 @@ Each change was checked against `cyrius.cyml`, the source or the tool's own help
 | `004-agent-process-control.md` | 2026-09-22 | ✅ Accepted | 2.3.0. Process control on an unauthenticated API: executable by type, loopback bind, browser control refused, bounded stop. |
 | `005-agent-channels.md` | 2026-09-22 | ✅ Accepted, §2 superseded | 2.3.3. A socketpair per agent on fd 3; §2 (the service thread) superseded by ADR-006 at 2.3.4. |
 | `006-own-event-loop.md` | 2026-09-23 | ✅ Accepted | 2.3.4. daimon's own epoll loop over sandhi's HTTP; the serving model since 2.3.4. 2.4.2 addendum: when every slot is taken. |
-| `007-daimon-on-agnos.md` | 2026-09-23 | ✅ Accepted | 2.4.0. The agnos kernel's primitives behind daimon's seams; the polled loop; gaps filed with agnos. 2.4.1 addendum: capacity, the clock, CI, 1 KB writes, detached calls, and the corrected fork claim. 2.4.2 addendum: a detached call's read waits for the RTC (`daimon_agnos_recv_bound`). |
+| `007-daimon-on-agnos.md` | 2026-09-23 | ✅ Accepted | 2.4.3 addendum: the writer's pacing (512 bytes, 1 ms, never back to back), measured under a throttled QEMU. 2.4.0. The agnos kernel's primitives behind daimon's seams; the polled loop; gaps filed with agnos. 2.4.1 addendum: capacity, the clock, CI, 1 KB writes, detached calls, and the corrected fork claim. 2.4.2 addendum: a detached call's read waits for the RTC (`daimon_agnos_recv_bound`). |
 | `008-agent-containment-cgroup.md` | 2026-09-23 | ✅ Accepted | 2.4.2. A cgroup per agent where daimon's cgroup is its own; uncontained, warned and audited elsewhere. |
 
 **ADR posture**: low decision-velocity. Only architecturally significant calls earn an ADR — minor decisions ride CHANGELOG + design comments. 1.1.4 sandhi adoption was a candidate but rode the CHANGELOG entry; the migration audit at `docs/audit/2026-04-27-sandhi-migration.md` carries the deep rationale. Re-evaluate at v2.0.0 cut.
@@ -369,7 +379,7 @@ Date-stamped, frozen by design. Each P(-1) hardening pass per CLAUDE.md cadence 
 | `2026-04-13-security-audit.md` | 2026-04-13 | 📦 Frozen | 0.7.0 P(-1) security audit. 10 findings, 9 fixed at 0.7.0, VULN-007 gated. |
 | `2026-04-27-sandhi-migration.md` | 2026-04-27 | 📦 Frozen | 1.1.4 sandhi adoption — VULN-001 strengthened, VULN-008 trade-off documented (sandhi's 30s SO_RCVTIMEO replaces no-timeout), 1.1.5 sandhi follow-ups (now 1.2.1 / 1.2.2). |
 | `2026-09-22-agent-lifecycle-audit.md` | 2026-09-23 | ✅ Open (addenda per 2.3.x release) | VULN-011 – VULN-018. 2.4.2 addendum: the three residuals closed, four containment faults found in review and fixed, what is left. 2.3.4 addendum: VULN-012 remainder, VULN-014 and VULN-018 fixed; VULN-015 an operator option; VULN-016 waits for 2.5.x identity. |
-| `2026-09-23-agnos-platform-audit.md` | 2026-09-23 | ✅ Open | AG-1 – AG-15: the agnos kernel's (and, AG-12 and AG-15, cyrius's agnos code's) gaps as they reach daimon, each filed upstream, with daimon's interim. 2.4.2 fixed AG-15 in daimon. 2.4.1 fixed AG-12 and AG-13 in daimon, and mitigates AG-14. |
+| `2026-09-23-agnos-platform-audit.md` | 2026-09-23 | ✅ Open | 2.4.3: AG-14 caught with QEMU's monitor (a receiver that falls behind). AG-1 – AG-15: the agnos kernel's (and, AG-12 and AG-15, cyrius's agnos code's) gaps as they reach daimon, each filed upstream, with daimon's interim. 2.4.2 fixed AG-15 in daimon. 2.4.1 fixed AG-12 and AG-13 in daimon, and mitigates AG-14. |
 
 Next audit slot: the CLAUDE.md cadence sets the trigger (security-touching work, or a CVE pattern in daimon's surfaces: its event loop and sandhi's HTTP framing, bayan's JSON parser, the agent channels, /proc scrape paths, the bump allocator).
 
@@ -379,7 +389,7 @@ Next audit slot: the CLAUDE.md cadence sets the trigger (security-touching work,
 
 | File | Last touched | Status | Notes |
 |---|---|---|---|
-| `api.md` | 2026-09-23 | ✅ Fresh | 2.4.2: slot eviction, `contained`, Containment, `http_evicted`. 2.4.1: room and the 503, 1 KB answers, detached calls on AGNOS. 2.4.0: "On AGNOS" (start, limits, stop, capture, listener); limits_enforced. 2.3.4: who may call, the loop, stops, messages, output. |
+| `api.md` | 2026-09-23 | ✅ Fresh | 2.4.3: answers on agnos 512 bytes at a time, 1 ms apart. 2.4.2: slot eviction, `contained`, Containment, `http_evicted`. 2.4.1: room and the 503, 1 KB answers, detached calls on AGNOS. 2.4.0: "On AGNOS" (start, limits, stop, capture, listener); limits_enforced. 2.3.4: who may call, the loop, stops, messages, output. |
 | `quickstart.md` | 2026-09-23 | ✅ Fresh | 2.4.2: 1087 assertions. 2.4.1: 1050 assertions; `run.sh --release`. 2.4.0: tests/agnos. |
 | `agent-ipc.md` | 2026-09-23 | ✅ Fresh | 2.3.3, new: the fd-3 wire protocol. 2.3.4: reply 4, names, the HTTP message routes. 2.4.0: the AGNOS channel. 2.4.1: the machine's 16 channels, the 503. |
 

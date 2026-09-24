@@ -128,19 +128,23 @@ fn _c_upstream_request(conn, ms) {
     return 0 - 1;
 }
 
-# Send `n` bytes on `conn` in pieces of at most 1 KB, yielding between them.
-# A connection's receive ring on agnos is 2048 bytes, and sock_send#48 holds the
-# CPU while it waits for room: one larger write to a process on this machine
-# never finishes (filed with agnos, 2026-09-23). daimon writes this way too.
+# Send `n` bytes on `conn` in pieces of at most 512 bytes, 20 ms apart. A
+# connection's receive ring on agnos is 2048 bytes, and sock_send#48 holds the
+# CPU while it waits for room (filed with agnos, 2026-09-23): a piece the
+# receiver has no room for stops the machine, because the receiver cannot run to
+# drain its ring. Through 2.4.2 this sent 1 KB pieces with one pause between,
+# and that was not enough when the guest ran slowly. With QEMU held to 30% of a
+# CPU, the QEMU monitor caught this process in sock_send's wait with the second
+# 1 KB piece of its 9 KB answer, daimon's child not having drained the first.
 fn _c_send_paced(conn, buf, n) {
     var off = 0;
     while (off < n) {
         var want = n - off;
-        if (want > 1024) { want = 1024; }
+        if (want > 512) { want = 512; }
         var w = syscall(SYS_SOCK_SEND, conn, buf + off, want);
         if (w <= 0) { return 0 - 1; }
         off = off + w;
-        if (off < n) { sys_pause(); }
+        if (off < n) { _c_wait_ms(20); }
     }
     return 0;
 }

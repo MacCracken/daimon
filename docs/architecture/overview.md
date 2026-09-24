@@ -181,8 +181,8 @@ On AGNOS (2.4.0, [ADR-007](../adr/007-daimon-on-agnos.md)) the same flow uses th
 primitives: `spawn_path` for fork/exec, `proclist` for `/proc`, `kill` (a pending signal the agent
 reads) for pidfd, and a `chan_op` pair, the agent's end endowed at spawn, for the socketpair. The
 loop polls and yields with `pause`. Since 2.4.1 its deadlines read `daimon_now_ms`, which survives a
-refused TSC calibration. Its answers are written 1 KB at a time, because a larger write to a local
-process stops the machine there.
+refused TSC calibration. Its answers are written 512 bytes at a time, 1 ms apart, because a write a
+local process has no room for stops the machine there.
 
 ## Consumers
 

@@ -1069,6 +1069,11 @@ fn _srv_relay(slot, timed_out) {
             }
             store64(slot + 104, load64(slot + 104) + n);
             k = k + 1;
+            #ifdef CYRIUS_TARGET_AGNOS
+            # The next read's first piece would follow this one's last at once
+            # (daimon_write_all yields only between its own pieces).
+            daimon_yield_ms(DAIMON_WRITE_GAP_MS);
+            #endif
         }
     }
     if (timed_out == 1) {

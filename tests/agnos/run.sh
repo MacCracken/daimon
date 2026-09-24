@@ -103,7 +103,8 @@ while [ $try -lt 3 ]; do
         -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
         -drive "file=$IMG,format=raw,if=none,id=disk0" -device "nvme,drive=disk0,serial=DAIMON-GUEST" \
         -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
-        -serial "file:$LOG" -display none -no-reboot > "$WORK/qemu.out" 2>&1 &
+        -serial "file:$LOG" -display none -no-reboot \
+        -monitor "unix:build/agnos-guest/mon.sock,server,nowait" > "$WORK/qemu.out" 2>&1 &
     QP=$!
     # The firmware sometimes never hands off to the kernel (agnsh-smoke's measured
     # flake): retry only then, never after the kernel has run.
@@ -114,11 +115,20 @@ while [ $try -lt 3 ]; do
 done
 [ $QP -ne 0 ] || { echo "agnos-guest: VOID: the kernel never started"; exit 2; }
 i=0; while [ $i -lt "$TIMEOUT" ]; do strings "$LOG" | grep -q "LAUNCHER DONE" && break; i=$((i + 1)); sleep 1; done
+# A guest that did not finish: where it is, from QEMU's monitor, before QEMU goes
+# (tests/agnos/monitor.py says how to read it). The socket's path is relative: a
+# Unix socket's must be under 108 bytes.
+if ! strings "$LOG" | grep -q "LAUNCHER DONE" && command -v python3 >/dev/null 2>&1; then
+    python3 tests/agnos/monitor.py build/agnos-guest/mon.sock > "$WORK/monitor.txt" 2>&1
+fi
 kill $QP 2>/dev/null; wait $QP 2>/dev/null
 
 strings "$LOG" | grep -E "AGNOS kernel v|tsc: |^GUEST|^AGENT|^CLIENT|^LAUNCHER|daimon v|FAIL|passed, |response:" | sed 's/^/  /'
 rc=0
-if ! strings "$LOG" | grep -q "LAUNCHER DONE"; then echo "agnos-guest: FAIL: the run did not finish within ${TIMEOUT}s"; rc=1; fi
+if ! strings "$LOG" | grep -q "LAUNCHER DONE"; then
+    echo "agnos-guest: FAIL: the run did not finish within ${TIMEOUT}s"; rc=1
+    [ -f "$WORK/monitor.txt" ] && sed 's/^/  /' "$WORK/monitor.txt"
+fi
 if ! strings "$LOG" | grep -q "GUEST DONE 0"; then echo "agnos-guest: FAIL: the agent test"; rc=1; fi
 if ! strings "$LOG" | grep -q "CLIENT DONE 0"; then echo "agnos-guest: FAIL: the HTTP test"; rc=1; fi
 # The fixture's own report: the argv daimon built, and the environment it passed.

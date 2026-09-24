@@ -332,18 +332,22 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: agnos-guest-serial-log
-          path: build/agnos-guest/serial.log
+          path: |
+            build/agnos-guest/serial.log
+            build/agnos-guest/monitor.txt
           if-no-files-found: ignore
 
   aarch64-vm:
-    # 2.4.2. daimon's agent and syscall-portability suites, built for aarch64, in
-    # a VM running a real aarch64 Linux kernel (tests/aarch64/run.sh: Alpine
-    # 3.24.2's netboot kernel and minirootfs, pinned by SHA-256), as an ordinary
-    # user. The "Syscall portability under qemu-aarch64" step above cannot check
-    # RLIMIT_AS: user-mode QEMU passes prlimit64's RLIMIT_AS through as a no-op
-    # and runs a thread of its own, so six agent checks fail there (206 of 212,
-    # measured). Under the real kernel all 212 pass, the containment checks on
-    # the contained path (the VM hands the suites a cgroup of their own).
+    # 2.4.2. daimon's suites, built for aarch64, in a VM running a real aarch64
+    # Linux kernel (tests/aarch64/run.sh: Alpine 3.24.2's netboot kernel and
+    # minirootfs, pinned by SHA-256), as an ordinary user. Every suite since
+    # 2.4.3; 2.4.2 ran the agent and syscall-portability suites
+    # only, so fifteen had never run on aarch64 in CI. The "Syscall portability
+    # under qemu-aarch64" step above cannot check RLIMIT_AS: user-mode QEMU passes
+    # prlimit64's RLIMIT_AS through as a no-op and runs a thread of its own, so six
+    # agent checks fail there (206 of 212, measured). Under the real kernel all
+    # 1087 checks pass, the containment checks on the contained path (the VM hands
+    # the suites a cgroup of their own).
     name: aarch64 VM test
     runs-on: ubuntu-latest
     steps:
