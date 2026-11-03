@@ -4,142 +4,113 @@
 >
 > **Severity legend**: **P0** blocking (security / correctness — must-fix before ship) · **P1** high (must-have for the current arc) · **P2** medium (schedule when capacity opens) · **P3 / Low** nice-to-have, no urgency. Upstream-blocker items quote the upstream tracker's own severity.
 
-**Where daimon stands** — `2.4.4`, cyrius 6.6.20, each of the nine dep pins at its latest release
-for that toolchain (bote 3.3.17, samay 1.1.7, ai-hwaccel 2.4.2, nein 1.7.1). Builds on
-**three targets**: x86_64, aarch64 and AGNOS.
-- **Agents can be started, stopped, paused, resumed and deleted through the API** (2.3.0), under
-  their rlimits, with exit status reported.
-- **On AGNOS too** (2.4.0, [ADR-007](../adr/007-daimon-on-agnos.md)): agents are started, stopped,
-  collected, heard on their channel and measured with the kernel's own primitives. daimon runs its
-  own loop there. `tests/agnos/run.sh` checks this under QEMU, in CI on every push since 2.4.1, on
-  agnos 1.57.14 since 2.4.4 (1.57.5 before). agnos 1.57.7 closed every gap daimon filed; adopting
-  the rest (limits, pause/resume, argv, captured output) is in 2.4.x.
-- **Scheduled tasks can be started and completed** (2.3.1), and an executor can list its node's
-  work.
-- **Request bodies are read with the typed JSON parser** (2.3.2): strings are decoded, nesting is
-  respected, and a body that is not one JSON object, repeats a top-level key or carries U+0000 in a
-  top-level string is refused.
-- **Agents can send messages to daimon** (2.3.3) on a channel open as their fd 3, and HTTP clients
-  can read and send them (2.3.4) ([docs/guides/agent-ipc.md](../guides/agent-ipc.md)).
-- **daimon runs its own event loop** (2.3.4, [ADR-006](../adr/006-own-event-loop.md)): one thread,
-  one epoll set. A slow client holds only its own connection, a stop waits for its agent and not
-  for the server, and agents are collected as they exit. Agents lead their own process groups and
-  die with daimon. Where daimon's cgroup is its own, each agent runs in a cgroup of its own, so a
-  stop reaches everything it started (2.4.2, [ADR-008](../adr/008-agent-containment-cgroup.md)); and
-  one client cannot hold every connection slot.
-- **1087 tests** in 17 suites, every one against its real `src/` module, plus 143 HTTP smoke checks,
-  30 benchmarks, 7 fuzz harnesses, the AGNOS guest test's 92 checks, and every suite in an
-  aarch64 VM with a real kernel, all run by CI. CI also verifies
-  the committed `cyrius.lock` (2.4.1).
-- The API binds 127.0.0.1 unless told otherwise (`--listen`). While it does, a request must name a
-  loopback host, and no route accepts a write from another site's page.
-- Zero open issue filings of daimon's own. Twelve agnos filings and two cyrius filings are open
-  upstream (2.4.x).
+**Where daimon stands** — `2.5.2`, cyrius 6.7.18, every dependency at a release for that toolchain
+(nein 1.9.0, bote 3.8.0). It builds for x86_64, aarch64 and AGNOS, and CI runs the suites, the HTTP
+smoke and the fuzz harnesses on Linux, every suite and the binary's smoke on a real aarch64 kernel,
+and the AGNOS guest test on agnos 1.57.14.
+- Agents are registered, started under their limits, stopped, paused, resumed and deleted through
+  the API, each in a cgroup of its own where daimon can make one. They talk to daimon on a channel.
+- Scheduled tasks are placed by samay, started and completed through the API.
+- daimon runs one thread and its own event loop. A call that waits on another server runs in a child.
+- The API binds 127.0.0.1 unless `--listen` says otherwise, refuses other sites' pages, and has no
+  caller authentication. Everything that changes the firewall, reads its live state, or archives
+  the audit chain is refused until it does (2.6.x).
 
-## The arc to 3.0.0
+## The releases ahead
 
-daimon is an agent *registry* that cannot start an agent. Everything below is that gap and its
-prerequisites, sequenced. Each line is a release train, not a single release.
+Each line is a release train, not a single release. One bite at a time, suite green at every step.
 
-| arc | theme | why it must come after the one above |
-|---|---|---|
-| **2.3.x** | **Agent lifecycle** — start / stop / signal / reap through the API | The product gap. **2.3.0** shipped the process half (start, stop, pause, resume, delete, reaping); **2.3.1** task start/complete; **2.3.2** request-string decoding; **2.3.3** agent channels; **2.3.4** message routes, daimon's own event loop, and the lifecycle follow-ups. Its last three items shipped in **2.4.2**. Closed. |
-| **2.4.x** | **AGNOS spawn + IPC** — `sys_spawn_path`, `chan_op` capability channels, `sys_proclist` | Nothing to map until a route actually spawns. **2.4.0** shipped the mapping (spawn, signal, reap, channels, the polled loop, proclist); **2.4.1** the guest test in CI, capacity, and a clock that survives a refused TSC calibration; **2.4.2** closed 2.3.x's last items; **2.4.3** ran every suite on a real aarch64 kernel and caught the AGNOS stall with QEMU's monitor. What remains waits on agnos filings; see below. |
-| **2.5.x** | **Agent identity + MCP authentication** | Prerequisite for un-gating nein's mutating firewall tools, and for any `claims`-based authorisation. Needs 2.3.x, because identity is per-agent. |
-| **3.0.0** | **Per-agent arena isolation** — VULN-007's open half; unlocks multi-tenant hosting, kavach sandboxing, untrusted federation, external MCP callbacks | Major because it changes the allocation model under every agent and flips the gates the P0 below guards. Needs identity (2.5.x) to know what a tenant *is*. |
+| release | theme | severity | why this order |
+|---|---|---|---|
+| **2.6.x** | **Caller identity and MCP authentication** | P1 | Every gated tool, the memory API and task reporting wait on it, and 3.0.0 needs it to know what a tenant is. |
+| **2.7.x** | **Adopting agnos 1.57.7** — limits, pause and resume, captured output, one write per answer | P2 | agnos closed every gap daimon filed; daimon still runs its interims. Independent of 2.6.x. |
+| **2.8.x** | **Serving hardening** — the leads 2.4.4 – 2.5.2 left, bote's consumer audit | P2 | Bounded, measurable items; none blocks another. |
+| **2.9.x** | **Modules without a route** — federation, screen capture, the memory API | P3 | The memory API needs 2.6.x. |
+| **3.0.0** | **Per-agent arena isolation** (VULN-007's open half) | P0 when any gate below opens | Changes the allocation model under every agent. Needs 2.6.x. |
 
 ⚠ The 3.0.0 line is where the security gates open, not where they are first considered. Each `2.x.0`
 cut re-evaluates the P0 below.
 
-
 ---
 
-## 2.3.x · P1 — Wire the agent lifecycle to the API
+## 2.6.x · P1 — Caller identity and MCP authentication
 
-Shipped in 2.3.0 – 2.3.4 and 2.4.2: the CHANGELOG entries, ADR-004 – ADR-006, ADR-008 and the addenda
-to [docs/audit/2026-09-22-agent-lifecycle-audit.md](../audit/2026-09-22-agent-lifecycle-audit.md).
-Nothing is open. 2.4.2 closed the last three items:
-- agents contained by a cgroup of their own;
-- the oldest trickling request giving way when every slot is taken;
-- RLIMIT_AS verified on aarch64 under a real kernel.
+`POST /v1/mcp/call` and every other route have **no caller authentication**: a request is answered
+for whoever can reach the port. What exists stops browsers, not a local process:
+- every state change is POST or DELETE, and one from another site's page is refused on every route;
+- the API binds 127.0.0.1 by default, on AGNOS too since 2.4.4, and while it does a request must
+  name a loopback host (DNS rebinding);
+- agent and task control answer 403 to any request that carries `Origin`.
 
-What those leave (agents uncontained where daimon's cgroup is not its own; an agent that moves its own
-processes to another cgroup, as it may, being daimon's user; a connection flood; a VM, not hardware)
-is in the audit's 2.4.2 addendum.
+**Still open**: anything on the host can do everything, and so can any client on the network once
+`--listen` opens it. bote's `claims` argument, the seam an identity arrives through, is a reserved
+`0` in its 3.x ABI.
 
-**Sequence**: the 2.4.x items below as their agnos filings land, and 2.5.x. One bite at a time,
-suite green at every step.
+Refused until this lands, each with an operator flag that reopens it on a trusted single-tenant host:
+- `nein_allow` / `nein_deny` (change the firewall; `_nein_admin_enabled`, since 2.1.8);
+- `nein_status` / `nein_list` / `nein_diff` (run `nft` as root, return the live ruleset;
+  `_nein_live_reads_enabled`, since 2.5.2);
+- `libro_retention` (archives the audit chain; `_libro_retention_enabled`, since 2.5.1).
 
-## 2.4.x · P2 — AGNOS spawn + IPC mapping
+Also waiting on identity:
+- **The agent memory API.** The store works, but no route reaches it, and one must not until a caller
+  can be tied to an agent: otherwise any client reads any agent's memory. Its records also need the
+  Rust original's `tags` field: `list_by_tag` is a substring search over the record today.
+- **Who may replace an external MCP registration.** Re-registering a name replaces it, whoever
+  registered it first. (Taking a builtin's name is refused since 2.2.3.)
+- **Who may report a task** (VULN-016). Any caller can mark any task running, completed or failed,
+  and completing one early returns its capacity while the work may still run.
+- **`libro_export` / `libro_query`** answer the whole audit chain to any caller (bote's consumer
+  audit, Medium). Read-only, so not gated; decide what a caller may see once callers exist.
 
-Shipped in 2.4.0 and 2.4.1: the CHANGELOG entries, [ADR-007](../adr/007-daimon-on-agnos.md) and
-[docs/audit/2026-09-23-agnos-platform-audit.md](../audit/2026-09-23-agnos-platform-audit.md).
+## 2.7.x · P2 — Adopting agnos 1.57.7
 
-**Adopting agnos 1.57.7** — agnos 1.57.6 and 1.57.7 closed all twelve filings daimon made
-(`docs/development/issues/archived/2026-09-23-*.md` in the agnos repo), and the guest test runs the
-latest release, 1.57.14, since 2.4.4. 2.4.4 took what came with the toolchain and the kernel: a
-loopback-only listener, a stop's SIGKILL that ends the agent, the decoded wait status. Still to adopt:
+agnos 1.57.6 and 1.57.7 closed all twelve filings daimon made (`docs/development/issues/archived/
+2026-09-23-*.md` in the agnos repo). daimon has taken the loopback listener, a stop that ends the
+agent, the wait status (2.4.4), argv as separate arguments and the spawn failure's reason (2.5.2).
+Still to adopt, each verified in the guest test:
 
-| agnos filing | closed in | daimon today | to do |
-|---|---|---|---|
-| `parent-cannot-end-stop-or-continue-a-child` | 1.57.7 | a stop ends the agent (2.4.4); pause/resume answer 501 | map pause/resume to signals 19/18; reach descendants |
-| `no-per-process-resource-limits` | 1.57.7 | agents run without limits, audited | arm `spawn_limits`#107 at spawn; `limits_enforced:true`; refuse a start whose limits fail |
-| `child-inherits-every-fd-and-spawn-arms-leak` | 1.57.6 | `--agent-output capture` refused | `SPAWN_F_CLEANFD`; capture stdout and stderr |
-| `spawn-path-args-cannot-contain-spaces` | 1.57.6 | 422 for a name with a space | `SPAWN_F_ARGV`: pass the argv as separate arguments |
-| `spawn-path-failure-gives-no-reason` | 1.57.6 | "the process table is full, or it cannot load the executable" (500) | read the `SPAWN_E_*` code; a full table is capacity (503) |
-| `sock-send-and-connect-hold-the-cpu` (P1 for daimon) | 1.57.7 | 512-byte pieces 1 ms apart | one write per answer again (sandhi's path, as on Linux), once measured on 1.57.14 |
-| `tcp-server-cannot-be-loopback-only` | 1.57.7 | loopback-only listener (2.4.4) | per-client rate limiting, if agnos gives a peer address |
-| `inbound-tcp-syn-dropped-by-isr-drain`, `socket-ids-have-no-owner` | 1.57.7 | nothing in daimon | re-measure accept from the host; close audit AG-1 and AG-8 |
+| agnos filing | daimon today | to do |
+|---|---|---|
+| `no-per-process-resource-limits` | agents run without limits, audited `agent.limits.unenforced` | arm `spawn_limits`#107 (pages, ms) before the spawn; `limits_enforced:true`; refuse a start whose arm fails; a CPU-burning fixture to see SIGXCPU (wait status 280) |
+| `parent-cannot-end-stop-or-continue-a-child` | pause / resume answer 501 | signals 19 / 18; the guest test reads `PROCLIST_STOPPED`; reach an agent's descendants |
+| `child-inherits-every-fd-and-spawn-arms-leak` | `--agent-output capture` refused at startup | `SPAWN_F_CLEANFD` with the redirect armed; capture stdout and stderr |
+| `sock-send-and-connect-hold-the-cpu` (P1 for daimon) | answers written 512 bytes at a time, 1 ms apart | measure a whole-answer write on 1.57.14 under a CPU quota; one write per answer if it holds |
+| `tcp-server-cannot-be-loopback-only` | loopback-only listener (2.4.4), one rate-limit bucket for every client | per-client rate limiting, if agnos gives a peer address |
+| `inbound-tcp-syn-dropped-by-isr-drain`, `socket-ids-have-no-owner` | nothing in daimon | re-measure accept from the host; close audit AG-1 and AG-8 |
 
 Nothing to change in daimon for `sleep-ms-holds-the-cpu`, `sock-recv-never-reports-eof-after-peer-fin`
 and `tsc-calibration-refused-stops-the-us-clock` (`daimon_now_ms` stays for older kernels).
 
-**daimon's own, on agnos:** nothing open.
+## 2.8.x · P2 — Serving hardening
 
-2.4.1 settled the two items that were here before: the guest test runs in CI (on the released
-kernel, pinned by SHA-256), and capacity was measured and answered. It also brought detached calls
-to agnos, which 2.4.0 had wrongly put down to agnos having no fork (audit AG-13). `max_agents` stays, because the
-kernel's tables bound running agents, not registrations (the 2.4.1 CHANGELOG).
+- [ ] **A whole-answer deadline for writes on Linux** (2.4.4). An answer goes through sandhi's
+  `sock_send_all` or daimon's `_srv_send_all`, both bounded per write by `SO_SNDTIMEO`, so a local
+  client that reads a trickle of an answer larger than its socket buffer holds the loop while each
+  write makes progress. Not measured.
+- [ ] **External MCP callback URLs** (bote's consumer audit, Medium). A registration's `callback_url`
+  is checked for its scheme only, so daimon forwards calls wherever a caller points it, loopback
+  and private addresses included. Local MCP servers on loopback are the main use, so this needs a
+  policy (an allow-list, or the operator's), not bote's `web_fetch` guard as it is.
+- [ ] **The relayed-error envelope** (bote's consumer audit, Medium): what an external server's error
+  answer may put into daimon's reply.
+- [ ] **The agent-frame arena** (2.5.1 lead, not measured). `_ipc_arena` is the stdlib's growable
+  arena, which bote found keeps a new chunk for each allocation larger than any before (filed with
+  cyrius by bote, 2026-11-02). Frames are capped at 64 KB and the arena is rewound per frame, so
+  growth should stop at a high-water mark: measure it with frames of rising size.
+- [ ] **The request-body parse cost** (2.5.1). bayan 1.11's bounds-checked parser made
+  `http_body_read3` 47% slower (1.30 → 1.91 µs). Upstream's; re-measure at each bayan move.
+- [ ] **nein's live readers on the loop.** If an operator sets `_nein_live_reads_enabled`, each call
+  waits on `nft` on the loop, up to 60 s since nein 1.8.2. Detach them (`mcp_builtin_waits`), with
+  the gate's audit entry made before the child is forked.
+- [ ] P3: CI resolves with `cyrius deps --no-lock` then `--verify`; `cyrius deps --locked` (cyrius
+  6.7.6) checks the resolve against the lock in one step. Rehearse it in CI's own steps first.
 
-## 2.5.x · P1 — Agent identity and MCP caller authentication
+## 2.9.x · P3 — Modules without a route
 
-`POST /v1/mcp/call` has **no caller authentication**: it dispatches on a tool name taken from the
-request body. That is why 2.1.8 registered nein's firewall tools with the mutating half
-(`nein_allow` / `nein_deny`) **gated shut** — there is nothing to authorise against. bote's `claims`
-argument, the seam an identity would arrive through, is a reserved `0` in the 3.x ABI.
-
-⚠ **What 2.2.2, 2.3.0 and 2.3.4 closed, and what they did not.**
-- 2.2.2: every route enforces its method, so a state change can no longer be triggered by a
-  cross-origin GET (`<img src>`, prefetch — measured, both `/decommission` and `/cancel` were
-  reachable that way).
-- 2.3.0: the API binds 127.0.0.1 by default (VULN-011), and the agent-control routes answer 403 to
-  any request carrying `Origin` (VULN-012).
-- 2.3.4: a request must name a loopback host while daimon listens on loopback (DNS rebinding), and a
-  state change from another site's page is refused on every route. A page served from loopback may
-  still write (VULN-012's remainder).
-
-**Still open**: anything on the host can still do everything, and so can any client on the network
-once `--listen` opens it. On agnos, until the connection-owner filing closes, any process on the
-box can also act on daimon's connections directly (audit AG-1). Each of those layers stops browsers;
-this item is the fix.
-
-nein's firewall admin tools (`nein_allow` / `nein_deny`) are registered and **gated shut** as of
-2.1.8 for exactly this reason. Three things unblock together when this lands: un-gating the firewall admin tools
-(`_nein_admin_enabled` stops being an operator-trust flag), per-agent authorisation on every other
-MCP tool, and a meaningful definition of "tenant" for the 3.0.0 isolation work.
-
-Also waiting on identity:
-- **The agent memory API.** The per-agent memory store works since 2.2.3 (it crashed on its first
-  call before), but no route reaches it, and one must not until a caller can be tied to an agent —
-  otherwise any client reads any agent's memory. Its records also need the `tags` field the Rust
-  original had: `list_by_tag` is a substring search over the record today.
-- **Who may replace an external MCP registration.** Re-registering a name replaces it, whoever
-  registered it first. (Taking a *builtin's* name is refused since 2.2.3.)
-- **Who may report a task** (VULN-016, 2.3.1). Any caller can mark any task running, completed or
-  failed. Completing a task early returns its capacity while the work may still run. Only the
-  task's executor should be able to.
-
-Needs 2.3.x first — identity is per-agent, and there are no agents until the lifecycle exists.
+- [ ] Routes for the federation and screen-capture modules. Both came with the port and have their
+  own tests, but no route reaches them, so `federation_nodes` in `/v1/metrics` is always 0.
+- [ ] The agent memory API, once 2.6.x can tie a caller to an agent.
 
 ## 3.0.0 · P0 (gated, dormant) — VULN-007: per-agent arena isolation
 
@@ -148,43 +119,14 @@ federation, or external MCP callbacks (bote). Dormant today because no consumer 
 those; **P0 the moment one does.** Re-evaluate at every `2.x.0` cut.
 
 Zero-on-reset and secret hygiene close the *reuse* and *leak* channels but do not **isolate trust
-domains** — one bump allocator still backs every agent. Isolation is the open half and the hard
-prerequisite. (Both shipped halves are in the CHANGELOG.)
+domains**: one bump allocator still backs every agent. Isolation is the open half and the hard
+prerequisite. Needs 2.6.x to know what a tenant is.
 
-## Beyond the arc (unsequenced)
+## Beyond (unsequenced)
 
-Severity assigned when the arc's shape is chosen.
+Severity assigned when one is scheduled.
 
-- [ ] Routes for the federation and screen-capture modules. Both came with the port and have their
-  own tests, but no route reaches them, so `federation_nodes` in `/v1/metrics` is always 0. (The
-  memory store's route waits for identity, 2.5.x.)
-- [ ] A whole-answer deadline for writes on Linux (2.4.4). An answer goes through sandhi's
-  `sock_send_all` (sandhi 1.10.6) or daimon's `_srv_send_all`, both bounded per write by
-  `SO_SNDTIMEO`, so a local client that reads a trickle of an answer larger than its socket buffer
-  holds the loop while each write makes progress. Not measured. The API is loopback-only on Linux, so
-  this needs a local client.
 - [ ] jnana integration — grounded knowledge queries backed by verified AGNOS science data
 - [ ] gRPC transport option alongside HTTP
 - [ ] WebSocket streaming for real-time agent events
 - [ ] Agent migration between nodes
-
-## Recorded by cyrius 6.7.6 (2026-10-08) — for the next cyrius pin move
-
-⛔ Needs cyrius >= 6.7.6 — nothing to do until cyrius 6.7.6 is tagged; then at your pin bump:
-
-- **Git first: a `path` beside `git` / `tag` becomes a dev override** (none here: 2.4.4 dropped
-  samay's and nein's `path`, and its lock already carries a commit pin for every git dep).
-  From 6.7.6 it is read only in local mode (`CYRIUS_LOCAL=1`, `CYRIUS_LOCAL=<dep,dep>` or `--local`).
-  With no switch, `cyrius deps` / `build` resolve the TAG (commit pin checked) and print one `hint:`
-  line naming the checkout not used, so a local build and CI compile the same code.
-- Local mode prints a `local:` line per override and builds from `build/local-deps/` without writing
-  `lib/` or `cyrius.lock`; a hand-written `include "lib/<dep>.cyr"` sees the override there too (the
-  compiler's `CYRIUS_LIB_OVERLAY`, set by `cyrius`).
-- The first default resolve adds commit pins for these deps to `cyrius.lock` — a one-time diff.
-- CI lock guards and `sed`-the-path-out steps can become `cyrius deps --locked`.
-- `.github/workflows/ci.yml:65,75` and `release.yml:63,68` (`cyrius deps [--no-lock]` then `cyrius deps
-  --verify`) are such guards; with `lib/` gitignored, `--locked` checks the resolve against `cyrius.lock` alone
-  and builds from `build/locked-deps/`.
-- crab resolves daimon from its tag, and from 6.7.6 a dependency resolved from its tag has its own `path`
-  entries ignored.
-- Reference: the cyrius guide's *Git first; local development is a switch (6.7.6)*.

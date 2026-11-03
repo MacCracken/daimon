@@ -1,6 +1,6 @@
 # ADR-007: daimon on AGNOS — the kernel's own primitives, a polled loop, and gaps filed rather than designed around
 
-**Status**: Accepted, with addenda for 2.4.1, 2.4.2, 2.4.3 and 2.4.4 below. The 2.4.1 addendum
+**Status**: Accepted, with addenda for 2.4.1, 2.4.2, 2.4.3, 2.4.4 and 2.5.2 below. The 2.4.1 addendum
 corrects decision 2, the 2.4.3 addendum replaces the 2.4.1 writer's 1 KB pieces, and the 2.4.4 addenda
 retire the 2.4.2 one and two rows of decision 3's table (the listener, and what ends a process).
 **Date**: 2026-09-23 (2.4.0)
@@ -217,3 +217,12 @@ daimon with it:
 The other rows stand until daimon adopts the new primitives: limits (`spawn_limits`#107), pause and
 resume (signals 19 and 18), separate argv (`SPAWN_F_ARGV`), captured output (`SPAWN_F_CLEANFD`), and
 one write per answer once `sock_send`#48 no longer holds the CPU. The roadmap lists them.
+
+## Addendum — 2.5.2: argv and the spawn's reason
+
+Two more rows of decision 3's table retire. daimon starts an agent with `sys_spawn_argv`
+(`SPAWN_F_ARGV`, agnos 1.57.6): each argument passes as it is, so a name may hold spaces, up to 1024
+bytes in all. And `spawn_path`#43 now says why it refused: a full process table or no memory is
+room (503, the agent's status kept, as for a full channel table); anything else is the executable.
+The rows that stand are limits, pause and resume, captured output and the writer's pacing (roadmap
+2.7.x).

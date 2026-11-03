@@ -136,7 +136,7 @@ mcp_deregister(reg, "remote-scan");
 assert(mcp_find_tool(reg, "remote-scan") == 0, "deregister removes an external tool");
 
 # Re-registering an external name replaces it (an update, not a second entry).
-# Who may replace whose registration is the identity question (roadmap 2.5.x).
+# Who may replace whose registration is the identity question (roadmap 2.6.x).
 var n_before = mcp_tool_count(reg);
 mcp_register_external(reg, mcp_tool_new(str_from("buftool"), str_from("d2"), str_from("{}")),
   str_from("http://up.test/y"));

@@ -59,7 +59,7 @@ main.cyr             CLI: serve [port] [--async] [--trace] [--agents-dir DIR] [-
 ├── sched.cyr        Task start / complete over samay (2.3.1)
 │   └── sched_task_start / sched_task_complete   SCHEDULED → RUNNING → COMPLETED/FAILED, capacity returned
 │
-├── memory.cyr       Per-agent key-value store. No route reaches it until agent identity (roadmap 2.5.x)
+├── memory.cyr       Per-agent key-value store. No route reaches it until agent identity (roadmap 2.6.x)
 │   ├── AgentMemoryStore   Filesystem-backed, atomic write (temp + fsync + rename)
 │   ├── validate_key       Path traversal prevention
 │   └── sanitize_key       Filename-safe transformation
@@ -80,8 +80,8 @@ main.cyr             CLI: serve [port] [--async] [--trace] [--agents-dir DIR] [-
 ├── mcp_builtin.cyr  The 13 builtin tools, dispatched in-process
 │   ├── mcp_libro_init     bote's five libro tools, bound to daimon's audit chain
 │   ├── mcp_web_init       bote's web_fetch / web_search (these run in a detached child)
-│   ├── mcp_nein_init      nein's six firewall tools, behind daimon_nein_gate: nein_allow / nein_deny
-│   │                      refused until caller authentication (roadmap 2.5.x)
+│   ├── mcp_nein_init      nein's six firewall tools, behind daimon_nein_gate: all but nein_validate
+│   │                      refused until caller authentication (2.5.2; roadmap 2.6.x)
 │   └── mcp_dispatch_builtin   name → handler
 │
 ├── screen.cyr       Capture management (no route reaches it)
@@ -190,7 +190,7 @@ Every AGNOS agent (over the HTTP API and, once started by daimon, its channel on
 
 ## Key Design Decisions
 
-1. **Single compilation unit, multi-file source** — `src/main.cyr` `include`s 29 per-domain `src/*.cyr` modules. Cyrius flattens the includes into one global scope and compiles in one pass; no separate library crate. The 1.2.8 split kept the monolith's source order; later modules came with their features (`mcp_builtin.cyr` / `audit.cyr` at 1.3.0, `secmem.cyr` at 1.3.2, `trace.cyr` at 1.3.3, `syscalls.cyr` at 2.1.6, `sched.cyr` at 2.3.1). At 2.5.1 `src/` is 10,080 lines; the largest modules are `agent.cyr` (1,668), `server.cyr` (1,230) and `ipc.cyr` (1,086).
+1. **Single compilation unit, multi-file source** — `src/main.cyr` `include`s 29 per-domain `src/*.cyr` modules. Cyrius flattens the includes into one global scope and compiles in one pass; no separate library crate. The 1.2.8 split kept the monolith's source order; later modules came with their features (`mcp_builtin.cyr` / `audit.cyr` at 1.3.0, `secmem.cyr` at 1.3.2, `trace.cyr` at 1.3.3, `syscalls.cyr` at 2.1.6, `sched.cyr` at 2.3.1). At 2.5.2 `src/` is 10,116 lines; the largest modules are `agent.cyr` (1,668), `server.cyr` (1,230) and `ipc.cyr` (1,086).
 2. **daimon's own event loop, sandhi's HTTP** (2.3.4, ADR-006) — `server_loop` owns accept and reads (one thread, epoll). Requests are framed, smuggling-checked and answered with sandhi's public functions, as sandhi's own loops did through 2.3.3. `serve --async` is accepted and runs the same loop. On AGNOS (2.4.0, ADR-007) the loop polls instead of waiting on epoll, and yields with `pause`. Single trust domain.
 3. **Bump allocator** — fast allocation, no individual free. Single trust domain (see VULN-007 security gate for multi-tenant). So upkeep on the loop's tick must not allocate: `agents_tick` allocates nothing, idle or with a live agent (measured at 2.4.2).
 4. **Everything is i64** — Cyrius type system. Structs are manually laid out with `alloc()` + `store64()`/`load64()` at fixed offsets.

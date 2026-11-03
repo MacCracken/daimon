@@ -259,21 +259,25 @@ assert_eq(_g_reap(h2, 20000), 1, "agnos: an agent that exits is reaped");
 assert_eq(agent_status(h2), AGENT_FAILED, "agnos: ... FAILED (exit 3)");
 assert_eq(agent_exit_code(h2), 3, "agnos: ... with exit code 3");
 
-# --- command lines agnos cannot pass ------------------------------------------
+# --- argv: a real one since 2.5.2 (SPAWN_F_ARGV, agnos 1.57.6) -----------------
+# Through 2.5.1 the line form split on spaces and stopped at 127 bytes, so a name
+# with a space was refused as AGENT_OP_ARGS.
 var h3 = agent_handle_new(3, str_from("two words"));
 var r3_t, r3_v = agent_start(h3, 0, 0);
-assert_eq(is_err_result(r3_t), 1, "agnos: a name with a space is refused (the kernel splits on spaces)");
-assert_eq(r3_v, AGENT_OP_ARGS, "agnos: ... as AGENT_OP_ARGS");
-assert_eq(agent_status(h3), AGENT_PENDING, "agnos: ... and the agent stays PENDING");
+assert_eq(is_ok(r3_t), 1, "agnos: a name with a space starts (its argv is passed as it is)");
+assert_eq(agent_status(h3), AGENT_RUNNING, "agnos: ... RUNNING");
+agent_stop_begin(h3, "test");
+assert_eq(_g_stop(h3, 20000), 1, "agnos: ... and stops");
 var lsb = str_builder_new();
 var li = 0;
-while (li < 100) {
+while (li < 1100) {
     str_builder_add_cstr(lsb, "n");
     li = li + 1;
 }
 var h4 = agent_handle_new(4, str_builder_build(lsb));
 var r4_t, r4_v = agent_start(h4, 0, 0);
-assert_eq(r4_v, AGENT_OP_ARGS, "agnos: a command line over 127 bytes is refused");
+assert_eq(r4_v, AGENT_OP_ARGS, "agnos: an argv over 1024 bytes is refused");
+assert_eq(agent_status(h4), AGENT_PENDING, "agnos: ... and the agent stays PENDING");
 
 # --- pause is refused; the agent is then stopped ------------------------------
 var h5 = agent_handle_new(5, str_from("pausable"));
@@ -328,8 +332,9 @@ str_builder_add_int(cl, cap_code);
 str_builder_add_cstr(cl, "\n");
 _g_say(str_data(str_builder_build(cl)));
 assert(cap_n >= 8, "agnos: at least 8 agents run at once");
-assert(cap_code == AGENT_OP_NO_EXEC || cap_code == AGENT_OP_CAPACITY,
-  "agnos: a start past the machine's tables is refused (spawn_path#43, or no free channel)");
+assert_eq(cap_code, AGENT_OP_CAPACITY,
+  "agnos: a start past the machine's tables is refused as capacity (no process slot, or no channel)");
+assert_eq(agent_status(cap_h), AGENT_PENDING, "agnos: ... and the refused agent stays PENDING (2.5.2)");
 assert(cap_h != 0 && agent_pid(cap_h) == 0, "agnos: ... the refused agent has no process");
 assert_eq(ipc_channel_count(), cap_n, "agnos: ... and daimon closed its channel");
 # The kernel must not keep it either: were a refusal's channel kept, four more

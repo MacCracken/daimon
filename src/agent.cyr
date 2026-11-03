@@ -38,8 +38,8 @@ enum AgentOpError {
     AGENT_OP_NO_EXEC = 5;         # execve failed
     AGENT_OP_UNSUPPORTED = 6;     # this target cannot do this yet (agnos: pause / resume)
     AGENT_OP_SIGNAL = 7;          # the signal could not be delivered
-    AGENT_OP_ARGS = 8;            # the command line cannot be passed (agnos: a space, or > 127 bytes)
-    AGENT_OP_CAPACITY = 9;        # no room for another agent's channel (agnos: CH_E_FULL). 2.4.1
+    AGENT_OP_ARGS = 8;            # the argv cannot be passed (agnos: over 1024 bytes, or a NUL in the name)
+    AGENT_OP_CAPACITY = 9;        # no room: a channel (CH_E_FULL, 2.4.1), process slot or memory (2.5.2)
 }
 
 # AgentHandle: {id, name, status, created_at, started_at, pid,
@@ -1345,41 +1345,48 @@ fn agent_start(h, mem_limit, cpu_secs) {
 # yet is filed with it (the agnos repo, docs/development/issues/2026-09-23-*):
 #   - resource limits: the agent runs without its quota, and each start records
 #     that (agent_limits_enforced 0, audit agent.limits.unenforced);
-#   - argv: one line split on spaces, at most 127 bytes, so an agent whose name
-#     contains a space, or a longer line, is refused (AGENT_OP_ARGS);
-#   - ending a process: a stop asks with SIGTERM and waits (agent_stop_step).
+#   - argv: through 2.5.1, one line split on spaces, at most 127 bytes, so a name
+#     with a space was refused; since 2.5.2 a real argv (SPAWN_F_ARGV, agnos
+#     1.57.6), so only a blob over SPAWN_ARGV_MAX (1024 bytes) is (AGENT_OP_ARGS);
+#   - ending a process: a stop asks with SIGTERM, then SIGKILL, which ends the
+#     agent since agnos 1.57.7 (agent_stop_step).
 # The agent's channel is chan_op's (src/ipc.cyr): the pair is minted, the
 # agent's end is endowed to the child (CH_ENDOW moves it; the kernel chooses
 # the fd, announced as AGNOS_IPC_FD), and daimon's end is served by the loop.
-var AGENT_AGNOS_LINE_MAX = 127;     # spawn_path#43 refuses a longer line
 var AGENT_AGNOS_ENV_MAX = 1024;     # an env blob over this, or with more
 var AGENT_AGNOS_ENV_ENTRIES = 16;   # entries, gets the kernel's default env instead
 
-fn _agent_has_space(p, n) {
+fn _agent_has_nul(p, n) {
     var i = 0;
     while (i < n) {
-        if (load8(p + i) == 32) { return 1; }
+        if (load8(p + i) == 0) { return 1; }
         i = i + 1;
     }
     return 0;
 }
 
-# "<exe> --agent-id <id> --agent-name <name>" as spawn_path takes it, or 0 when
-# it cannot be passed.
-fn _agent_cmdline_agnos(exe, id, name) {
+# The argv blob sys_spawn_argv takes, "<exe>\0--agent-id\0<id>\0--agent-name\0<name>\0"
+# (2.5.2), or 0 when it cannot be passed: an empty name, a name holding NUL (it
+# would end the argument early), or a blob over SPAWN_ARGV_MAX. Through 2.5.1
+# this was the one line spawn_path#43 splits on spaces, at most 127 bytes.
+fn _agent_argv_agnos(exe, id, name) {
     var nl = str_len(name);
     if (nl == 0) { return 0; }
-    if (_agent_has_space(str_data(name), nl) == 1) { return 0; }
-    if (_agent_has_space(exe, strlen(exe)) == 1) { return 0; }
+    if (_agent_has_nul(str_data(name), nl) == 1) { return 0; }
     var sb = str_builder_new();
     str_builder_add_cstr(sb, exe);
-    str_builder_add_cstr(sb, " --agent-id ");
+    str_builder_add_byte(sb, 0);
+    str_builder_add_cstr(sb, "--agent-id");
+    str_builder_add_byte(sb, 0);
     str_builder_add_int(sb, id);
-    str_builder_add_cstr(sb, " --agent-name ");
+    str_builder_add_byte(sb, 0);
+    str_builder_add_cstr(sb, "--agent-name");
+    str_builder_add_byte(sb, 0);
     str_builder_add(sb, name);
-    var line = str_builder_build(sb);
-    if (str_len(line) > AGENT_AGNOS_LINE_MAX) { return 0; }
-    return line;
+    str_builder_add_byte(sb, 0);
+    var blob = str_builder_build(sb);
+    if (str_len(blob) > SPAWN_ARGV_MAX) { return 0; }
+    return blob;
 }
 
 # daimon's environment as spawn_path's env blob ("K=V\0K=V\0"), filtered by
@@ -1441,8 +1448,8 @@ fn _agent_env_blob_agnos(extra) {
 fn _agent_start_agnos(h) {
     var exe = agent_find_executable(agent_type(h));
     if (exe == 0) { return Err(AGENT_OP_NO_EXECUTABLE); }
-    var line = _agent_cmdline_agnos(exe, agent_id(h), agent_name(h));
-    if (line == 0) { return Err(AGENT_OP_ARGS); }
+    var argv_blob = _agent_argv_agnos(exe, agent_id(h), agent_name(h));
+    if (argv_blob == 0) { return Err(AGENT_OP_ARGS); }
     var chfds: i32[2];
     # -CH_E_FULL: the machine's 16 channels are in use, or daimon's fd table
     # (32 slots) is full. Nothing about the agent failed, so its status stays.
@@ -1471,17 +1478,25 @@ fn _agent_start_agnos(h) {
         env_p = str_data(env);
         env_n = str_len(env);
     }
+    var prev_status = agent_status(h);
     agent_set_status(h, AGENT_STARTING);
     sakshi_info("starting agent", 14);
-    var pid = sys_spawn_path_env(str_data(line), str_len(line), env_p, env_n);
+    var pid = sys_spawn_argv(str_data(argv_blob), str_len(argv_blob), env_p, env_n, 0);
     if (pid < 0) {
-        # A failed spawn leaves the endowment armed for whatever spawns next;
-        # with both ends closed, its placement is refused (filed with agnos).
-        # #43 answers -1 for every failure: a full process table (16 slots for
-        # the whole machine) and an executable it cannot load look the same
-        # (filed with agnos, 2026-09-23). The executable was just found by stat.
+        # Every #43 return clears the caller's spawn arms, the endowment
+        # included (agnos 1.57.6), and both ends are closed here.
         sys_chan_close(agent_end);
         sys_chan_close(own_end);
+        # Since agnos 1.57.6 #43 says why (2.5.2; -1 for everything before). A
+        # full process table (16 slots for the machine) and no memory are room,
+        # not the agent: it is refused as AGENT_OP_CAPACITY (503) and keeps its
+        # status, as when no channel is free. The rest is the executable.
+        if (pid == 0 - SPAWN_E_NOPROC || pid == 0 - SPAWN_E_NOMEM) {
+            agent_set_status(h, prev_status);
+            daimon_audit_agent(SEV_WARNING, "agent", "agent.spawn.capacity",
+              "agent not started: agnos has no free process slot or memory for it", str_data(agent_name(h)));
+            return Err(AGENT_OP_CAPACITY);
+        }
         agent_set_status(h, AGENT_FAILED);
         daimon_audit_agent(SEV_WARNING, "agent", "agent.spawn.fail", "agent process failed to start",
           str_data(agent_name(h)));

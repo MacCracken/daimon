@@ -109,7 +109,7 @@ POST /v1/agents/7/messages
 → 201 {"id":13} · 404 no such agent · 429 its queue (or the bus) is full
 ```
 
-Both refuse browsers, like agent control. The API has no authentication until 2.5.x, so any
+Both refuse browsers, like agent control. The API has no authentication until 2.6.x, so any
 client that can reach it can read any agent's queue. A message's memory is freed when it is taken,
 or when its agent is deleted (VULN-018).
 

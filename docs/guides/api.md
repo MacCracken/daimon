@@ -176,12 +176,13 @@ daimon warns once at startup, and audits `agent.cgroup.unavailable`.
 kernel's primitives. Some things differ until agnos closes the gaps filed with it
 (`docs/development/issues/2026-09-23-*.md` in the agnos repo):
 - **Room**: the machine has 16 process slots and 16 channels. Measured in daimon's guest test,
-  12 agents run at once. A start with no free channel answers **503** ("no room for another
-  agent"), and the agent stays as it was (2.4.1). A start that `spawn_path` refuses answers **500**
-  ("its process table is full, or it cannot load the executable"): agnos does not say which.
-- **Start**: `spawn_path` runs `<exe> --agent-id <id> --agent-name <name>` as one line split on
-  spaces, at most 127 bytes. So a name with a space, or a longer line, answers **422**. The
-  environment is daimon's (filtered by `--agent-env`), at most 16 entries and 1024 bytes, plus
+  12 agents run at once. A start with no free channel, process slot or memory answers **503** ("no
+  room for another agent"), and the agent stays as it was (2.4.1; a full process table since
+  2.5.2, which agnos 1.57.6 reports). A start that cannot load the executable answers **500**.
+- **Start**: `spawn_path` runs `<exe> --agent-id <id> --agent-name <name>` with each argument
+  passed as it is (2.5.2), so a name may hold spaces. The arguments may take 1024 bytes in all; a
+  longer name answers **422**. Through 2.5.1 they were one line split on spaces, at most 127 bytes.
+  The environment is daimon's (filtered by `--agent-env`), at most 16 entries and 1024 bytes, plus
   `AGNOS_IPC_FD` naming the channel's fd, which the kernel chooses.
 - **No limits**: agnos has none, so the agent runs without its quota. Its JSON says
   `"limits_enforced":false`, and each start is audited `agent.limits.unenforced`.
@@ -225,10 +226,11 @@ request body as its params.
 | tools | what they do |
 |---|---|
 | `libro_query`, `libro_verify`, `libro_export`, `libro_proof` | daimon's audit chain (libro's tools, through bote): search it, verify its hash links, export it, prove an entry's inclusion |
-| `libro_retention` | libro's retention policy, which archives entries off the chain. **Refused** until callers are authenticated (2.5.1; roadmap 2.5.x): `"access denied: tool gated by host policy"`, audited `libro.retention.deny`. Any local caller could empty the audit chain with it |
+| `libro_retention` | libro's retention policy, which archives entries off the chain. **Refused** until callers are authenticated (2.5.1; roadmap 2.6.x): `"access denied: tool gated by host policy"`, audited `libro.retention.deny`. Any local caller could empty the audit chain with it |
 | `web_fetch`, `web_search` | bote's web tools: a page's readable text (`{url}`, http or https only), and results from the SearXNG instance at `BOTE_SEARXNG_URL` (`{query, count?}`). Unset, `web_search` says so |
-| `nein_status`, `nein_list`, `nein_validate`, `nein_diff` | nein's read-only firewall tools |
-| `nein_allow`, `nein_deny` | nein's tools that change the live firewall. **Refused** until callers are authenticated (roadmap 2.5.x): `"access denied: tool gated by host policy"`, audited `nein.gate.deny` |
+| `nein_validate` | nein's offline check of a rule (`{protocol, port, source?}`); touches nothing outside daimon |
+| `nein_status`, `nein_list`, `nein_diff` | nein's tools that read the live firewall: they run `nft` as root and return the ruleset. **Refused** until callers are authenticated (2.5.2; roadmap 2.6.x), audited `nein.gate.deny`. 2.1.8 – 2.5.1 answered them to any caller |
+| `nein_allow`, `nein_deny` | nein's tools that change the live firewall. **Refused** until callers are authenticated (roadmap 2.6.x): `"access denied: tool gated by host policy"`, audited `nein.gate.deny` |
 
 Every builtin answers with an MCP tool result. libro's tools return bare JSON, which daimon wraps
 as the text of one content block, with `isError` true when that JSON says `"ok":false`. bote's and
@@ -250,7 +252,7 @@ POST /v1/mcp/tools
 {"name":"scan","description":"port scanner","callback_url":"http://localhost:9000",
  "inputSchema":{"type":"object","properties":{"target":{"type":"string"}},"required":["target"]}}
 → 201 {"ok":true} · 400 no name or callback_url, or not http(s) · 409 a builtin's name
-# Registering a name again replaces it, whoever registered it first (roadmap 2.5.x).
+# Registering a name again replaces it, whoever registered it first (roadmap 2.6.x).
 
 # Call a tool: MCP tools/call params
 POST /v1/mcp/call
@@ -425,7 +427,7 @@ capacity at once, so the next schedule can use it. `status` for complete accepts
 `failed` or `Completed` / `Failed`.
 
 Anyone who can reach the API can report any task. Only browsers are refused (the Origin rule, as for
-agents), and executor identity waits for authentication (roadmap 2.5.x).
+agents), and executor identity waits for authentication (roadmap 2.6.x).
 
 ## Metrics
 
@@ -484,7 +486,7 @@ a minute. That is every client on AGNOS, which gives no peer address.
 
 ## Security
 
-- There is **no authentication** (roadmap 2.5.x). The defaults limit who can reach the API. It binds
+- There is **no authentication** (roadmap 2.6.x). The defaults limit who can reach the API. It binds
   127.0.0.1, answers only to loopback host names while it does, and refuses state changes from
   other sites on every route. Agent and task control refuse any browser-originated request.
 - All user-controlled strings in responses are JSON-escaped.

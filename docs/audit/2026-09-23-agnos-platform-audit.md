@@ -107,13 +107,13 @@ run. Clients on the same box reach it through the loopback queue.
 **daimon**: its server does not depend on EOF. It reads a request to its own framing and closes after
 answering.
 
-### AG-10: An agent's command line cannot carry a space (LOW) — agnos filing; 422
+### AG-10: An agent's command line cannot carry a space (LOW) — fixed in agnos 1.57.6; argv passed as it is since daimon 2.5.2
 
 **Filed**: `2026-09-23-spawn-path-args-cannot-contain-spaces.md`.
 **daimon**: an agent whose name has a space, or whose command line is over 127 bytes, is refused (422)
 rather than started with a split name.
 
-### AG-11: A failed `spawn_path` gives no reason (LOW, observability) — agnos filing (2.4.1)
+### AG-11: A failed `spawn_path` gives no reason (LOW, observability) — fixed in agnos 1.57.6; read since daimon 2.5.2
 
 `#43` answers -1 for every failure, from a missing executable to a full process table. `proclist`#99
 cannot tell them apart either: agnos has no zombie state, so an exited, unreaped process holds its
@@ -272,6 +272,18 @@ AG-11, AG-14; AG-1 and AG-8 not re-measured) are on the roadmap.
 - **AG-12's fallback stays.** cyrius 6.6.7 also resolved its filing: `clock_now_ns` falls back to
   `uptime_ms`#40, latched, when `#95` answers -1, so the vendored libraries' deadlines end too.
   `daimon_now_ms` has the same shape and is left as it is.
+
+## What 2.5.2 changed in daimon itself
+
+- **AG-10: argv as separate arguments.** daimon starts an agent with `sys_spawn_argv`
+  (`SPAWN_F_ARGV`), so a name may hold spaces and the arguments may take 1024 bytes; through 2.5.1
+  the one line was split on spaces and stopped at 127 bytes, and such a start answered 422.
+- **AG-11: the spawn's reason.** `-SPAWN_E_NOPROC` (a full process table) and `-SPAWN_E_NOMEM` are
+  room, not the agent: the start answers 503 and the agent keeps its status, as for a full channel
+  table. Anything else is the executable (500, the agent FAILED).
+- Verified in the guest test on agnos 1.57.14: "two words" starts and stops (the fixture prints
+  `argc 5`), an argument blob over 1024 bytes is refused, and the start past the process table is
+  refused as capacity with the agent still PENDING.
 
 ## Verification
 

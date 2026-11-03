@@ -12,7 +12,7 @@
 # Grid: CSRF via text/plain) and CVE-2024-28224 (Ollama: DNS rebinding).
 # daimon's own clients send no Origin. 2.3.1 applies the same guard to task
 # start / complete — new routes, so no existing client can break. Every other
-# route is unchanged until authentication (roadmap 2.5.x). `what` names the
+# route is unchanged until authentication (roadmap 2.6.x). `what` names the
 # subject ("agent" / "task") in the 403 and in the audit action
 # (`<what>.control.origin`). Returns 1 if it answered 403.
 fn _route_refuse_browser(fd, buf, buf_len, what) {

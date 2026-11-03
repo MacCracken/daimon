@@ -23,7 +23,10 @@ while (i < argc()) {
     _a_put(argv(i));
     i = i + 1;
 }
-_a_put("\n");
+# The count, so a name with a space shows as one argument (2.5.2: 5, not 6).
+_a_put(" (argc ");
+fmt_int(argc());
+_a_put(")\n");
 # The environment, from the init stack (argc, argv, NULL, then envp).
 var base = _agnos_argv_base();
 var envv = base + 8 + (load64(base) + 1) * 8;

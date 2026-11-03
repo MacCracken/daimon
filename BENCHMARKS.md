@@ -45,6 +45,14 @@ those numbers are not comparable.
 
 `tests/rag_ingest.bcyr` (real since 2.1.6): `rag_ingest_real_5k` 133.1µs, `rag_chunk_only_5k` 508ns.
 
+### 2.5.2 — nein 1.9.0 and bote 3.8.0
+
+2.5.1 against 2.5.2, both on cyrius 6.7.18, 20 interleaved runs with the order alternating, medians,
+at a load average of 1.9–2.9 (a first attempt, under load 13 from another process, was discarded).
+Every row is within ±2.6% except `trace_id_hex` 52.0 → 47.0 ns (−9.6%: 2.5.1's placement shift
+undone), `config_default` 95 → 86 ns (−9.5%, spread 29%) and `rag_chunk_only_5k` 547 → 572.5 ns
+(+4.7%). No daimon code on a measured path changed.
+
 ### 2.5.1 — cyrius 6.7.18: bayan 1.11's parser is slower
 
 2.5.0 (built by cyrius 6.7.9) against 2.5.1 (6.7.18), both files, 20 interleaved runs with the order
@@ -535,7 +543,7 @@ Scheduler scheduling (1.5x), supervisor registration (2.5x), MCP registration (1
 | ipc | Complete | Complete (2.3.4) | Agents send on a channel (a socketpair, their fd 3), read by daimon's event loop; HTTP clients send and take messages; messages are freed, names first-wins (2.3.4). The socket-file endpoint was removed at 2.3.3 |
 | api | Complete | Complete | 44 method + path routes (the Rust original had no agent or task control; 2.3.0 added 5, 2.3.1 added 3, 2.3.4 added 3) |
 | logging | Complete | Complete | sakshi integration |
-| firewall | Complete | Integrated (2.1.8) | nein's MCP tools; the mutating half is gated shut until caller authentication (roadmap 2.5.x) |
+| firewall | Complete | Integrated (2.1.8) | nein's MCP tools; all but `nein_validate` gated shut until caller authentication (2.5.2; roadmap 2.6.x) |
 | http-forward | Complete | Complete | External MCP forwarding via sandhi_rpc_mcp_call (1.2.1) |
 
 ### Test Coverage
@@ -543,8 +551,8 @@ Scheduler scheduling (1.5x), supervisor registration (2.5x), MCP registration (1
 | | Rust | Cyrius |
 |---|---|---|
 | Unit tests | 305 | — (inline in test groups) |
-| Integration tests | 28 | 1094 assertions / 17 suites, each against its real `src/` module (2.4.3); AGNOS guest test 92 checks (tests/agnos/run.sh --release, in CI); aarch64 VM, every suite (1087 assertions) and a 20-check smoke of the binary under a real kernel (tests/aarch64/run.sh, in CI) |
+| Integration tests | 28 | 1094 assertions / 17 suites, each against its real `src/` module (2.4.3); AGNOS guest test 95 checks (tests/agnos/run.sh --release, in CI); aarch64 VM, every suite (1094 assertions) and a 20-check smoke of the binary under a real kernel (tests/aarch64/run.sh, in CI) |
 | Benchmarks | 19 | 30, against the real code (2.4.2) |
 | Fuzz harnesses | 0 | 7, property-based, run in CI (2.3.2) |
-| HTTP smoke | — | tests/smoke.sh, 147 checks, run in CI (2.4.2) |
+| HTTP smoke | — | tests/smoke.sh, 151 checks, run in CI (2.4.2) |
 | Security audit | — | 33 findings (2026-04-13: 10; 2026-09-22 lifecycle: 8; 2026-09-23 AGNOS platform: 15, most filed with agnos) — see docs/audit/ |

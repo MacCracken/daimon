@@ -4,6 +4,102 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.5.2] - 2026-11-03
+
+**nein 1.9.0 and bote 3.8.0; nein's live readers are gated with the rest; on AGNOS an agent's argv
+passes as it is and a full process table is capacity; the roadmap is rewritten.** **1094 tests**
+across 17 suites, **151 HTTP smoke checks** (four new) and 7 fuzz harnesses, all green on Linux. On
+a real aarch64 kernel: all 1094 checks and the binary's 20-check smoke. The AGNOS guest test passes
+95 checks on agnos 1.57.14 (61 + 34; three new). fmt, lint and vet are clean; x86_64, aarch64 and
+agnos build; `cyrius.lock` verifies 91 of 91.
+
+### Changed — dependency pins
+
+| dep | was | now |
+|---|---|---|
+| nein | 1.8.1 | **1.9.0** |
+| bote | 3.7.5 | **3.8.0** |
+
+Both are pinned to cyrius 6.7.18 and agree with daimon's other pins: nein 1.9.0 pins bote-core
+3.8.0, libro 2.11.3, majra 2.13.0, sigil 3.13.15 and patra 1.16.6. bote's full bundle still defines
+every top-level name of its core one (572 names), so daimon still vendors it once.
+
+- **bote 3.8.0** (3.7.6, 3.7.7, 3.8.0): output schemas, progress and cancellation, all in bote's
+  dispatcher, which daimon does not use. The functions daimon calls (`libro_tool_*`, the web
+  handlers, `jsonx_get_raw`) are unchanged, and so are their results.
+- **nein 1.9.0** (1.8.2, 1.9.0): see *Security*. Once a tool is permitted, its arguments must be one
+  JSON object with plainly spelled, unique keys and `port` a plain integer (1.8.2); `nein_diff`
+  reconciles only the chains the target declares (it emptied other tenants' chains, 1.8.2); `nft`
+  runs in a child that is killed after 60 s. No new tools; names and descriptions are unchanged.
+
+### Security — nein's gate, migrated
+
+- **nein 1.9.0 changed the gate's contract.** A tool runs only when the host's gate answers
+  `NEIN_GATE_PERMIT`; any other answer denies. daimon's gate answered `1`, so on 2.5.2's first
+  build every nein tool, `nein_validate` included, answered `access denied`. It fails closed, and
+  **no test noticed**: nothing exercised a nein tool. With the old answer put back, a scratch build
+  answered `nein_validate` with `access denied: tool gated by host policy`.
+- **The live readers are refused too.** `nein_status`, `nein_list` and `nein_diff` run `nft` as
+  root and return the live ruleset (set elements, allowed sources, comments). 2.1.8 – 2.5.1 answered
+  them to any caller of the unauthenticated API as "read-only". nein 1.9.0's migration guide, which
+  names daimon, says to permit them only to callers allowed to see the ruleset; daimon cannot tell
+  callers apart. The gate now classifies with `nein_tool_class(nein_tool_index(name))`:
+  `NEIN_TOOL_OFFLINE` (`nein_validate`) runs; `NEIN_TOOL_READS_LIVE` and `NEIN_TOOL_MUTATES` are
+  refused and audited `nein.gate.deny`, until caller authentication (roadmap 2.6.x). An operator
+  can reopen each, `_nein_live_reads_enabled` and `_nein_admin_enabled`. Measured: `nein_validate`
+  with `{"protocol":"tcp","port":22}` answers `valid`; the other five answer the refusal.
+- `nein_mcp_set_gate` answers 1 when nein refuses the gate (one per process, since 1.9.0); daimon
+  warns and audits `nein.gate.install.fail`. nein then runs only offline tools.
+- **New smoke checks**: `nein_validate` runs, `nein_status` and `nein_allow` are refused, and the
+  refusals are on the audit chain (147 → 151).
+
+### Changed — AGNOS: argv and the spawn's reason (agnos audit AG-10, AG-11)
+
+- **An agent's argv passes as it is.** daimon starts an agent with `sys_spawn_argv`
+  (`SPAWN_F_ARGV`, agnos 1.57.6): `<exe> --agent-id <id> --agent-name <name>` as five arguments,
+  1024 bytes in all. A name with a space starts (the guest test's fixture prints `--agent-name two
+  words (argc 5)`); a start over 1024 bytes answers 422. Through 2.5.1 the line was split on spaces
+  and stopped at 127 bytes, so a name with a space answered 422.
+- **A full process table is capacity.** Since agnos 1.57.6 `spawn_path`#43 says why it refused.
+  `-SPAWN_E_NOPROC` (the machine's 16 slots) and `-SPAWN_E_NOMEM` answer **503** and the agent keeps
+  its status, as a full channel table has since 2.4.1. Through 2.5.1 every refusal was 500 ("its
+  process table is full, or it cannot load the executable") and the agent was left FAILED. The rest
+  are the executable: 500, FAILED. Measured in the guest test: 12 agents run, and the start past the
+  table is refused with code 9 (capacity), the agent still PENDING.
+- Tests: the guest program's two-word agent starts and stops, an argument blob over 1024 bytes is
+  refused, and the capacity refusal must be `AGENT_OP_CAPACITY`; the HTTP client's two-word agent
+  answers 200 and stops (it answered 422). The fixture agent prints its argument count.
+
+### Changed — roadmap
+
+Rewritten: open work only, and the releases ahead renumbered, since 2.5.x became maintenance.
+- **2.6.x** caller identity and MCP authentication (P1; was 2.5.x), with everything that waits on
+  it: the gated tools, the memory API, registration ownership, task reporting, who may read the audit
+  chain.
+- **2.7.x** adopting agnos 1.57.7: limits, pause and resume, captured output, the writer's pacing.
+- **2.8.x** serving hardening: the whole-answer write deadline, external callback URLs and relayed
+  errors (bote's consumer audit), the agent-frame arena lead, the parse cost, detaching nein's live
+  readers, `cyrius deps --locked`.
+- **2.9.x** the modules without a route; **3.0.0** per-agent arena isolation.
+The shipped 2.3.x and 2.4.x narratives and cyrius 6.7.6's pin-move note are gone (the CHANGELOG
+holds them). Code and docs that said "roadmap 2.5.x" for identity say 2.6.x.
+
+### Sizes and performance
+
+| target | 2.5.1 | 2.5.2 | |
+|---|---:|---:|---:|
+| x86_64 | 2,126,880 | 2,177,168 | +2.4% |
+| aarch64 | 4,842,200 | 4,912,960 | +1.5% |
+| agnos | 2,039,536 | 2,089,800 | +2.5% |
+
+2.5.1 against 2.5.2, both on cyrius 6.7.18, `tests/daimon.bcyr` and `tests/rag_ingest.bcyr`, 20
+interleaved runs with the order alternating, medians, at a load average of 1.9–2.9. A first attempt
+was discarded: another process took the load to 13 during it, and its spreads were 40–80%. Every row
+is within ±2.6% except `trace_id_hex` 52.0 → 47.0 ns (−9.6%, spreads 6% / 4%), which returns 2.5.1's
++10.6% (code placement under dead-code removal), `config_default` 95 → 86 ns (−9.5%, spread 29%),
+which moves between sessions, and `rag_chunk_only_5k` 547 → 572.5 ns (+4.7%, spreads 8% / 5%). No
+daimon code on these paths changed; the bote and nein bundles move the layout.
+
 ## [2.5.1] - 2026-11-03
 
 **`libro_retention` is gated shut, and cyrius 6.7.9 → 6.7.18 with every dependency at its latest

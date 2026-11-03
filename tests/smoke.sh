@@ -39,6 +39,12 @@ LIBRO_AUDIT=$(curl -s --max-time 2 -X POST "http://127.0.0.1:$LIBRO_PORT/v1/mcp/
 # caller), the chain keeps its entries, and the refusal is on it.
 LIBRO_RETAIN=$(curl -s --max-time 2 -X POST "http://127.0.0.1:$LIBRO_PORT/v1/mcp/call" -d '{"name":"libro_retention","arguments":{"policy":"keep_count","value":0}}' || true)
 LIBRO_AFTER=$(curl -s --max-time 2 -X POST "http://127.0.0.1:$LIBRO_PORT/v1/mcp/call" -d '{"name":"libro_export","arguments":{}}' || true)
+# 2.5.2: nein 1.9.0's gate contract (a permit is NEIN_GATE_PERMIT, not 1) and its
+# classes: the offline tool runs, the live reader and the mutating one are refused.
+NEIN_VALID=$(curl -s --max-time 2 -X POST "http://127.0.0.1:$LIBRO_PORT/v1/mcp/call" -d '{"name":"nein_validate","arguments":{"protocol":"tcp","port":22}}' || true)
+NEIN_LIVE=$(curl -s --max-time 2 -X POST "http://127.0.0.1:$LIBRO_PORT/v1/mcp/call" -d '{"name":"nein_status","arguments":{}}' || true)
+NEIN_MUT=$(curl -s --max-time 2 -X POST "http://127.0.0.1:$LIBRO_PORT/v1/mcp/call" -d '{"name":"nein_allow","arguments":{"protocol":"tcp","port":22}}' || true)
+NEIN_AUDIT=$(curl -s --max-time 2 -X POST "http://127.0.0.1:$LIBRO_PORT/v1/mcp/call" -d '{"name":"libro_export","arguments":{}}' || true)
 kill $LIBRO_SRV 2>/dev/null || true
 # Fixed-string matches (-F). Two of these checks had been failing unnoticed —
 # nothing in CI ran them — until 2.2.3 ran them again:
@@ -61,6 +67,10 @@ libro_check "$LIBRO_AUDIT"    "audit records SSRF-rejected registration" 'mcp.re
 libro_check "$LIBRO_RETAIN"   "libro_retention is refused (2.5.1)" 'access denied: tool gated by host policy'
 libro_check "$LIBRO_AFTER"    "... the chain keeps its genesis entry" 'mcp.host.init'
 libro_check "$LIBRO_AFTER"    "... and records the refusal" 'libro.retention.deny'
+libro_check "$NEIN_VALID"     "nein_validate runs (offline; nein 1.9.0's gate)" '"text":"valid"'
+libro_check "$NEIN_LIVE"      "nein_status is refused (it reads the live firewall)" 'access denied: tool gated by host policy'
+libro_check "$NEIN_MUT"       "nein_allow is refused (it changes the firewall)" 'access denied: tool gated by host policy'
+libro_check "$NEIN_AUDIT"     "... and the refusals are audited" 'nein.gate.deny'
 if [ $LIBRO_OK -ne 1 ]; then echo "  libro smoke FAILED"; SMOKE_EXIT=1; fi
 
 echo ""

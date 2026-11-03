@@ -97,6 +97,6 @@ tests/agnos/          The AGNOS guest test: sh tests/agnos/run.sh --release boot
 tests/aarch64/        The aarch64 VM test: every suite and a smoke of the binary under a real kernel
 tests/daimon.bcyr     Benchmarks (28; tests/rag_ingest.bcyr has 2 more)
 fuzz/                 Property-based fuzz harnesses (7), sharing fuzz/rng.cyr
-build/daimon          The binary: 2,126,880 bytes, static; unreachable code removed (2.5.1)
+build/daimon          The binary: 2,177,168 bytes, static; unreachable code removed (2.5.1)
 docs/                 Architecture, guides, ADRs, audit reports, roadmap
 ```

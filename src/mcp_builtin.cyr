@@ -46,7 +46,7 @@ fn mcp_libro_init(reg) {
 # libro_export then had no entries. Whoever can reach the API could erase the
 # record of what they did with it. It stays registered, so the manifest still
 # lists it, and answers nein's refusal, audited `libro.retention.deny`, until
-# daimon has caller identity (roadmap 2.5.x). The other four libro tools read.
+# daimon has caller identity (roadmap 2.6.x). The other four libro tools read.
 #
 # Flipping `_libro_retention_enabled` to 1 re-opens it; it is there for an
 # operator on a trusted single-tenant host to choose, as `_nein_admin_enabled`.
@@ -117,38 +117,53 @@ fn mcp_dispatch_builtin(name_c, args) {
 # would be a remote root-equivalent hole, strictly worse than the SSRF and
 # rate-limiter defects this project has already fixed.
 #
-# The gate therefore fails CLOSED on the admin set until daimon has agent
-# identity (roadmap 2.5.x). Read-only tools — status / validate / list / diff —
-# are exposed; nein classifies the split itself via nein_tool_read_only(i), so
-# daimon hardcodes nothing.
+# The gate therefore fails CLOSED until daimon has caller identity (roadmap):
+# it permits only what nein classifies as NEIN_TOOL_OFFLINE (nein_validate,
+# which touches nothing outside the process). nein classifies; daimon
+# hardcodes no tool name.
 #
-# Flipping `_nein_admin_enabled` to 1 before authentication is wired re-opens
-# exactly the hole above. It exists so an operator on a trusted single-tenant
-# host can make that choice deliberately, not by default.
+# ⛔ THE LIVE READERS ARE DENIED TOO, since 2.5.2. nein_status / nein_list /
+# nein_diff (NEIN_TOOL_READS_LIVE) run `nft list ruleset` as root and return the
+# live ruleset, set elements, allowed sources and comments included, to whoever
+# calls. 2.1.8 – 2.5.1 permitted them as "read-only" (nein_tool_read_only). nein
+# 1.9.0's migration guide says to permit them only to callers allowed to see the
+# ruleset, and daimon cannot tell callers apart. (They also wait on `nft` on the
+# loop, for up to 60 s since nein 1.8.2: mcp_builtin_waits does not detach them.)
+#
+# Flipping `_nein_admin_enabled` (the mutating pair) or `_nein_live_reads_enabled`
+# (the live readers) to 1 before authentication is wired re-opens exactly the
+# exposure above. They exist so an operator on a trusted single-tenant host can
+# make that choice deliberately, not by default.
 #
 # ⚠ On agnos the tools ARE registered and return a specific refusal — nein 1.6.12
 # fails closed there with "nftables backend unavailable on agnos", because agnos
 # has its own network stack and no nft binary. A diagnosable error beats a tool
 # that silently vanishes from the manifest on one target.
 var _nein_admin_enabled = 0;
+var _nein_live_reads_enabled = 0;
 
-# gate_fp contract (nein): fn(tool_name: cstring, claims: i64) -> 1 permit / 0 deny.
-# nein calls this BEFORE each tool acts and returns an "access denied" envelope
-# on 0, never touching the firewall.
+# gate_fp contract (nein 1.9.0): fn(tool_name: cstring, claims: i64) ->
+# NEIN_GATE_PERMIT to permit; any other answer denies. nein calls this BEFORE a
+# tool acts and returns an "access denied" envelope on a denial, never touching
+# the firewall. Through nein 1.8 the permit was 1, which 1.9.0 reads as a denial:
+# on 2.5.2's first build every nein tool, nein_validate included, was refused.
 fn daimon_nein_gate(tool_name_c, claims) {
-    var i = 0;
-    while (i < nein_tool_count()) {
-        if (streq(nein_tool_name(i), tool_name_c) == 1) {
-            if (nein_tool_read_only(i) == 1) { return 1; }
-            if (_nein_admin_enabled == 1) { return 1; }
-            daimon_audit(SEV_SECURITY, "mcp", "nein.gate.deny",
-              "mutating nein firewall tool denied — daimon has no MCP caller authentication");
-            return 0;
-        }
-        i = i + 1;
+    var cls = nein_tool_class(nein_tool_index(tool_name_c));
+    if (cls == NEIN_TOOL_OFFLINE) { return NEIN_GATE_PERMIT; }
+    if (cls == NEIN_TOOL_READS_LIVE) {
+        if (_nein_live_reads_enabled == 1) { return NEIN_GATE_PERMIT; }
+        daimon_audit(SEV_SECURITY, "mcp", "nein.gate.deny",
+          "nein tool that reads the live firewall denied — daimon has no MCP caller authentication");
+        return 0;
     }
-    # Unknown name: deny. A gate that permits what it cannot classify is the
-    # wrong default, even though nein_mcp_dispatch answers "unknown nein tool".
+    if (cls == NEIN_TOOL_MUTATES) {
+        if (_nein_admin_enabled == 1) { return NEIN_GATE_PERMIT; }
+        daimon_audit(SEV_SECURITY, "mcp", "nein.gate.deny",
+          "mutating nein firewall tool denied — daimon has no MCP caller authentication");
+        return 0;
+    }
+    # Unknown name (class 0): deny. A gate that permits what it cannot classify is
+    # the wrong default, even though nein_mcp_dispatch answers "unknown nein tool".
     return 0;
 }
 
@@ -156,7 +171,12 @@ fn daimon_nein_gate(tool_name_c, claims) {
 # rather than restating them here — a restated table is a table that drifts.
 # Installs the gate BEFORE any call can be served. Call once from app_init.
 fn mcp_nein_init(reg) {
-    nein_mcp_set_gate(&daimon_nein_gate);
+    # nein 1.9.0 answers 1 when it refuses the gate (one gate per process). nein
+    # then runs only offline tools, which fails closed; say so.
+    if (nein_mcp_set_gate(&daimon_nein_gate) != 0) {
+        sakshi_warn("nein refused daimon's gate: only nein_validate will run", 56);
+        daimon_audit(SEV_SECURITY, "mcp", "nein.gate.install.fail", "nein refused daimon's tool gate");
+    }
     var schema = str_from("{\"type\":\"object\"}");
     var i = 0;
     while (i < nein_tool_count()) {
