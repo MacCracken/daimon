@@ -4,12 +4,171 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [2.4.4] - 2026-11-02
 
-**A documentation sweep: every guide checked against the running 2.4.3 binary.** Documentation
-only; no code, test or CI file changed.
+**cyrius 6.6.6 → 6.6.20, and each dependency pin moved to its latest release for that toolchain.**
+daimon's own source moves off a deprecated bayan name and drops an agnos workaround the toolchain
+made unnecessary. **1087 tests** across 17 suites, **143 HTTP smoke checks** and 7 fuzz harnesses,
+all green on Linux. On a real aarch64 kernel: all 1087 checks and the binary's 20-check smoke. fmt,
+lint and vet are clean; x86_64, aarch64 and agnos build; `cyrius.lock` verifies 84 of 84.
+⛔ **The AGNOS guest test fails** on the agnos 1.57.5 it runs: cyrius 6.6.20 refuses a loopback-only
+listener on agnos before 1.57.7, and daimon binds 127.0.0.1 by default (*AGNOS*, below).
+
+### Changed — toolchain and dependency pins
+
+| dep | was | now | | dep | was | now |
+|---|---|---|---|---|---|---|
+| cyrius | 6.6.6 | **6.6.20** | | libro | 2.10.3 | **2.10.8** |
+| sakshi | 2.5.2 | **2.5.7** | | majra | 2.9.1 | **2.9.3** |
+| bayan | 1.5.6 | **1.5.12** | | bote | 3.3.13 | **3.3.17** |
+| sigil | 3.12.18 | **3.13.10** | | samay | 1.1.3 | **1.1.7** |
+| ai-hwaccel | 2.4.0 | **2.4.2** | | nein | 1.7.0 | **1.7.1** |
+
+Each new tag is the dependency's last release pinned to cyrius 6.6.20 or earlier; every later one
+needs 6.7.x. nein 1.7.1, cut for this release, pins the same set. The toolchain also brings sandhi
+1.9.17 → **1.10.8** (from the stdlib snapshot), and libro brings patra 1.14.3 → **1.15.2**. The
+pinned sakshi, bayan and
+sigil are byte-identical to the copies cyrius 6.6.20 folds, so `cyrius deps` keeps the snapshot's file
+and prints `refusing to overwrite stdlib leaf` for each, harmlessly. 2.4.3 printed it for bayan, sigil
+and patra.
+
+- **samay and nein resolve from their tags.** Their `path = "../samay"` / `"../nein"` lines are gone,
+  as ai-hwaccel's went at 2.4.0. With a `path`, the tag is inert and `cyrius deps` copies the sibling
+  checkout. `../samay` is at samay 1.5.1, built for cyrius 6.7.18, so a local build of 2.4.3's HEAD
+  vendored it and failed: `refusing to emit binary with 1 reachable undefined function(s)`, because
+  samay 1.5.1 calls `bayan_json_v_obj_get_by_cstr`, which bayan 1.5.6 does not have. CI, with no
+  siblings, built the tag. A local build now compiles what CI compiles.
+- **The lock was rebuilt from nothing**: 84 entries (was 83), and one commit pin for each of the 11
+  git deps. Since cyrius 6.6.20 (its CVE-83) a lock write keeps the commit pins earlier resolves made,
+  so `rm -rf lib && cyrius deps` left each old tag listed beside its new one. They were inert
+  (`cyrius deps --verify` passed with them), but the lock should name only what is vendored. After a
+  pin move, run `rm -rf lib cyrius.lock && cyrius deps` (CONTRIBUTING, CLAUDE.md).
+- **One version of each library.** nein 1.7.1 pins bote-core 3.3.17, libro 2.10.8, majra 2.9.3,
+  sigil 3.13.10 and patra 1.15.2, the versions daimon resolves. nein 1.7.0 pulled bote-core 3.3.13
+  (and the 6.6.6 line's libro, majra, sigil and patra, which daimon's own pins overrode).
+
+What the moves carry for daimon:
+
+- **cyrius 6.6.7 – 6.6.20.**
+  - agnos (6.6.7, its CVE-48): a socket bound to 127/8 listens on loopback only, through a listen
+    class agnos has since 1.57.7. On an older kernel the listen is refused: it fails closed rather
+    than listen on the network. See *AGNOS* below.
+  - agnos (6.6.7, daimon's filing): a blocking socket read is timed by `uptime_us`#95, else the RTC,
+    and counts pauses only when no clock reads; a timeout answers -11, not 0. See *Changed — daimon*.
+  - agnos (6.6.7, daimon's filing): `clock_now_ns` falls back to `uptime_ms`#40, latched, when `#95`
+    answers -1. The vendored libraries' deadlines now end on a guest whose TSC calibration was
+    refused. `daimon_now_ms` has the same shape and stays.
+  - `file_write_atomic` opens its temp file `O_EXCL | O_NOFOLLOW` (6.6.20, its CVE-100);
+    `src/memory.cyr` writes through it.
+  - Codegen: two P0 miscompiles fixed (a `continue` in a `for` inside a `while` inside a `for`; `: f64`
+    return paths), and aarch64 frame offsets past 64 KiB (its CVE-90).
+  - Diagnostics: the new errors of 6.6.7 – 6.6.20 have no site in daimon. `return None();` no longer
+    draws the pair-return warning (6.6.9), so `memory_store_get`'s false positive, carried since 2.1.4,
+    is gone. A `#deprecated` function warns at every call (6.6.16).
+- **sandhi 1.10.8.**
+  - Its senders write the whole response through `sock_send_all` and return the write's result
+    (1.10.6). daimon's Linux answers go through them. Through 1.10.5 a short write was ignored, so a
+    response could be cut short of its own Content-Length. The bound on the loop changes with it: a
+    client that stops reading still costs one `SO_SNDTIMEO` (`SERVE_IDLE_MS`, 5 s), but one that
+    reads a trickle now holds the loop for as long as every write makes some progress within it,
+    where one write and its one timeout used to end it. That needs an answer larger than the socket's
+    send buffer, and daimon's own relay writer (`_srv_send_all`) already worked this way (roadmap).
+    Two comments that said "one sock_send" are corrected.
+  - Its client (1.10.7), behind the MCP forwards and `web_fetch`: a body shorter than its
+    Content-Length is `SANDHI_ERR_PROTOCOL` (it was success), a `Connection: close` body is no longer
+    cut at its first NUL byte, and HEAD, 204 and 304 end at their headers.
+  - A DNS lookup is refused when `getrandom` fails, instead of using a clock-derived query id (1.10.3).
+- **bayan 1.5.12.** `bayan_json_v_obj_get` is deprecated (1.5.10) for `_by_cstr` / `_by_str`; the
+  answers are the same. The typed parser daimon reads bodies with is unchanged except that floats are
+  correctly rounded (1.5.7): a double near a rounding tie can decode 1 ULP differently.
+- **sakshi 2.5.7.** Timestamps count from the reference clock (`CLOCK_MONOTONIC_RAW` on Linux) since
+  2.5.4, so absolute timestamps jump once across this upgrade and now agree between processes. The
+  x86_64 calibration's −246 ppm bias is gone. The trace-id functions daimon uses are unchanged.
+- **sigil 3.13.10.** daimon calls none of it; libro, bote and the native TLS do. ECDSA P-256 / P-384
+  signing is constant-time (3.13.8, HIGH upstream), and verification is stricter (3.13.x).
+- **nein 1.7.1.** Its four MCP handlers that passed `str_data(str_builder_build(sb))` to `_mcp_ok`
+  go through one helper, so 6.6.13's wider Str → cstring check no longer warns on them. They were
+  not a live bug: a fresh `str_builder_build` is NUL-terminated. Its `.deps` sidecars shrank to
+  `syscalls`.
+- **libro 2.10.8, majra 2.9.3, bote 3.3.17, samay 1.1.7, ai-hwaccel 2.4.2.** Nothing on the paths daimon
+  calls changes beyond the `_by_cstr` renames in bote's web tools, samay and ai-hwaccel. Each bundle's
+  `.deps` sidecar now lists only what it needs (cyrius 6.6.18's distlib); daimon builds without adding
+  a module to its `[deps].stdlib`.
+
+### Changed — daimon
+
+- **bayan lookups by their current name.** The 13 calls in `src/` (`http.cyr`'s `http_json_*`,
+  `ipc.cyr`, `mcp.cyr`, `api_agent.cyr`, `api_edge.cyr`) and one in `tests/mcp.tcyr` call
+  `bayan_json_v_obj_get_by_cstr`, which the deprecated name forwarded to. Every key is a C-string
+  literal. Each build loses 13 deprecation warnings.
+- **agnos: `daimon_agnos_recv_bound` is gone** (agnos audit AG-15, ADR-007's 2.4.4 addendum). 2.4.2
+  lifted the stdlib's 6000-pause read bound at `serve`'s start because it ran out in about a second.
+  cyrius 6.6.7 resolved daimon's filing, and since then the pause count applies only when no clock
+  reads at all, where lifting it made the wait unbounded.
+
+### AGNOS — the default listener is refused before agnos 1.57.7
+
+- **What changed.** Through cyrius 6.6.6 the agnos socket adapter ignored the bind address, so
+  daimon's 127.0.0.1 listener took the NIC's address, and `serve` warned and audited it (agnos audit
+  AG-2). Since 6.6.7 (its CVE-48) `sock_bind` keeps the address and `sock_listen`#56 asks for a listen
+  class: LOOPBACK for 127/8, which agnos has since 1.57.7. On an older kernel the stdlib refuses the
+  listen: "it FAILS CLOSED rather than listening on the network".
+- **Measured**: `sh tests/agnos/run.sh --release` (agnos 1.57.5, gnoboot 0.7.2). The guest program's
+  59 checks pass. daimon prints its banner, its listener is refused, and each of the client's checks
+  reads 0 bytes until the launcher stops waiting at 120 s.
+- **daimon says nothing when its listener cannot open.** `serve` prints "listening on port" before
+  `server_loop` opens the listener, and `server_loop` returns 1 without a message.
+- agnos 1.57.6 and 1.57.7 resolved every agnos filing daimon made at 2.4.0 – 2.4.3, the loopback
+  listener among them (agnos 1.57.14 is the latest release). daimon adopts none of them yet.
+- **Tried in a scratch copy, not in this tree:**
+  - agnos 1.57.5, with the launcher starting daimon `--listen 0.0.0.0`: all 92 checks pass.
+  - agnos 1.57.14 (SHA-256 from its release), with the test client dialing 127.0.0.1: the default
+    listener works. 56 of the guest program's 59 checks pass; the 3 that fail assert 1.57.5's limit
+    ("no signal ends a process yet"), and a stop now ends the agent. 32 of the client's 33 pass;
+    `health answers while a forwarded call waits on its server` answered in 15,001 ms. Not diagnosed.
+
+### Known issues (carried, re-checked at 6.6.20)
+
+- `duplicate fn` warnings between `lib/bote.cyr` and `lib/bote-core.cyr`, both bote 3.3.17 now, so
+  the duplicates are the same definitions.
+- `undefined function 'sys_dup2'` in the agnos build: the agnos syscall peer has none, and the call
+  (`_agent_child`, Linux's fork path) is unreachable there. 2.4.3 on 6.6.6 printed it too.
+- sigil's `var buf[262144]` gets static storage, as it always has.
+
+### Sizes
+
+| target | 2.4.3 (6.6.6) | 2.4.4 (6.6.20) | |
+|---|---:|---:|---:|
+| x86_64 | 3,313,248 | 3,511,992 | +6.0% |
+| aarch64 | 4,209,992 | 4,085,120 | −3.0% |
+| agnos | 3,242,848 | 3,450,208 | +6.4% |
+
+`src/` is unchanged in size (10,044 lines). The difference is the toolchain and the vendored code.
+
+### Performance
+
+2.4.3 (cyrius 6.6.6) against 2.4.4, `tests/daimon.bcyr` and `tests/rag_ingest.bcyr`, each tree built
+by its own toolchain. **20 interleaved runs with the order alternating, medians**, at a load average
+of 1.9–2.1 (the benchmark included). A first round of 10 agreed in direction on every row below.
+
+| Benchmark | 2.4.3 | 2.4.4 | change | spread 2.4.3 | spread 2.4.4 |
+|---|---:|---:|---:|---:|---:|
+| mcp_register_100_tools | 63.84 µs | 66.87 µs | +4.7% | 15% | 21% |
+| agent_reap_live | 496.0 ns | 514.0 ns | +3.6% | 4% | 3% |
+| hashmap_1000_insert_lookup | 518.4 µs | 536.0 µs | +3.4% | 7% | 9% |
+| supervisor_register_1000 | 2.565 ms | 2.611 ms | +1.8% | 4% | 5% |
+| config_default | 88.0 ns | 86.0 ns | −2.3% | 5% | 6% |
+| rag_chunk_only_5k | 533.0 ns | 521.5 ns | −2.2% | 8% | 4% |
+| rag_chunk_5k_chars | 4.53 µs | 4.45 µs | −1.9% | 4% | 3% |
+
+The other 22 are within ±1.6%, except `mcp_find_tool_in_100` (+5.5%, spreads of 54–56%). daimon's
+code on these paths did not change, so the moves are the toolchain's and the vendored libraries'.
+Their cause was not measured. Measured before nein moved to 1.7.1, whose change is confined to four
+of its own MCP handlers, which no benchmark calls.
 
 ### Changed — documentation
+
+A documentation sweep made after 2.4.3, checking every guide against the running 2.4.3 binary:
 
 - **README** rewritten around what daimon does today:
   - the 13 builtin MCP tools (it named five), MCP resources and prompts, containment and tracing;

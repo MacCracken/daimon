@@ -6,7 +6,7 @@ to get involved.
 ## Getting Started
 
 1. Fork the repository and clone your fork
-2. Install [Cyrius](https://github.com/MacCracken/cyrius) 6.6.6, the pin in `cyrius.cyml` (`[package].cyrius`)
+2. Install [Cyrius](https://github.com/MacCracken/cyrius) 6.6.20, the pin in `cyrius.cyml` (`[package].cyrius`)
 3. Build and run `sh tests/test.sh` (below) to verify your environment
 
 ## Development Workflow
@@ -42,9 +42,11 @@ never `sleep_ms`, which holds the CPU. Read the clock with `daimon_now_ms`, and 
 `lib/` is gitignored. `cyrius deps` fills it with the stdlib subset from the pin and each git
 dependency at its tag, then rewrites `cyrius.lock` from what `lib/` holds. CI verifies the committed
 lock (`cyrius deps --verify`). If the lock names files a clean checkout does not vendor, rebuild it
-with `rm -rf lib && cyrius deps`. samay and nein also name a sibling checkout (`path = "../samay"`,
-`"../nein"`). When one is present, `cyrius deps` copies it instead of the tag, so a checkout in the
-middle of a change ends up in your build and your lock.
+with `rm -rf lib && cyrius deps`. After moving a pin, delete `cyrius.lock` too
+(`rm -rf lib cyrius.lock && cyrius deps`): since cyrius 6.6.20 the lock keeps the commit pins
+earlier resolves made, so the old tags would stay listed beside the new ones. No dependency names a
+sibling checkout (`path`), since 2.4.4: with one, `cyrius deps` copies the checkout instead of the
+tag, and a sibling on another release line ends up in your build and your lock.
 
 ## Pull Requests
 

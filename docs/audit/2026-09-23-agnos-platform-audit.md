@@ -189,7 +189,7 @@ only agnos can fix that.
   relays (ADR-007's addendum). The test client pauses 20 ms between 512-byte pieces.
 - The evidence is added to the agnos filing.
 
-### AG-15: A detached call's read gave up after about a second (MEDIUM, availability) — fixed in daimon; cyrius filing (2.4.2)
+### AG-15: A detached call's read gave up after about a second (MEDIUM, availability) — fixed in cyrius 6.6.7; daimon's interim removed (2.4.4)
 
 A blocking socket read on agnos is the stdlib's `_agnos_sock_recv_block` (cyrius
 `lib/syscalls_x86_64_agnos.cyr`). It polls `sock_recv`#49 with a `pause`#14 between polls. It is
@@ -248,6 +248,16 @@ the test's server went on sending into its connection. That is not measured.
 
 - **daimon's writer on agnos** (AG-14): 512-byte pieces, 1 ms apart, never two back to back, and
   the same gap between the reads `_srv_relay` relays. It mitigates the hold. Only agnos can fix it.
+
+## What 2.4.4 changed in daimon itself
+
+- **AG-15's interim is gone.** cyrius 6.6.7 resolved the filing: `_agnos_sock_recv_block` times its
+  wait with `uptime_us`#95, else the RTC, and counts pauses only when no clock reads at all. A
+  timeout answers -11 (EAGAIN), no longer 0, which read as EOF. With 6.6.20 pinned,
+  `daimon_agnos_recv_bound` could only make that last case unbounded, so it was removed.
+- **AG-12's fallback stays.** cyrius 6.6.7 also resolved its filing: `clock_now_ns` falls back to
+  `uptime_ms`#40, latched, when `#95` answers -1, so the vendored libraries' deadlines end too.
+  `daimon_now_ms` has the same shape and is left as it is.
 
 ## Verification
 

@@ -45,6 +45,25 @@ those numbers are not comparable.
 
 `tests/rag_ingest.bcyr` (real since 2.1.6): `rag_ingest_real_5k` 133.1µs, `rag_chunk_only_5k` 508ns.
 
+### 2.4.4 — cyrius 6.6.20 and the pin move
+
+2.4.3 (built by cyrius 6.6.6) against 2.4.4 (6.6.20), both files, 20 interleaved runs with the order
+alternating, medians, at a load average of 1.9–2.1. No daimon code on a measured path changed:
+
+| Benchmark | 2.4.3 | 2.4.4 | change | spread 2.4.3 | spread 2.4.4 |
+|---|---:|---:|---:|---:|---:|
+| mcp_register_100_tools | 63.84 µs | 66.87 µs | +4.7% | 15% | 21% |
+| agent_reap_live | 496.0 ns | 514.0 ns | +3.6% | 4% | 3% |
+| hashmap_1000_insert_lookup | 518.4 µs | 536.0 µs | +3.4% | 7% | 9% |
+| supervisor_register_1000 | 2.565 ms | 2.611 ms | +1.8% | 4% | 5% |
+| config_default | 88.0 ns | 86.0 ns | −2.3% | 5% | 6% |
+| rag_chunk_only_5k | 533.0 ns | 521.5 ns | −2.2% | 8% | 4% |
+| rag_chunk_5k_chars | 4.53 µs | 4.45 µs | −1.9% | 4% | 3% |
+
+The other 22 are within ±1.6% (`mcp_find_tool_in_100`, +5.5%, has spreads of 54–56%). A first round
+of 10 runs, whose load rose to 2.9, agreed in direction on every row above. Their cause was not
+measured.
+
 ### 2.4.3 — the QEMU round
 
 **Linux is unchanged.** 2.4.2 against 2.4.3, `tests/daimon.bcyr`, ten interleaved runs with the

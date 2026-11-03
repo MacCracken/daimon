@@ -21,7 +21,7 @@ main.cyr             CLI: serve [port] [--async] [--trace] [--agents-dir DIR] [-
 │                    shape with per-target bodies — daimon_signal (pidfd, then kill), daimon_reap_code,
 │                    daimon_unlink, daimon_yield_ms (pause#14 on agnos), daimon_now_ms (2.4.1: survives
 │                    a refused TSC calibration), daimon_write_all (2.4.1; 512-byte pieces 1 ms apart
-│                    on agnos since 2.4.3), daimon_agnos_recv_bound (2.4.2)
+│                    on agnos since 2.4.3)
 ├── error.cyr        DAIMON_ERR_* codes + HTTP status mapping; error_json; json_escape_str /
 │                    json_escape_text (output escaping, VULN-002); json_object_ok (the rule a request
 │                    body and a channel frame share)
@@ -195,4 +195,4 @@ Every AGNOS agent (over the HTTP API and, once started by daimon, its channel on
 3. **Bump allocator** — fast allocation, no individual free. Single trust domain (see VULN-007 security gate for multi-tenant). So upkeep on the loop's tick must not allocate: `agents_tick` allocates nothing, idle or with a live agent (measured at 2.4.2).
 4. **Everything is i64** — Cyrius type system. Structs are manually laid out with `alloc()` + `store64()`/`load64()` at fixed offsets.
 5. **pidfd for signals** — race-free process management on Linux 5.3+, with `kill()` fallback (`daimon_signal`).
-6. **Dependencies** — a Cyrius stdlib subset (`[deps].stdlib` in `cyrius.cyml`) and nine first-party git dependencies, all pinned by tag in `cyrius.cyml`: sakshi (logging, tracing), bote (MCP: libro and web tools), libro (the audit chain), majra (bote's event sink), sigil (crypto), bayan (JSON), samay (the scheduler), nein (firewall tools) and ai-hwaccel (samay's). sandhi (HTTP framing and answers, and the MCP client) comes with the stdlib. `cyrius deps` vendors all of it into `lib/`, which is gitignored; `cyrius.lock` records a hash for each of its 83 entries, and CI verifies them. `CLAUDE.md` says why each dep is there and what it pins.
+6. **Dependencies** — a Cyrius stdlib subset (`[deps].stdlib` in `cyrius.cyml`) and nine first-party git dependencies, all pinned by tag in `cyrius.cyml`: sakshi (logging, tracing), bote (MCP: libro and web tools), libro (the audit chain), majra (bote's event sink), sigil (crypto), bayan (JSON), samay (the scheduler), nein (firewall tools) and ai-hwaccel (samay's). sandhi (HTTP framing and answers, and the MCP client) comes with the stdlib. `cyrius deps` vendors all of it into `lib/`, which is gitignored; `cyrius.lock` records a hash for each of its 84 entries and the commit of each git dependency's tag, and CI verifies them. `CLAUDE.md` says why each dep is there and what it pins.

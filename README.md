@@ -56,7 +56,7 @@ See [SECURITY.md](SECURITY.md) and the audit reports in [docs/audit/](docs/audit
 
 ## Building
 
-Requires [Cyrius](https://github.com/MacCracken/cyrius) 6.6.6, the pin in `cyrius.cyml`.
+Requires [Cyrius](https://github.com/MacCracken/cyrius) 6.6.20, the pin in `cyrius.cyml`.
 
 ```bash
 cyrius deps                             # vendor the stdlib subset and the git deps into lib/ (gitignored)
@@ -66,9 +66,8 @@ cyrius build src/main.cyr build/daimon  # also --aarch64 build/daimon-aarch64, -
 ```
 
 `cyrius deps` resolves sakshi, bote, libro, majra, sigil, bayan, samay, nein and ai-hwaccel at the
-tags in `cyrius.cyml`, and every build runs it first. samay and nein also name a sibling checkout
-(`path = "../samay"`, `"../nein"`); when that checkout is present, `cyrius deps` uses it instead of
-the tag.
+tags in `cyrius.cyml`, and every build runs it first. None of them names a sibling checkout (since
+2.4.4), so a local build compiles what CI compiles.
 
 Each tagged release publishes:
 - the source tarball;
@@ -108,16 +107,16 @@ found.
 
 ## Status
 
-At 2.4.3, `src/` is 10,044 lines in 30 modules. The port (0.7.0) turned 9,724 lines of Rust into
+At 2.4.4, `src/` is 10,044 lines in 30 modules. The port (0.7.0) turned 9,724 lines of Rust into
 4,141 of Cyrius. The binaries are statically linked:
 
 | target | bytes |
 |---|---:|
-| x86_64 | 3,313,248 |
-| aarch64 | 4,209,992 |
-| agnos | 3,242,848 |
+| x86_64 | 3,511,992 |
+| aarch64 | 4,085,120 |
+| agnos | 3,450,208 |
 
-Of x86_64's bytes, 1,623,422 are unreachable code that the toolchain NOPs in place rather than
+Of x86_64's bytes, 1,681,822 are unreachable code that the toolchain NOPs in place rather than
 removing (CHANGELOG 1.2.4). The 181 KB this line once gave was the v1.0.1 port-era build (cyrius
 4.2.0, BENCHMARKS.md).
 

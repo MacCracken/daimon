@@ -153,7 +153,7 @@ mcp_register_external(mreg, mcp_tool_new(str_from("e\"quoted"), str_from("line1\
 var man = mcp_manifest_json(mreg);
 var mroot = bayan_json_v_parse(man);
 assert(mroot != 0, "the manifest parses as JSON — a quote and a newline in a registration included");
-var mtools = bayan_json_v_obj_get(mroot, "tools");
+var mtools = bayan_json_v_obj_get_by_cstr(mroot, "tools");
 assert_eq(bayan_json_v_arr_len(mtools), 2, "it lists the builtin and the external tool");
 assert(str_contains(man, str_from("\"count\":2")) == 1, "and counts both");
 assert(str_contains(man, str_from("e\\\"quoted")) == 1, "the quote in a name arrives escaped");

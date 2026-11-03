@@ -37,8 +37,8 @@ fn mcp_extract_input_schema(body) {
     var root = bayan_json_v_parse(body);
     if (root == 0) { return str_from("{}"); }
     if (bayan_json_v_is_obj(root) == 0) { return str_from("{}"); }
-    var sv = bayan_json_v_obj_get(root, "inputSchema");
-    if (sv == 0) { sv = bayan_json_v_obj_get(root, "input_schema"); }
+    var sv = bayan_json_v_obj_get_by_cstr(root, "inputSchema");
+    if (sv == 0) { sv = bayan_json_v_obj_get_by_cstr(root, "input_schema"); }
     if (sv == 0) { return str_from("{}"); }
     if (bayan_json_v_is_obj(sv) == 0) { return str_from("{}"); }
     return bayan_json_v_build(sv);
@@ -276,7 +276,7 @@ fn mcp_extract_prompt_arguments(body) {
     var root = bayan_json_v_parse(body);
     if (root == 0) { return str_from("[]"); }
     if (bayan_json_v_is_obj(root) == 0) { return str_from("[]"); }
-    var av = bayan_json_v_obj_get(root, "arguments");
+    var av = bayan_json_v_obj_get_by_cstr(root, "arguments");
     if (av == 0) { return str_from("[]"); }
     if (bayan_json_v_is_arr(av) == 0) { return str_from("[]"); }
     return bayan_json_v_build(av);

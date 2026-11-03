@@ -333,7 +333,7 @@ fn api_agent_message_send(fd, id_cstr, body) {
                 return 0;
             }
         }
-        var pv = bayan_json_v_obj_get(root, "payload");
+        var pv = bayan_json_v_obj_get_by_cstr(root, "payload");
         if (pv != 0) { payload = bayan_json_v_build(pv); }
     }
     if (payload == 0) { payload = str_from("null"); }

@@ -66,7 +66,7 @@ fn _edge_arch_ok(s) {
 # integer in lo..hi. (A float is not accepted: http_json_int would truncate it.)
 fn _edge_int_field(root, key, dflt, lo, hi) {
     if (http_json_has(root, key) == 0) { return dflt; }
-    var v = bayan_json_v_obj_get(root, key);
+    var v = bayan_json_v_obj_get_by_cstr(root, key);
     if (bayan_json_v_is_int(v) == 0) { return 0 - 1; }
     var n = bayan_json_v_int(v);
     if (n < lo) { return 0 - 1; }
@@ -104,7 +104,7 @@ fn api_edge_register(fd, body) {
     if (disk < 0) { http_error(fd, 422, str_from("disk_mb must be an integer from 0 to 1099511627776")); return 0; }
     var gpu = 0;
     if (http_json_has(root, "has_gpu") == 1) {
-        var gv = bayan_json_v_obj_get(root, "has_gpu");
+        var gv = bayan_json_v_obj_get_by_cstr(root, "has_gpu");
         if (bayan_json_v_is_bool(gv) == 0) { http_error(fd, 422, str_from("has_gpu must be true or false")); return 0; }
         gpu = bayan_json_v_bool(gv);
     }

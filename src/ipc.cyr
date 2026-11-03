@@ -644,12 +644,12 @@ fn _ipc_frame(ch, body, len) {
     var ps: i64[6];   # bayan's parser state (_JP_STATE_SIZE = 48)
     var root = bayan_json_v_parse_ctx_a(_ipc_arena, &ps, body, len);
     if (json_object_ok(root) == 0) { return _ipc_refuse(ch, NACK_INVALID); }
-    var target = bayan_json_v_str(bayan_json_v_obj_get(root, "target"));
+    var target = bayan_json_v_str(bayan_json_v_obj_get_by_cstr(root, "target"));
     if (target == 0) { return _ipc_refuse(ch, NACK_INVALID); }
     if (str_len(target) == 0) { return _ipc_refuse(ch, NACK_INVALID); }
     if (str_len(target) > IPC_TARGET_MAX) { return _ipc_refuse(ch, NACK_INVALID); }
     var mtype = MSG_EVENT;
-    var tv = bayan_json_v_obj_get(root, "type");
+    var tv = bayan_json_v_obj_get_by_cstr(root, "type");
     if (tv != 0) {
         if (bayan_json_v_is_null(tv) == 0) {
             mtype = 0 - 1;
@@ -658,7 +658,7 @@ fn _ipc_frame(ch, body, len) {
         }
     }
     var payload = 0;
-    var pv = bayan_json_v_obj_get(root, "payload");
+    var pv = bayan_json_v_obj_get_by_cstr(root, "payload");
     if (pv != 0) { payload = bayan_json_v_build_a(_ipc_arena, pv); }
     else { payload = str_new_a(_ipc_arena, "null", 4); }
     if (_ipc_bus == 0) { return _ipc_refuse(ch, NACK_QUEUE_FULL); }

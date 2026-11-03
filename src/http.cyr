@@ -237,7 +237,7 @@ fn http_bad_body(fd) {
 
 # 1 if the top-level field is present and not JSON null.
 fn http_json_has(root, key) {
-    var v = bayan_json_v_obj_get(root, key);
+    var v = bayan_json_v_obj_get_by_cstr(root, key);
     if (v == 0) { return 0; }
     if (bayan_json_v_is_null(v) == 1) { return 0; }
     return 1;
@@ -249,7 +249,7 @@ fn http_json_has(root, key) {
 # numbers, so clients send them unquoted. true / false, objects and arrays are
 # not strings.
 fn http_json_str(root, key) {
-    var v = bayan_json_v_obj_get(root, key);
+    var v = bayan_json_v_obj_get_by_cstr(root, key);
     if (v == 0) { return 0; }
     if (bayan_json_v_is_str(v) == 1) { return bayan_json_v_str(v); }
     if (bayan_json_v_is_int(v) == 1) { return bayan_json_v_build(v); }
@@ -262,7 +262,7 @@ fn http_json_str(root, key) {
 # ("7", read the way jget_int read it), and true / false as 1 / 0 (jget_int
 # read `true` as 0).
 fn http_json_int(root, key) {
-    var v = bayan_json_v_obj_get(root, key);
+    var v = bayan_json_v_obj_get_by_cstr(root, key);
     if (v == 0) { return 0; }
     if (bayan_json_v_is_str(v) == 1) { return str_to_int(bayan_json_v_str(v)); }
     if (bayan_json_v_is_bool(v) == 1) { return bayan_json_v_bool(v); }
@@ -273,7 +273,7 @@ fn http_json_int(root, key) {
 # (`{"src":"a"}`, `42`), or 0 when absent or null. For free-form fields such as
 # RAG `metadata`, which the Rust original took as any JSON value.
 fn http_json_text(root, key) {
-    var v = bayan_json_v_obj_get(root, key);
+    var v = bayan_json_v_obj_get_by_cstr(root, key);
     if (v == 0) { return 0; }
     if (bayan_json_v_is_null(v) == 1) { return 0; }
     if (bayan_json_v_is_str(v) == 1) { return bayan_json_v_str(v); }
@@ -308,8 +308,9 @@ fn _http_reason(status) {
 }
 
 # agnos (2.4.1): daimon writes every answer itself, as the same bytes sandhi
-# would send, through daimon_write_all. sandhi_server_send_response makes one
-# write per part and ignores a short count, which fails there twice over:
+# would send, through daimon_write_all. sandhi_server_send_response hands each
+# part to the kernel in one write (and through sandhi 1.10.5 ignored a short
+# count; 1.10.6 finishes it with sock_send_all), which fails there twice over:
 # - a detached call's child answers into a pipe (server_detach), a 4080-byte
 #   ring whose write returns short when full, so an answer over 4 KB lost its
 #   tail. The child names its pipe here (http_answer_into_pipe);

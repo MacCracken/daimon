@@ -1,7 +1,8 @@
 # ADR-007: daimon on AGNOS — the kernel's own primitives, a polled loop, and gaps filed rather than designed around
 
-**Status**: Accepted, with addenda for 2.4.1, 2.4.2 and 2.4.3 below. The 2.4.1 addendum corrects
-decision 2, and the 2.4.3 addendum replaces the 2.4.1 writer's 1 KB pieces.
+**Status**: Accepted, with addenda for 2.4.1, 2.4.2, 2.4.3 and 2.4.4 below. The 2.4.1 addendum
+corrects decision 2, the 2.4.3 addendum replaces the 2.4.1 writer's 1 KB pieces, and the 2.4.4 addendum
+retires the 2.4.2 one.
 **Date**: 2026-09-23 (2.4.0)
 **Context**: AGNOS is daimon's primary target, but through 2.3.4 daimon only *built* for it. There an
 agent start answered 501, and the HTTP API ran on sandhi's sync loop. Mapping daimon's agent lifecycle
@@ -186,3 +187,12 @@ held to 30% of a CPU: the guest stood still in 1 run of 6 with the old pacing, 1
 client's fixed, and 0 of 9 with both. Rejected: waiting until the receiver has drained, which agnos
 gives a sender no way to see (the filing's ask); a longer gap, which would slow every answer for a
 hazard the measurement no longer shows.
+
+## Addendum — 2.4.4: the read bound goes back to the stdlib
+
+cyrius 6.6.7 resolved the filing behind the 2.4.2 addendum. `_agnos_sock_recv_block` now times its
+wait with `uptime_us`#95, or the RTC when the TSC calibration was refused, and counts pauses only when
+no clock reads at all. A timeout answers -11 (EAGAIN) instead of 0, which callers took for EOF.
+daimon pins cyrius 6.6.20 since 2.4.4, and `daimon_agnos_recv_bound` is gone: it now applied only
+in that last case, and there it made the wait unbounded. As the 2.4.2 addendum expected, nothing
+else had to change.

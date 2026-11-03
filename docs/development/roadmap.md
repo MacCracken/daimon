@@ -4,8 +4,9 @@
 >
 > **Severity legend**: **P0** blocking (security / correctness — must-fix before ship) · **P1** high (must-have for the current arc) · **P2** medium (schedule when capacity opens) · **P3 / Low** nice-to-have, no urgency. Upstream-blocker items quote the upstream tracker's own severity.
 
-**Where daimon stands** — `2.4.3`, cyrius 6.6.6, nine dep pins current (samay 1.1.3, ai-hwaccel
-2.4.0). Builds on **three targets**: x86_64, aarch64 and AGNOS.
+**Where daimon stands** — `2.4.4`, cyrius 6.6.20, each of the nine dep pins at its latest release
+for that toolchain (bote 3.3.17, samay 1.1.7, ai-hwaccel 2.4.2, nein 1.7.1). Builds on
+**three targets**: x86_64, aarch64 and AGNOS.
 - **Agents can be started, stopped, paused, resumed and deleted through the API** (2.3.0), under
   their rlimits, with exit status reported.
 - **On AGNOS too** (2.4.0, [ADR-007](../adr/007-daimon-on-agnos.md)): agents are started, stopped,
@@ -92,16 +93,6 @@ When each closes, daimon's interim changes:
 | `tsc-calibration-refused-stops-the-us-clock` (2.4.1) | `daimon_now_ms` falls back to `uptime_ms`#40 | nothing to change; the fallback stays for older kernels |
 | `sock-send-and-connect-hold-the-cpu` (2.4.1, P1 for daimon) | answers are written in 512-byte pieces 1 ms apart; a local client that stops reading, or rarely one on a very slow machine, can still stop the machine (caught with QEMU's monitor) | one write per answer again (sandhi's path, as on Linux) |
 
-**Waiting on cyrius** — `docs/development/issues/2026-09-23-daimon-agnos-clock-stands-still-when-tsc-calibration-refused.md`
-in the cyrius repo: `clock_now_ms` on agnos stands still when the kernel refused its TSC calibration.
-daimon's own timing reads `daimon_now_ms`, which falls back; the vendored libraries' reads of
-`clock_now_ms` wait on this. When it closes, `daimon_now_ms` can become `clock_now_ms` again.
-
-**Waiting on cyrius** (2.4.2) — `2026-09-23-daimon-agnos-socket-read-gives-up-after-a-second.md`:
-a blocking socket read on agnos gave up after 6000 pauses, about a second in the guest, though its RTC
-bound is 30 s. daimon lifts that bound at startup (`daimon_agnos_recv_bound`, agnos audit AG-15).
-When it closes, and daimon's cyrius pin includes the fix, that call goes.
-
 **daimon's own, on agnos:** nothing open.
 
 2.4.1 settled the two items that were here before: the guest test runs in CI (on the released
@@ -166,6 +157,11 @@ Severity assigned when the arc's shape is chosen.
 - [ ] Routes for the federation and screen-capture modules. Both came with the port and have their
   own tests, but no route reaches them, so `federation_nodes` in `/v1/metrics` is always 0. (The
   memory store's route waits for identity, 2.5.x.)
+- [ ] A whole-answer deadline for writes on Linux (2.4.4). An answer goes through sandhi's
+  `sock_send_all` (sandhi 1.10.6) or daimon's `_srv_send_all`, both bounded per write by
+  `SO_SNDTIMEO`, so a local client that reads a trickle of an answer larger than its socket buffer
+  holds the loop while each write makes progress. Not measured. The API is loopback-only on Linux, so
+  this needs a local client.
 - [ ] jnana integration — grounded knowledge queries backed by verified AGNOS science data
 - [ ] gRPC transport option alongside HTTP
 - [ ] WebSocket streaming for real-time agent events
@@ -175,7 +171,8 @@ Severity assigned when the arc's shape is chosen.
 
 ⛔ Needs cyrius >= 6.7.6 — nothing to do until cyrius 6.7.6 is tagged; then at your pin bump:
 
-- **Git first: a `path` beside `git` / `tag` becomes a dev override** (here: `samay`, `nein`).
+- **Git first: a `path` beside `git` / `tag` becomes a dev override** (none here: 2.4.4 dropped
+  samay's and nein's `path`, and its lock already carries a commit pin for every git dep).
   From 6.7.6 it is read only in local mode (`CYRIUS_LOCAL=1`, `CYRIUS_LOCAL=<dep,dep>` or `--local`).
   With no switch, `cyrius deps` / `build` resolve the TAG (commit pin checked) and print one `hint:`
   line naming the checkout not used, so a local build and CI compile the same code.
