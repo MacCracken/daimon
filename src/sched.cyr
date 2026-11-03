@@ -20,15 +20,16 @@ enum SchedOpError {
     SCHED_OP_BAD_STATUS = 3;   # complete was asked for a status that is not terminal
 }
 
-# SCHEDULED -> RUNNING. Stamps started_at: samay's stats derive the average
-# wait (started - created) and run (completed - started) times from it, and
-# nothing in samay sets it. Returns Ok(task) or Err(SCHED_OP_*).
+# SCHEDULED -> RUNNING. Returns Ok(task) or Err(SCHED_OP_*). samay's stats
+# derive the average wait (started - created) and run (completed - started)
+# times from started_at, which samay's transition stamps since samay 1.4.3,
+# keeping a requeued task's first start. 2.3.1 - 2.5.0 stamped it here, when
+# samay set it nowhere; on samay 1.4.3 that overwrote the first start (2.5.1).
 fn sched_task_start(s, id) {
     var task = task_scheduler_get_task(s, id);
     if (task == 0) { return Err(SCHED_OP_NOT_FOUND); }
     var r_t, r_v = scheduled_task_transition(task, TASK_RUNNING);
     if (is_err_result(r_t) == 1) { return Err(SCHED_OP_BAD_STATE); }
-    ScheduledTask_set_started_at(task, dt_now());
     return Ok(task);
 }
 

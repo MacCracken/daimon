@@ -31,7 +31,9 @@ without blocking, so a slow client holds only its own connection:
 
 Since 2.3.2 a body is **one JSON object**, read with a full JSON parser. It gets **400** when it:
 - is not JSON (for example form-encoded), has trailing content, or is not an object;
-- repeats a top-level key. Parsers disagree on which one wins, so daimon accepts neither;
+- repeats a key, in any object at any depth (at the top level since 2.3.2, nested ones since 2.5.1,
+  which bayan 1.11.1 refuses). Parsers disagree on which one wins, so daimon accepts neither;
+- has a number with a leading zero, such as `01` (2.5.1, bayan 1.11.1; RFC 8259 §6);
 - has U+0000 in a top-level string.
 
 Values:
@@ -222,7 +224,8 @@ request body as its params.
 
 | tools | what they do |
 |---|---|
-| `libro_query`, `libro_verify`, `libro_export`, `libro_proof`, `libro_retention` | daimon's audit chain (libro's tools, through bote): search it, verify its hash links, export it, prove an entry's inclusion, apply a retention policy |
+| `libro_query`, `libro_verify`, `libro_export`, `libro_proof` | daimon's audit chain (libro's tools, through bote): search it, verify its hash links, export it, prove an entry's inclusion |
+| `libro_retention` | libro's retention policy, which archives entries off the chain. **Refused** until callers are authenticated (2.5.1; roadmap 2.5.x): `"access denied: tool gated by host policy"`, audited `libro.retention.deny`. Any local caller could empty the audit chain with it |
 | `web_fetch`, `web_search` | bote's web tools: a page's readable text (`{url}`, http or https only), and results from the SearXNG instance at `BOTE_SEARXNG_URL` (`{query, count?}`). Unset, `web_search` says so |
 | `nein_status`, `nein_list`, `nein_validate`, `nein_diff` | nein's read-only firewall tools |
 | `nein_allow`, `nein_deny` | nein's tools that change the live firewall. **Refused** until callers are authenticated (roadmap 2.5.x): `"access denied: tool gated by host policy"`, audited `nein.gate.deny` |
@@ -489,4 +492,4 @@ a minute. That is every client on AGNOS, which gives no peer address.
 - Maximum request size: 64 KB.
 - An agent's executable is chosen by daimon from its type, never by a request. See Agents.
 - Request bodies are parsed strictly (see Request bodies). Every string field is decoded, and a
-  body with a duplicate top-level key or U+0000 in a top-level string is refused.
+  body with a duplicate key (at any depth since 2.5.1) or U+0000 in a top-level string is refused.

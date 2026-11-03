@@ -18,8 +18,9 @@ Rust. AGNOS is its primary target; it also runs on Linux, x86_64 and aarch64.
   and write ([agent-ipc.md](docs/guides/agent-ipc.md)). With `serve --agent-output capture`, daimon
   also keeps each agent's stdout and stderr.
 - **MCP host.** daimon hosts 13 built-in tools: libro's five audit-chain tools, `web_fetch` and
-  `web_search`, and nein's six firewall tools. The two tools that change the firewall are refused
-  until callers are authenticated (roadmap 2.5.x). External MCP servers register tools, resources
+  `web_search`, and nein's six firewall tools. The two tools that change the firewall, and
+  `libro_retention`, which archives audit entries (2.5.1), are refused until callers are
+  authenticated (roadmap 2.5.x). External MCP servers register tools, resources
   and prompts, and daimon forwards calls to them.
 - **Audit trail.** daimon records its lifecycle and security events on a hash-linked
   [libro](https://github.com/MacCracken/libro) chain, which the `libro_*` tools query, verify and
@@ -57,7 +58,7 @@ See [SECURITY.md](SECURITY.md) and the audit reports in [docs/audit/](docs/audit
 
 ## Building
 
-Requires [Cyrius](https://github.com/MacCracken/cyrius) 6.7.9, the pin in `cyrius.cyml`.
+Requires [Cyrius](https://github.com/MacCracken/cyrius) 6.7.18, the pin in `cyrius.cyml`.
 
 ```bash
 cyrius deps                             # vendor the stdlib subset and the git deps into lib/ (gitignored)
@@ -79,10 +80,10 @@ Each tagged release publishes:
 
 ```bash
 sh tests/test.sh                    # every suite, the HTTP smoke and the fuzz harnesses
-cyrius tests                        # every suite in tests/: 1087 checks, 17 files
+cyrius test tests                   # every suite in tests/: 1094 checks, 17 files
 cyrius fuzz                         # 7 property-based harnesses, 176,349 generated cases
 cyrius bench tests/daimon.bcyr      # 28 benchmarks, one only where agents can be contained (+2 in tests/rag_ingest.bcyr)
-sh tests/smoke.sh                   # the linked binary over HTTP, 143 checks: libro, tracing, regressions,
+sh tests/smoke.sh                   # the linked binary over HTTP, 147 checks: libro, tracing, regressions,
                                     # the agent lifecycle, the bind address, task start/complete,
                                     # request-string decoding, agent channels and messages,
                                     # the event loop, hosts and origins, captured output,
@@ -108,17 +109,18 @@ found.
 
 ## Status
 
-At 2.5.0, `src/` is 10,060 lines in 30 modules. The port (0.7.0) turned 9,724 lines of Rust into
+At 2.5.1, `src/` is 10,080 lines in 30 modules. The port (0.7.0) turned 9,724 lines of Rust into
 4,141 of Cyrius. The binaries are statically linked:
 
 | target | bytes |
 |---|---:|
-| x86_64 | 3,514,176 |
-| aarch64 | 4,087,280 |
-| agnos | 3,448,104 |
+| x86_64 | 2,126,880 |
+| aarch64 | 4,842,200 |
+| agnos | 2,039,536 |
 
-Of x86_64's bytes, 1,711,902 are unreachable code that the toolchain NOPs in place rather than
-removing (CHANGELOG 1.2.4). The 181 KB this line once gave was the v1.0.1 port-era build (cyrius
+Since cyrius 6.7.18 (daimon 2.5.1) the x86_64 and agnos builds remove unreachable code, about 2 MB
+of it; until then it was NOPed in place (CHANGELOG 1.2.4). The aarch64 build still NOPs it, which is
+why it is the largest. The 181 KB this line once gave was the v1.0.1 port-era build (cyrius
 4.2.0, BENCHMARKS.md).
 
 Next on the [roadmap](docs/development/roadmap.md): agent identity and MCP caller authentication

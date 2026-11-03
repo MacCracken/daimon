@@ -153,15 +153,18 @@ fn main() {
     assert_eq(map_count(m), 2, "count unchanged after overwrite");
 
     # =============================================================
-    # JSON — the flat parser the api_* handlers use
+    # JSON — bayan's flat parser. No api_* handler has used it since 2.3.2
+    # (http_body_json and http_json_*, tests/http.tcyr); it stays as the
+    # baseline the json_parse benchmark measures. bayan 1.11.0 renamed the
+    # lookups by key type (2.5.1).
     # =============================================================
     test_group("json");
     var jpairs = json_parse(str_from("{\"name\":\"test\",\"port\":\"8090\"}"));
     assert(jpairs != 0, "parse ok");
-    var jname = json_get(jpairs, str_from("name"));
+    var jname = bayan_json_get_by_str(jpairs, str_from("name"));
     assert(jname != 0, "got name");
     assert(str_eq(jname, str_from("test")) == 1, "name is test");
-    assert_eq(json_get_int(jpairs, str_from("port")), 8090, "port is 8090");
+    assert_eq(bayan_json_get_int_by_str(jpairs, str_from("port")), 8090, "port is 8090");
 
     # (jget / jget_int were removed at 2.3.2 — see src/error.cyr. Their
     #  replacements, http_body_json and http_json_*, are tested in

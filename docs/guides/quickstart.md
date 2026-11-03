@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- [Cyrius](https://github.com/MacCracken/cyrius) 6.7.9, the pin in `cyrius.cyml`
+- [Cyrius](https://github.com/MacCracken/cyrius) 6.7.18, the pin in `cyrius.cyml`
 - Linux, x86_64 or aarch64, to build and run it here. For AGNOS, build with `--agnos`; see
   [Run Tests](#run-tests) for the guest test
 
@@ -72,7 +72,7 @@ To see what agents print, start daimon with `serve --agent-output capture` and r
 
 ```bash
 sh tests/test.sh                  # every suite, the HTTP smoke and the fuzz harnesses
-cyrius tests                      # every tests/*.tcyr suite. Judge a suite by its exit status: it prints its
+cyrius test tests                 # every tests/*.tcyr suite. Judge a suite by its exit status: it prints its
                                   # "N passed, 0 failed" line before it exits
 cyrius fuzz                       # the fuzz/ harnesses
 sh tests/smoke.sh                 # the built binary over HTTP
@@ -91,12 +91,12 @@ cyrius bench tests/daimon.bcyr
 
 ```
 src/                  Source: 30 modules, entry src/main.cyr
-tests/*.tcyr          17 test suites, 1087 checks, each including the real src/ module it tests
+tests/*.tcyr          17 test suites, 1094 checks, each including the real src/ module it tests
 tests/smoke.sh        HTTP smoke checks against the built binary (143); runs tests/containment.sh
 tests/agnos/          The AGNOS guest test: sh tests/agnos/run.sh --release boots agnos under QEMU
 tests/aarch64/        The aarch64 VM test: every suite and a smoke of the binary under a real kernel
 tests/daimon.bcyr     Benchmarks (28; tests/rag_ingest.bcyr has 2 more)
 fuzz/                 Property-based fuzz harnesses (7), sharing fuzz/rng.cyr
-build/daimon          The binary: 3,514,176 bytes, static; 1,711,902 of them NOPed unreachable code
+build/daimon          The binary: 2,126,880 bytes, static; unreachable code removed (2.5.1)
 docs/                 Architecture, guides, ADRs, audit reports, roadmap
 ```

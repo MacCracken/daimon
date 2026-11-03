@@ -102,7 +102,7 @@ var s1_t, s1_v = sched_task_start(s, _id(p1));
 assert_eq(is_ok(s1_t), 1, "a SCHEDULED task starts");
 assert_eq(s1_v, p1, "... and the task is returned");
 assert_eq(ScheduledTask_status(p1), TASK_RUNNING, "RUNNING");
-assert(ScheduledTask_started_at(p1) > 0, "started_at is stamped (samay sets it nowhere)");
+assert(ScheduledTask_started_at(p1) > 0, "started_at is stamped (by samay's transition since 1.4.3)");
 assert(ScheduledTask_started_at(p1) >= ScheduledTask_created_at(p1), "... not before creation");
 var s2_t, s2_v = sched_task_start(s, _id(p1));
 assert_eq(s2_v, SCHED_OP_BAD_STATE, "a RUNNING task cannot start again");
@@ -174,5 +174,27 @@ assert_eq(SchedulerStats_running(st), 0, "none running");
 # every task that started (all three), so its mean is >= 10.
 assert(SchedulerStats_average_run_time_ms(st) >= 30, "average run time reflects started_at");
 assert(SchedulerStats_average_wait_time_ms(st) >= 10, "average wait time reflects started_at");
+
+# --- a requeued task keeps its first start (2.5.1) ----------------------------
+# Preempted and placed again, it starts a second time; its wait is measured from
+# the first start. Until 2.5.1 sched_task_start stamped started_at itself and
+# overwrote the one samay keeps.
+test_group("sched_requeue");
+var rs = task_scheduler_new();
+task_scheduler_register_node(rs, node_capacity_new(str_from("rn"), f64_from(8), 4096, 102400, 0));
+var rt = _task("requeued");
+task_scheduler_submit_task(rs, rt);
+task_scheduler_schedule_pending(rs);
+var r1_t, r1_v = sched_task_start(rs, _id(rt));
+assert_eq(is_ok(r1_t), 1, "the task starts");
+var first_start = ScheduledTask_started_at(rt);
+assert(first_start > 0, "... and has a start");
+_nap_ms(5);
+assert_eq(is_ok(scheduled_task_transition(rt, TASK_PREEMPTED)), 1, "it is preempted");
+assert_eq(is_ok(scheduled_task_transition(rt, TASK_QUEUED)), 1, "... requeued");
+assert_eq(is_ok(scheduled_task_transition(rt, TASK_SCHEDULED)), 1, "... and placed again");
+var r2_t, r2_v = sched_task_start(rs, _id(rt));
+assert_eq(is_ok(r2_t), 1, "it starts again");
+assert_eq(ScheduledTask_started_at(rt), first_start, "... keeping its first start");
 
 syscall(SYS_EXIT, assert_summary());

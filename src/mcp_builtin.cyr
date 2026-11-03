@@ -39,6 +39,26 @@ fn mcp_libro_init(reg) {
     return 0;
 }
 
+# ⛔ libro_retention IS DENIED BY DEFAULT (2.5.1), as nein's mutating tools are.
+# It archives entries off daimon's audit chain, and `POST /v1/mcp/call` has no
+# caller authentication: measured on 2.5.0, one local call with
+# {"policy":"keep_count","value":0} answered "archived":2,"retained":0, and
+# libro_export then had no entries. Whoever can reach the API could erase the
+# record of what they did with it. It stays registered, so the manifest still
+# lists it, and answers nein's refusal, audited `libro.retention.deny`, until
+# daimon has caller identity (roadmap 2.5.x). The other four libro tools read.
+#
+# Flipping `_libro_retention_enabled` to 1 re-opens it; it is there for an
+# operator on a trusted single-tenant host to choose, as `_nein_admin_enabled`.
+var _libro_retention_enabled = 0;
+
+fn _mcp_libro_retention(args) {
+    if (_libro_retention_enabled == 1) { return libro_tool_retention(args, 0); }
+    daimon_audit(SEV_SECURITY, "mcp", "libro.retention.deny",
+      "libro_retention denied: it archives audit entries, and daimon has no MCP caller authentication");
+    return nein_mcp_err("access denied: tool gated by host policy");
+}
+
 # mcp_web_init: register bote's web tools (web_fetch / web_search) as builtin MCP tools. web_search targets
 # the SearXNG instance at BOTE_SEARXNG_URL (unset -> the tool reports it, never faked). The handlers live in
 # bote (lib/bote-core_bote.cyr, 2.5.0); daimon only hosts + dispatches them. Call from app_init after the
@@ -69,7 +89,7 @@ fn mcp_dispatch_builtin(name_c, args) {
     if (streq(name_c, "libro_verify") == 1) { return libro_tool_verify(args, 0); }
     if (streq(name_c, "libro_export") == 1) { return libro_tool_export(args, 0); }
     if (streq(name_c, "libro_proof") == 1) { return libro_tool_proof(args, 0); }
-    if (streq(name_c, "libro_retention") == 1) { return libro_tool_retention(args, 0); }
+    if (streq(name_c, "libro_retention") == 1) { return _mcp_libro_retention(args); }
     if (streq(name_c, "web_fetch") == 1) { return web_fetch_handler(args, 0); }
     if (streq(name_c, "web_search") == 1) { return web_search_handler(args, 0); }
     # nein firewall tools. The gate runs inside nein_mcp_dispatch; claims is

@@ -35,6 +35,10 @@ LIBRO_QUERY=$(curl -s --max-time 2 -X POST "http://127.0.0.1:$LIBRO_PORT/v1/mcp/
 # events reach the libro tools, not just the genesis entry.
 curl -s --max-time 2 -X POST "http://127.0.0.1:$LIBRO_PORT/v1/mcp/tools" -d '{"name":"evil","description":"x","callback_url":"file:///etc/passwd"}' >/dev/null 2>&1 || true
 LIBRO_AUDIT=$(curl -s --max-time 2 -X POST "http://127.0.0.1:$LIBRO_PORT/v1/mcp/call" -d '{"name":"libro_export","arguments":{}}' || true)
+# 2.5.1: libro_retention is refused (it archived the whole chain for any local
+# caller), the chain keeps its entries, and the refusal is on it.
+LIBRO_RETAIN=$(curl -s --max-time 2 -X POST "http://127.0.0.1:$LIBRO_PORT/v1/mcp/call" -d '{"name":"libro_retention","arguments":{"policy":"keep_count","value":0}}' || true)
+LIBRO_AFTER=$(curl -s --max-time 2 -X POST "http://127.0.0.1:$LIBRO_PORT/v1/mcp/call" -d '{"name":"libro_export","arguments":{}}' || true)
 kill $LIBRO_SRV 2>/dev/null || true
 # Fixed-string matches (-F). Two of these checks had been failing unnoticed —
 # nothing in CI ran them — until 2.2.3 ran them again:
@@ -54,6 +58,9 @@ libro_check "$LIBRO_EXPORT"   "export returns genesis entry" 'mcp.host.init'
 libro_check "$LIBRO_VERIFY"   "verify: chain integrity ok"   '{\"ok\":true}'
 libro_check "$LIBRO_QUERY"    "query filters by severity"    'mcp.host.init'
 libro_check "$LIBRO_AUDIT"    "audit records SSRF-rejected registration" 'mcp.register.reject'
+libro_check "$LIBRO_RETAIN"   "libro_retention is refused (2.5.1)" 'access denied: tool gated by host policy'
+libro_check "$LIBRO_AFTER"    "... the chain keeps its genesis entry" 'mcp.host.init'
+libro_check "$LIBRO_AFTER"    "... and records the refusal" 'libro.retention.deny'
 if [ $LIBRO_OK -ne 1 ]; then echo "  libro smoke FAILED"; SMOKE_EXIT=1; fi
 
 echo ""

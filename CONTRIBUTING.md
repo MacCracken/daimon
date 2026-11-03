@@ -6,7 +6,7 @@ to get involved.
 ## Getting Started
 
 1. Fork the repository and clone your fork
-2. Install [Cyrius](https://github.com/MacCracken/cyrius) 6.7.9, the pin in `cyrius.cyml` (`[package].cyrius`)
+2. Install [Cyrius](https://github.com/MacCracken/cyrius) 6.7.18, the pin in `cyrius.cyml` (`[package].cyrius`)
 3. Build and run `sh tests/test.sh` (below) to verify your environment
 
 ## Development Workflow
@@ -18,7 +18,7 @@ cyrius build src/main.cyr build/daimon  # Build (also --agnos, --aarch64)
 cyrius vet src/main.cyr              # Include dependencies
 cyrius fmt <file> --check            # Formatting (without --check it rewrites the file)
 CYRIUS_DCE=0 cyrius lint <file>      # CI fails on any warning, and on a non-zero exit
-cyrius tests                         # Run every test suite
+cyrius test tests                     # Run every test suite (`cyrius tests` was removed at cyrius 6.7.12)
 cyrius fuzz                          # Run the fuzz harnesses
 cyrius bench tests/daimon.bcyr       # Run benchmarks
 sh tests/test.sh                     # Tests + fuzz + HTTP smoke (tests/smoke.sh)

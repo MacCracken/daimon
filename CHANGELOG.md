@@ -4,6 +4,157 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.5.1] - 2026-11-03
+
+**`libro_retention` is gated shut, and cyrius 6.7.9 → 6.7.18 with every dependency at its latest
+release** (nein 1.8.1 and bote 3.7.5 by choice: newer tags of each are in progress). **1094 tests**
+across 17 suites (seven new), **147 HTTP smoke checks** (three new) and 7 fuzz harnesses, all green
+on Linux. On a real aarch64 kernel: all 1094 checks and the binary's 20-check smoke. The AGNOS guest test passes
+its 92 checks on agnos 1.57.14, and 6 runs of 6 with QEMU held to 30% of a CPU. fmt, lint and vet are clean; x86_64, aarch64 and agnos
+build; `cyrius.lock` verifies 91 of 91. ⚠ **bayan 1.11's JSON parser makes daimon's request-body
+read about 47% slower** (*Performance*).
+
+### Security — `libro_retention` is refused
+
+Through 2.5.0 any local caller of the unauthenticated API could empty daimon's audit chain: one call
+to `libro_retention` with `{"policy":"keep_count","value":0}` answered `"archived":2,"retained":0`,
+and `libro_export` then had no entries (measured on 2.5.0). Whoever could reach the API could erase
+the record of what they did with it. bote 3.4.10 closed only the form with no `value`.
+
+`libro_retention` is now handled as `nein_allow` / `nein_deny` are: still registered, so the manifest
+lists it, and refused with nein's `"access denied: tool gated by host policy"` before bote's handler
+runs, audited `libro.retention.deny` (`_mcp_libro_retention`, `src/mcp_builtin.cyr`). It reopens
+when daimon has caller identity (roadmap 2.5.x), or for an operator who sets
+`_libro_retention_enabled`, as with `_nein_admin_enabled`. The other four libro tools only read.
+New smoke checks: the call is refused, the chain keeps its genesis entry, and the refusal is on it.
+
+### Changed — toolchain and dependency pins
+
+| dep | was | now | | dep | was | now |
+|---|---|---|---|---|---|---|
+| cyrius | 6.7.9 | **6.7.18** | | libro | 2.11.0 | **2.11.3** |
+| sakshi | 2.5.8 | **2.5.10** | | majra | 2.12.0 | **2.13.0** |
+| bayan | 1.5.13 | **1.11.1** | | bote | 3.4.10 | **3.7.5** |
+| sigil | 3.13.11 | **3.13.15** | | samay | 1.2.0 | **1.5.1** |
+| ai-hwaccel | 2.4.2 | **2.5.6** | | nein | 1.8.0 | **1.8.1** |
+
+Every pin is at its newest tag except bote (3.7.6 is newer; nein 1.8.2, in progress, moves to it)
+and nein (1.8.2 is in progress), and all of them name each other at exactly these versions: nein
+1.8.1 pins bote-core 3.7.5, libro 2.11.3, majra 2.13.0, sigil 3.13.15 and patra 1.16.6; samay 1.5.1
+pins bayan 1.11.1 and ai-hwaccel 2.5.6. sakshi, sigil and bayan's newest tags are also what cyrius
+6.7.18 folds, byte-identical, so the rule to pin the fold's version costs nothing this time. The
+toolchain brings sandhi 1.10.9 → **1.13.7**, and libro brings patra 1.16.0 → **1.16.6**. bote is still
+vendored once, as `[deps.bote-core]` naming the full bundle (2.5.0).
+
+- **The lock** has 91 entries (was 83): bayan 1.11's bundle includes `lib/unicode/*` (seven files)
+  and `lib/ws.cyr`. 10 commit pins, as before. CI's `cyrius deps --no-lock` then `--verify` pass on a
+  clean copy.
+- **x86_64 and agnos builds now remove unreachable code** instead of NOPing it in place: "2016180
+  bytes of dead code eliminated", where 6.7.9 declined ("more than 4096 dead-code runs, the repair
+  registry cap"). The compiler audits every surviving function after compaction and refuses to emit
+  a binary it corrupted; it emitted these. aarch64 has no compaction yet and grows with the new code.
+What the moves carry for daimon:
+
+- **bayan 1.11.1** (six minors; folded into cyrius 6.7.18).
+  - **A duplicate key at any depth is refused** (1.11.1), not only at the top level, which is all
+    daimon's own check covered. A body repeating a key inside a nested object, MCP `arguments`
+    included, is now 400; an agent frame doing so gets `NACK_INVALID`. Measured: `{"name":"x",
+    "metadata":{"a":1,"a":2}}` is 400, as is `{"name":"libro_verify","arguments":{"x":1,"x":2}}`.
+  - **A number with a leading zero (`01`) is refused** (1.11.1; RFC 8259 §6). Measured: 400.
+  - **The parser reads through bounds-checked slices** (cyrius 6.7.18's decision D1): a read past the
+    input ends the process (exit 134) instead of reading past the buffer. bayan knows of no such
+    read; it fuzzed 60,000 mutated documents. Its stated cost is about 1.5× the parse time
+    (*Performance*). daimon's lookups, `obj_get_by_cstr` and the value readers, are unchanged.
+  - Its bundle brings `lib/unicode/*` (its markdown parser, which daimon never calls, so DCE drops
+    it). `lib/ws.cyr` comes from bote's `ws_server` leaf, which includes it since cyrius 6.7.12.
+- **sandhi 1.13.7.** The request-framing checks daimon makes (`content_length`, the CL+TE and TE
+  checks) no longer allocate on the global heap: before, 8–16 bytes per request with a body, for good
+  (`alloc` frees nothing), and under heap exhaustion a failed copy read as "no such header", so the
+  two smuggling guards answered no. A response header holding a NUL is now dropped rather than cut at
+  it (`Content-Length\0x: 5` read as `Content-Length: 5`), which reaches the MCP forwards and
+  `web_fetch`. The other functions daimon calls are unchanged.
+- **bote 3.7.5.** The functions daimon calls keep their signatures and result shapes.
+  - `web_fetch` / `web_search` run in a child of their own (3.6.5), with `PDEATHSIG`, and
+    `BOTE_WEB_TIMEOUT_MS` (15 s) bounds the whole call: a stuck fetch is an `isError` result at 15 s
+    instead of daimon's 504 at 60 s. On Linux that child is a grandchild of daimon's detached call;
+    the smoke's "every call's child is reaped" still holds. Pages up to 2 MiB are read (256 KiB
+    before). Invalid UTF-8 in a page becomes U+FFFD.
+  - The SSRF guard reads a URL's authority as a client does (3.4.15): `http://a@b@127.0.0.1/` and
+    `http://0x7f.0.0.1/` passed the literal check before (the resolved-address check still caught
+    them, bote says).
+  - The libro tools read integer arguments with bote's schema parser (3.4.15): `1e3` is 1000, and a
+    non-number is 0. daimon skips bote's schema validation, so this is the only reading. Measured:
+    `libro_query` with `"limit":1` returns one entry, with `"limit":"1"` every entry (0 is no limit).
+  - The full bundle still defines every top-level name of the core one (536 of 536).
+- **samay 1.5.1.** The functions daimon calls keep their signatures.
+  - `scheduled_task_transition` stamps `started_at` and `completed_at` (1.4.3), keeping a requeued
+    task's first start. daimon stamped `started_at` itself and overwrote it (*Fixed*).
+  - Re-registering a node keeps its reservations (1.4.3), which `POST /v1/scheduler/nodes` could
+    double-sell before; submitting an existing task id is `Err(1)`.
+  - A task with no accelerator need (every daimon task) goes to nodes without an accelerator first
+    (1.5.0), so placement changes on fleets that mix in GPU nodes.
+- **sigil 3.13.15**, through sandhi's TLS client (https `web_fetch` and MCP forwards): X.509 name
+  constraints are checked (CYRIUS-2026-0042, P2), and a CA's commonName is no longer read as a host.
+- **sakshi 2.5.10, libro 2.11.3, majra 2.13.0, nein 1.8.1, patra 1.16.6, ai-hwaccel 2.5.6**: nothing
+  on daimon's paths changes (sakshi's static data drops from 69 KB to 9 KB).
+- **cyrius 6.7.10 – 6.7.18**: none of the meaning changes reaches daimon's code (they concern
+  structs, generics, `Str` overload routing, f64 operators and declaration zones, which daimon does
+  not use), and none of the new errors has a site. On agnos, a socket write goes through
+  `sock_send_dl`#109 where the kernel has it (6.7.11). lint, fmt and vet behave as at 6.7.9 on
+  daimon's files; lint still needs `CYRIUS_DCE=0`.
+
+### Fixed
+
+- **A requeued task's start time is kept.** samay 1.4.3 stamps `started_at` itself and keeps the
+  first start when a task is preempted and placed again; `sched_task_start` stamped it as well, and
+  overwrote it. daimon no longer stamps it. New test (`tests/sched.tcyr`, `sched_requeue`): it fails
+  on the old code ("... keeping its first start", 5 ms later) and passes now.
+
+### Changed — tests
+
+- `tests/daimon.tcyr`'s flat-parser group calls bayan 1.11's `bayan_json_get_by_str` /
+  `_int_by_str` (the old names are deprecated), and says it is the `json_parse` benchmark's
+  baseline, not what the handlers use.
+- `src/http.cyr`'s comment on `http_body_json` and the API guide say what bayan 1.11 refuses.
+- README, CONTRIBUTING and the quickstart run the suites with `cyrius test tests`: `cyrius tests` was
+  removed at cyrius 6.7.12 ("use `cyrius test <dir>`").
+
+### Sizes
+
+| target | 2.5.0 (6.7.9) | 2.5.1 (6.7.18) | |
+|---|---:|---:|---:|
+| x86_64 | 3,514,176 | 2,126,880 | −39.5% |
+| aarch64 | 4,087,280 | 4,842,200 | +18.5% |
+| agnos | 3,448,104 | 2,039,536 | −40.9% |
+
+### Performance
+
+2.5.0 (cyrius 6.7.9) against 2.5.1 (6.7.18), `tests/daimon.bcyr` and `tests/rag_ingest.bcyr`, 20
+interleaved runs with the order alternating, medians, at a load average of 1.9. **Three JSON
+benchmarks are much slower; the rest are within ±3% but for the rows shown.**
+
+| Benchmark | 2.5.0 | 2.5.1 | change | spread 2.5.0 | spread 2.5.1 |
+|---|---:|---:|---:|---:|---:|
+| json_parse | 443.5 ns | 943.5 ns | **+112.7%** | 3% | 3% |
+| http_body_read3 | 1.30 µs | 1.91 µs | **+46.7%** | 2% | 1% |
+| mcp_extract_input_schema | 4.71 µs | 6.42 µs | **+36.3%** | 2% | 2% |
+| trace_id_hex | 47.0 ns | 52.0 ns | +10.6% | 2% | 4% |
+| config_default | 87.0 ns | 94.0 ns | +8.0% | 16% | 3% |
+| ipc_frame_roundtrip | 12.36 µs | 12.91 µs | +4.4% | 6% | 5% |
+| mcp_register_100_tools | 65.47 µs | 67.67 µs | +3.4% | 21% | 13% |
+| scheduler_100_tasks | 336.51 µs | 327.64 µs | −2.6% | 6% | 2% |
+
+- **The JSON rows are bayan 1.11's parser.** `http_body_read3` is daimon's request-body read
+  (`http_body_json` and three fields): about 0.6 µs more per request with a body.
+  `mcp_extract_input_schema` is a tool registration's. `json_parse` is bayan's flat parser, which
+  daimon does not use. The same benchmark binary built with `CYRIUS_DCE=0` is as slow (939 ns), so it
+  is not the new dead-code removal. bayan states the cost of its bounds-checked reads as about 1.5×
+  the parse time; how much of the rest is its other changes was not measured. daimon cannot pin an
+  older bayan on 6.7.18: the snapshot's file is kept whatever the pin.
+- **`trace_id_hex` is the dead-code removal**: 47 ns with `CYRIUS_DCE=0`, 52 ns with it, in the same
+  build. Code placement, not code. `config_default` moves between sessions without changing (2.4.2,
+  2.4.3, 2.5.0).
+
 ## [2.5.0] - 2026-11-03
 
 **cyrius 6.6.20 → 6.7.9, the 6.7 language line, and each dependency pin moved with it.** bote 3.4,

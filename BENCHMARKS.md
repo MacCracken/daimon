@@ -45,6 +45,27 @@ those numbers are not comparable.
 
 `tests/rag_ingest.bcyr` (real since 2.1.6): `rag_ingest_real_5k` 133.1µs, `rag_chunk_only_5k` 508ns.
 
+### 2.5.1 — cyrius 6.7.18: bayan 1.11's parser is slower
+
+2.5.0 (built by cyrius 6.7.9) against 2.5.1 (6.7.18), both files, 20 interleaved runs with the order
+alternating, medians, at a load average of 1.9:
+
+| Benchmark | 2.5.0 | 2.5.1 | change | spread 2.5.0 | spread 2.5.1 |
+|---|---:|---:|---:|---:|---:|
+| json_parse | 443.5 ns | 943.5 ns | **+112.7%** | 3% | 3% |
+| http_body_read3 | 1.30 µs | 1.91 µs | **+46.7%** | 2% | 1% |
+| mcp_extract_input_schema | 4.71 µs | 6.42 µs | **+36.3%** | 2% | 2% |
+| trace_id_hex | 47.0 ns | 52.0 ns | +10.6% | 2% | 4% |
+| config_default | 87.0 ns | 94.0 ns | +8.0% | 16% | 3% |
+| ipc_frame_roundtrip | 12.36 µs | 12.91 µs | +4.4% | 6% | 5% |
+| mcp_register_100_tools | 65.47 µs | 67.67 µs | +3.4% | 21% | 13% |
+| scheduler_100_tasks | 336.51 µs | 327.64 µs | −2.6% | 6% | 2% |
+
+The other 21 are within ±3%. The JSON rows are bayan 1.11.1's parser (folded into 6.7.18), which
+reads through bounds-checked slices; built with `CYRIUS_DCE=0` the 2.5.1 binary is as slow
+(`json_parse` 939 ns), so dead-code removal is not the cause. `trace_id_hex` is: 47 ns without it,
+52 ns with it, in the same build.
+
 ### 2.5.0 — cyrius 6.7.9 and the pin move
 
 2.4.4 (built by cyrius 6.6.20) against 2.5.0 (6.7.9), both files, 20 interleaved runs with the order
@@ -522,8 +543,8 @@ Scheduler scheduling (1.5x), supervisor registration (2.5x), MCP registration (1
 | | Rust | Cyrius |
 |---|---|---|
 | Unit tests | 305 | — (inline in test groups) |
-| Integration tests | 28 | 1087 assertions / 17 suites, each against its real `src/` module (2.4.3); AGNOS guest test 92 checks (tests/agnos/run.sh --release, in CI); aarch64 VM, every suite (1087 assertions) and a 20-check smoke of the binary under a real kernel (tests/aarch64/run.sh, in CI) |
+| Integration tests | 28 | 1094 assertions / 17 suites, each against its real `src/` module (2.4.3); AGNOS guest test 92 checks (tests/agnos/run.sh --release, in CI); aarch64 VM, every suite (1087 assertions) and a 20-check smoke of the binary under a real kernel (tests/aarch64/run.sh, in CI) |
 | Benchmarks | 19 | 30, against the real code (2.4.2) |
 | Fuzz harnesses | 0 | 7, property-based, run in CI (2.3.2) |
-| HTTP smoke | — | tests/smoke.sh, 143 checks, run in CI (2.4.2) |
+| HTTP smoke | — | tests/smoke.sh, 147 checks, run in CI (2.4.2) |
 | Security audit | — | 33 findings (2026-04-13: 10; 2026-09-22 lifecycle: 8; 2026-09-23 AGNOS platform: 15, most filed with agnos) — see docs/audit/ |

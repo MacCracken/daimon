@@ -218,8 +218,10 @@ fn http_parse_body(buf, len) {
 #   * a top-level string holding U+0000. Every such field ends up as a C
 #     string somewhere (registry keys, argv, audit entries), where it would be
 #     cut at the NUL and stop matching the value daimon checked.
-# Nested values are left alone: daimon reads only top-level fields, and forwards
-# nested ones (MCP `arguments`) without interpreting them.
+# Nested values are not interpreted: daimon reads only top-level fields, and
+# forwards nested ones (MCP `arguments`). But since bayan 1.11.1 (daimon 2.5.1)
+# the parser itself refuses a duplicate key at any depth, and a number with a
+# leading zero (`01`), so those bodies are refused too.
 # (The checks are json_object_ok, src/error.cyr, shared with agent channel
 # frames since 2.3.3.)
 fn http_body_json(body) {
