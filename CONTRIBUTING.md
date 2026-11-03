@@ -17,7 +17,7 @@ cyrius deps                          # Vendor the stdlib subset and the git deps
 cyrius build src/main.cyr build/daimon  # Build (also --agnos, --aarch64)
 cyrius vet src/main.cyr              # Include dependencies
 cyrius fmt <file> --check            # Formatting (without --check it rewrites the file)
-cyrius lint <file>                   # CI fails on any warning
+CYRIUS_DCE=0 cyrius lint <file>      # CI fails on any warning, and on a non-zero exit
 cyrius tests                         # Run every test suite
 cyrius fuzz                          # Run the fuzz harnesses
 cyrius bench tests/daimon.bcyr       # Run benchmarks

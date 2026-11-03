@@ -183,12 +183,14 @@ kernel's primitives. Some things differ until agnos closes the gaps filed with i
   `AGNOS_IPC_FD` naming the channel's fd, which the kernel chooses.
 - **No limits**: agnos has none, so the agent runs without its quota. Its JSON says
   `"limits_enforced":false`, and each start is audited `agent.limits.unenforced`.
-- **Stop asks**: SIGTERM, which the agent sees on a signalfd. An agent that ignores it stays at status
-  4 (Stopping), because no signal ends a process on agnos yet. Pause and resume answer **501**.
+- **Stop**: SIGTERM, which the agent sees on a signalfd, then SIGKILL after the grace period, as on
+  Linux. Since agnos 1.57.7 the SIGKILL ends an agent that ignores SIGTERM: status 5 (Stopped), exit
+  code 137. Through 1.57.6 it stayed at status 4 (Stopping). Pause and resume answer **501**.
 - **No captured output**: `serve --agent-output capture` exits 1, because an agnos child inherits
   daimon's whole fd table.
-- **The listener** is on the NIC's address: agnos cannot bind 127.0.0.1. daimon warns and audits
-  `http.listen.not_loopback`. Local clients reach it at the box's own address, not 127.0.0.1.
+- **The listener** is on 127.0.0.1, loopback only, as on Linux (2.4.4). That needs agnos 1.57.7 or
+  later: an older kernel refuses it, and daimon says `cannot listen on 127.0.0.1:8090` and exits 1.
+  `--listen 0.0.0.0` listens on every address. Through 2.4.3 the listener took the NIC's address.
 - **5 connections at once**, not 128. The kernel has 8 TCP slots for the whole machine: the
   listener takes one, and daimon's own calls to other servers need theirs.
 - **The rate limit is shared.** agnos gives no peer address, so every client draws on one bucket of

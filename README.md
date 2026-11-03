@@ -39,9 +39,10 @@ slow client holds only its own connection, and a call that waits on another serv
 process.
 
 **On AGNOS** (2.4.0) daimon starts, stops and hears its agents with the kernel's own primitives,
-and (2.4.1) runs its calls to other servers in a child, as on Linux. Some things agnos does not
-provide yet, such as resource limits, a way to end a process, or a loopback-only listener. Each gap
-is filed with agnos. What daimon does meanwhile is in [ADR-007](docs/adr/007-daimon-on-agnos.md) and
+and (2.4.1) runs its calls to other servers in a child, as on Linux. It needs agnos 1.57.7 or later
+(2.4.4), where its listener is loopback only, as on Linux, and a stop ends an agent that ignores
+SIGTERM. agnos 1.57.6 and 1.57.7 closed every gap daimon filed; resource limits, pause and resume,
+and captured output still wait on daimon's side. See [ADR-007](docs/adr/007-daimon-on-agnos.md) and
 the [AGNOS audit](docs/audit/2026-09-23-agnos-platform-audit.md).
 
 ## Security
@@ -107,14 +108,14 @@ found.
 
 ## Status
 
-At 2.4.4, `src/` is 10,044 lines in 30 modules. The port (0.7.0) turned 9,724 lines of Rust into
+At 2.4.4, `src/` is 10,059 lines in 30 modules. The port (0.7.0) turned 9,724 lines of Rust into
 4,141 of Cyrius. The binaries are statically linked:
 
 | target | bytes |
 |---|---:|
-| x86_64 | 3,511,992 |
-| aarch64 | 4,085,120 |
-| agnos | 3,450,208 |
+| x86_64 | 3,512,024 |
+| aarch64 | 4,085,144 |
+| agnos | 3,450,104 |
 
 Of x86_64's bytes, 1,681,822 are unreachable code that the toolchain NOPs in place rather than
 removing (CHANGELOG 1.2.4). The 181 KB this line once gave was the v1.0.1 port-era build (cyrius

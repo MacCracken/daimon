@@ -238,12 +238,10 @@ fn server_banner(port, mode) {
     str_builder_add_int(sb, port);
     str_builder_add_cstr(sb, " (");
     str_builder_add_cstr(sb, mode);
-    # The bind address (2.3.0). Not on agnos: its kernel binds the single NIC
-    # and sock_bind ignores the address (lib/net.cyr), so naming one would lie.
-    #ifndef CYRIUS_TARGET_AGNOS
+    # The bind address (2.3.0; on agnos too since 2.4.4, where sock_bind has kept
+    # the address since cyrius 6.6.7).
     str_builder_add_cstr(sb, ", ");
     str_builder_add(sb, config_listen_addr(_config));
-    #endif
     str_builder_add_cstr(sb, ")\n");
     var banner = str_builder_build(sb);
     print(str_data(banner), str_len(banner));
@@ -762,9 +760,10 @@ fn _srv_event_data(i) {
 
 fn _srv_listen(addr, port) {
     #ifdef CYRIUS_TARGET_AGNOS
-    # lib/net's listener: sock_listen#56 takes the port only, so the kernel
-    # listens on the NIC's address whatever `addr` says (filed with agnos,
-    # 2026-09-23; serve warns).
+    # lib/net's listener. Since cyrius 6.6.7 sock_bind keeps `addr`, and
+    # sock_listen#56 asks for its class: loopback only for 127/8, which agnos
+    # has since 1.57.7. An older kernel refuses that listen rather than widen it
+    # (2.4.4; through 2.4.3 the listener took the NIC's address, agnos audit AG-2).
     var s_t, s_fd = tcp_socket();
     if (is_err_result(s_t) == 1) { return 0 - 1; }
     var b_t, b_v = sock_bind(s_fd, addr, port);
@@ -796,6 +795,26 @@ fn _srv_listen(addr, port) {
     #endif
 }
 
+# A listener that cannot open says so, and serve returns 1 (2.4.4: the banner,
+# printed first, was all there was). On agnos a loopback-only listener needs agnos
+# 1.57.7 or later; an older kernel refuses it (cyrius 6.6.7).
+fn _srv_listen_refused(port) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "daimon: cannot listen on ");
+    str_builder_add(sb, config_listen_addr(_config));
+    str_builder_add_cstr(sb, ":");
+    str_builder_add_int(sb, port);
+    #ifdef CYRIUS_TARGET_AGNOS
+    if (server_loopback_only() == 1) {
+        str_builder_add_cstr(sb, " (a loopback-only listener needs agnos 1.57.7 or later)");
+    }
+    #endif
+    str_builder_add_cstr(sb, "\n");
+    var m = str_builder_build(sb);
+    print(str_data(m), str_len(m));
+    return 1;
+}
+
 # Serve on addr:port until the listener fails. Returns 1 then (or when it
 # cannot bind), as sandhi's loops did; it does not return otherwise.
 #ifdef CYRIUS_TARGET_AGNOS
@@ -806,7 +825,7 @@ fn _srv_listen(addr, port) {
 # one scheduler tick, 10 ms, when nothing else is ready.
 fn server_loop(addr, port) {
     _srv_lfd = _srv_listen(addr, port);
-    if (_srv_lfd < 0) { return 1; }
+    if (_srv_lfd < 0) { return _srv_listen_refused(port); }
     _srv_slots = alloc(SERVE_MAX_CONNS * SRV_SLOT_SIZE);
     memset(_srv_slots, 0, SERVE_MAX_CONNS * SRV_SLOT_SIZE);
     _srv_reject = arena_allocator(4096);
@@ -841,7 +860,7 @@ fn server_loop(addr, port) {
 #else
 fn server_loop(addr, port) {
     _srv_lfd = _srv_listen(addr, port);
-    if (_srv_lfd < 0) { return 1; }
+    if (_srv_lfd < 0) { return _srv_listen_refused(port); }
     _srv_epfd = sys_epoll_create();
     if (_srv_epfd < 0) {
         sys_close(_srv_lfd);
@@ -1035,11 +1054,16 @@ fn _srv_detach_fail(cfd, code, action, msg) {
 
 # Read a detached call's pipe: bytes read, 0 once every writer is gone,
 # -_SRV_EAGAIN while it is empty with a writer, other negatives for errors.
+# agnos (2.4.4): sys_read_nb, read#5 with a4 = 1. Since agnos 1.57.8 a read with
+# a4 = 0, which sys_read passes, waits on an empty pipe, and the loop then held
+# every client until the child answered (the guest test's health check, 15 s).
+# An older kernel answers -2 either way.
 fn _srv_pipe_read(fd, buf, len) {
-    var n = sys_read(fd, buf, len);
     #ifdef CYRIUS_TARGET_AGNOS
+    var n = sys_read_nb(fd, buf, len);
     if (n == 0 - 2) { return 0 - _SRV_EAGAIN; }   # pipe_read: empty, a writer still open
     #else
+    var n = sys_read(fd, buf, len);
     while (n == 0 - _SRV_EINTR) { n = sys_read(fd, buf, len); }
     #endif
     return n;
@@ -1184,14 +1208,9 @@ fn server_detach(work, arg) {
 fn serve(port) {
     #ifdef CYRIUS_TARGET_AGNOS
     server_banner(port, "event loop");
-    # agnos's sock_listen#56 has no address: the listener takes the NIC's, and
-    # the API is reachable from the network even with the default 127.0.0.1
-    # (filed with agnos, 2026-09-23). The Host check still applies.
-    if (server_loopback_only() == 1) {
-        sakshi_warn("agnos listens on the NIC's address, not loopback: the API is reachable from the network", 87);
-        daimon_audit(SEV_WARNING, "http", "http.listen.not_loopback",
-          "agnos cannot bind the listener to loopback; it is on the NIC's address");
-    }
+    # The listener is on the bind address, 127.0.0.1 unless --listen, as on
+    # Linux (2.4.4). Through 2.4.3 agnos put it on the NIC's address, and serve
+    # warned and audited http.listen.not_loopback (agnos audit AG-2).
     return server_loop(server_bind_addr(), port);
     #else
     server_banner(port, "event loop");

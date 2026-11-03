@@ -32,7 +32,9 @@ fn _l_wait_ms(ms) {
 fn _l_wait_exit(pid, ms) {
     var t0 = _l_now_ms();
     while (_l_now_ms() - t0 < ms) {
-        var r = sys_waitpid(pid);
+        # agnos's waitpid#4 by number: cyrius lint compiles this file for the host,
+        # where sys_waitpid takes Linux's three arguments (2.4.4).
+        var r = syscall(SYS_WAITPID, pid);
         if (r != 0 - 2) { return r; }
         sys_pause();
     }

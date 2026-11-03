@@ -138,7 +138,10 @@ fn daimon_reap(pid) {
 #           killed it (the shell's convention, so one int carries both)
 #      -2 — still running
 #      -1 — no such child
-# agnos's #4 already answers exactly this shape, so its arm passes through.
+# agnos's #4 answers -2 and -1 the same way. Its status is a status word since
+# agnos 1.57.7 (0x100 | the signal for a process a signal ended: SIGKILL is 265),
+# decoded here as on Linux (2.4.4; through 2.4.3 it was passed through as the
+# exit code). An older kernel's bare exit code decodes to itself.
 #
 # ⛔ pid <= 0 is refused, not forwarded. waitpid(0) reaps ANY child in daimon's
 # process group and waitpid(-1) ANY child at all: an agent record whose pid is
@@ -147,7 +150,10 @@ fn daimon_reap_code(pid) {
     if (pid <= 0) { return 0 - 1; }
     #ifdef CYRIUS_TARGET_AGNOS
     var wr = sys_waitpid(pid);
-    if (wr >= 0) { return wr; }
+    if (wr >= 0) {
+        if (WIFSIGNALED(wr) == 1) { return 128 + WTERMSIG(wr); }
+        return WEXITSTATUS(wr);
+    }
     if (wr == 0 - 2) { return 0 - 2; }
     return 0 - 1;
     #else

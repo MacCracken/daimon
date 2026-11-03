@@ -236,7 +236,10 @@ fn _c_req(method, path, body) {
 # Open a connection to daimon and send one request on it, without reading the
 # answer. Returns the connection, or -1.
 fn _c_open(method, path, body) {
-    var conn = syscall(SYS_SOCK_CONNECT, sys_net_ip(), 8090, 0);
+    # 127.0.0.1 in the kernel's ip4 form (2.4.4): daimon's default listener is
+    # loopback only there since agnos 1.57.7. Through 2.4.3 this dialed the
+    # guest's own address, where the listener was.
+    var conn = syscall(SYS_SOCK_CONNECT, 0x7F000001, 8090, 0);
     if (conn < 0) { return 0 - 1; }
     var sb = str_builder_new();
     str_builder_add_cstr(sb, method);

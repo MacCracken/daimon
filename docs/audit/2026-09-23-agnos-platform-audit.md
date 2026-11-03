@@ -30,7 +30,7 @@ checked on every call, as `chan_auth` does for channels).
 **daimon**: documented exposure. Until agnos fixes it, anything an agent can do on the box includes
 interfering with daimon's API.
 
-### AG-2: The API cannot be loopback-only on agnos (MEDIUM) — agnos filing; daimon warns and audits
+### AG-2: The API cannot be loopback-only on agnos (MEDIUM) — fixed in agnos 1.57.7 and cyrius 6.6.7; loopback only since daimon 2.4.4
 
 `sock_listen`#56 takes a port and no address, so daimon's default 127.0.0.1 binding (VULN-011) cannot
 hold there. The listener serves the NIC's address. TCP to 127.0.0.1 is also dropped
@@ -50,7 +50,7 @@ guarantee (a start whose limits fail is refused) cannot hold there.
 **daimon**: by the operator's ruling (2026-09-23), agents start without limits on agnos. Every start
 is audited `agent.limits.unenforced`, and the agent's JSON says `"limits_enforced":false`.
 
-### AG-4: A stop can only ask (MEDIUM) — agnos filing
+### AG-4: A stop can only ask (MEDIUM) — fixed in agnos 1.57.7: the stop's SIGKILL ends the agent since daimon 2.4.4
 
 `kill`#16 sets a pending bit. No signal has a default action, so SIGKILL does not end a process that
 does not read its signalfd. A hung or hostile agent keeps running after its stop, and keeps its slot
@@ -251,6 +251,20 @@ the test's server went on sending into its connection. That is not measured.
 
 ## What 2.4.4 changed in daimon itself
 
+agnos 1.57.6 and 1.57.7 closed every agnos filing above, and the guest test runs 1.57.14 since
+2.4.4. The findings whose filing is closed but whose fix daimon has not adopted (AG-3, AG-5, AG-10,
+AG-11, AG-14; AG-1 and AG-8 not re-measured) are on the roadmap.
+
+- **AG-2: the listener is loopback only.** cyrius 6.6.7 passes the bind address to `sock_listen`#56,
+  and agnos 1.57.7 honours it; an older kernel refuses it. `serve` no longer warns or audits
+  `http.listen.not_loopback`, and a listener that cannot open says so.
+- **AG-4: a stop ends the agent.** The SIGKILL daimon sends at the end of the grace period ends an
+  agent that ignores SIGTERM: Stopped, exit code 137, no `agent.stop.pending`. `daimon_reap_code`
+  decodes the status word `waitpid`#4 answers since 1.57.7 (265 for SIGKILL).
+- **A detached call no longer holds the loop on agnos 1.57.8 and later**, where a pipe read with
+  a4 = 0 waits: `_srv_pipe_read` reads with `sys_read_nb`. Found by the guest test on 1.57.14 (health
+  took 15 s while a forwarded call waited; 2 ms after).
+
 - **AG-15's interim is gone.** cyrius 6.6.7 resolved the filing: `_agnos_sock_recv_block` times its
   wait with `uptime_us`#95, else the RTC, and counts pauses only when no clock reads at all. A
   timeout answers -11 (EAGAIN), no longer 0, which read as EOF. With 6.6.20 pinned,
@@ -260,6 +274,9 @@ the test's server went on sending into its connection. That is not measured.
   `daimon_now_ms` has the same shape and is left as it is.
 
 ## Verification
+
+- 2.4.4: the guest test passes its 92 checks on agnos 1.57.14 (gnoboot 0.7.2), with the client
+  dialing 127.0.0.1.
 
 - 2.4.3: with QEMU held to 30% of a CPU, the guest stood still in 0 runs of 9, against 1 in 6 with
   2.4.2's pacing (AG-14). A run that times out now prints where the guest is, from QEMU's monitor

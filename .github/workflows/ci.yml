@@ -103,17 +103,29 @@ jobs:
       - name: Lint
         # Fail-on-warn — daimon is clean under 6.1.24. Lint covers
         # src/ + tests/ + bench/ + fuzz/ (harnesses and the shared fuzz/rng.cyr).
+        # 2.4.4: since cyrius 6.6.11 lint first compiles the file alone, for the
+        # host, and exits non-zero on a refusal. Its status is checked, not just
+        # its output: under `bash -e` a bare `out=$(cyrius lint ...)` ended the
+        # step before the refusal was printed. CYRIUS_DCE=0 because lint emits
+        # nothing, and with the job's CYRIUS_DCE=1 cycc compacted each one-file
+        # compile and refused it ("dead-code elimination corrupted N live
+        # function body/bodies"); the full build declines compaction.
         run: |
           fail=0
           for f in src/*.cyr tests/*.tcyr tests/*.bcyr tests/agnos/*.cyr fuzz/*.fcyr fuzz/*.cyr; do
             [ -f "$f" ] || continue
-            out=$(cyrius lint "$f" 2>&1)
+            rc=0
+            out=$(CYRIUS_DCE=0 cyrius lint "$f" 2>&1) || rc=$?
             echo "$out"
+            if [ $rc -ne 0 ]; then
+              echo "::error::cyrius lint exited $rc on $f"
+              fail=1
+            fi
             if echo "$out" | grep -qE '^\s*warn '; then
               fail=1
             fi
           done
-          [ $fail -eq 0 ] || { echo "lint: warnings present"; exit 1; }
+          [ $fail -eq 0 ] || { echo "lint: warnings or refusals present"; exit 1; }
 
       - name: Build (DCE)
         run: |
@@ -293,7 +305,7 @@ jobs:
 
   agnos-guest:
     # 2.4.1. daimon's AGNOS guest test on every push. tests/agnos/run.sh --release
-    # downloads agnos 1.57.5 and gnoboot 0.7.2 from their GitHub releases, refuses
+    # downloads agnos 1.57.14 (1.57.5 until 2.4.4) and gnoboot 0.7.2 from their GitHub releases, refuses
     # them unless they match the SHA-256 pinned in the script, boots them under
     # QEMU (TCG; no KVM needed), and runs daimon's agent lifecycle (guest.cyr) and
     # the real daimon binary over HTTP (http_client.cyr) inside the guest. Until

@@ -11,8 +11,9 @@ daimon's own source moves off a deprecated bayan name and drops an agnos workaro
 made unnecessary. **1087 tests** across 17 suites, **143 HTTP smoke checks** and 7 fuzz harnesses,
 all green on Linux. On a real aarch64 kernel: all 1087 checks and the binary's 20-check smoke. fmt,
 lint and vet are clean; x86_64, aarch64 and agnos build; `cyrius.lock` verifies 84 of 84.
-⛔ **The AGNOS guest test fails** on the agnos 1.57.5 it runs: cyrius 6.6.20 refuses a loopback-only
-listener on agnos before 1.57.7, and daimon binds 127.0.0.1 by default (*AGNOS*, below).
+The AGNOS guest test passes its 92 checks on **agnos 1.57.14** (it ran 1.57.5), which daimon now needs
+1.57.7 or later of: since cyrius 6.6.7 its 127.0.0.1 listener is loopback only there, as on Linux.
+With QEMU held to 30% of a CPU it passes 9 runs of 9.
 
 ### Changed — toolchain and dependency pins
 
@@ -52,7 +53,7 @@ What the moves carry for daimon:
 - **cyrius 6.6.7 – 6.6.20.**
   - agnos (6.6.7, its CVE-48): a socket bound to 127/8 listens on loopback only, through a listen
     class agnos has since 1.57.7. On an older kernel the listen is refused: it fails closed rather
-    than listen on the network. See *AGNOS* below.
+    than listen on the network. See *Changed — AGNOS*.
   - agnos (6.6.7, daimon's filing): a blocking socket read is timed by `uptime_us`#95, else the RTC,
     and counts pauses only when no clock reads; a timeout answers -11, not 0. See *Changed — daimon*.
   - agnos (6.6.7, daimon's filing): `clock_now_ns` falls back to `uptime_ms`#40, latched, when `#95`
@@ -106,26 +107,59 @@ What the moves carry for daimon:
   cyrius 6.6.7 resolved daimon's filing, and since then the pause count applies only when no clock
   reads at all, where lifting it made the wait unbounded.
 
-### AGNOS — the default listener is refused before agnos 1.57.7
+### Changed — AGNOS: agnos 1.57.14, a loopback listener, and a stop that ends
 
-- **What changed.** Through cyrius 6.6.6 the agnos socket adapter ignored the bind address, so
-  daimon's 127.0.0.1 listener took the NIC's address, and `serve` warned and audited it (agnos audit
-  AG-2). Since 6.6.7 (its CVE-48) `sock_bind` keeps the address and `sock_listen`#56 asks for a listen
-  class: LOOPBACK for 127/8, which agnos has since 1.57.7. On an older kernel the stdlib refuses the
-  listen: "it FAILS CLOSED rather than listening on the network".
-- **Measured**: `sh tests/agnos/run.sh --release` (agnos 1.57.5, gnoboot 0.7.2). The guest program's
-  59 checks pass. daimon prints its banner, its listener is refused, and each of the client's checks
-  reads 0 bytes until the launcher stops waiting at 120 s.
-- **daimon says nothing when its listener cannot open.** `serve` prints "listening on port" before
-  `server_loop` opens the listener, and `server_loop` returns 1 without a message.
-- agnos 1.57.6 and 1.57.7 resolved every agnos filing daimon made at 2.4.0 – 2.4.3, the loopback
-  listener among them (agnos 1.57.14 is the latest release). daimon adopts none of them yet.
-- **Tried in a scratch copy, not in this tree:**
-  - agnos 1.57.5, with the launcher starting daimon `--listen 0.0.0.0`: all 92 checks pass.
-  - agnos 1.57.14 (SHA-256 from its release), with the test client dialing 127.0.0.1: the default
-    listener works. 56 of the guest program's 59 checks pass; the 3 that fail assert 1.57.5's limit
-    ("no signal ends a process yet"), and a stop now ends the agent. 32 of the client's 33 pass;
-    `health answers while a forwarded call waits on its server` answered in 15,001 ms. Not diagnosed.
+daimon 2.4.4 needs **agnos 1.57.7 or later**, and the guest test moves from 1.57.5 to the latest
+release, **1.57.14** (`tests/agnos/run.sh`, SHA-256 from its SHA256SUMS; gnoboot stays 0.7.2). agnos
+1.57.6 and 1.57.7 closed every gap daimon filed at 2.4.0 – 2.4.3. This release takes what came with
+the toolchain and the kernel; the rest is on the roadmap (limits, pause and resume, argv, captured
+output, one write per answer).
+
+- **The listener is loopback only, as on Linux** (agnos audit AG-2). Through cyrius 6.6.6 the agnos
+  socket adapter ignored the bind address, so the 127.0.0.1 listener took the NIC's address, and
+  `serve` warned and audited `http.listen.not_loopback`. Since 6.6.7 (its CVE-48) `sock_bind` keeps
+  the address and `sock_listen`#56 asks for a loopback-only class, which agnos has since 1.57.7. On
+  an older kernel the stdlib refuses the listen: "it FAILS CLOSED rather than listening on the
+  network". The warning and audit are gone, and the banner names the address on agnos too.
+  Measured on 2.4.4's first cut: on agnos 1.57.5 the guest program's 59 checks passed, the listener
+  was refused, and every HTTP check read 0 bytes.
+- **A listener that cannot open says so**, on both platforms: `daimon: cannot listen on
+  127.0.0.1:8090` (on agnos, plus that it needs 1.57.7), exit 1. `serve` printed its banner first and
+  returned 1 with no word of why (measured on Linux with the port taken).
+- **A stop ends an agent that ignores SIGTERM** (AG-4). The SIGKILL daimon sends at the end of the
+  grace period ends a process since agnos 1.57.7. Through 1.57.6 it set a pending bit, and the agent
+  stayed Stopping.
+- **`daimon_reap_code` decodes agnos's wait status.** Since 1.57.7 `waitpid`#4 answers a status word
+  (265 for a SIGKILLed child), which daimon passed through as the exit code. It is now 128 + the
+  signal, or the exit code, as on Linux; an older kernel's bare code decodes to itself.
+- **A detached call no longer holds the loop.** Since agnos 1.57.8 a read with a4 = 0, which
+  `sys_read` passes, waits on an empty pipe. The loop read a detached call's pipe that way, and
+  every other client waited for the child's answer: the guest test's health check took 15,001 ms
+  while a forwarded call waited. `_srv_pipe_read` reads with `sys_read_nb` (a4 = 1): 2 ms.
+- **Tests**: the client dials 127.0.0.1 (it dialed the guest's own address); the stubborn agent's
+  checks expect Stopped, a cleared pid and exit code 137 where they expected Stopping; the launcher
+  calls `waitpid`#4 by number (below, *CI*).
+- **Measured**: `sh tests/agnos/run.sh --release` on 1.57.14 passes 59 + 33 checks (83 s). With QEMU
+  held to 30% of a CPU (three lanes, three runs each): 9 of 9, 208 – 219 s, the kernel's TSC
+  calibrated in every run (3193 cycles/µs; 1.57.5 refused its calibration at 25%, AG-12).
+
+### Fixed — CI's lint step
+
+CI failed at *Lint* on the 6.6.20 tree with nothing printed but `Error: Process completed with exit
+code 1`. Since cyrius 6.6.11 `cyrius lint` compiles each file alone for the host first, and exits
+non-zero on a refusal. Under `bash -e`, `out=$(cyrius lint "$f")` ended the step before that file's
+output was echoed, and the step looked only for `warn` lines anyway. Eight files were refused:
+- seven (`src/main.cyr`, `src/api_agent.cyr`, `src/api_mcp.cyr`, `tests/daimon.tcyr`,
+  `tests/ipc.tcyr`, `tests/agnos/guest.cyr`, `fuzz/scheduler_fsm.fcyr`) with `dead-code elimination
+  corrupted N live function body/bodies; refusing to emit`, only under the job's `CYRIUS_DCE=1`. The
+  compiler compacts dead code in each small one-file compile and audits the result; the full build
+  declines compaction (more than 4096 dead-code runs). With `CYRIUS_DCE=0` all seven lint clean.
+- `tests/agnos/launcher.cyr` with `'sys_waitpid' expects 3 arguments, got 1`: an agnos-only program,
+  compiled for the host, where `sys_waitpid` takes Linux's three.
+
+The step now runs `CYRIUS_DCE=0 cyrius lint`, fails on its exit status as well as on `warn`, and
+names the file. The launcher calls agnos's `waitpid`#4 by number. Local lint loops that only grepped
+for `warn` (the one 2.4.4's first cut was checked with) missed all eight.
 
 ### Known issues (carried, re-checked at 6.6.20)
 
@@ -139,11 +173,11 @@ What the moves carry for daimon:
 
 | target | 2.4.3 (6.6.6) | 2.4.4 (6.6.20) | |
 |---|---:|---:|---:|
-| x86_64 | 3,313,248 | 3,511,992 | +6.0% |
-| aarch64 | 4,209,992 | 4,085,120 | −3.0% |
-| agnos | 3,242,848 | 3,450,208 | +6.4% |
+| x86_64 | 3,313,248 | 3,512,024 | +6.0% |
+| aarch64 | 4,209,992 | 4,085,144 | −3.0% |
+| agnos | 3,242,848 | 3,450,104 | +6.4% |
 
-`src/` is unchanged in size (10,044 lines). The difference is the toolchain and the vendored code.
+The difference is the toolchain and the vendored code; daimon's own changes are a few dozen lines.
 
 ### Performance
 
@@ -164,7 +198,8 @@ of 1.9–2.1 (the benchmark included). A first round of 10 agreed in direction o
 The other 22 are within ±1.6%, except `mcp_find_tool_in_100` (+5.5%, spreads of 54–56%). daimon's
 code on these paths did not change, so the moves are the toolchain's and the vendored libraries'.
 Their cause was not measured. Measured before nein moved to 1.7.1, whose change is confined to four
-of its own MCP handlers, which no benchmark calls.
+of its own MCP handlers, and before the AGNOS changes, which on Linux touch only `serve`'s start; no
+benchmark calls either.
 
 ### Changed — documentation
 

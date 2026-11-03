@@ -11,9 +11,9 @@ for that toolchain (bote 3.3.17, samay 1.1.7, ai-hwaccel 2.4.2, nein 1.7.1). Bui
   their rlimits, with exit status reported.
 - **On AGNOS too** (2.4.0, [ADR-007](../adr/007-daimon-on-agnos.md)): agents are started, stopped,
   collected, heard on their channel and measured with the kernel's own primitives. daimon runs its
-  own loop there. `tests/agnos/run.sh` checks this on agnos 1.57.5 under QEMU, in CI on every push
-  since 2.4.1. What agnos cannot do yet (limits, ending a process, a loopback-only listener, …) is
-  filed with agnos; see 2.4.x.
+  own loop there. `tests/agnos/run.sh` checks this under QEMU, in CI on every push since 2.4.1, on
+  agnos 1.57.14 since 2.4.4 (1.57.5 before). agnos 1.57.7 closed every gap daimon filed; adopting
+  the rest (limits, pause/resume, argv, captured output) is in 2.4.x.
 - **Scheduled tasks can be started and completed** (2.3.1), and an executor can list its node's
   work.
 - **Request bodies are read with the typed JSON parser** (2.3.2): strings are decoded, nesting is
@@ -75,23 +75,24 @@ suite green at every step.
 Shipped in 2.4.0 and 2.4.1: the CHANGELOG entries, [ADR-007](../adr/007-daimon-on-agnos.md) and
 [docs/audit/2026-09-23-agnos-platform-audit.md](../audit/2026-09-23-agnos-platform-audit.md).
 
-**Waiting on agnos** — twelve filings in the agnos repo, `docs/development/issues/2026-09-23-*.md`.
-When each closes, daimon's interim changes:
+**Adopting agnos 1.57.7** — agnos 1.57.6 and 1.57.7 closed all twelve filings daimon made
+(`docs/development/issues/archived/2026-09-23-*.md` in the agnos repo), and the guest test runs the
+latest release, 1.57.14, since 2.4.4. 2.4.4 took what came with the toolchain and the kernel: a
+loopback-only listener, a stop's SIGKILL that ends the agent, the decoded wait status. Still to adopt:
 
-| agnos filing | daimon's interim today | when it closes |
-|---|---|---|
-| `inbound-tcp-syn-dropped-by-isr-drain` (P1 for daimon) | the API is reachable only from the box itself | nothing to change; re-measure accept from the host |
-| `socket-ids-have-no-owner` (P1) | documented exposure (audit AG-1) | nothing to change; close AG-1 |
-| `parent-cannot-end-stop-or-continue-a-child` | a stop asks; pause/resume answer 501 | SIGKILL ends the stop; map pause/resume; reach descendants |
-| `no-per-process-resource-limits` | agents run without limits, audited | arm the limits at spawn; `limits_enforced:true`; refuse a start whose limits fail |
-| `tcp-server-cannot-be-loopback-only` | listen on the NIC's address, warn and audit | listen on 127.0.0.1 by default, as on Linux; per-client rate limiting |
-| `child-inherits-every-fd-and-spawn-arms-leak` | `--agent-output capture` refused | capture stdout and stderr on agnos |
-| `spawn-path-args-cannot-contain-spaces` | 422 for a name with a space | pass the argv as separate arguments |
-| `sleep-ms-holds-the-cpu` | `daimon_yield_ms` (pause) | nothing to change |
-| `sock-recv-never-reports-eof-after-peer-fin` | the guest client reads to `Content-Length` | nothing to change in daimon |
-| `spawn-path-failure-gives-no-reason` (2.4.1) | a failed spawn is answered "the process table is full, or it cannot load the executable" (500) | answer a full table as capacity (503), like a full channel table |
-| `tsc-calibration-refused-stops-the-us-clock` (2.4.1) | `daimon_now_ms` falls back to `uptime_ms`#40 | nothing to change; the fallback stays for older kernels |
-| `sock-send-and-connect-hold-the-cpu` (2.4.1, P1 for daimon) | answers are written in 512-byte pieces 1 ms apart; a local client that stops reading, or rarely one on a very slow machine, can still stop the machine (caught with QEMU's monitor) | one write per answer again (sandhi's path, as on Linux) |
+| agnos filing | closed in | daimon today | to do |
+|---|---|---|---|
+| `parent-cannot-end-stop-or-continue-a-child` | 1.57.7 | a stop ends the agent (2.4.4); pause/resume answer 501 | map pause/resume to signals 19/18; reach descendants |
+| `no-per-process-resource-limits` | 1.57.7 | agents run without limits, audited | arm `spawn_limits`#107 at spawn; `limits_enforced:true`; refuse a start whose limits fail |
+| `child-inherits-every-fd-and-spawn-arms-leak` | 1.57.6 | `--agent-output capture` refused | `SPAWN_F_CLEANFD`; capture stdout and stderr |
+| `spawn-path-args-cannot-contain-spaces` | 1.57.6 | 422 for a name with a space | `SPAWN_F_ARGV`: pass the argv as separate arguments |
+| `spawn-path-failure-gives-no-reason` | 1.57.6 | "the process table is full, or it cannot load the executable" (500) | read the `SPAWN_E_*` code; a full table is capacity (503) |
+| `sock-send-and-connect-hold-the-cpu` (P1 for daimon) | 1.57.7 | 512-byte pieces 1 ms apart | one write per answer again (sandhi's path, as on Linux), once measured on 1.57.14 |
+| `tcp-server-cannot-be-loopback-only` | 1.57.7 | loopback-only listener (2.4.4) | per-client rate limiting, if agnos gives a peer address |
+| `inbound-tcp-syn-dropped-by-isr-drain`, `socket-ids-have-no-owner` | 1.57.7 | nothing in daimon | re-measure accept from the host; close audit AG-1 and AG-8 |
+
+Nothing to change in daimon for `sleep-ms-holds-the-cpu`, `sock-recv-never-reports-eof-after-peer-fin`
+and `tsc-calibration-refused-stops-the-us-clock` (`daimon_now_ms` stays for older kernels).
 
 **daimon's own, on agnos:** nothing open.
 

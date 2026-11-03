@@ -118,7 +118,7 @@ Every AGNOS agent, every consumer app, hoosh, agnoshi, aethersafha.
 - **Fixed local arrays: use element-typed `var a: i64[N]` for slot arrays** (and `u8[N]` / `i32[N]` / `u32[N]` for sized byte/scalar buffers). Since cyrius 6.2.1, bare `var a[N]` is **N bytes in a function** (N i64 slots only at top level) — an address-taken `var a[N]` written via `store64(&a + i*8)` under-reserves and silently corrupts adjacent memory. This caused the 1.2.6 routing-404 bug; swept in 1.2.7. Before re-testing any "fixed" compiler footgun, **read the cyrius language CHANGELOG** — fixes there are often language changes, not silent codegen patches.
 - Original Rust implementations are in git history at tags `0.5.0` / `0.6.0` (e.g. `git show 0.6.0:src/agent.rs`). The Cyrius port starts at `0.7.0`.
 
-## Commands (verified at 2.4.3)
+## Commands (verified at 2.4.4)
 
 ```sh
 export CYRIUS_NO_WARN_SHADOW_LIB=1 CYRIUS_DCE=1   # what CI sets
@@ -127,7 +127,7 @@ cyrius test tests/<suite>.tcyr                   # one suite (17 suites, each in
 sh tests/test.sh                                 # every suite + tests/smoke.sh (the linked binary over HTTP) + cyrius fuzz
 cyrius vet src/main.cyr
 cyrius fmt <file> --check                        # CI runs this on src/*.cyr tests/*.tcyr tests/*.bcyr tests/agnos/*.cyr fuzz/*
-cyrius lint <file>                               # CI fails on any `warn`
+CYRIUS_DCE=0 cyrius lint <file>                  # CI fails on any `warn` and on a non-zero exit (see below)
 ./scripts/bench-history.sh                       # tests/daimon.bcyr; `cyrius bench tests/rag_ingest.bcyr` for the other two
 ./scripts/version-bump.sh <version>              # VERSION + src/config.cyr, only when the user names the version
 sh tests/agnos/run.sh --release                  # AGNOS guest test on the released kernel, SHA-256 pinned (CI runs this)
@@ -225,15 +225,31 @@ that names a file a clean checkout does not vendor fails there.
 - **Every unit that includes `src/agent.cyr` must include `src/ipc.cyr`.** An undefined function is
   only a *warning* when no call reaches it, and a build error when one does.
 - **cyrius has no adjacent-literal concatenation** (`"a" "b"` is a syntax error), and `cyrius fmt
-  --check` / `cyrius lint` do not compile: build or run the suite after every edit.
+  --check` does not compile: build or run the suite after every edit. `cyrius lint` compiles each
+  file alone for the host since cyrius 6.6.11, and exits non-zero on a refusal: judge it by its exit
+  status, and run it with `CYRIUS_DCE=0` (under `CYRIUS_DCE=1` cycc compacts each one-file compile
+  and refuses it). An agnos-only file must compile for the host too: call an agnos syscall whose
+  wrapper's arity differs by number (`tests/agnos/launcher.cyr`).
 - **AGNOS is the primary target.** Arch- and kernel-specific calls go through the shims in
   `src/syscalls.cyr` (`daimon_reap_code`, `daimon_signal`, `daimon_yield_ms`, …) and the agnos arms
   in `src/agent.cyr`, `src/ipc.cyr` and `src/server.cyr` (2.4.0, ADR-007): `spawn_path`#43, `kill`#16,
   `waitpid`#4, `chan_op`#97, `proclist`#99. For agnos syscalls read `agnos/kernel/core/syscall.cyr`,
   not the cyrius peer `lib/syscalls_x86_64_agnos.cyr`, which mirrors an older kernel.
-  - **Never `sleep_ms` / `sys_nanosleep` on agnos**: both are `sleep_ms`#41, which disables
-    preemption for the whole sleep, so the agents daimon waits for do not run. Wait with
-    `daimon_yield_ms` (`pause`#14 until the deadline).
+  - **daimon 2.4.4 needs agnos 1.57.7 or later** for its default listener: since cyrius 6.6.7 a
+    127.0.0.1 bind is loopback only there, and an older kernel refuses it (`--listen 0.0.0.0` does
+    not need it). The guest test runs the latest release, 1.57.14. agnos 1.57.6 and 1.57.7 closed
+    every gap daimon filed; the rules below that name one hold until daimon adopts the fix
+    (roadmap, 2.4.x).
+  - **Read a pipe with `sys_read_nb`** (a4 = 1, answers -2 for "nothing yet"). `sys_read` passes
+    a4 = 0, which since agnos 1.57.8 waits on an empty pipe or channel endpoint: on the loop that
+    held every client (2.4.4, `_srv_pipe_read`). A channel record is `sys_chan_recv`, which never
+    waits.
+  - **`waitpid`#4 answers a status word since agnos 1.57.7**: decode it with `WIFSIGNALED` /
+    `WTERMSIG` / `WEXITSTATUS`, as `daimon_reap_code` does (a SIGKILLed agent is 265, reported
+    137).
+  - **Never `sleep_ms` / `sys_nanosleep` on agnos**: both are `sleep_ms`#41, which through agnos
+    1.57.6 disabled preemption for the whole sleep, so the agents daimon waits for did not run. Wait
+    with `daimon_yield_ms` (`pause`#14 until the deadline).
   - **Never write more than 512 bytes at once on agnos**, and never two pieces back to back (2.4.1;
     512 and the timed gap since 2.4.3). A TCP receive ring there is 2048 bytes and
     `sock_send`#48 holds the CPU while it waits for room, so a write the receiver has no room for
@@ -250,8 +266,9 @@ that names a file a clean checkout does not vendor fails there.
   - **The guest's console costs about 65 ms a line.** A guest program prints a bounded excerpt,
     never a whole answer.
   - **Room is the kernel's**: 16 process slots and 16 channels for the machine, 32 fds per process,
-    8 TCP slots for every end of every connection (one inside the machine takes two). `kill`#16 only
-    sets a pending bit, so a child daimon forks or spawns cannot be made to exit.
+    8 TCP slots for every end of every connection (one inside the machine takes two). Through agnos
+    1.57.6 `kill`#16 only set a pending bit; since 1.57.7 signal 9 ends a child, so a stop's SIGKILL
+    ends an agent that ignores SIGTERM there too (2.4.4).
   - **The `/bin/agnsh` slot is a foreground `execwait` child** (kybernet runs it to completion):
     something tested there does not behave as daimon in service would. `tests/agnos/` puts a launcher
     in that slot and runs everything under test as background processes.

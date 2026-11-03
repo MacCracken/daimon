@@ -299,7 +299,7 @@ assert_eq(agent_status(h8), AGENT_STOPPED, "agnos: agent_stop ends it (daimon_yi
 assert_eq(agent_exit_code(h8), 0, "agnos: ... with the agent's own exit code");
 
 # --- capacity: agnos's tables bound the running agents, not max_agents (2.4.1) --
-# agnos 1.57.5 has 16 process slots and 16 channels for the whole machine.
+# agnos (1.57.5 to 1.57.14) has 16 process slots and 16 channels for the whole machine.
 # Start user agents until one is refused; the refusal must leave nothing behind.
 # Stop them all; the same number must start again (every slot and channel came
 # back), and the next one must be refused again.
@@ -369,17 +369,19 @@ assert_eq(is_ok(r10_t), 1, "agnos: ... and starts once a channel is free");
 agent_stop_begin(h9, "test");
 assert_eq(_g_stop(h9, 20000), 1, "agnos: ... then stops");
 
-# --- an agent that ignores SIGTERM: agnos cannot end it yet ---------------------
+# --- an agent that ignores SIGTERM: SIGKILL ends it (agnos 1.57.7) ------------
+# Through agnos 1.57.6 kill#16 only set a pending bit, and this stop gave up with
+# the agent STOPPING and still running (2.4.0 - 2.4.3).
 var h6 = agent_handle_new(6, str_from("stubborn"));
 agent_set_type(h6, AGENT_TYPE_SERVICE);
 var r6_t, r6_v = agent_start(h6, 0, 0);
 assert_eq(is_ok(r6_t), 1, "agnos: a service agent starts");
 _g_wait(200);
 agent_stop_begin(h6, "test");
-assert_eq(_g_stop(h6, 20000), 1, "agnos: a stop of an agent that ignores SIGTERM gives up");
-assert_eq(agent_status(h6), AGENT_STOPPING, "agnos: ... leaving it STOPPING (no signal ends a process yet)");
-assert(agent_pid(h6) > 0, "agnos: ... with its pid kept, for a later reap");
-assert_eq(daimon_reap_code(agent_pid(h6)), 0 - 2, "agnos: ... and it is still running");
+assert_eq(_g_stop(h6, 20000), 1, "agnos: a stop of an agent that ignores SIGTERM finishes");
+assert_eq(agent_status(h6), AGENT_STOPPED, "agnos: ... with it STOPPED: the SIGKILL ended it");
+assert_eq(agent_pid(h6), 0, "agnos: ... reaped, its pid cleared");
+assert_eq(agent_exit_code(h6), 128 + SIGKILL, "agnos: ... its exit code 128 + SIGKILL (wait status 265 decoded)");
 
 # --- no executable for a type -------------------------------------------------
 agent_set_agents_dir("/none");

@@ -5,8 +5,9 @@
 #   /bin/guest   tests/agnos/guest.cyr: src/agent.cyr against the real kernel,
 #                with the fixture agents under /agents;
 #   /bin/daimon  the real daimon, `serve 8090 --agents-dir /agents`;
-#   /bin/client  tests/agnos/http_client.cyr: daimon's API over TCP to the
-#                guest's own address (the kernel's loopback path).
+#   /bin/client  tests/agnos/http_client.cyr: daimon's API over TCP to
+#                127.0.0.1 (2.4.4: daimon's listener is loopback-only there,
+#                as on Linux, since agnos 1.57.7 and cyrius 6.6.7).
 #
 #   sh tests/agnos/run.sh            # exit 0 = every assertion passed
 #   sh tests/agnos/run.sh --release  # on the released binaries pinned below (CI)
@@ -22,11 +23,12 @@
 set -u
 cd "$(dirname "$0")/../.."
 ROOT=$(pwd)
-# The releases --release boots (2.4.1). Each is byte-identical to the build 2.4.0
-# was first measured on. Move a pin by changing the version and its SHA-256 together,
-# from the release's own SHA256SUMS.
-AGNOS_RELEASE=1.57.5
-AGNOS_RELEASE_SHA256=5b73d81c2e872f72396840f9d25036e7245f50f231b1cf4873fd27432ad079be
+# The releases --release boots (2.4.1). gnoboot is byte-identical to the build 2.4.0
+# was first measured on; agnos moved 1.57.5 -> 1.57.14 at 2.4.4, the latest release,
+# whose 1.57.7 is the first that can listen on loopback only. Move a pin by changing
+# the version and its SHA-256 together, from the release's own SHA256SUMS.
+AGNOS_RELEASE=1.57.14
+AGNOS_RELEASE_SHA256=e7d3c6a92bc4666986de4639dcbc23a79dd777ef8fd966a8febd560dcacbb4a9
 GNOBOOT_RELEASE=0.7.2
 GNOBOOT_RELEASE_SHA256=7420e59dcd26da498babc8ad0ff24d37b3bea8d832f670be3225ea5162c6d7e3
 KERNEL=${AGNOS_KERNEL:-$ROOT/../agnos/build/agnos}

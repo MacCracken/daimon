@@ -1,8 +1,8 @@
 # ADR-007: daimon on AGNOS — the kernel's own primitives, a polled loop, and gaps filed rather than designed around
 
 **Status**: Accepted, with addenda for 2.4.1, 2.4.2, 2.4.3 and 2.4.4 below. The 2.4.1 addendum
-corrects decision 2, the 2.4.3 addendum replaces the 2.4.1 writer's 1 KB pieces, and the 2.4.4 addendum
-retires the 2.4.2 one.
+corrects decision 2, the 2.4.3 addendum replaces the 2.4.1 writer's 1 KB pieces, and the 2.4.4 addenda
+retire the 2.4.2 one and two rows of decision 3's table (the listener, and what ends a process).
 **Date**: 2026-09-23 (2.4.0)
 **Context**: AGNOS is daimon's primary target, but through 2.3.4 daimon only *built* for it. There an
 agent start answered 501, and the HTTP API ran on sandhi's sync loop. Mapping daimon's agent lifecycle
@@ -196,3 +196,24 @@ no clock reads at all. A timeout answers -11 (EAGAIN) instead of 0, which caller
 daimon pins cyrius 6.6.20 since 2.4.4, and `daimon_agnos_recv_bound` is gone: it now applied only
 in that last case, and there it made the wait unbounded. As the 2.4.2 addendum expected, nothing
 else had to change.
+
+## Addendum — 2.4.4: agnos 1.57.14, and the gaps agnos closed
+
+agnos 1.57.6 and 1.57.7 closed every filing behind decision 3's table, and daimon 2.4.4 needs 1.57.7:
+cyrius 6.6.7 (its CVE-48) makes a 127/8 bind listen on loopback only, which an older kernel refuses
+rather than widen. The guest test moved from 1.57.5 to the latest release, 1.57.14. What changed in
+daimon with it:
+- **The listener** row is retired. The listener is on the bind address, 127.0.0.1 by default, as on
+  Linux; the `http.listen.not_loopback` warning and audit are gone. A listener that cannot open now
+  says so (`daimon: cannot listen on …`) instead of returning 1 after the banner.
+- **Nothing ends a process** is retired. `kill`#16 9 ends a child since 1.57.7, so the SIGKILL a stop
+  already sent at the end of its grace period ends an agent that ignores SIGTERM: Stopped, exit 137.
+- **A status word from `waitpid`#4** (1.57.7: 265 for a SIGKILLed child). `daimon_reap_code` decodes
+  it as on Linux; it had passed the value through as the exit code.
+- **A pipe read waits since 1.57.8** when a4 is 0, which `sys_read` passes. The loop read a detached
+  call's pipe that way and held every client until the child answered (15 s in the guest test).
+  `_srv_pipe_read` uses `sys_read_nb`.
+
+The other rows stand until daimon adopts the new primitives: limits (`spawn_limits`#107), pause and
+resume (signals 19 and 18), separate argv (`SPAWN_F_ARGV`), captured output (`SPAWN_F_CLEANFD`), and
+one write per answer once `sock_send`#48 no longer holds the CPU. The roadmap lists them.
