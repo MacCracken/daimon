@@ -5,7 +5,7 @@ description = "daimon — AGNOS agent orchestrator"
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/daimon"
 language = "cyrius"
-cyrius = "6.6.20"
+cyrius = "6.7.9"
 
 [build]
 entry = "src/main.cyr"
@@ -53,7 +53,7 @@ stdlib = [
 
 [deps.sakshi]
 git = "https://github.com/MacCracken/sakshi.git"
-tag = "2.5.7"
+tag = "2.5.8"
 modules = ["dist/sakshi.cyr"]
 
 [deps.ai-hwaccel]
@@ -63,37 +63,37 @@ modules = ["dist/ai-hwaccel.cyr"]
 
 [deps.samay]
 git = "https://github.com/MacCracken/samay.git"
-tag = "1.1.7"
+tag = "1.2.0"
 modules = ["dist/samay.cyr"]
 
 [deps.bayan]
 git = "https://github.com/MacCracken/bayan.git"
-tag = "1.5.12"
+tag = "1.5.13"
 modules = ["dist/bayan.cyr"]
 
 [deps.sigil]
 git = "https://github.com/MacCracken/sigil.git"
-tag = "3.13.10"
+tag = "3.13.11"
 modules = ["dist/sigil.cyr"]
 
 [deps.libro]
 git = "https://github.com/MacCracken/libro.git"
-tag = "2.10.8"
+tag = "2.11.0"
 modules = ["dist/libro.cyr"]
 
 [deps.majra]
 git = "https://github.com/MacCracken/majra.git"
-tag = "2.9.3"
+tag = "2.12.0"
 modules = ["dist/majra.cyr"]
 
-[deps.bote]
+[deps.bote-core]
 git = "https://github.com/MacCracken/bote.git"
-tag = "3.3.17"
+tag = "3.4.10"
 modules = ["dist/bote.cyr"]
 
 [deps.nein]
 git = "https://github.com/MacCracken/nein.git"
-tag = "1.7.1"
+tag = "1.8.0"
 modules = ["dist/nein-mcp.cyr"]
 
 [release]

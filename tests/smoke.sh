@@ -596,9 +596,11 @@ if [ $HO_OK -ne 1 ]; then echo "  host/origin/edge smoke FAILED"; SMOKE_EXIT=1; 
 
 echo ""
 echo "=== detached calls smoke (2.3.4) ==="
-# A call that waits on another server (a forwarded MCP call, web_fetch) runs in
+# A call that waits on another server (a forwarded MCP call, a web tool) runs in
 # a child process; the loop relays its answer. Before, it held the server: a
-# health check sent during a 2 s call waited 1.7 s.
+# health check sent during a 2 s call waited 1.7 s. The web call is web_search,
+# pointed at this endpoint by BOTE_SEARXNG_URL (2.5.0): since bote 3.4 web_fetch
+# refuses a loopback address (its SSRF guard), which the last check here asserts.
 DT_OK=1
 dt_check() {
     printf "  %s: " "$1"
@@ -607,7 +609,7 @@ dt_check() {
 if command -v python3 >/dev/null 2>&1; then
     DT_DIR=$(mktemp -d)
     # An MCP endpoint that answers after 2 s: POST a JSON-RPC result naming the
-    # method it was asked, GET a page.
+    # method it was asked, GET /search a SearXNG-shaped result list.
     cat > "$DT_DIR/slow_mcp.py" <<'PY'
 import json, sys, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -622,14 +624,15 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
     def do_GET(self):
         time.sleep(2)
-        body = b"<html><body><p>slow page</p></body></html>"
-        self.send_response(200); self.send_header("Content-Type", "text/html")
+        body = json.dumps({"results": [{"title": "slow page", "url": "http://example.invalid/",
+            "content": "slow"}]}).encode()
+        self.send_response(200); self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
 ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
 PY
     python3 "$DT_DIR/slow_mcp.py" 18094 >/dev/null 2>&1 &
     DT_UP=$!
-    ./build/daimon serve 18093 >/dev/null 2>&1 &
+    BOTE_SEARXNG_URL=http://127.0.0.1:18094 ./build/daimon serve 18093 >/dev/null 2>&1 &
     DT_SRV=$!
     DT=http://127.0.0.1:18093
     i=0; while [ $i -lt 25 ]; do curl -s --max-time 1 "$DT/v1/health" >/dev/null 2>&1 && break; i=$((i + 1)); sleep 0.1; done
@@ -641,7 +644,7 @@ PY
         case $what in
             tool) path=/v1/mcp/call; body='{"name":"slow_tool","arguments":{}}'; want='slow ok: tools/call' ;;
             resource) path=/v1/mcp/resources/read; body='{"uri":"test://slow"}'; want='slow ok: resources/read' ;;
-            web) path=/v1/mcp/call; body='{"name":"web_fetch","arguments":{"url":"http://127.0.0.1:18094/page"}}'; want='slow page' ;;
+            web) path=/v1/mcp/call; body='{"name":"web_search","arguments":{"query":"slow"}}'; want='slow page' ;;
         esac
         curl -s --max-time 20 -o "$DT_DIR/$what.out" -w '%{http_code}' -X POST "$DT$path" -d "$body" > "$DT_DIR/$what.code" &
         DT_CALL=$!
@@ -653,6 +656,12 @@ PY
         dt_check "$what: the call is answered (200)" "$(cat "$DT_DIR/$what.code")" "200"
         dt_check "$what: ... with the endpoint's answer" "$(grep -c "$want" "$DT_DIR/$what.out")" "1"
     done
+    # bote 3.4's SSRF guard (2.5.0): web_fetch refuses a loopback address. Until
+    # bote 3.3.17 it checked only the scheme, and this fetch returned the page.
+    curl -s --max-time 10 -o "$DT_DIR/ssrf.out" -X POST "$DT/v1/mcp/call" \
+        -d '{"name":"web_fetch","arguments":{"url":"http://127.0.0.1:18094/page"}}'
+    dt_check "web_fetch refuses a loopback address (SSRF guard)" \
+        "$(grep -c '"isError":true' "$DT_DIR/ssrf.out")$(grep -c 'SSRF guard' "$DT_DIR/ssrf.out")" "11"
     sleep 0.3
     # The children are reaped: none of daimon's is left, zombie or not. (The
     # parent pid is field 2 after the ")" that ends the command name.)

@@ -4,6 +4,126 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.5.0] - 2026-11-03
+
+**cyrius 6.6.20 → 6.7.9, the 6.7 language line, and each dependency pin moved with it.** bote 3.4,
+which needs 6.7, changes what daimon's web and audit tools do (below). **1087 tests** across 17 suites, **144 HTTP smoke checks** (one new) and
+7 fuzz harnesses, all green on Linux. On a real aarch64 kernel: all 1087 checks and the binary's
+smoke. The AGNOS guest test passes its 92 checks on agnos 1.57.14. fmt, lint and vet are clean;
+x86_64, aarch64 and agnos build; `cyrius.lock` verifies 83 of 83.
+
+### Changed — toolchain and dependency pins
+
+| dep | was | now | | dep | was | now |
+|---|---|---|---|---|---|---|
+| cyrius | 6.6.20 | **6.7.9** | | libro | 2.10.8 | **2.11.0** |
+| sakshi | 2.5.7 | **2.5.8** | | majra | 2.9.3 | **2.12.0** |
+| bayan | 1.5.12 | **1.5.13** | | bote | 3.3.17 | **3.4.10** |
+| sigil | 3.13.10 | **3.13.11** | | samay | 1.1.7 | **1.2.0** |
+| ai-hwaccel | 2.4.2 | 2.4.2 | | nein | 1.7.1 | **1.8.0** |
+
+libro, majra, bote, samay and nein are at their newest tag pinned at or below cyrius 6.7.9 (the
+next of each pins 6.7.18), and agree with each other: nein 1.8.0 pins libro 2.11.0, majra 2.12.0,
+bote-core 3.4.10, sigil 3.13.11 and patra 1.16.0, and bote 3.4.10 pins the same libro and majra.
+ai-hwaccel has no release between 2.4.2 (pinned 6.6.20) and 2.5.0 (6.7.18). The toolchain brings
+sandhi 1.10.8 → **1.10.9**, and libro brings patra 1.15.2 → **1.16.0**.
+
+- **sakshi, sigil and bayan are pinned to the versions cyrius 6.7.9 folds**, as at 2.4.4: 2.5.8,
+  3.13.11 and 1.5.13, byte-identical to the snapshot's files. Each has newer tags pinned at or below
+  6.7.9 (sakshi 2.5.10, sigil 3.13.15, bayan 1.5.14), but `cyrius deps` keeps the snapshot's file
+  over a dependency of the same name (`refusing to overwrite stdlib leaf`). Measured with sakshi
+  pinned 2.5.10: the lock named 2.5.10's commit and `lib/sakshi.cyr` was still 2.5.8. A newer pin
+  would only make the lock misstate the code. libro 2.11.0 asks for sigil 3.13.12, and 6.7.9 now
+  says that the root's 3.13.11 wins (`note: sigil 3.13.12 (wanted by libro) not used`).
+- **One packaging of bote** (`[deps.bote-core]`, vendored as `lib/bote-core_bote.cyr`). nein pulls
+  bote's core bundle, `bote-core`, and daimon pinned the full one, `bote`. Through bote 3.3 the two
+  only duplicated functions (249 `duplicate fn` warnings, the last definition winning). bote 3.4
+  declares `const BOTE_LOG_LINE_BYTES` in both, and a duplicate `const` is an error: on 6.7.9 the
+  build stopped at `lib/bote-core.cyr:88:7: const 'BOTE_LOG_LINE_BYTES' is declared twice`. daimon
+  now declares `[deps.bote-core]` with `modules = ["dist/bote.cyr"]`: a root block naming its own
+  `modules` replaces a transitive one's, as the `sigil` pin has since 1.4.2, so only the full bundle
+  is vendored, and it defines all 321 of the core bundle's top-level names. The 249 warnings are
+  gone (x86_64: 253 warnings → 4). `[deps.bote-core]` with `modules = []` did not work: it stops the
+  root block vendoring, and nein's selection resolves anyway.
+- **The lock**: 83 entries (was 84; one bote file instead of two), 10 commit pins (was 11).
+- CI's `cyrius deps --no-lock` then `--verify` work unchanged on 6.7.9 (rehearsed in a clean copy).
+
+What the moves carry for daimon:
+
+- **bote 3.4.10.**
+  - **`web_fetch` has an SSRF guard** (3.4.0, 3.4.4, 3.4.7). Through 3.3.17 it checked only the
+    scheme, so daimon's unauthenticated API could fetch loopback, private and cloud-metadata
+    addresses for any local caller; bote's consumer audit rated daimon's exposure High. It now
+    refuses loopback, link-local, private, CGNAT (100.64/10) and metadata addresses, literal or
+    resolved (`127.0.0.1.nip.io` is refused). Measured: `web_fetch` of `http://127.0.0.1:…`
+    answers `web_fetch: refused (SSRF guard: loopback)`, `isError: true`. `web_search` is
+    unguarded by design: its endpoint is the operator's `BOTE_SEARXNG_URL`.
+  - **The `libro_*` tools answer a CallToolResult** (3.4.10): text, `structuredContent`, and
+    `isError` when `ok` is false. daimon passes a result with `content` through, so clients gain
+    `structuredContent`. Timestamps in `libro_query` / `libro_export` are RFC 3339 strings; they
+    were heap addresses (an information leak, 3.4.10).
+  - `libro_retention` with a `keep_*` policy and no `value` is an error; it archived the whole chain
+    (3.4.10). Control bytes in a result are escaped (3.4.6).
+- **sigil 3.13.11**: `sha256()` and `sha384()` wipe their context (LOW), which libro's entry hashes
+  use; `pem_decode_privkey` wipes the decoded key (MEDIUM), on a TLS server path daimon does not use.
+- **sakshi 2.5.8, bayan 1.5.13, libro 2.11.0, samay 1.2.0, nein 1.8.0**: toolchain releases. Their
+  bundles differ in version headers or in constants that became `const` (same values); the functions
+  daimon calls are unchanged.
+- **majra 2.12.0** adds functions (no collision with daimon's names) and deprecates its bare `ERR_*`
+  aliases, which daimon's `DAIMON_ERR_*` already avoid. **patra 1.16.0** and **sandhi 1.10.9**:
+  nothing on daimon's paths changes.
+- **cyrius 6.6.21 – 6.7.9, the 6.7 language minor.** It changes what some code that still compiles
+  means. Each change was checked against daimon's `src/`, `tests/`, `tests/agnos/` and `fuzz/`, with
+  comments and strings blanked before searching, and none reaches daimon. It has no lone `!` (a real
+  operator since 6.7.3, which the lexer used to drop), no unary minus or `~` on a constant (binds
+  tighter since 6.7.9: `-K + 10` was 15, is 5), no typed pointers, structs, `impl`s, generics,
+  `for` loops or compound assignment. Its one overload pair, `secure_zero` / `secure_zero_str`, is
+  never called with a `Str`; every `: stack` pair is bound with `var t, v`. The new hard errors
+  (reserved words, an unmatched top-level `}`, forward-call arity) have no site. `cyrius lint`,
+  `fmt` and `vet` behave as at 6.6.20 on daimon's files. `cyrius deps --locked` (6.7.6) could
+  replace CI's `--no-lock` + `--verify` pair; not adopted here.
+
+### Changed — tests
+
+- **The smoke's detached web call is `web_search`.** It proved a web-tool call runs in a child with
+  `web_fetch` of a slow local page, which the SSRF guard now refuses. daimon is started with
+  `BOTE_SEARXNG_URL` pointing at the slow endpoint, which answers a SearXNG result list after 2 s.
+- **New smoke check**: `web_fetch` refuses a loopback address (143 → 144 checks).
+
+### Known issues
+
+- **`libro_retention` can empty daimon's audit chain**, from any local caller of the unauthenticated
+  API. Measured on 2.5.0: `keep_count` with `"value":0` answers `"archived":2,"retained":0`, and
+  `libro_export` then has no entries. bote 3.4.10 closed only the missing-`value` form. The tool has
+  been registered ungated since 1.3.0, unlike nein's mutating tools.
+- `undefined function 'sys_dup2'` in the agnos build (unreachable there), and sigil's static
+  `var buf[262144]`, as before.
+
+### Sizes
+
+| target | 2.4.4 (6.6.20) | 2.5.0 (6.7.9) | |
+|---|---:|---:|---:|
+| x86_64 | 3,512,024 | 3,514,176 | +0.1% |
+| aarch64 | 4,085,144 | 4,087,280 | +0.1% |
+| agnos | 3,450,104 | 3,448,104 | −0.1% |
+
+### Performance
+
+2.4.4 (cyrius 6.6.20) against 2.5.0 (6.7.9), `tests/daimon.bcyr` and `tests/rag_ingest.bcyr`, 20
+interleaved runs with the order alternating, medians, at a load average of 1.9–2.4 (the benchmark
+included). Every row is within ±1.2% except:
+
+| Benchmark | 2.4.4 | 2.5.0 | change | spread 2.4.4 | spread 2.5.0 |
+|---|---:|---:|---:|---:|---:|
+| config_default | 98.0 ns | 87.0 ns | −11.2% | 4% | 9% |
+| trace_id_hex | 50.0 ns | 47.0 ns | −6.0% | 2% | 6% |
+| agent_reap_live | 518.0 ns | 500.5 ns | −3.4% | 5% | 10% |
+| json_parse | 433.0 ns | 446.5 ns | +3.1% | 63% | 5% |
+| mcp_find_tool_in_100 | 106.0 ns | 100.0 ns | −5.7% | 108% | 65% |
+
+`config_default` has moved by this much before without its code changing (2.4.2, 2.4.3), and
+measured 86 ns for 2.4.4 in 2.4.4's own A/B. Their cause was not measured.
+
 ## [2.4.4] - 2026-11-02
 
 **cyrius 6.6.6 → 6.6.20, and each dependency pin moved to its latest release for that toolchain.**

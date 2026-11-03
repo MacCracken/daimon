@@ -6,7 +6,7 @@
 #   libro_query  libro_verify  libro_export  libro_proof  libro_retention
 #
 # daimon owns one libro chain (chain_new — libro, via the bote MCP bundle);
-# bote's libro_tools handlers (lib/bote.cyr) read / verify / export it after
+# bote's libro_tools handlers (lib/bote-core_bote.cyr, 2.5.0) read / verify / export it after
 # libro_tools_init binds it. The five tools are registered in daimon's own
 # MCP registry (so /v1/mcp/tools lists them alongside builtins + external
 # tools) and dispatched here by calling the bote handlers directly with the
@@ -41,7 +41,8 @@ fn mcp_libro_init(reg) {
 
 # mcp_web_init: register bote's web tools (web_fetch / web_search) as builtin MCP tools. web_search targets
 # the SearXNG instance at BOTE_SEARXNG_URL (unset -> the tool reports it, never faked). The handlers live in
-# bote (lib/bote.cyr); daimon only hosts + dispatches them. Call from app_init after the registry exists.
+# bote (lib/bote-core_bote.cyr, 2.5.0); daimon only hosts + dispatches them. Call from app_init after the
+# registry exists.
 fn mcp_web_init(reg) {
     var schema = str_from("{\"type\":\"object\"}");
     mcp_register_builtin(reg, mcp_tool_new(str_from("web_fetch"),

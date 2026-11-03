@@ -57,7 +57,7 @@ See [SECURITY.md](SECURITY.md) and the audit reports in [docs/audit/](docs/audit
 
 ## Building
 
-Requires [Cyrius](https://github.com/MacCracken/cyrius) 6.6.20, the pin in `cyrius.cyml`.
+Requires [Cyrius](https://github.com/MacCracken/cyrius) 6.7.9, the pin in `cyrius.cyml`.
 
 ```bash
 cyrius deps                             # vendor the stdlib subset and the git deps into lib/ (gitignored)
@@ -108,16 +108,16 @@ found.
 
 ## Status
 
-At 2.4.4, `src/` is 10,059 lines in 30 modules. The port (0.7.0) turned 9,724 lines of Rust into
+At 2.5.0, `src/` is 10,060 lines in 30 modules. The port (0.7.0) turned 9,724 lines of Rust into
 4,141 of Cyrius. The binaries are statically linked:
 
 | target | bytes |
 |---|---:|
-| x86_64 | 3,512,024 |
-| aarch64 | 4,085,144 |
-| agnos | 3,450,104 |
+| x86_64 | 3,514,176 |
+| aarch64 | 4,087,280 |
+| agnos | 3,448,104 |
 
-Of x86_64's bytes, 1,681,822 are unreachable code that the toolchain NOPs in place rather than
+Of x86_64's bytes, 1,711,902 are unreachable code that the toolchain NOPs in place rather than
 removing (CHANGELOG 1.2.4). The 181 KB this line once gave was the v1.0.1 port-era build (cyrius
 4.2.0, BENCHMARKS.md).
 

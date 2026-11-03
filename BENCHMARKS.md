@@ -45,6 +45,23 @@ those numbers are not comparable.
 
 `tests/rag_ingest.bcyr` (real since 2.1.6): `rag_ingest_real_5k` 133.1µs, `rag_chunk_only_5k` 508ns.
 
+### 2.5.0 — cyrius 6.7.9 and the pin move
+
+2.4.4 (built by cyrius 6.6.20) against 2.5.0 (6.7.9), both files, 20 interleaved runs with the order
+alternating, medians, at a load average of 1.9–2.4. No daimon code on a measured path changed. Every
+row is within ±1.2% except:
+
+| Benchmark | 2.4.4 | 2.5.0 | change | spread 2.4.4 | spread 2.5.0 |
+|---|---:|---:|---:|---:|---:|
+| config_default | 98.0 ns | 87.0 ns | −11.2% | 4% | 9% |
+| trace_id_hex | 50.0 ns | 47.0 ns | −6.0% | 2% | 6% |
+| agent_reap_live | 518.0 ns | 500.5 ns | −3.4% | 5% | 10% |
+| json_parse | 433.0 ns | 446.5 ns | +3.1% | 63% | 5% |
+| mcp_find_tool_in_100 | 106.0 ns | 100.0 ns | −5.7% | 108% | 65% |
+
+`config_default` measured 86 ns for 2.4.4 in the 2.4.4 round: it moves between sessions without its
+code changing. Causes not measured.
+
 ### 2.4.4 — cyrius 6.6.20 and the pin move
 
 2.4.3 (built by cyrius 6.6.6) against 2.4.4 (6.6.20), both files, 20 interleaved runs with the order

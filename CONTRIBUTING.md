@@ -6,7 +6,7 @@ to get involved.
 ## Getting Started
 
 1. Fork the repository and clone your fork
-2. Install [Cyrius](https://github.com/MacCracken/cyrius) 6.6.20, the pin in `cyrius.cyml` (`[package].cyrius`)
+2. Install [Cyrius](https://github.com/MacCracken/cyrius) 6.7.9, the pin in `cyrius.cyml` (`[package].cyrius`)
 3. Build and run `sh tests/test.sh` (below) to verify your environment
 
 ## Development Workflow
