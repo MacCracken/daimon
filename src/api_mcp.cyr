@@ -51,16 +51,20 @@ fn api_mcp_deregister(fd, name_cstr) {
 
 # _mcp_wrap_builtin: wrap a builtin tool's raw JSON result in a conformant MCP
 # `tools/call` result envelope — {"content":[{"type":"text","text":"<result>"}],
-# "isError":<bool>}. The builtin libro_* tools return bare daimon JSON
+# "isError":<bool>}. The builtin libro_* tools once returned bare JSON
 # ({"ok":true,...} / {"ok":false,"error":...}), which is NOT a valid MCP result:
 # a strict client (thoth) that reads content[0].text found none and rendered
 # "no text content could be parsed". We embed the raw result JSON as the text
 # block and derive isError from its `ok` field (ok:false -> isError:true). External
 # tools already return conformant results and pass through verbatim below, so this
 # wrapping is builtin-only.
+#
+# Every builtin today returns a full MCP result, so this wraps none of them: the
+# libro tools since bote 3.4.10 (a success carries `structuredContent`; an error,
+# since bote 3.8.5, only the text block and isError), the web tools, and nein's.
 fn _mcp_wrap_builtin(result) {
-    # Already-conformant results (a "content" array — bote's fs_* / web_* tools return a full MCP block) pass
-    # through verbatim; only BARE builtin JSON (libro's {"ok":...}) is wrapped, so a client never double-wraps.
+    # Already-conformant results (a "content" array) pass through verbatim; only a
+    # BARE builtin result ({"ok":...}) is wrapped, so a client never double-wraps.
     if (jsonx_get_raw(result, "content") != 0) { return str_from(result); }
     var is_err = 0;
     var okraw = jsonx_get_raw(result, "ok");

@@ -1,9 +1,9 @@
 commit	ccdcd9c035e205c1373b3c0d2c5878004da6edbc	ai-hwaccel	https://github.com/MacCracken/ai-hwaccel.git	2.5.6
 commit	965298dfaa16587ac1835e1ced8482184bd864a6	bayan	https://github.com/MacCracken/bayan.git	1.11.1
-commit	0de2037b8428811950672a028a694abc12ef2fd7	bote-core	https://github.com/MacCracken/bote.git	3.8.0
+commit	81c12232fef208740f291b92d1f5138d3d05d7a4	bote-core	https://github.com/MacCracken/bote.git	3.8.9
 commit	f4a31a450a112587d6fcc46a946e1b6061878e6f	libro	https://github.com/MacCracken/libro.git	2.11.3
 commit	40b827f275c452f592e0735b19b0cb47448c2794	majra	https://github.com/MacCracken/majra.git	2.13.0
-commit	3bd9eaa693e51cecd1ed72e2e76e4757f27d1235	nein	https://github.com/MacCracken/nein.git	1.9.0
+commit	aab55de52140a5c68964efa66bf485e30720d35f	nein	https://github.com/MacCracken/nein.git	1.9.1
 commit	efa2e34aefcb1dc65a01e734b2b19bfe18b10c7f	patra	https://github.com/MacCracken/patra.git	1.16.6
 commit	569e9f8d5fbaffa0d68f0271796da4d72d68588d	sakshi	https://github.com/MacCracken/sakshi.git	2.5.10
 commit	a65f7e4c4f4e08d32c65a6ef09f4a61333cd053b	samay	https://github.com/MacCracken/samay.git	1.5.1
@@ -26,7 +26,7 @@ eba2079d68fe37db226c7d6803e8a35fe822dd906f4be22f3760e468da441e38  lib/async_agno
 23516d97b8eb5ba1c7a1b6e34a89b3b0653f68d858edca8521a7ccce5a06bce5  lib/atomic.cyr
 233e7263692ab65ca4dab7bb98aae0ddc0fa3cc937c87ca8ff96326d3f0ae20e  lib/bayan.cyr
 cd9321d9400401cd8895d1f488d969ea391a1194b327f7a1fa60b99912b73cf2  lib/bench.cyr
-a69703a7f3675826ff832e9c17b8519b14a57e97e096d8440fe8a1705061eefd  lib/bote-core_bote.cyr
+90d6fdd38b472f44fa7a3035803d45f797af356bee5b1e72cf76db381f1d9244  lib/bote-core_bote.cyr
 b99081e633d572569ee63c6a915fe4aa39b3ac4ff5665c08cc4c9416ed2f6928  lib/boxed.cyr
 09c4d27912d9cd18e36a0e24b6d5d1771aecd8b57661813d3886844494e2c2be  lib/callback.cyr
 2e2e802085112d781225c517fca853b4adbf29850a96b21b6ff32469f0736516  lib/chrono.cyr
@@ -46,7 +46,7 @@ f38092748e5a9197f7a526e54801fd15fab70d2a04d1c23f4f71003f564fb3d6  lib/keccak.cyr
 df88b5cf68aa94ddd132cf9a71dc23dcdc325bf418cd5d8c9ec99af9c600358e  lib/majra.cyr
 3a85748ee6bf83fe72bb310f21341c97232649def8c6064213da5502d86888f4  lib/math.cyr
 6390e2b0611636af94078acc9a6122eaaeab59b31c5cffe95bbcbc77d89748e5  lib/mmap.cyr
-bfdaaecb628699e8211ffafbaf6eaa3aff977e2d14e7764429d9477fe3313b0f  lib/nein-mcp.cyr
+4808bb8e1c9626a0ed4bb501355c440d69880d864fe76437f86b9a7143fbefbc  lib/nein-mcp.cyr
 69eb81d777646d1b4dbaf69ebc38cb7ed680231d44cc833eb861978ef2255262  lib/net.cyr
 4a8f6db7d99bbc2934c3d36e8d440e7e004d9d2b6566a2a59066063c623d721d  lib/patra.cyr
 52d8879572df7a9ab0c5d1b97eb1f41799b06e684c01876d8023f04a4c63ee0d  lib/poison.cyr

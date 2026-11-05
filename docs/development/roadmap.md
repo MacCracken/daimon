@@ -4,8 +4,8 @@
 >
 > **Severity legend**: **P0** blocking (security / correctness — must-fix before ship) · **P1** high (must-have for the current arc) · **P2** medium (schedule when capacity opens) · **P3 / Low** nice-to-have, no urgency. Upstream-blocker items quote the upstream tracker's own severity.
 
-**Where daimon stands** — `2.5.2`, cyrius 6.7.18, every dependency at a release for that toolchain
-(nein 1.9.0, bote 3.8.0). It builds for x86_64, aarch64 and AGNOS, and CI runs the suites, the HTTP
+**Where daimon stands** — `2.5.3`, cyrius 6.7.18, every dependency at a release for that toolchain
+(nein 1.9.1, bote 3.8.9). It builds for x86_64, aarch64 and AGNOS, and CI runs the suites, the HTTP
 smoke and the fuzz harnesses on Linux, every suite and the binary's smoke on a real aarch64 kernel,
 and the AGNOS guest test on agnos 1.57.14.
 - Agents are registered, started under their limits, stopped, paused, resumed and deleted through

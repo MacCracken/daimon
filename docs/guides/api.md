@@ -228,15 +228,16 @@ request body as its params.
 | `libro_query`, `libro_verify`, `libro_export`, `libro_proof` | daimon's audit chain (libro's tools, through bote): search it, verify its hash links, export it, prove an entry's inclusion |
 | `libro_retention` | libro's retention policy, which archives entries off the chain. **Refused** until callers are authenticated (2.5.1; roadmap 2.6.x): `"access denied: tool gated by host policy"`, audited `libro.retention.deny`. Any local caller could empty the audit chain with it |
 | `web_fetch`, `web_search` | bote's web tools: a page's readable text (`{url}`, http or https only), and results from the SearXNG instance at `BOTE_SEARXNG_URL` (`{query, count?}`). Unset, `web_search` says so |
-| `nein_validate` | nein's offline check of a rule (`{protocol, port, source?}`); touches nothing outside daimon |
+| `nein_validate` | nein's offline check of a rule (`{protocol, port, source?, table?, chain?}`); touches nothing outside daimon. Since nein 1.9.1 (daimon 2.5.3) a `table` or `chain` nft cannot read, a keyword such as `fwd` or a name starting with a digit, answers `invalid 'table' name` / `invalid 'chain' name` |
 | `nein_status`, `nein_list`, `nein_diff` | nein's tools that read the live firewall: they run `nft` as root and return the ruleset. **Refused** until callers are authenticated (2.5.2; roadmap 2.6.x), audited `nein.gate.deny`. 2.1.8 – 2.5.1 answered them to any caller |
 | `nein_allow`, `nein_deny` | nein's tools that change the live firewall. **Refused** until callers are authenticated (roadmap 2.6.x): `"access denied: tool gated by host policy"`, audited `nein.gate.deny` |
 
-Every builtin answers with an MCP tool result. libro's tools return bare JSON, which daimon wraps
-as the text of one content block, with `isError` true when that JSON says `"ok":false`. bote's and
-nein's tools return their own content blocks, which pass through as they are. Every nein tool but
-`nein_validate` runs `nft`, so it needs root and nftables. Without them, or on AGNOS, which has no
-nftables, it answers `"isError":true`. No external registration may take a builtin's name (409).
+Every builtin answers with an MCP tool result, built by bote or nein and passed through as it is.
+A libro tool's success carries its JSON twice, as the text of one content block and as
+`structuredContent`; its error, since bote 3.8.5 (daimon 2.5.3), only the text block, with
+`"isError":true`. Every nein tool but `nein_validate` runs `nft`, so it needs root and nftables.
+Without them, or on AGNOS, which has no nftables, it answers `"isError":true`. No external
+registration may take a builtin's name (409).
 
 ### Tools
 
@@ -257,7 +258,7 @@ POST /v1/mcp/tools
 # Call a tool: MCP tools/call params
 POST /v1/mcp/call
 {"name":"libro_verify","arguments":{}}
-→ {"content":[{"type":"text","text":"{\"ok\":true}"}],"isError":false}
+→ {"content":[{"type":"text","text":"{\"ok\":true}"}],"structuredContent":{"ok":true}}
 {"name":"scan","arguments":{"target":"10.0.0.1"}}
 → the external server's result, verbatim
 → 400 unknown tool · 502 the server could not be reached, or answered wrongly · 504 no answer in 60 s

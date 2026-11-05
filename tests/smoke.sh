@@ -45,6 +45,11 @@ NEIN_VALID=$(curl -s --max-time 2 -X POST "http://127.0.0.1:$LIBRO_PORT/v1/mcp/c
 NEIN_LIVE=$(curl -s --max-time 2 -X POST "http://127.0.0.1:$LIBRO_PORT/v1/mcp/call" -d '{"name":"nein_status","arguments":{}}' || true)
 NEIN_MUT=$(curl -s --max-time 2 -X POST "http://127.0.0.1:$LIBRO_PORT/v1/mcp/call" -d '{"name":"nein_allow","arguments":{"protocol":"tcp","port":22}}' || true)
 NEIN_AUDIT=$(curl -s --max-time 2 -X POST "http://127.0.0.1:$LIBRO_PORT/v1/mcp/call" -d '{"name":"libro_export","arguments":{}}' || true)
+# 2.5.3: nein 1.9.1 refuses a table or chain name nft cannot read (a keyword).
+NEIN_NAME=$(curl -s --max-time 2 -X POST "http://127.0.0.1:$LIBRO_PORT/v1/mcp/call" -d '{"name":"nein_validate","arguments":{"protocol":"tcp","port":22,"table":"fwd"}}' || true)
+# 2.5.3: a libro error result passes through as bote builds it, once: since bote
+# 3.8.5 it is the text block and isError, with no structuredContent.
+LIBRO_PROOF_BAD=$(curl -s --max-time 2 -X POST "http://127.0.0.1:$LIBRO_PORT/v1/mcp/call" -d '{"name":"libro_proof","arguments":{"index":999}}' || true)
 kill $LIBRO_SRV 2>/dev/null || true
 # Fixed-string matches (-F). Two of these checks had been failing unnoticed —
 # nothing in CI ran them — until 2.2.3 ran them again:
@@ -71,6 +76,9 @@ libro_check "$NEIN_VALID"     "nein_validate runs (offline; nein 1.9.0's gate)" 
 libro_check "$NEIN_LIVE"      "nein_status is refused (it reads the live firewall)" 'access denied: tool gated by host policy'
 libro_check "$NEIN_MUT"       "nein_allow is refused (it changes the firewall)" 'access denied: tool gated by host policy'
 libro_check "$NEIN_AUDIT"     "... and the refusals are audited" 'nein.gate.deny'
+libro_check "$NEIN_NAME"      "nein_validate refuses an nft keyword as a table name (nein 1.9.1)" "invalid 'table' name"
+libro_check "$LIBRO_PROOF_BAD" "a libro error result arrives whole and once (bote 3.8.5)" \
+  '{"content":[{"type":"text","text":"{\"ok\":false,\"error\":\"index out of range\"}"}],"isError":true}'
 if [ $LIBRO_OK -ne 1 ]; then echo "  libro smoke FAILED"; SMOKE_EXIT=1; fi
 
 echo ""

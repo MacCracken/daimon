@@ -45,6 +45,17 @@ those numbers are not comparable.
 
 `tests/rag_ingest.bcyr` (real since 2.1.6): `rag_ingest_real_5k` 133.1µs, `rag_chunk_only_5k` 508ns.
 
+### 2.5.3 — bote 3.8.9 and nein 1.9.1
+
+2.5.2 against 2.5.3, both on cyrius 6.7.18, 20 interleaved runs with the order alternating, medians,
+at a load average of 1.9–2.1. 26 of the 29 rows are within ±2.1%. The other three moved the other
+way at 2.5.2:
+- `config_default` 86 → 94 ns (+9.3%);
+- `trace_id_hex` 46 → 50 ns (+8.7%);
+- `rag_chunk_only_5k` 565.5 → 528 ns (−6.6%).
+
+No benchmark calls bote or nein code, and no daimon code on a measured path changed.
+
 ### 2.5.2 — nein 1.9.0 and bote 3.8.0
 
 2.5.1 against 2.5.2, both on cyrius 6.7.18, 20 interleaved runs with the order alternating, medians,
@@ -554,5 +565,5 @@ Scheduler scheduling (1.5x), supervisor registration (2.5x), MCP registration (1
 | Integration tests | 28 | 1094 assertions / 17 suites, each against its real `src/` module (2.4.3); AGNOS guest test 95 checks (tests/agnos/run.sh --release, in CI); aarch64 VM, every suite (1094 assertions) and a 20-check smoke of the binary under a real kernel (tests/aarch64/run.sh, in CI) |
 | Benchmarks | 19 | 30, against the real code (2.4.2) |
 | Fuzz harnesses | 0 | 7, property-based, run in CI (2.3.2) |
-| HTTP smoke | — | tests/smoke.sh, 151 checks, run in CI (2.4.2) |
+| HTTP smoke | — | tests/smoke.sh, 153 checks, run in CI (2.4.2) |
 | Security audit | — | 33 findings (2026-04-13: 10; 2026-09-22 lifecycle: 8; 2026-09-23 AGNOS platform: 15, most filed with agnos) — see docs/audit/ |

@@ -83,7 +83,7 @@ sh tests/test.sh                    # every suite, the HTTP smoke and the fuzz h
 cyrius test tests                   # every suite in tests/: 1094 checks, 17 files
 cyrius fuzz                         # 7 property-based harnesses, 176,349 generated cases
 cyrius bench tests/daimon.bcyr      # 28 benchmarks, one only where agents can be contained (+2 in tests/rag_ingest.bcyr)
-sh tests/smoke.sh                   # the linked binary over HTTP, 151 checks: libro, tracing, regressions,
+sh tests/smoke.sh                   # the linked binary over HTTP, 153 checks: libro, tracing, regressions,
                                     # the agent lifecycle, the bind address, task start/complete,
                                     # request-string decoding, agent channels and messages,
                                     # the event loop, hosts and origins, captured output,
@@ -109,14 +109,14 @@ found.
 
 ## Status
 
-At 2.5.2, `src/` is 10,116 lines in 30 modules. The port (0.7.0) turned 9,724 lines of Rust into
+At 2.5.3, `src/` is 10,120 lines in 30 modules. The port (0.7.0) turned 9,724 lines of Rust into
 4,141 of Cyrius. The binaries are statically linked:
 
 | target | bytes |
 |---|---:|
-| x86_64 | 2,177,168 |
-| aarch64 | 4,912,960 |
-| agnos | 2,089,800 |
+| x86_64 | 2,269,352 |
+| aarch64 | 5,054,280 |
+| agnos | 2,177,872 |
 
 Since cyrius 6.7.18 (daimon 2.5.1) the x86_64 and agnos builds remove unreachable code, about 2 MB
 of it; until then it was NOPed in place (CHANGELOG 1.2.4). The aarch64 build still NOPs it, which is

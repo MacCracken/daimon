@@ -88,12 +88,12 @@ modules = ["dist/majra.cyr"]
 
 [deps.bote-core]
 git = "https://github.com/MacCracken/bote.git"
-tag = "3.8.0"
+tag = "3.8.9"
 modules = ["dist/bote.cyr"]
 
 [deps.nein]
 git = "https://github.com/MacCracken/nein.git"
-tag = "1.9.0"
+tag = "1.9.1"
 modules = ["dist/nein-mcp.cyr"]
 
 [release]

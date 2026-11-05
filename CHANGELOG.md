@@ -4,6 +4,82 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.5.3] - 2026-11-04
+
+**bote 3.8.9 and nein 1.9.1.** **1094 tests** across 17 suites, **153 HTTP smoke checks** (two new)
+and 7 fuzz harnesses, all green on Linux. On a real aarch64 kernel: all 1094 checks and the binary's
+20-check smoke. The AGNOS guest test passes 95 checks on agnos 1.57.14 (61 + 34). fmt, lint and vet
+are clean; x86_64, aarch64 and agnos build; `cyrius.lock` verifies 91 of 91.
+
+### Changed — dependency pins
+
+| dep | was | now |
+|---|---|---|
+| bote | 3.8.0 | **3.8.9** |
+| nein | 1.9.0 | **1.9.1** |
+
+Every other pin was already its repo's latest release. bote is 3.8.9 by choice, though a 3.8.10 tag
+exists; 3.8.9 is also the bote that nein 1.9.1 pins. nein 1.9.1 pins the same 6.7.18 set as daimon
+(bote-core 3.8.9, libro 2.11.3, majra 2.13.0, sigil 3.13.15, patra 1.16.6). The lock moves by four
+lines, two commit pins and two bundle hashes. It was re-resolved from an empty `lib/`, and a second
+resolve leaves it byte-identical.
+
+- **bote 3.8.9** (3.8.1 – 3.8.9). Most of it is in bote's dispatcher, which daimon does not use:
+  titles, icons and instructions, multi round-trip requests, input schemas compiled from JSON and
+  judged (composition keywords, a work budget), output schemas on bote's own tools, and a request
+  that names a key twice refused with `-32600`. What reaches daimon:
+  - **A libro error result has no `structuredContent`** (3.8.5). It is
+    `{"content":[{"type":"text","text":"{\"ok\":false,…}"}],"isError":true}`. Through 3.8.4 the error
+    object was also its `structuredContent`, which the tool's new outputSchema refuses. A success
+    still carries both. daimon passes the result through as it is.
+  - **`jsonx_get_raw`'s key scanner**, which daimon uses to take `arguments` out of a call's body
+    and to read a builtin result's `content`, now matches an escaped key of 256 bytes or more as it
+    decodes, and allocates nothing (3.8.2). daimon has already parsed the body with bayan, which
+    refuses a key named twice at any depth, so the two read the same members.
+- **nein 1.9.1**: nein now validates only what nft can parse. No contract change: the gate, the
+  tool classes and the tool table are as in 1.9.0. For `nein_validate`, the one nein tool daimon
+  runs:
+  - a `table` or `chain` that is an nft keyword (`fwd`, `log`, `ip`, …) or starts with a digit or
+    `-` answers `invalid 'table' name` / `invalid 'chain' name`;
+  - an IPv6 address of six groups and a dotted quad with no `::` is refused.
+
+  Interface names are quoted where they render as values. Each of these failed at apply before;
+  none was an injection.
+
+### Changed
+
+- `_mcp_wrap_builtin`'s comment (`src/api_mcp.cyr`) said libro's tools return bare JSON, which has
+  not been true since bote 3.4.10. Every builtin returns a full MCP result, so the function wraps
+  none of them. No code change.
+- `docs/guides/api.md` said the same thing. Its `libro_verify` example showed `"isError":false`,
+  where daimon answers `"structuredContent":{"ok":true}`. Both are corrected, and `nein_validate`'s
+  row lists `table` and `chain`.
+
+### Tests
+
+- Two smoke checks (151 → 153), each of which fails on 2.5.2's binary:
+  - `nein_validate` with `"table":"fwd"` answers `invalid 'table' name`. 2.5.2 answered `valid`,
+    which nft would have refused at apply.
+  - `libro_proof` past the chain's end answers bote's error result whole and once, with no
+    `structuredContent`. 2.5.2's result carried it.
+
+### Sizes and performance
+
+| target | 2.5.2 | 2.5.3 | |
+|---|---:|---:|---:|
+| x86_64 | 2,177,168 | 2,269,352 | +4.2% |
+| aarch64 | 4,912,960 | 5,054,280 | +2.9% |
+| agnos | 2,089,800 | 2,177,872 | +4.2% |
+
+2.5.2 against 2.5.3, both on cyrius 6.7.18, `tests/daimon.bcyr` and `tests/rag_ingest.bcyr`: 20
+interleaved runs with the order alternating, medians, at a load average of 1.9–2.1. 26 of the 29
+rows are within ±2.1%. The other three are the rows that moved at 2.5.1 and 2.5.2, the other way:
+- `config_default` 86 → 94 ns (+9.3%, spreads 3% / 2%);
+- `trace_id_hex` 46 → 50 ns (+8.7%, spreads 2% / 10%);
+- `rag_chunk_only_5k` 565.5 → 528 ns (−6.6%, spreads 9% / 5%).
+
+No benchmark calls bote or nein code, and no daimon code on a measured path changed.
+
 ## [2.5.2] - 2026-11-03
 
 **nein 1.9.0 and bote 3.8.0; nein's live readers are gated with the rest; on AGNOS an agent's argv
