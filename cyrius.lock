@@ -1,6 +1,6 @@
 commit	ccdcd9c035e205c1373b3c0d2c5878004da6edbc	ai-hwaccel	https://github.com/MacCracken/ai-hwaccel.git	2.5.6
 commit	965298dfaa16587ac1835e1ced8482184bd864a6	bayan	https://github.com/MacCracken/bayan.git	1.11.1
-commit	81c12232fef208740f291b92d1f5138d3d05d7a4	bote-core	https://github.com/MacCracken/bote.git	3.8.9
+commit	1503109df263d74006ae16f76a4c4209b680a49d	bote-core	https://github.com/MacCracken/bote.git	3.8.15
 commit	f4a31a450a112587d6fcc46a946e1b6061878e6f	libro	https://github.com/MacCracken/libro.git	2.11.3
 commit	40b827f275c452f592e0735b19b0cb47448c2794	majra	https://github.com/MacCracken/majra.git	2.13.0
 commit	aab55de52140a5c68964efa66bf485e30720d35f	nein	https://github.com/MacCracken/nein.git	1.9.1
@@ -26,7 +26,7 @@ eba2079d68fe37db226c7d6803e8a35fe822dd906f4be22f3760e468da441e38  lib/async_agno
 23516d97b8eb5ba1c7a1b6e34a89b3b0653f68d858edca8521a7ccce5a06bce5  lib/atomic.cyr
 233e7263692ab65ca4dab7bb98aae0ddc0fa3cc937c87ca8ff96326d3f0ae20e  lib/bayan.cyr
 cd9321d9400401cd8895d1f488d969ea391a1194b327f7a1fa60b99912b73cf2  lib/bench.cyr
-90d6fdd38b472f44fa7a3035803d45f797af356bee5b1e72cf76db381f1d9244  lib/bote-core_bote.cyr
+8f527416923797d05feabcd7a8d62a5bb3ea7e91a7b6774d3f8e39f270b52f89  lib/bote-core_bote.cyr
 b99081e633d572569ee63c6a915fe4aa39b3ac4ff5665c08cc4c9416ed2f6928  lib/boxed.cyr
 09c4d27912d9cd18e36a0e24b6d5d1771aecd8b57661813d3886844494e2c2be  lib/callback.cyr
 2e2e802085112d781225c517fca853b4adbf29850a96b21b6ff32469f0736516  lib/chrono.cyr
