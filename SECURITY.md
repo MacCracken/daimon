@@ -47,6 +47,18 @@ This policy covers the daimon binary and its HTTP API. Security concerns include
 
 Security audit reports are published in `docs/audit/`.
 
+## What the API exposes by design
+
+The HTTP API has no caller authentication until roadmap 2.6.x. Two surfaces added in 2.5.4 hold state
+that outlives a restart, under `serve --data-dir` (default `/var/lib/agnos`, created 0700):
+- **`mcp/toolpins`**, the pinned digest of each tool definition. A pin is trust on first use: whoever
+  registers a name first sets it. It is protected against corruption, not against daimon's own uid.
+- **The file index**, off unless an operator passes `serve --index-root`. Any local process can then
+  read the names, sizes and times of the files under that root, which are identical, and their tags,
+  as the user daimon runs as. Do not name a root that crosses a trust boundary, such as `/home` on a
+  shared machine with daimon running as root. See
+  [the 2.5.4 audit](docs/audit/2026-11-06-tool-pins-and-file-index-audit.md).
+
 ## Disclosure
 
 We follow coordinated disclosure. Reporters will be credited in the release

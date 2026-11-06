@@ -110,6 +110,17 @@ fn daimon_rename(old_cstr, old_len, new_cstr, new_len) {
     #endif
 }
 
+# lstat `path`, whose final link is not followed, into `buf` (STAT_BUFSZ bytes;
+# read it through the Stat enum, whose offsets differ per target). 0 on success.
+# agnos: sys_lstat(path, pathlen, buf). Linux: sys_lstat(path, buf).
+fn daimon_lstat(path_cstr, path_len, buf) {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return sys_lstat(path_cstr, path_len, buf);
+    #else
+    return sys_lstat(path_cstr, buf);
+    #endif
+}
+
 # Non-blocking reap of one child. THE TWO KERNELS DISAGREE, so this normalises:
 #     1  — the child has exited and was reaped
 #     0  — the child is still alive

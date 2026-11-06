@@ -1,0 +1,457 @@
+# =========================================================================
+# mcp_pin — what each MCP tool's definition was when daimon first saw it (2.5.4)
+# =========================================================================
+#
+# An MCP tool's description is read by the model as guidance, so swapping one
+# after it was approved is prompt injection with an approval already granted
+# (the CVE-2025-54136 shape). A client defends with its own pins, and when it
+# loses them it has nothing to compare against. daimon holds a second record it
+# can rebuild from: docs/development/issues/2026-11-06-a-client-that-loses-its-
+# tool-pins-has-nothing-to-repair-from.md. docs/adr/009-tool-definition-pins.md
+# records why it has this shape.
+#
+# THE DIGEST covers the bytes a client receives, so a client computes the same
+# value: SHA-256 over
+#
+#     name \0 description \0 inputSchema
+#
+# name and description decoded from their JSON strings, and inputSchema as the
+# text the manifest serves. That text is bayan's compact form, which bayan
+# parses and rebuilds to the same bytes, so a client that re-serialises it (as
+# thoth does) gets them too. tests/mcp_pin.tcyr checks that, and
+# fuzz/tool_pin.fcyr draws for it. A NUL inside name or description would make
+# the form ambiguous, and a client hashing C strings would stop there:
+# http_body_json refuses a body with one in a top-level string, so neither can
+# hold one. (tests/smoke.sh checks that through the route.)
+#
+# A PIN IS NOT MOVED BY A REGISTRATION. It records the first definition daimon
+# saw under a name. A later registration that differs is still served, marked
+# `changed` with the pinned digest beside it, and audited `mcp.tool.changed`. So
+# whoever can POST /v1/mcp/tools can change what is served, and cannot change
+# what a client repairs from. Deregistering keeps the pin: a tool that vanishes
+# and returns with a new definition is exactly the swap.
+#
+# ⚠ TRUST ON FIRST USE, as the client's own pins are. The first registration of a
+# name is believed. Caller identity (roadmap 2.6.x) is what could say who made it.
+#
+# Only two things move a pin:
+# - a new binary, for a builtin: its definition is the binary's, and installing
+#   one is the deliberate act. Audited `mcp.pin.builtin.moved`.
+# - mcp_pin_accept, for an external tool: POST /v1/mcp/tools/{name}/accept, which
+#   is refused unless the operator passed `serve --mcp-pin-accept`. It is one
+#   decision for the whole host; per-consumer acceptance through t-ron needs
+#   callers to be identified (roadmap 2.6.x).
+#
+# THE STORE is `<data_dir>/mcp/toolpins`, one line per pin under a whole-file
+# digest:
+#
+#     DAIMON-TOOLPIN-1
+#     {"name":"…","sha256":"<64 hex>","pinned_at":<epoch secs>[,"builtin":true]}
+#     DIGEST\t<sha256 hex over every byte before this line>
+#
+# A file that fails any check is refused WHOLE and left untouched as evidence,
+# and nothing writes over it: a per-line skip, or starting afresh, would let
+# corrupting the file reset every pin to a first sight. The state says so to
+# every client (`rejected`) until the operator moves it aside. The digest
+# catches a torn write, a disk and a stale format; it does not stop someone who
+# can write the file, who is the service's own uid. The directory is 0700.
+
+var MCP_PINS_MAX = 1024;          # thoth's TOOLPIN_MAX. Past it a tool is served `unpinned`
+var MCP_PIN_NAME_MAX = 256;       # a longer name is served `unpinned`; it bounds the file
+var MCP_PIN_STORE_MAX = 2097152;  # 1024 rows of the longest name, escaped, fit in this
+var MCP_PIN_MAGIC = "DAIMON-TOOLPIN-1\n";
+var MCP_PIN_MAGIC_LEN = 17;
+var MCP_PIN_DIGEST_TAG = "DIGEST\t";
+var MCP_PIN_TRAILER_LEN = 72;     # the tag, 64 hex digits and a newline
+var MCP_PIN_FILE = "mcp/toolpins";
+
+# What a store is. Its name is what a client reads in the manifest.
+var MCP_PIN_UNBOUND = 0;      # no store was opened
+var MCP_PIN_LOADED = 1;       # a previous run's records were read
+var MCP_PIN_NEW = 2;          # none existed; this run's are being kept
+var MCP_PIN_REJECTED = 3;     # a file failed its checks, and is left alone
+var MCP_PIN_UNAVAILABLE = 4;  # nothing can be kept: pins last for this run
+
+# What mcp_pin_tool found.
+var MCP_PIN_V_FIRST = 0;      # first sight: pinned now
+var MCP_PIN_V_SAME = 1;       # matches its pin
+var MCP_PIN_V_CHANGED = 2;    # differs from its pin
+var MCP_PIN_V_UNPINNED = 3;   # no pin can be kept for it
+var MCP_PIN_V_MOVED = 4;      # a builtin that a new binary changed: re-pinned
+
+var _pins = 0;                # map<name_cstr, McpPin>
+var _pin_list = 0;            # vec<McpPin>, in pin order: the file's order
+var _pin_state = 0;
+var _pin_path = 0;            # the store's path (cstr), 0 when none can be written
+var _pin_buf = 0;             # kept: a flush rebuilds the whole file into it
+var _pin_buf_cap = 0;
+var _pin_dropped = 0;         # tools served `unpinned`
+var _mcp_pin_accept_enabled = 0;   # `serve --mcp-pin-accept`
+
+fn mcp_pins_init() {
+    _pins = map_new();
+    _pin_list = vec_new();
+    _pin_state = MCP_PIN_UNBOUND;
+    _pin_path = 0;
+    _pin_dropped = 0;
+    _mcp_pin_summary = 0;
+    return 0;
+}
+
+fn mcp_pin_state() { return _pin_state; }
+fn mcp_pin_count() { return vec_len(_pin_list); }
+fn mcp_pin_find(name_c) { return map_get(_pins, name_c); }
+
+fn mcp_pin_state_name(st) {
+    if (st == MCP_PIN_LOADED) { return "loaded"; }
+    if (st == MCP_PIN_NEW) { return "new"; }
+    if (st == MCP_PIN_REJECTED) { return "rejected"; }
+    if (st == MCP_PIN_UNAVAILABLE) { return "unavailable"; }
+    return "unbound";
+}
+
+# The manifest's "pins" member. Rebuilt only when it changes.
+fn _pin_summary_update() {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"state\":\"");
+    str_builder_add_cstr(sb, mcp_pin_state_name(_pin_state));
+    if (_pin_path != 0) { str_builder_add_cstr(sb, "\",\"durable\":true,\"count\":"); }
+    else { str_builder_add_cstr(sb, "\",\"durable\":false,\"count\":"); }
+    str_builder_add_int(sb, vec_len(_pin_list));
+    str_builder_add_cstr(sb, ",\"unpinned\":");
+    str_builder_add_int(sb, _pin_dropped);
+    str_builder_add_cstr(sb, "}");
+    _mcp_pin_summary = str_data(str_builder_build(sb));
+    return 0;
+}
+
+# SHA-256 hex (lowercase) of a tool's definition as it is served: see the header.
+fn mcp_definition_sha256(t) {
+    var ctx: i64[18];
+    var out: i64[4];
+    var nul: u8[1];
+    store8(&nul, 0);
+    sha256_init_into(&ctx);
+    var name = mcp_tool_name(t);
+    var desc = mcp_tool_desc(t);
+    var schema = mcp_manifest_schema(t);
+    sha256_update(&ctx, str_data(name), str_len(name));
+    sha256_update(&ctx, &nul, 1);
+    sha256_update(&ctx, str_data(desc), str_len(desc));
+    sha256_update(&ctx, &nul, 1);
+    sha256_update(&ctx, str_data(schema), str_len(schema));
+    sha256_finalize(&ctx, &out);
+    return hex_encode(&out, 32);
+}
+
+# One line of the file. Kept on the pin, so a flush allocates nothing per row.
+fn _pin_row_build(p) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"name\":\"");
+    str_builder_add(sb, json_escape_str(str_from(mcp_pin_name(p))));
+    str_builder_add_cstr(sb, "\",\"sha256\":\"");
+    str_builder_add_cstr(sb, mcp_pin_sha(p));
+    str_builder_add_cstr(sb, "\",\"pinned_at\":");
+    str_builder_add_int(sb, mcp_pin_at(p));
+    if ((mcp_pin_flags(p) & MCP_PIN_BUILTIN) != 0) { str_builder_add_cstr(sb, ",\"builtin\":true"); }
+    str_builder_add_cstr(sb, "}\n");
+    store64(p + 32, str_builder_build(sb));
+    return 0;
+}
+
+fn _pin_new(name_c, sha, at, flags) {
+    var p = alloc(40);
+    store64(p, name_c);
+    store64(p + 8, sha);
+    store64(p + 16, at);
+    store64(p + 24, flags);
+    _pin_row_build(p);
+    map_set(_pins, name_c, p);
+    vec_push(_pin_list, p);
+    return p;
+}
+
+# Room for `want` bytes in the kept buffer. It doubles, so what growing leaves
+# behind on the bump allocator stays below the buffer's own size.
+fn _pin_buf_room(want) {
+    if (want <= _pin_buf_cap) { return 1; }
+    var cap = _pin_buf_cap;
+    if (cap == 0) { cap = 65536; }
+    while (cap < want) { cap = cap * 2; }
+    var b = alloc(cap);
+    if (b == 0) { return 0; }
+    _pin_buf = b;
+    _pin_buf_cap = cap;
+    return 1;
+}
+
+# Write every pin to the store. A failure ends durability for this run, and says
+# so. Nothing is written while a rejected file is at the path (_pin_path is 0).
+fn _pin_flush() {
+    if (_pin_path == 0) { return 0; }
+    var want = MCP_PIN_MAGIC_LEN + MCP_PIN_TRAILER_LEN;
+    var i = 0;
+    while (i < vec_len(_pin_list)) {
+        want = want + str_len(mcp_pin_row(vec_get(_pin_list, i)));
+        i = i + 1;
+    }
+    if ((want > MCP_PIN_STORE_MAX) || (_pin_buf_room(want) == 0)) {
+        _pin_write_failed("the tool pin store would not fit");
+        return 0;
+    }
+    memcpy(_pin_buf, MCP_PIN_MAGIC, MCP_PIN_MAGIC_LEN);
+    var off = MCP_PIN_MAGIC_LEN;
+    i = 0;
+    while (i < vec_len(_pin_list)) {
+        var row = mcp_pin_row(vec_get(_pin_list, i));
+        memcpy(_pin_buf + off, str_data(row), str_len(row));
+        off = off + str_len(row);
+        i = i + 1;
+    }
+    var hex = sha256_hex(_pin_buf, off);
+    memcpy(_pin_buf + off, MCP_PIN_DIGEST_TAG, 7);
+    memcpy(_pin_buf + off + 7, hex, 64);
+    store8(_pin_buf + off + 71, 10);
+    if (file_write_atomic(_pin_path, _pin_buf, off + MCP_PIN_TRAILER_LEN) != 0) {
+        _pin_write_failed("the tool pin store could not be written; pins last for this run");
+        return 0;
+    }
+    return 1;
+}
+
+fn _pin_write_failed(msg) {
+    _pin_path = 0;
+    _pin_state = MCP_PIN_UNAVAILABLE;
+    sakshi_warn(msg, strlen(msg));
+    daimon_audit(SEV_SECURITY, "mcp", "mcp.pin.store.unavailable", msg);
+    _pin_summary_update();
+    return 0;
+}
+
+fn _pin_hex_ok(s) {
+    if (str_len(s) != 64) { return 0; }
+    var d = str_data(s);
+    var i = 0;
+    while (i < 64) {
+        var c = load8(d + i);
+        var ok = 0;
+        if ((c >= 48) && (c <= 57)) { ok = 1; }
+        if ((c >= 97) && (c <= 102)) { ok = 1; }
+        if (ok == 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# One row of a verified file into `out` (a vec of McpPin not yet published).
+# Returns 1, or 0 for a row the store's writer could not have made.
+fn _pin_parse_row(line, len, seen, out) {
+    var root = bayan_json_v_parse_buf(line, len);
+    if (root == 0) { return 0; }
+    if (bayan_json_v_is_obj(root) == 0) { return 0; }
+    var nv = bayan_json_v_obj_get_by_cstr(root, "name");
+    var sv = bayan_json_v_obj_get_by_cstr(root, "sha256");
+    var av = bayan_json_v_obj_get_by_cstr(root, "pinned_at");
+    if ((nv == 0) || (sv == 0) || (av == 0)) { return 0; }
+    if ((bayan_json_v_is_str(nv) == 0) || (bayan_json_v_is_str(sv) == 0)) { return 0; }
+    if (bayan_json_v_is_int(av) == 0) { return 0; }
+    var name = bayan_json_v_str(nv);
+    var sha = bayan_json_v_str(sv);
+    var at = bayan_json_v_int(av);
+    if ((str_len(name) == 0) || (str_len(name) > MCP_PIN_NAME_MAX)) { return 0; }
+    if (_pin_hex_ok(sha) == 0) { return 0; }
+    if (at < 0) { return 0; }
+    var name_c = str_cstr(name);
+    if (strlen(name_c) != str_len(name)) { return 0; }   # a NUL in the name
+    if (map_get(seen, name_c) != 0) { return 0; }        # a name twice
+    map_set(seen, name_c, 1);
+    var flags = MCP_PIN_FROM_STORE;
+    var bv = bayan_json_v_obj_get_by_cstr(root, "builtin");
+    if (bv != 0) {
+        if (bayan_json_v_is_bool(bv) == 0) { return 0; }
+        if (bayan_json_v_bool(bv) == 1) { flags = flags | MCP_PIN_BUILTIN; }
+    }
+    var p = alloc(40);
+    store64(p, name_c);
+    store64(p + 8, str_cstr(sha));
+    store64(p + 16, at);
+    store64(p + 24, flags);
+    vec_push(out, p);
+    return 1;
+}
+
+# Check a whole file and take its pins. Nothing is taken unless all of it passes:
+# a row skipped would be a first sight through the back door. Returns 1 or 0.
+fn _pin_load(buf, n) {
+    if (n < MCP_PIN_MAGIC_LEN + MCP_PIN_TRAILER_LEN) { return 0; }
+    if (memeq(buf, MCP_PIN_MAGIC, MCP_PIN_MAGIC_LEN) != 1) { return 0; }
+    var end = n - MCP_PIN_TRAILER_LEN;
+    if (memeq(buf + end, MCP_PIN_DIGEST_TAG, 7) != 1) { return 0; }
+    if (load8(buf + n - 1) != 10) { return 0; }
+    if (load8(buf + end - 1) != 10) { return 0; }
+    var hex = sha256_hex(buf, end);
+    if (memeq(buf + end + 7, hex, 64) != 1) { return 0; }
+    var seen = map_new();
+    var taken = vec_new();
+    var pos = MCP_PIN_MAGIC_LEN;
+    while (pos < end) {
+        var e = pos;
+        while ((e < end) && (load8(buf + e) != 10)) { e = e + 1; }
+        if (_pin_parse_row(buf + pos, e - pos, seen, taken) == 0) { return 0; }
+        if (vec_len(taken) > MCP_PINS_MAX) { return 0; }
+        pos = e + 1;
+    }
+    var i = 0;
+    while (i < vec_len(taken)) {
+        var p = vec_get(taken, i);
+        _pin_row_build(p);
+        map_set(_pins, mcp_pin_name(p), p);
+        vec_push(_pin_list, p);
+        i = i + 1;
+    }
+    return 1;
+}
+
+# The file at `path`, read whole into the kept buffer: its length, -2 for no file,
+# or -1 for one that cannot be read or is past MCP_PIN_STORE_MAX.
+#
+# ⛔ An EMPTY file is a length, 0, and fails _pin_load like any other. It must not
+# read as no file: then truncating the store would make every pin a first sight
+# and write over the evidence (tests/mcp_pin.tcyr found this in its first run).
+fn _pin_read(path) {
+    if (file_exists(path) != 1) { return 0 - 2; }
+    if (is_symlink(str_from(path)) == 1) { return 0 - 1; }
+    if (_pin_buf_room(4096) == 0) { return 0 - 1; }
+    while (1 == 1) {
+        var n = file_read_all(path, _pin_buf, _pin_buf_cap);
+        if (n < 0) { return 0 - 1; }
+        if (n > MCP_PIN_STORE_MAX) { return 0 - 1; }
+        if (n < _pin_buf_cap) { return n; }
+        # It filled the buffer, so there may be more. A store is small, and this
+        # reserves room for what it holds rather than for the largest one.
+        if (_pin_buf_room(_pin_buf_cap * 2) == 0) { return 0 - 1; }
+    }
+    return 0 - 1;
+}
+
+# Open the store under `data_dir` (a cstr). Call before serving, once the
+# builtins are registered: mcp_pin_builtins compares them with what it holds.
+fn mcp_pins_open(data_dir, reg) {
+    var dir = path_join(str_from(data_dir), str_from("mcp"));
+    var path = path_join(str_from(data_dir), str_from(MCP_PIN_FILE));
+    _pin_state = MCP_PIN_NEW;
+    if (xmkdir_p(str_cstr(dir), 448) == 0) { _pin_path = str_cstr(path); }
+    else {
+        _pin_state = MCP_PIN_UNAVAILABLE;
+        sakshi_warn("no data directory for tool pins; they last for this run", 55);
+        daimon_audit(SEV_WARNING, "mcp", "mcp.pin.store.unavailable", "no data directory for tool pins");
+    }
+    if (_pin_path != 0) {
+        var n = _pin_read(_pin_path);
+        if (n != 0 - 2) {
+            var ok = 0;
+            if (n >= 0) { ok = _pin_load(_pin_buf, n); }
+            if (ok == 1) { _pin_state = MCP_PIN_LOADED; }
+            else {
+                _pin_path = 0;
+                _pin_state = MCP_PIN_REJECTED;
+                sakshi_warn("the tool pin store failed its checks and is left as it is; pins last for this run", 81);
+                daimon_audit(SEV_SECURITY, "mcp", "mcp.pin.store.rejected",
+                  "the tool pin store failed its checks; left untouched");
+            }
+        }
+    }
+    _pin_summary_update();
+    mcp_pin_builtins(reg);
+    return _pin_state;
+}
+
+# A tool's digest and pin, onto it. Takes a pin at first sight. Does not flush:
+# see mcp_pin_builtins and mcp_pin_external. Returns what it found (MCP_PIN_V_*).
+fn mcp_pin_tool(t, flags) {
+    var sha = mcp_definition_sha256(t);
+    mcp_tool_set_sha(t, sha);
+    mcp_tool_set_pin(t, 0);
+    var name = mcp_tool_name(t);
+    var name_c = str_cstr(name);
+    var p = map_get(_pins, name_c);
+    if (p != 0) {
+        mcp_tool_set_pin(t, p);
+        if (streq(mcp_pin_sha(p), sha) == 1) { return MCP_PIN_V_SAME; }
+        if ((flags & MCP_PIN_BUILTIN) == 0) { return MCP_PIN_V_CHANGED; }
+        _pin_move(p, sha, MCP_PIN_BUILTIN);
+        return MCP_PIN_V_MOVED;
+    }
+    var fits = 1;
+    if (str_len(name) == 0) { fits = 0; }
+    if (str_len(name) > MCP_PIN_NAME_MAX) { fits = 0; }
+    if (vec_len(_pin_list) >= MCP_PINS_MAX) { fits = 0; }
+    if (fits == 0) {
+        _pin_dropped = _pin_dropped + 1;
+        return MCP_PIN_V_UNPINNED;
+    }
+    mcp_tool_set_pin(t, _pin_new(name_c, sha, clock_epoch_secs(), flags));
+    return MCP_PIN_V_FIRST;
+}
+
+fn _pin_move(p, sha, flags) {
+    store64(p + 8, sha);
+    store64(p + 16, clock_epoch_secs());
+    store64(p + 24, flags);
+    _pin_row_build(p);
+    return 0;
+}
+
+# Every builtin against what the store holds. A builtin's definition is the
+# binary's, so a new binary moves its pin (see the header), and says so.
+fn mcp_pin_builtins(reg) {
+    var builtin = load64(reg);
+    var keys = map_keys(builtin);
+    var dirty = 0;
+    var i = 0;
+    while (i < vec_len(keys)) {
+        var t = map_get(builtin, vec_get(keys, i));
+        var v = mcp_pin_tool(t, MCP_PIN_BUILTIN);
+        if (v == MCP_PIN_V_MOVED) {
+            dirty = 1;
+            daimon_audit(SEV_WARNING, "mcp", "mcp.pin.builtin.moved", str_cstr(mcp_tool_name(t)));
+        }
+        if (v == MCP_PIN_V_FIRST) { dirty = 1; }
+        i = i + 1;
+    }
+    if (dirty == 1) { _pin_flush(); }
+    _pin_summary_update();
+    return 0;
+}
+
+# A registration just stored under `name_c`: its digest and pin, its audit entry,
+# and the store. Returns what mcp_pin_tool found.
+fn mcp_pin_external(reg, name_c) {
+    var t = mcp_find_tool(reg, name_c);
+    if (t == 0) { return MCP_PIN_V_UNPINNED; }
+    var v = mcp_pin_tool(t, 0);
+    if (v == MCP_PIN_V_FIRST) {
+        _pin_flush();
+        daimon_audit(SEV_INFO, "mcp", "mcp.tool.register", name_c);
+    } elif (v == MCP_PIN_V_SAME) {
+        daimon_audit(SEV_INFO, "mcp", "mcp.tool.register", name_c);
+    } elif (v == MCP_PIN_V_CHANGED) {
+        daimon_audit(SEV_SECURITY, "mcp", "mcp.tool.changed", name_c);
+    } else {
+        daimon_audit(SEV_WARNING, "mcp", "mcp.tool.unpinned",
+          "tool registered with no pin: name too long, or the table is full");
+    }
+    _pin_summary_update();
+    return v;
+}
+
+# Make the tool's definition as it is served the pinned one. The caller has
+# decided this is permitted. Returns 1, or 0 when it has no pin to move.
+fn mcp_pin_accept(t) {
+    var p = mcp_tool_pin(t);
+    if (p == 0) { return 0; }
+    _pin_move(p, mcp_tool_sha(t), mcp_pin_flags(p) & MCP_PIN_BUILTIN);
+    _pin_flush();
+    _pin_summary_update();
+    return 1;
+}

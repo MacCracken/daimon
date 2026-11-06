@@ -1,0 +1,830 @@
+# =========================================================================
+# files — tests against THE REAL src/files.cyr (2.5.4)
+#
+# docs/development/issues/2026-09-23-crab-needs-a-file-index-tags-and-ranked-
+# search.md. The tree under build/files_test is real: a real walk over real
+# entries, with a FIFO and symlinks in it, because the failures that matter here
+# are what a disk holds and a list in memory does not. A "restart" clears what a
+# process holds and opens the same directory again.
+# =========================================================================
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/io.cyr"
+include "lib/fs.cyr"
+include "lib/hashmap.cyr"
+include "lib/tagged.cyr"
+include "lib/bayan.cyr"
+include "lib/syscalls.cyr"
+include "lib/chrono.cyr"
+include "lib/sigil.cyr"
+include "lib/net.cyr"
+include "lib/tls.cyr"
+include "lib/sandhi.cyr"
+include "lib/assert.cyr"
+
+# strstr answers an index or -1, so 0 is a match at the start and -1 is truthy.
+fn holds(hay, needle) {
+    if (strstr(hay, needle) >= 0) { return 1; }
+    return 0;
+}
+
+var SEV_INFO = 1;
+var SEV_WARNING = 2;
+var SEV_SECURITY = 5;
+var _audit_last = 0;
+fn daimon_audit(sev, source, action, details) { _audit_last = action; return 0; }
+
+include "src/syscalls.cyr"
+include "src/error.cyr"
+include "src/files.cyr"
+
+alloc_init();
+
+var BASE = "build/files_test";
+var ROOT = 0;      # absolute: a root must be
+var DATA = 0;
+var META = 0;
+var INDEX = 0;
+
+fn abspath(rel) {
+    var cwd = alloc(1024);
+    assert(syscall(SYS_GETCWD, cwd, 1000) > 0, "(getcwd)");
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, cwd);
+    str_builder_add_cstr(sb, "/");
+    str_builder_add_cstr(sb, rel);
+    return str_data(str_builder_build(sb));
+}
+
+fn in_root(rel) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, ROOT);
+    str_builder_add_cstr(sb, "/");
+    str_builder_add_cstr(sb, rel);
+    return str_data(str_builder_build(sb));
+}
+
+fn put(rel, text) {
+    var p = in_root(rel);
+    assert_eq(file_write_atomic(p, text, strlen(text)), 0, "(fixture written)");
+    return p;
+}
+
+fn rm_tree(p) {
+    var names = dir_list(str_from(p));
+    var i = 0;
+    while (i < vec_len(names)) {
+        var full = str_cstr(path_join(str_from(p), vec_get(names, i)));
+        if (is_symlink(str_from(full)) == 1) { sys_unlink(full); }
+        elif (is_dir(str_from(full)) == 1) { rm_tree(full); }
+        else { sys_unlink(full); }
+        i = i + 1;
+    }
+    sys_rmdir(p);
+    return 0;
+}
+
+# What a process holds, gone: as after an exit.
+fn forget() {
+    _fx_enabled = 0;
+    _fx_dir = 0;
+    _fx_phase = FX_IDLE;
+    _fx_want = 0;
+    _fx_want_path = 0;
+    _fx_paused = 0;
+    _fx_power_state = 0;
+    _fx_power_next = 0;
+    _fx_active = 0;
+    _fx_generation = 0;
+    _fx_indexed_at = 0;
+    _fx_persisted = 0;
+    _fx_next_at = 0;
+    _fx_meta_skipped = 0;
+    _fx_meta_failed = 0;
+    _fx_journal_bytes = 0;
+    if (_fx_hash_fd >= 0) { file_close(_fx_hash_fd); }
+    _fx_hash_fd = 0 - 1;
+    files_init();
+    return 0;
+}
+
+fn open_at(root) {
+    forget();
+    if (root != 0) { files_add_root(root); }
+    files_open(DATA);
+    # So a test machine on battery does not pause these.
+    _fx_power_files = vec_new();
+    return 0;
+}
+
+# Run slices until nothing is wanted. Bounded: a walk that never ends is a failure.
+fn run_job() {
+    var i = 0;
+    while (files_busy() == 1) {
+        files_tick(daimon_now_ms());
+        i = i + 1;
+        if (i > 2000000) { assert(0 == 1, "a job ended"); return 0; }
+    }
+    return i;
+}
+
+fn count(q) { return files_count(files_query_parse(q)); }
+
+fn has_tag(path, tag) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "tag=");
+    str_builder_add_cstr(sb, tag);
+    var f = files_query_parse(str_data(str_builder_build(sb)));
+    _fx_filter_bind(f);
+    if (load64(f + FX_Q_NOTAG) != 0) { return 0; }
+    var idx = _fx_find(_fx_active, path, strlen(path));
+    if (idx < 0) { return 0; }
+    return _fx_match(_fx_active, _fx_rec(_fx_active, idx), f, 0);
+}
+
+fn tag(path, name) {
+    var add = vec_new();
+    vec_push(add, name);
+    var sb = str_builder_new();
+    var ok = files_tag(path, add, vec_new(), sb);
+    files_journal(sb);
+    return ok;
+}
+
+fn untag(path, name) {
+    var rm = vec_new();
+    vec_push(rm, name);
+    var sb = str_builder_new();
+    var ok = files_tag(path, vec_new(), rm, sb);
+    files_journal(sb);
+    return ok;
+}
+
+fn rate(path, n) {
+    var sb = str_builder_new();
+    var ok = files_rate(path, n, sb);
+    files_journal(sb);
+    return ok;
+}
+
+fn answer() {
+    store8(files_out() + files_out_len(), 0);
+    return files_out();
+}
+
+fn answer_json() {
+    var v = bayan_json_v_parse(str_new(files_out(), files_out_len()));
+    assert(v != 0, "the answer is JSON");
+    return v;
+}
+
+fn jint(v, key) { return bayan_json_v_int(bayan_json_v_obj_get_by_cstr(v, key)); }
+fn jstr(v, key) { return str_cstr(bayan_json_v_str(bayan_json_v_obj_get_by_cstr(v, key))); }
+
+fn record(path) {
+    var idx = _fx_find(_fx_active, path, strlen(path));
+    if (idx < 0) { return 0; }
+    return _fx_rec(_fx_active, idx);
+}
+
+fn group_of(path) {
+    var r = record(path);
+    if (r == 0) { return 0 - 1; }
+    return load64(r + FX_R_GROUP);
+}
+
+# --- a path has one spelling ----------------------------------------------
+test_group("files_path_ok");
+fn ok_path(p) { return files_path_ok(p, strlen(p)); }
+assert_eq(ok_path("/"), 1, "the root");
+assert_eq(ok_path("/a"), 1, "one component");
+assert_eq(ok_path("/a/b.c"), 1, "two");
+assert_eq(ok_path("/a/..b"), 1, "two dots that are part of a name");
+assert_eq(ok_path("/a/b.."), 1, "... at either end");
+assert_eq(ok_path("/.hidden"), 1, "a hidden name");
+assert_eq(ok_path(""), 0, "empty");
+assert_eq(ok_path("a/b"), 0, "relative");
+assert_eq(ok_path("/a/"), 0, "a trailing slash");
+assert_eq(ok_path("/a//b"), 0, "an empty component");
+assert_eq(ok_path("//a"), 0, "a leading double slash");
+assert_eq(ok_path("/a/./b"), 0, "a . component");
+assert_eq(ok_path("/a/."), 0, "a final .");
+assert_eq(ok_path("/a/../b"), 0, "⛔ a .. component");
+assert_eq(ok_path("/a/.."), 0, "⛔ a final ..");
+assert_eq(ok_path("/.."), 0, "⛔ .. at the top");
+assert_eq(ok_path("/a\nb"), 0, "a control byte");
+var longp = alloc(FILES_PATH_MAX + 3);
+memset(longp, 97, FILES_PATH_MAX + 2);
+store8(longp, 47);
+store8(longp + FILES_PATH_MAX + 2, 0);
+assert_eq(ok_path(longp), 0, "longer than a path may be");
+
+test_group("files_utf8_ok");
+fn bytes1(a) { var v: i64[1]; store8(&v, a); return files_utf8_ok(&v, 1); }
+fn bytes2(a, b) { var v: i64[1]; store8(&v, a); store8(&v + 1, b); return files_utf8_ok(&v, 2); }
+fn bytes3(a, b, c) { var v: i64[1]; store8(&v, a); store8(&v + 1, b); store8(&v + 2, c); return files_utf8_ok(&v, 3); }
+fn bytes4(a, b, c, d) {
+    var v: i64[1];
+    store8(&v, a); store8(&v + 1, b); store8(&v + 2, c); store8(&v + 3, d);
+    return files_utf8_ok(&v, 4);
+}
+assert_eq(files_utf8_ok("plain", 5), 1, "ASCII");
+assert_eq(bytes2(0xC3, 0xA9), 1, "two bytes: é");
+assert_eq(bytes3(0xE2, 0x82, 0xAC), 1, "three: €");
+assert_eq(bytes4(0xF0, 0x9F, 0x98, 0x80), 1, "four: an emoji");
+assert_eq(bytes4(0xF4, 0x8F, 0xBF, 0xBF), 1, "U+10FFFF, the last");
+assert_eq(bytes1(0xFF), 0, "a byte UTF-8 never uses");
+assert_eq(bytes1(0x80), 0, "a continuation byte alone");
+assert_eq(bytes1(0xC3), 0, "a lead byte with nothing after it");
+assert_eq(bytes2(0xC0, 0xAF), 0, "⛔ an overlong /: the classic path filter bypass");
+assert_eq(bytes3(0xE0, 0x80, 0xAF), 0, "⛔ a longer overlong /");
+assert_eq(bytes3(0xED, 0xA0, 0x80), 0, "a surrogate");
+assert_eq(bytes4(0xF4, 0x90, 0x80, 0x80), 0, "past U+10FFFF");
+assert_eq(bytes2(0xE2, 0x82), 0, "cut short");
+
+test_group("files_under");
+fn under(p, d) { return files_under(p, strlen(p), d, strlen(d)); }
+assert_eq(under("/home/a", "/home/a"), 1, "itself");
+assert_eq(under("/home/a/b", "/home/a"), 1, "below");
+assert_eq(under("/home/ab", "/home/a"), 0, "⛔ a sibling sharing a prefix");
+assert_eq(under("/home", "/home/a"), 0, "above");
+assert_eq(under("/anything", "/"), 1, "everything is under /");
+
+test_group("roots");
+forget();
+assert_eq(files_add_root("/a/"), 0, "a root is refused in a second spelling");
+assert_eq(files_add_root("relative"), 0, "a relative root is refused");
+
+# --- the fixture ----------------------------------------------------------
+xmkdir_p(BASE, 493);
+rm_tree(abspath(BASE));
+xmkdir_p("build/files_test/root/sub/deep", 493);
+xmkdir_p("build/files_test/root/.hidden_dir", 493);
+xmkdir_p("build/files_test/outside", 493);
+ROOT = abspath("build/files_test/root");
+DATA = abspath("build/files_test/data");
+META = abspath("build/files_test/data/files/meta");
+INDEX = abspath("build/files_test/data/files/index");
+
+var A = put("a.txt", "hello");
+var B = put("b.txt", "hello");
+var C = put("c.txt", "world");                # the same size, other content
+var D = put("sub/d.txt", "hello");
+var E = put("sub/e.bin", "x");
+var HF = put(".hidden_file", "hidden");
+var HD = put(".hidden_dir/f.txt", "hello");
+var E1 = put("empty1", "");
+var E2 = put("empty2", "");
+var RAW = put("sub/deep/IMG.CR2", "raw bytes");
+var ODD = put("sub/odd\"name\\.txt", "odd");
+file_write_atomic(abspath("build/files_test/outside/secret.txt"), "hello", 5);
+sys_symlink(abspath("build/files_test/outside"), in_root("escape_dir"));
+sys_symlink(abspath("build/files_test/outside/secret.txt"), in_root("escape_file"));
+sys_symlink(A, in_root("link_to_a"));
+sys_symlink("/nowhere", in_root("dangling"));
+# ⛔ A FIFO: an open or a read of this would hold the loop for good.
+assert_eq(sys_mknodat(0 - 100, in_root("fifo"), 0x1000 | 420, 0), 0, "(the fixture FIFO is made)");
+# A name that is no text: valid on Linux, and impossible to put in JSON.
+var badname = alloc(64);
+var bn = strlen(ROOT);
+memcpy(badname, ROOT, bn);
+store8(badname + bn, 47);
+store8(badname + bn + 1, 0xFF);
+memcpy(badname + bn + 2, "bad", 4);
+assert_eq(file_write_atomic(badname, "x", 1), 0, "(the fixture name that is no text is made)");
+
+# --- no root: no index ----------------------------------------------------
+test_group("no root");
+open_at(0);
+assert_eq(files_enabled(), 0, "with no root there is no index");
+assert_streq(files_state_name(), "none", "and it says so");
+assert_eq(files_busy(), 0, "and nothing runs");
+assert_eq(file_exists(DATA), 0, "and nothing is written");
+
+# --- the first walk -------------------------------------------------------
+test_group("the first walk");
+open_at(ROOT);
+assert_eq(files_enabled(), 1, "a root opens the index");
+assert_streq(files_state_name(), "building", "before the first walk it is building, not none");
+files_status_json();
+assert(holds(answer(), "\"state\":\"building\"") == 1, "and a client reads that");
+run_job();
+assert_streq(files_state_name(), "fresh", "after it, fresh");
+assert_eq(_fx_persisted, 1, "and kept");
+assert(file_exists(INDEX) == 1, "on disk");
+assert_eq(file_exists(abspath("build/files_test/data/files/index.tmp")), 0, "no temp file is left");
+
+assert(record(A) != 0, "a file is indexed");
+assert(record(D) != 0, "in a subdirectory");
+assert(record(RAW) != 0, "at any depth");
+assert(record(HF) != 0, "a hidden file is a file");
+assert_eq(record(HD), 0, "a hidden directory is not walked");
+assert_eq(record(in_root("escape_file")), 0, "⛔ a symlink to a file is not one");
+assert_eq(record(in_root("escape_dir")), 0, "⛔ a symlink to a directory is not one");
+assert_eq(record(in_root("escape_dir/secret.txt")), 0, "⛔ and is not followed out of the root");
+assert_eq(record(in_root("link_to_a")), 0, "a symlink inside the root is not one either");
+assert_eq(record(in_root("dangling")), 0, "nor a dangling one");
+assert_eq(record(in_root("fifo")), 0, "⛔ a FIFO is passed over, and held nothing");
+assert_eq(record(badname), 0, "⛔ a name that is not text is passed over");
+assert_eq(load64(_fx_active + FX_G_SKIPPED), 1, "and counted, not lost in silence");
+assert_eq(load64(record(A) + FX_R_SIZE), 5, "its size");
+assert(load64(record(A) + FX_R_MTIME) > 0, "its mtime");
+assert_eq(load64(_fx_active + FX_G_TRUNC), 0, "the walk was not cut short");
+assert_eq(count(0), 10, "the files, and nothing else");
+
+# --- duplicates -----------------------------------------------------------
+test_group("duplicates");
+assert(group_of(A) != 0, "two files of one content share a group");
+assert_eq(group_of(A), group_of(B), "the same one");
+assert_eq(group_of(A), group_of(D), "wherever they are");
+assert_eq(group_of(C), 0, "⛔ one size and other content is no duplicate");
+assert_eq(group_of(E1), 0, "empty files are not duplicates of each other");
+assert_eq(group_of(E), 0, "a file of a unique size is not read");
+assert_eq(_fx_hashed, 4, "only files sharing a size were read for a digest");
+assert_eq(count("duplicates=1"), 3, "the folder holds them");
+
+# --- tags, exactly --------------------------------------------------------
+test_group("tags");
+assert_eq(tag(A, "wip"), 1, "a tag is added");
+assert_eq(has_tag(A, "wip"), 1, "and read");
+assert_eq(tag(A, "toolchain"), 1, "a second");
+assert_eq(tag(B, "wip"), 1, "another file's");
+assert_eq(count("tag=wip"), 2, "files carrying a tag");
+assert_eq(count("tag=wi"), 0, "⛔ a tag match is exact, not a substring");
+assert_eq(count("tag=wipe"), 0, "⛔ in either direction");
+assert_eq(count("tag=nobody"), 0, "a tag nobody has holds nothing");
+assert_eq(tag(A, "wip"), 1, "adding one twice");
+files_meta_json(A);
+assert(holds(answer(), "\"tags\":[\"wip\",\"toolchain\"]") == 1, "leaves it once");
+assert_eq(count("untagged=1"), 8, "the rest are untagged");
+files_tags_json();
+var tj = answer_json();
+var tlist = bayan_json_v_obj_get_by_cstr(tj, "tags");
+assert_eq(bayan_json_v_arr_len(tlist), 2, "the tags that exist");
+assert_streq(jstr(bayan_json_v_arr_get(tlist, 0), "tag"), "wip", "with their names");
+assert_eq(jint(bayan_json_v_arr_get(tlist, 0), "files"), 2, "and counts");
+assert_eq(untag(B, "wip"), 1, "a tag is removed");
+assert_eq(count("tag=wip"), 1, "and is gone from the list");
+assert_eq(count("untagged=1"), 9, "and the file is untagged again");
+assert_eq(files_tag_ok(str_from(" wip")), 0, "a tag with a space at its start");
+assert_eq(files_tag_ok(str_from("wip ")), 0, "... or its end");
+assert_eq(files_tag_ok(str_from("")), 0, "an empty tag");
+assert_eq(files_tag_ok(str_from("a\tb")), 0, "a control byte");
+assert_eq(files_tag_ok(str_from("two words")), 1, "a space inside is fine");
+var bigadd = vec_new();
+var bi = 0;
+while (bi < FILES_FILE_TAGS_MAX + 1) {
+    var one = str_builder_new();
+    str_builder_add_cstr(one, "t");
+    str_builder_add_int(one, bi);
+    vec_push(bigadd, str_data(str_builder_build(one)));
+    bi = bi + 1;
+}
+var lim = str_builder_new();
+assert_eq(files_tag(C, bigadd, vec_new(), lim), 0, "past the limit on one file is refused");
+assert_eq(has_tag(C, "t0"), 0, "and changes nothing");
+
+# --- ratings --------------------------------------------------------------
+test_group("ratings");
+assert_eq(count("unrated=1"), 10, "nothing is rated");
+assert_eq(rate(A, 5), 1, "a rating is set");
+assert_eq(count("unrated=1"), 9, "unrated lists the rest");
+assert_eq(count("rating=4"), 1, "rated at least");
+assert_eq(load8(record(A) + FX_R_RATING), 5, "it reaches the record");
+assert_eq(rate(A, 0), 1, "0 clears it");
+assert_eq(count("unrated=1"), 10, "and it is unrated again");
+rate(C, 3);
+
+# --- queries --------------------------------------------------------------
+test_group("queries");
+assert_eq(files_query_parse("bogus=1"), 0, "⛔ an unknown key refuses the query: it must not answer with everything");
+assert_eq(files_query_parse("untagged"), 0, "a key with no value");
+assert_eq(files_query_parse("=1"), 0, "a value with no key");
+assert_eq(files_query_parse("limit=0"), 0, "a limit of none");
+assert_eq(files_query_parse("limit=100000"), 0, "a limit past the page's");
+assert_eq(files_query_parse("min_size=abc"), 0, "a number that is not one");
+assert_eq(files_query_parse("min_size=-1"), 0, "a negative one");
+assert_eq(files_query_parse("under=relative"), 0, "an under that is not a path");
+assert_eq(files_query_parse("under=/a/../b"), 0, "⛔ an under with ..");
+assert_eq(files_query_parse("ext="), 0, "an empty ext");
+assert_eq(count("ext=txt"), 5, "by extension");
+assert_eq(count("ext=cr2"), 1, "⛔ whatever case the file spells it in");
+assert_eq(count("ext=CR2,bin"), 2, "... or the query");
+assert_eq(count("ext=x"), 0, "a name with no such extension");
+assert_eq(count("min_size=6"), 2, "by size");
+var ub = str_builder_new();
+str_builder_add_cstr(ub, "under=");
+str_builder_add_cstr(ub, in_root("sub"));
+assert_eq(count(str_data(str_builder_build(ub))), 4, "under a directory");
+assert_eq(count("newer_days=1"), 10, "recent");
+assert_eq(count("older_days=1"), 0, "old");
+assert_eq(count("ext=txt&min_size=5"), 4, "filters combine");
+var pct = str_builder_new();
+str_builder_add_cstr(pct, "tag=two%20words");
+assert_eq(tag(C, "two words"), 1, "(a tag with a space)");
+assert_eq(count(str_data(str_builder_build(pct))), 1, "a value is percent-decoded");
+
+# --- pages ----------------------------------------------------------------
+test_group("pages");
+var pg = files_query_parse("limit=3");
+files_list_json(pg);
+var j1 = answer_json();
+assert_eq(bayan_json_v_arr_len(bayan_json_v_obj_get_by_cstr(j1, "files")), 3, "a page stops at its limit");
+assert_eq(jint(j1, "total"), 10, "and says how many there are");
+assert_eq(jint(j1, "next_offset"), 3, "and where to go on");
+var pg2 = files_query_parse("limit=8&offset=3");
+files_list_json(pg2);
+var j2 = answer_json();
+assert_eq(bayan_json_v_arr_len(bayan_json_v_obj_get_by_cstr(j2, "files")), 7, "the rest");
+assert_eq(jint(j2, "next_offset"), 0, "the last page says so");
+var pg3 = files_query_parse("offset=500");
+files_list_json(pg3);
+var j3 = answer_json();
+assert_eq(bayan_json_v_arr_len(bayan_json_v_obj_get_by_cstr(j3, "files")), 0, "past the end is an empty page");
+assert_eq(jint(j3, "total"), 10, "still counted");
+# A row with every awkward byte stays one JSON value.
+files_list_json(files_query_parse("ext=txt&limit=100"));
+var jn = answer_json();
+var names = bayan_json_v_obj_get_by_cstr(jn, "files");
+var sawodd = 0;
+var ni = 0;
+while (ni < bayan_json_v_arr_len(names)) {
+    if (streq(jstr(bayan_json_v_arr_get(names, ni), "path"), ODD) == 1) { sawodd = 1; }
+    ni = ni + 1;
+}
+assert_eq(sawodd, 1, "a quote and a backslash in a name survive the answer");
+assert_eq(files_meta_json(in_root("nothing-here")), 0, "a file nobody knows is no answer");
+
+# --- smart folders --------------------------------------------------------
+test_group("smart folders");
+files_smart_json();
+var sj = answer_json();
+var flist = bayan_json_v_obj_get_by_cstr(sj, "folders");
+assert_eq(bayan_json_v_arr_len(flist), 6, "six ship");
+fn folder(list, name) {
+    var i = 0;
+    while (i < bayan_json_v_arr_len(list)) {
+        var f = bayan_json_v_arr_get(list, i);
+        if (streq(jstr(f, "name"), name) == 1) { return f; }
+        i = i + 1;
+    }
+    return 0;
+}
+assert_eq(jint(folder(flist, "Recent"), "files"), 10, "each with a count: Recent");
+assert_eq(jint(folder(flist, "Duplicates"), "files"), 3, "Duplicates");
+assert_eq(jint(folder(flist, "Unrated"), "files"), 9, "Unrated");
+assert_eq(jint(folder(flist, "Raw only"), "files"), 1, "Raw only");
+assert_eq(jint(folder(flist, "Large & old"), "files"), 0, "Large & old");
+var before_tags = jint(folder(flist, "Untagged"), "files");
+tag(E, "wip");
+files_smart_json();
+var sj2 = answer_json();
+assert_eq(jint(folder(bayan_json_v_obj_get_by_cstr(sj2, "folders"), "Untagged"), "files"), before_tags - 1,
+    "a kept count does not outlive what it read");
+assert_eq(files_smart_save("Text", "ext=txt"), 1, "a query is saved");
+assert_eq(files_count(files_smart_filter("Text")), 5, "and holds what it says");
+assert_eq(files_smart_save("Later", "tag=not-yet"), 1, "it can name a tag that does not exist");
+assert_eq(files_count(files_smart_filter("Later")), 0, "which holds nothing");
+tag(D, "not-yet");
+assert_eq(files_count(files_smart_filter("Later")), 1, "⛔ until the tag does");
+assert_eq(files_smart_save("Bad", "bogus=1"), 0, "a query that cannot be read is not saved");
+assert_eq(files_smart_filter("Bad"), 0, "at all");
+assert_eq(files_smart_save("Raw only", "ext=cr2"), 1, "a query is saved over one that ships");
+assert_eq(files_smart_delete("Recent"), 0 - 1, "one that ships cannot be deleted");
+assert_eq(files_smart_delete("nothing"), 0, "nor one that does not exist");
+assert_eq(files_smart_delete("Later"), 1, "a saved one can");
+assert_eq(files_smart_filter("Later"), 0, "and is gone");
+assert_eq(files_smart_save("Raw only", "ext=cr2"), 1, "(saved again)");
+assert_eq(files_smart_delete("Raw only"), 1, "deleting a redefined one");
+assert_streq(load64(_fx_smart_find("Raw only") + 8), "ext=arw,cr2,cr3,dng,nef,orf,raf,rw2",
+    "puts the shipped query back");
+assert_eq(files_smart_save("Raw only", "ext=cr2"), 1, "(saved again, to outlive a restart)");
+assert_eq(files_smart_name_ok(str_from("a/b")), 0, "a name rides a URL path, so no slash");
+assert_eq(files_smart_name_ok(str_from("")), 0, "an empty name");
+
+# --- suggestions ----------------------------------------------------------
+test_group("suggested tags");
+tag(RAW, "photos");
+tag(D, "wip");
+files_suggest_json(in_root("sub"));
+var sg = answer_json();
+var slist = bayan_json_v_obj_get_by_cstr(sg, "suggested");
+assert(bayan_json_v_arr_len(slist) >= 2, "a folder is offered what its files carry");
+assert_streq(jstr(bayan_json_v_arr_get(slist, 0), "tag"), "wip", "most used first");
+assert_eq(jint(bayan_json_v_arr_get(slist, 0), "files"), 3 - 1, "saying how many");
+files_suggest_json(E);
+assert(holds(answer(), "\"tag\":\"wip\"") == 0, "a file is not offered what it has");
+assert(holds(answer(), "\"tag\":\"not-yet\"") == 1, "and is offered what its neighbours have");
+
+# --- a restart ------------------------------------------------------------
+test_group("a restart");
+var kept_files = load64(_fx_active + FX_G_FILES);
+var kept_group = group_of(A);
+var hashed_so_far = _fx_hashed;
+open_at(ROOT);
+assert_eq(files_enabled(), 1, "the index opens");
+assert_streq(files_state_name(), "catching_up", "it is served and a walk is coming");
+assert_eq(load64(_fx_active + FX_G_FILES), kept_files, "⛔ the index survives a restart, before any walk");
+assert_eq(group_of(A), kept_group, "with its duplicates");
+assert_eq(has_tag(A, "wip"), 1, "and its tags");
+assert_eq(count("rating=3"), 1, "and its ratings");
+assert_eq(files_count(files_smart_filter("Text")), 5, "and its saved queries");
+assert_streq(load64(_fx_smart_find("Raw only") + 8), "ext=cr2", "a redefinition holds");
+assert_eq(files_smart_filter("Later"), 0, "and a deleted one stays gone");
+files_status_json();
+assert(holds(answer(), "\"generation\":1") == 1, "a client can see which index this is");
+run_job();
+assert_streq(files_state_name(), "fresh", "the walk ends");
+assert_eq(_fx_hashed, hashed_so_far, "⛔ and read no unchanged file again");
+assert_eq(group_of(A) != 0, 1, "keeping its duplicates");
+
+# The journal is rewritten as what it says: one line per file and per folder.
+fn lines_in(p) {
+    var b = alloc(1048576);
+    var n = file_read_all(p, b, 1048575);
+    var c = 0;
+    var i = 0;
+    while (i < n) {
+        if (load8(b + i) == 10) { c = c + 1; }
+        i = i + 1;
+    }
+    return c;
+}
+var journal_lines = lines_in(META);
+tag(A, "more");
+untag(A, "more");
+assert_eq(lines_in(META), journal_lines + 2, "a change is one line");
+open_at(ROOT);
+assert_eq(lines_in(META), journal_lines, "a restart compacts them");
+assert_eq(has_tag(A, "wip"), 1, "and loses nothing");
+
+# ⛔ Re-tagging one file appends each time, so `meta` needs a bound of its own.
+test_group("the journal's bound");
+assert_eq(files_journal_full(), 0, "the journal has room");
+var bound = _fx_journal_bytes;
+FILES_JOURNAL_MAX = bound + 2048;
+var churn = 0;
+while ((files_journal_full() == 0) && (churn < 1000)) {
+    tag(A, "again");
+    untag(A, "again");
+    churn = churn + 1;
+}
+assert_eq(files_journal_full(), 1, "⛔ the same file, tagged over and over, reaches a bound");
+assert(lines_in(META) > journal_lines + 4, "(it did grow)");
+open_at(ROOT);
+assert_eq(files_journal_full(), 0, "and a restart compacts it");
+assert_eq(_fx_journal_bytes, bound, "to what it says");
+assert_eq(has_tag(A, "wip"), 1, "keeping everything");
+FILES_JOURNAL_MAX = 67108864;
+
+# --- a re-walk ------------------------------------------------------------
+test_group("a re-walk");
+run_job();
+var NEW = put("new.txt", "new file");
+sys_unlink(C);
+put("sub/e.bin", "y");     # same size; a new mtime only if the clock moved, so:
+put("sub/grown.txt", "hello");
+files_request(0);
+assert_streq(files_state_name(), "catching_up", "a re-walk is catching up");
+var gen0 = _fx_generation;
+assert(record(NEW) == 0, "the served index does not change under a client");
+run_job();
+assert_eq(_fx_generation, gen0 + 1, "a new generation is swapped in");
+assert(record(NEW) != 0, "a new file appears");
+assert_eq(record(C), 0, "a deleted one goes");
+assert_eq(group_of(in_root("sub/grown.txt")), group_of(A), "a new duplicate joins its group");
+assert_eq(count("rating=3"), 0, "a rating on a deleted file is not served");
+assert_eq(files_meta_json(C), 1, "but what a person gave is kept");
+assert(holds(answer(), "\"indexed\":false") == 1, "and says the file is not in the index");
+assert_eq(has_tag(A, "wip"), 1, "tags hold across a generation");
+
+# ⛔ Nothing here may grow daimon.
+test_group("nothing grows");
+files_request(0);
+run_job();
+var used0 = alloc_used();
+var w = 0;
+while (w < 5) {
+    files_request(0);
+    run_job();
+    w = w + 1;
+}
+assert_eq(alloc_used() - used0, 0, "⛔ five re-walks allocate nothing");
+var f0 = files_query_parse(0);
+var u = files_query_parse("untagged=1");
+used0 = alloc_used();
+w = 0;
+while (w < 100) {
+    files_list_json(u);
+    files_status_json();
+    files_smart_json();
+    files_tags_json();
+    w = w + 1;
+}
+assert_eq(alloc_used() - used0, 0, "⛔ a client polling allocates nothing here");
+
+# --- a scoped re-index ----------------------------------------------------
+test_group("re-index a path");
+var INSIDE = put("sub/deep/scoped.txt", "scoped!");
+var OUTSIDE_NEW = put("unscoped.txt", "unscoped");
+files_request(in_root("sub/deep"));
+run_job();
+assert(record(INSIDE) != 0, "a file under the path is found");
+assert_eq(record(OUTSIDE_NEW), 0, "one outside it is left for a whole walk");
+assert(record(A) != 0, "what lies outside is kept");
+assert_eq(group_of(A) != 0, 1, "digests and all");
+assert_eq(has_tag(A, "wip"), 1, "and tags");
+files_request(0);
+run_job();
+assert(record(OUTSIDE_NEW) != 0, "a whole walk finds it");
+files_request(in_root("sub/deep"));
+files_request(in_root("sub"));
+assert_eq(_fx_want_path, 0, "two asks at once widen rather than one dropping the other");
+run_job();
+
+# --- on battery -----------------------------------------------------------
+test_group("on battery");
+var BAT = abspath("build/files_test/bat_status");
+file_write_atomic(BAT, "Discharging\n", 12);
+files_power_use(BAT);
+files_request(0);
+files_tick(daimon_now_ms());
+assert_eq(_fx_paused, 1, "a job pauses on battery");
+assert_streq(files_state_name(), "paused", "and says so");
+files_status_json();
+assert(holds(answer(), "\"power\":\"battery\"") == 1, "and why");
+assert_eq(files_busy(), 0, "and runs no slice");
+assert(record(A) != 0, "the index stays served");
+file_write_atomic(BAT, "Charging\n", 9);
+_fx_power_next = 0;
+files_tick(daimon_now_ms());
+assert_eq(_fx_paused, 0, "back on mains it goes on");
+assert_eq(files_busy(), 1, "by itself");
+run_job();
+assert_streq(files_state_name(), "fresh", "and ends");
+_fx_power_files = vec_new();
+
+# --- the rewalk clock -----------------------------------------------------
+test_group("an hour on");
+assert(_fx_next_at > clock_epoch_secs(), "the next walk is in the future");
+var gen1 = _fx_generation;
+files_tick(daimon_now_ms());
+assert_eq(_fx_generation, gen1, "nothing runs before it");
+_fx_next_at = clock_epoch_secs() - 1;
+files_tick(daimon_now_ms());
+assert_eq(files_busy(), 1, "and one starts when it is due");
+run_job();
+assert_eq(_fx_generation, gen1 + 1, "and ends");
+
+# --- what a person gave survives a bad file -------------------------------
+test_group("a damaged journal");
+var nowtext = alloc(1048576);
+var jn0 = file_read_all(META, nowtext, 1048575);
+file_append_locked(META, "{\"p\":\"/torn", 11);     # a crash mid-append
+open_at(ROOT);
+assert_eq(_fx_meta_skipped, 1, "⛔ a torn last line is one line");
+assert_eq(has_tag(A, "wip"), 1, "and costs nothing before it");
+files_status_json();
+assert(holds(answer(), "\"meta_skipped\":1") == 1, "and a client can see it");
+var len_after = file_read_all(META, alloc(1048576), 1048575);
+assert_eq(len_after, jn0 + 11, "⛔ and the file is not rewritten over what was skipped");
+assert_streq(_audit_last, "files.index.open", "(opened)");
+file_write_atomic(META, nowtext, jn0);
+run_job();
+
+# Every shape of line that is not one, each costing only itself.
+fn bad_line(text, what) {
+    var b = alloc(jn0 + 4096);
+    memcpy(b, nowtext, jn0);
+    var n = strlen(text);
+    memcpy(b + jn0, text, n);
+    file_write_atomic(META, b, jn0 + n);
+    open_at(ROOT);
+    assert_eq(_fx_meta_skipped, 1, what);
+    assert_eq(has_tag(A, "wip"), 1, "... and costs nothing else");
+    run_job();
+    file_write_atomic(META, nowtext, jn0);
+    return 0;
+}
+bad_line("not json\n", "a line that is not JSON");
+bad_line("[1,2]\n", "not an object");
+bad_line("{\"p\":\"relative\",\"r\":0,\"t\":[]}\n", "a relative path");
+bad_line("{\"p\":\"/a/../b\",\"r\":0,\"t\":[]}\n", "⛔ a second spelling of a path");
+bad_line("{\"p\":\"/a\",\"r\":9,\"t\":[]}\n", "a rating out of range");
+bad_line("{\"p\":\"/a\",\"r\":1,\"t\":[1]}\n", "a tag that is no string");
+bad_line("{\"p\":\"/a\",\"r\":1,\"t\":[\" x\"]}\n", "a tag that is not one");
+bad_line("{\"s\":\"x\",\"q\":5}\n", "a saved query that is no string");
+
+# --- a damaged index: rebuilt, because it is derived ----------------------
+test_group("a damaged index");
+open_at(ROOT);
+run_job();
+var ib = alloc(4194304);
+var in0 = file_read_all(INDEX, ib, 4194303);
+assert(in0 > FILES_INDEX_HDR, "(the index is on disk)");
+fn index_with_byte(off, val) {
+    var c = alloc(in0);
+    memcpy(c, ib, in0);
+    store8(c + off, val);
+    file_write_atomic(INDEX, c, in0);
+    open_at(ROOT);
+    return 0;
+}
+index_with_byte(FILES_INDEX_HDR + 3, 255);
+assert_streq(_audit_last, "files.index.open", "(opened)");
+assert_streq(files_state_name(), "building", "⛔ an edited index is dropped, and rebuilt");
+assert_eq(load64(_fx_active + FX_G_N), 0, "none of it is served");
+assert_eq(has_tag(A, "wip"), 0, "(no records yet)");
+run_job();
+assert(record(A) != 0, "and the walk rebuilds it");
+assert_eq(has_tag(A, "wip"), 1, "and tags reach the new records");
+file_write_atomic(INDEX, "short", 5);
+open_at(ROOT);
+assert_streq(files_state_name(), "building", "a truncated one");
+run_job();
+file_write_atomic(INDEX, "", 0);
+open_at(ROOT);
+assert_streq(files_state_name(), "building", "an empty one");
+run_job();
+
+# Records that pass the digest and lie: offsets outside the pool.
+fn rehash(buf, n) {
+    var d: i64[4];
+    sha256(buf, n - 32, &d);
+    memcpy(buf + n - 32, &d, 32);
+    return 0;
+}
+var il = file_read_all(INDEX, ib, 4194303);
+fn index_lying(field, val) {
+    var c1 = alloc(il);
+    memcpy(c1, ib, il);
+    store64(c1 + FILES_INDEX_HDR + field, val);
+    rehash(c1, il);
+    file_write_atomic(INDEX, c1, il);
+    open_at(ROOT);
+    return 0;
+}
+index_lying(FX_R_PATH, 1099511627776);
+assert_streq(files_state_name(), "building", "⛔ a path offset past the pool is refused, digest or no");
+run_job();
+# ⛔ Wraps round a sum that checks only `off + plen + 1 > used`.
+index_lying(FX_R_PATH, 0x7FFFFFFFFFFFFFFF);
+assert_streq(files_state_name(), "building", "⛔ an offset that would wrap is refused");
+run_job();
+index_lying(FX_R_DIGEST, 0x7FFFFFFFFFFFFFFF);
+assert_streq(files_state_name(), "building", "⛔ a digest offset that would wrap is refused");
+run_job();
+index_lying(FX_R_SIZE, 0 - 1);
+assert_streq(files_state_name(), "building", "a negative size is refused");
+run_job();
+var c2 = alloc(il);
+memcpy(c2, ib, il);
+store64(c2 + 24, 99999999999);
+rehash(c2, il);
+file_write_atomic(INDEX, c2, il);
+open_at(ROOT);
+assert_streq(files_state_name(), "building", "⛔ a count past the table is refused");
+run_job();
+
+# ⛔ A file must not stay served from a root the operator removed.
+var NARROW = in_root("sub");
+open_at(NARROW);
+assert_streq(files_state_name(), "building", "⛔ an index from a wider root is not served");
+assert_eq(record(A), 0, "nothing outside today's roots");
+run_job();
+assert_eq(record(A), 0, "and the walk stays inside");
+assert(record(D) != 0, "and covers what is");
+assert(files_in_roots(A, strlen(A)) == 0, "a path outside is outside");
+
+# --- a full generation says so --------------------------------------------
+test_group("a full generation");
+files_set_max(4);
+open_at(ROOT);
+run_job();
+assert_eq(load64(_fx_active + FX_G_TRUNC), 1, "⛔ a walk that stopped short says so");
+files_status_json();
+assert(holds(answer(), "\"truncated\":true") == 1, "to a client");
+assert_eq(load64(_fx_active + FX_G_N), 4, "and stops at the limit");
+files_set_max(262144);
+
+# --- nowhere to keep it ---------------------------------------------------
+test_group("nowhere to keep it");
+var keep = DATA;
+DATA = "/proc/no-such-dir/data";
+open_at(ROOT);
+assert_eq(files_enabled(), 1, "the index still runs");
+run_job();
+assert(record(A) != 0, "and answers");
+assert_eq(_fx_persisted, 0, "and says it will not last");
+tag(A, "wip");
+files_status_json();
+assert(holds(answer(), "\"persisted\":false") == 1, "to a client");
+assert(holds(answer(), "\"meta_durable\":false") == 1, "for its tags too");
+DATA = keep;
+
+rm_tree(abspath(BASE));
+syscall(SYS_EXIT, assert_summary());

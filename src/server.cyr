@@ -851,7 +851,10 @@ fn server_loop(addr, port) {
             _srv_tick(now);
             _srv_reap_tick();
             ipc_tick(now);
+            files_tick(now);
             last_upkeep = now;
+        } elif (files_busy() == 1) {
+            files_tick(now);   # a slice each pass; the pause below yields to everything else
         }
         sys_pause();
     }
@@ -879,6 +882,9 @@ fn server_loop(addr, port) {
         # exiting, not a full one.
         var tick = SERVE_TICK_MS;
         if (_srv_deferred > 0) { tick = SERVE_TICK_BUSY_MS; }
+        # A walk runs a slice a pass, so a busy tick keeps it moving while the
+        # requests waiting for each pass still come first.
+        if (files_busy() == 1) { tick = SERVE_TICK_BUSY_MS; }
         var nr = sys_epoll_wait(_srv_epfd, _srv_events, SRV_EVENTS, tick);
         now = daimon_now_ms();
         var i = 0;
@@ -910,7 +916,10 @@ fn server_loop(addr, port) {
             _srv_tick(now);
             _srv_reap_tick();
             ipc_tick(now);
+            files_tick(now);
             last_upkeep = now;
+        } elif (files_busy() == 1) {
+            files_tick(now);
         }
     }
     return 0;
@@ -1206,6 +1215,11 @@ fn server_detach(work, arg) {
 # sandhi's epoll-cooperative loop, which ran each connection's handler to
 # completion just as the sync one did; the flag is still accepted.
 fn serve(port) {
+    # Before the first request: a manifest carries what the store holds (2.5.4).
+    var dd = config_data_dir(_config);
+    mcp_pins_open(str_cstr(dd), _mcp_registry);
+    files_open(str_cstr(dd));
+    _mem_store = memory_store_new(path_join(dd, str_from("agent-memory")));   # --data-dir covers all of it
     #ifdef CYRIUS_TARGET_AGNOS
     server_banner(port, "event loop");
     # The listener is on the bind address, 127.0.0.1 unless --listen, as on

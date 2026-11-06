@@ -1,0 +1,363 @@
+# =========================================================================
+# api_files — the file index, tags, ratings and smart folders (2.5.4)
+# =========================================================================
+#
+# src/files.cyr holds the rules; docs/guides/api.md the contract. A body is read
+# as every body is (http_body_json), and an answer comes from files.cyr's kept
+# buffer, so a client polling a sidebar grows nothing but the request's own cost.
+
+var FILES_BATCH_MAX = 256;    # files in one tag or rating request
+
+fn _files_send(fd) {
+    http_send_response(fd, 200, files_out(), files_out_len());
+    return 0;
+}
+
+# 1, or answers and returns 0: everything but a status needs an index.
+fn _files_open_or_answer(fd) {
+    if (files_enabled() == 1) { return 1; }
+    http_error(fd, 409, str_from("daimon holds no file index: no --index-root is configured"));
+    return 0;
+}
+
+# A path from a client, as a cstr, or answers and returns 0. It must be spelled
+# one way and lie under a root: a string comparison is what grants access here,
+# so that spelling is the check.
+fn _files_path(fd, s) {
+    var p = str_cstr(s);
+    if ((files_path_ok(p, strlen(p)) == 0) || (strlen(p) != str_len(s))) {
+        http_bad_request(fd,
+          str_from("a path must be absolute, with no empty, . or .. component and no trailing slash"));
+        return 0;
+    }
+    if (files_in_roots(p, strlen(p)) == 0) {
+        daimon_audit(SEV_WARNING, "files", "files.path.refused", p);
+        http_error(fd, 403, str_from("that path is outside the index roots"));
+        return 0;
+    }
+    return p;
+}
+
+# The `?…` of a request, or 0.
+fn _files_query_text(buf, len) {
+    var full = sandhi_server_get_path(buf, len);
+    if (full == 0) { return 0; }
+    var i = 0;
+    while (load8(full + i) != 0) {
+        if (load8(full + i) == 63) {
+            if (load8(full + i + 1) == 0) { return 0; }
+            return full + i + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# GET: what daimon holds. It answers with no index too: `none` is an answer.
+fn api_files_status(fd) {
+    if (files_enabled() == 1) {
+        files_status_json();
+        _files_send(fd);
+        return 0;
+    }
+    http_ok(fd, str_from("{\"state\":\"none\",\"files\":0,\"roots\":[]}"));
+    return 0;
+}
+
+# POST: {"path": "…"} re-indexes it, and no body or no path every root.
+fn api_files_reindex(fd, body) {
+    if (_files_open_or_answer(fd) == 0) { return 0; }
+    var want = 0;
+    if (body != 0) {
+        if (str_len(body) > 0) {
+            var root = http_body_json(body);
+            if (root == 0) { http_bad_body(fd); return 0; }
+            var ps = http_json_str(root, "path");
+            if (ps != 0) {
+                want = _files_path(fd, ps);
+                if (want == 0) { return 0; }
+            }
+        }
+    }
+    files_request(want);
+    daimon_audit(SEV_INFO, "files", "files.index.request", "a re-index was asked for");
+    http_send_response(fd, 202, "{\"ok\":true}", 11);
+    return 0;
+}
+
+# GET /v1/files?…
+fn api_files_list(fd, buf, len) {
+    if (_files_open_or_answer(fd) == 0) { return 0; }
+    var f = files_query_parse(_files_query_text(buf, len));
+    if (f == 0) { http_bad_request(fd, str_from("that query cannot be read")); return 0; }
+    files_list_json(f);
+    _files_send(fd);
+    return 0;
+}
+
+# GET /v1/files/meta?path=…
+fn api_files_meta(fd, buf, len) {
+    if (_files_open_or_answer(fd) == 0) { return 0; }
+    var raw = http_parse_query_param(buf, len, "path");
+    if (raw == 0) { http_bad_request(fd, str_from("missing path")); return 0; }
+    var p = _files_path(fd, str_from(raw));
+    if (p == 0) { return 0; }
+    if (files_meta_json(p) == 0) { http_error(fd, 404, str_from("no such file in the index")); return 0; }
+    _files_send(fd);
+    return 0;
+}
+
+# The strings of an array member as a vec of cstr, an empty vec when it is absent,
+# or 0 when it is not an array of strings. An array holding U+0000 is refused here:
+# http_body_json reads only the top level.
+fn _files_strs(root, key) {
+    var out = vec_new();
+    var v = bayan_json_v_obj_get_by_cstr(root, key);
+    if (v == 0) { return out; }
+    if (bayan_json_v_is_arr(v) == 0) { return 0; }
+    var i = 0;
+    while (i < bayan_json_v_arr_len(v)) {
+        var one = bayan_json_v_arr_get(v, i);
+        if (bayan_json_v_is_str(one) == 0) { return 0; }
+        var s = bayan_json_v_str(one);
+        var c = str_cstr(s);
+        if (strlen(c) != str_len(s)) { return 0; }
+        vec_push(out, c);
+        i = i + 1;
+    }
+    return out;
+}
+
+# The body's `path` or `paths`, each checked, as a vec of cstr; or answers and
+# returns 0. All are checked before anything changes.
+fn _files_paths(fd, root) {
+    var out = vec_new();
+    var one = http_json_str(root, "path");
+    if (one != 0) {
+        var p = _files_path(fd, one);
+        if (p == 0) { return 0; }
+        vec_push(out, p);
+    }
+    var list = _files_strs(root, "paths");
+    if (list == 0) { http_bad_request(fd, str_from("paths must be an array of strings")); return 0; }
+    var i = 0;
+    while (i < vec_len(list)) {
+        var q = _files_path(fd, str_from(vec_get(list, i)));
+        if (q == 0) { return 0; }
+        vec_push(out, q);
+        i = i + 1;
+    }
+    if ((vec_len(out) == 0) || (vec_len(out) > FILES_BATCH_MAX)) {
+        http_bad_request(fd, str_from("name a path, or up to 256 paths"));
+        return 0;
+    }
+    return out;
+}
+
+fn _files_tags_ok(v) {
+    var i = 0;
+    while (i < vec_len(v)) {
+        if (files_tag_ok(str_from(vec_get(v, i))) == 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# 1, or answers and returns 0 when no more edits can be kept (files_journal_full).
+fn _files_journal_or_answer(fd) {
+    if (files_journal_full() == 0) { return 1; }
+    daimon_audit(SEV_WARNING, "files", "files.meta.full", "the tag journal is full until a restart compacts it");
+    http_error(fd, 409, str_from("the tag journal is full; a restart compacts it"));
+    return 0;
+}
+
+fn _files_done(fd, n) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"ok\":true,\"files\":");
+    str_builder_add_int(sb, n);
+    str_builder_add_cstr(sb, "}");
+    http_ok(fd, str_builder_build(sb));
+    return 0;
+}
+
+# POST /v1/files/tags {"path"|"paths", "add": […], "remove": […]}
+fn api_files_tag(fd, body) {
+    if (_files_open_or_answer(fd) == 0) { return 0; }
+    if (body == 0) { http_bad_request(fd, str_from("missing body")); return 0; }
+    var root = http_body_json(body);
+    if (root == 0) { http_bad_body(fd); return 0; }
+    var paths = _files_paths(fd, root);
+    if (paths == 0) { return 0; }
+    var add = _files_strs(root, "add");
+    var remove = _files_strs(root, "remove");
+    if ((add == 0) || (remove == 0)) {
+        http_bad_request(fd, str_from("add and remove must be arrays of strings"));
+        return 0;
+    }
+    if ((_files_tags_ok(add) == 0) || (_files_tags_ok(remove) == 0)) {
+        http_bad_request(fd, str_from("a tag is 1 to 64 bytes with no control byte and no space at either end"));
+        return 0;
+    }
+    if (_files_journal_or_answer(fd) == 0) { return 0; }
+    var sb = str_builder_new();
+    var done = 0;
+    var i = 0;
+    while (i < vec_len(paths)) {
+        if (files_tag(vec_get(paths, i), add, remove, sb) == 1) { done = done + 1; }
+        i = i + 1;
+    }
+    files_journal(sb);
+    if (done < vec_len(paths)) {
+        http_error(fd, 409, str_from("a limit was reached: too many tags on a file, tags in all, or tagged files"));
+        return 0;
+    }
+    _files_done(fd, done);
+    return 0;
+}
+
+# POST /v1/files/rating {"path"|"paths", "rating": 0–5}. 0 clears it.
+fn api_files_rate(fd, body) {
+    if (_files_open_or_answer(fd) == 0) { return 0; }
+    if (body == 0) { http_bad_request(fd, str_from("missing body")); return 0; }
+    var root = http_body_json(body);
+    if (root == 0) { http_bad_body(fd); return 0; }
+    var paths = _files_paths(fd, root);
+    if (paths == 0) { return 0; }
+    if (http_json_has(root, "rating") == 0) { http_bad_request(fd, str_from("missing rating")); return 0; }
+    var rating = http_json_int(root, "rating");
+    if ((rating < 0) || (rating > FILES_RATING_MAX)) {
+        http_bad_request(fd, str_from("a rating is 0 to 5"));
+        return 0;
+    }
+    if (_files_journal_or_answer(fd) == 0) { return 0; }
+    var sb = str_builder_new();
+    var done = 0;
+    var i = 0;
+    while (i < vec_len(paths)) {
+        if (files_rate(vec_get(paths, i), rating, sb) == 1) { done = done + 1; }
+        i = i + 1;
+    }
+    files_journal(sb);
+    if (done < vec_len(paths)) {
+        http_error(fd, 409, str_from("a limit was reached: too many tagged files"));
+        return 0;
+    }
+    _files_done(fd, done);
+    return 0;
+}
+
+# GET /v1/files/tags/suggest?path=…
+fn api_files_suggest(fd, buf, len) {
+    if (_files_open_or_answer(fd) == 0) { return 0; }
+    var raw = http_parse_query_param(buf, len, "path");
+    if (raw == 0) { http_bad_request(fd, str_from("missing path")); return 0; }
+    var p = _files_path(fd, str_from(raw));
+    if (p == 0) { return 0; }
+    files_suggest_json(p);
+    _files_send(fd);
+    return 0;
+}
+
+# POST /v1/files/smart {"name": "…", "query": "untagged=1"}
+fn api_files_smart_save(fd, body) {
+    if (_files_open_or_answer(fd) == 0) { return 0; }
+    if (body == 0) { http_bad_request(fd, str_from("missing body")); return 0; }
+    var root = http_body_json(body);
+    if (root == 0) { http_bad_body(fd); return 0; }
+    var name = http_json_str(root, "name");
+    var query = http_json_str(root, "query");
+    if ((name == 0) || (query == 0)) { http_bad_request(fd, str_from("missing name or query")); return 0; }
+    if (files_smart_name_ok(name) == 0) {
+        http_bad_request(fd, str_from("a name is 1 to 64 bytes with no control byte or slash"));
+        return 0;
+    }
+    if (str_len(query) > FILES_QUERY_MAX) { http_bad_request(fd, str_from("that query is too long")); return 0; }
+    var q = str_cstr(query);
+    if (files_query_parse(q) == 0) { http_bad_request(fd, str_from("that query cannot be read")); return 0; }
+    if (_files_journal_or_answer(fd) == 0) { return 0; }
+    if (files_smart_save(str_cstr(name), q) == 0) {
+        http_error(fd, 409, str_from("a limit was reached: too many smart folders"));
+        return 0;
+    }
+    http_send_response(fd, 201, "{\"ok\":true}", 11);
+    return 0;
+}
+
+# /v1/files/smart/{name}: GET a page of what it holds, DELETE it.
+fn api_files_smart_one(fd, method, raw, buf, len) {
+    if (_files_open_or_answer(fd) == 0) { return 0; }
+    var name = sandhi_server_url_decode(raw);
+    if (name == 0) { http_bad_request(fd, str_from("that name cannot be read")); return 0; }
+    if (method == 3) {
+        var gone = files_smart_delete(name);
+        if (gone == 0) { http_error(fd, 404, str_from("no such smart folder")); return 0; }
+        if (gone < 0) {
+            http_error(fd, 409, str_from("this smart folder ships with daimon; save a query over it instead"));
+            return 0;
+        }
+        http_ok(fd, str_from("{\"ok\":true}"));
+        return 0;
+    }
+    if (method != 0) { http_method_not_allowed(fd); return 0; }
+    var saved = files_smart_filter(name);
+    if (saved == 0) { http_error(fd, 404, str_from("no such smart folder")); return 0; }
+    var page = files_query_parse(_files_query_text(buf, len));
+    if (page == 0) { http_bad_request(fd, str_from("that query cannot be read")); return 0; }
+    var f = alloc(FX_Q_SIZE);
+    memcpy(f, saved, FX_Q_SIZE);
+    store64(f + FX_Q_LIMIT, load64(page + FX_Q_LIMIT));
+    store64(f + FX_Q_OFFSET, load64(page + FX_Q_OFFSET));
+    files_list_json(f);
+    _files_send(fd);
+    return 0;
+}
+
+fn api_files_route(fd, method, path, buf, len) {
+    if (streq(path, "/v1/files") == 1) {
+        if (route_method(fd, method, 0) == 0) { return 0; }
+        return api_files_list(fd, buf, len);
+    }
+    if (streq(path, "/v1/files/index") == 1) {
+        if (method == 0) { return api_files_status(fd); }
+        if (method == 1) { return api_files_reindex(fd, http_parse_body(buf, len)); }
+        http_method_not_allowed(fd);
+        return 0;
+    }
+    if (streq(path, "/v1/files/meta") == 1) {
+        if (route_method(fd, method, 0) == 0) { return 0; }
+        return api_files_meta(fd, buf, len);
+    }
+    if (streq(path, "/v1/files/tags") == 1) {
+        if (method == 0) {
+            if (_files_open_or_answer(fd) == 0) { return 0; }
+            files_tags_json();
+            return _files_send(fd);
+        }
+        if (method == 1) { return api_files_tag(fd, http_parse_body(buf, len)); }
+        http_method_not_allowed(fd);
+        return 0;
+    }
+    if (streq(path, "/v1/files/tags/suggest") == 1) {
+        if (route_method(fd, method, 0) == 0) { return 0; }
+        return api_files_suggest(fd, buf, len);
+    }
+    if (streq(path, "/v1/files/rating") == 1) {
+        if (route_method(fd, method, 1) == 0) { return 0; }
+        return api_files_rate(fd, http_parse_body(buf, len));
+    }
+    if (streq(path, "/v1/files/smart") == 1) {
+        if (method == 0) {
+            if (_files_open_or_answer(fd) == 0) { return 0; }
+            files_smart_json();
+            return _files_send(fd);
+        }
+        if (method == 1) { return api_files_smart_save(fd, http_parse_body(buf, len)); }
+        http_method_not_allowed(fd);
+        return 0;
+    }
+    if (memeq(path, "/v1/files/smart/", 16) == 1) {
+        return api_files_smart_one(fd, method, path + 16, buf, len);
+    }
+    http_not_found(fd);
+    return 0;
+}

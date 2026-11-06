@@ -243,17 +243,21 @@ registration may take a builtin's name (409).
 
 ```
 # List tools, the builtins included (inputSchema is raw JSON Schema; {} / {"type":"object"} when unset).
-# GET /v1/mcp/manifest answers the same.
+# GET /v1/mcp/manifest answers the same. Each entry carries its digest and pin: see "Tool definition pins".
 GET /v1/mcp/tools
-→ {"tools":[{"name":"libro_verify","description":"Verify the libro chain's hash-link integrity","inputSchema":{"type":"object"}},...],"count":13}
+→ {"tools":[{"name":"libro_verify","description":"Verify the libro chain's hash-link integrity",
+    "inputSchema":{"type":"object"},"definition_sha256":"<64 hex>","pin_state":"pinned",
+    "pinned_sha256":"<64 hex>","pinned_at":1793990381,"pin_from_store":true},...],
+   "count":13,"pins":{"state":"loaded","durable":true,"count":14,"unpinned":0}}
 
-# Register an external tool. inputSchema is optional (alias: input_schema), stored verbatim, {} when
-# omitted. callback_url must be http:// or https:// (a scheme check, not a host allowlist).
+# Register an external tool. inputSchema is optional (alias: input_schema), stored in bayan's compact
+# form, {} when omitted. callback_url must be http:// or https:// (a scheme check, not a host allowlist).
 POST /v1/mcp/tools
 {"name":"scan","description":"port scanner","callback_url":"http://localhost:9000",
  "inputSchema":{"type":"object","properties":{"target":{"type":"string"}},"required":["target"]}}
-→ 201 {"ok":true} · 400 no name or callback_url, or not http(s) · 409 a builtin's name
-# Registering a name again replaces it, whoever registered it first (roadmap 2.6.x).
+→ 201 {"ok":true,"pin_state":"pinned"} · 400 no name or callback_url, or not http(s) · 409 a builtin's name
+# Registering a name again replaces what is served, whoever registered it first (roadmap 2.6.x). It does
+# not move the pin: {"ok":true,"pin_state":"changed"}, audited mcp.tool.changed.
 
 # Call a tool: MCP tools/call params
 POST /v1/mcp/call
@@ -267,6 +271,60 @@ POST /v1/mcp/call
 DELETE /v1/mcp/tools/scan
 → {"ok":true}
 ```
+
+### Tool definition pins (2.5.4)
+
+A tool's description is read by a model as guidance, so swapping one after it was approved is prompt
+injection with an approval already granted. A client that pins definitions (thoth does) can rebuild
+from daimon if it loses its own record, with one `GET /v1/mcp/tools`.
+
+| field | what it says |
+|---|---|
+| `definition_sha256` | the digest of what this entry serves |
+| `pinned_sha256` | the digest daimon first saw under this name |
+| `pinned_at` | when, in epoch seconds |
+| `pin_state` | `pinned` they match, `changed` they differ, `unpinned` no pin could be kept |
+| `pin_from_store` | the pin came from a previous run, not a first sight in this one |
+
+**The digest** is SHA-256, in lowercase hex, over
+
+    name \0 description \0 inputSchema
+
+with `name` and `description` decoded from their JSON strings, and `inputSchema` the text the manifest
+serves. That text is compact (no whitespace), in the key order it was registered with, and parsing it
+and re-serialising it compactly gives the same bytes. Neither name nor description can hold a NUL
+(`400`). For example:
+
+```bash
+printf 'libro_verify\0Verify the libro chain'"'"'s hash-link integrity\0{"type":"object"}' | sha256sum
+```
+
+A pin is what daimon first saw, and **a registration cannot move it**. A definition that differs is
+served, marked `changed`, and audited `mcp.tool.changed`. What to do with it is the client's decision.
+Deregistering keeps the pin. A pin is kept in `<data_dir>/mcp/toolpins`, so it outlives a restart;
+a registration does not, and a server registers again.
+
+Two things move a pin: a new binary, for a builtin (audited `mcp.pin.builtin.moved`), and accepting:
+
+```
+POST /v1/mcp/tools/{name}/accept
+→ 403 until callers are identified (roadmap 2.6.x), audited mcp.pin.accept.deny
+→ with `serve --mcp-pin-accept`: {"ok":true,"pin_state":"pinned"} · 404 · 409 a builtin, or no pin
+```
+
+`pins.state` in the manifest says how far to trust all this. `durable` is false in the last two:
+
+| state | meaning |
+|---|---|
+| `loaded` | a previous run's records were read |
+| `new` | none existed: every pin is this run's first sight |
+| `rejected` | the file failed its checks. It is left untouched, nothing writes over it, and pins last for this run. An operator moves it aside to start again |
+| `unavailable` | nothing can be kept (no data directory, or a write failed). On AGNOS a store needs 1.57.17 or later |
+
+⚠ This is trust on first use, and it trusts daimon at the moment of the repair. It closes a swap by
+an MCP server behind daimon, not one by daimon. Keep the client's own pins as well. See ADR-009.
+
+### Forwarded calls
 
 A call that waits on another server runs in a child process, so daimon keeps serving meanwhile.
 That covers a forwarded call, `resources/read`, `prompts/get`, `web_fetch` and `web_search`. One
@@ -312,6 +370,148 @@ POST /v1/mcp/prompts/deregister     {"name":"greet"}
 
 A forwarded read or get that the server answers with a JSON-RPC error is answered 502, with the
 server's message and code.
+
+## Files (2.5.4)
+
+An index of the files under the operator's roots, with each file's tags and rating, and saved queries
+over them. A file's identity is its absolute path.
+
+⛔ **It is off unless the operator names a root**, with `serve --index-root DIR` (repeatable, 16 at most).
+The API has no caller authentication until roadmap 2.6.x, so anything local can read what the index
+holds, as the user daimon runs as: the names, sizes and times of the files under a root, and which
+are identical. Name only what every local process may see. Every route here refuses a request
+carrying `Origin`, reads included (403).
+
+The index walks in the background and on restart, and every hour after. Nothing watches the disk, so
+`indexed_at` says how stale it is. It keeps to regular files. It follows no symlink, and passes over
+hidden directories (`.git`), `/proc`, `/sys`, `/dev`, `/run`, its own data directory, and any name
+that is not valid UTF-8, which JSON could not carry. `skipped` counts what it could not take.
+
+### What daimon holds
+
+```
+GET /v1/files/index
+→ {"state":"fresh","files":41208,"bytes":8123456,"duplicates":12,"skipped":0,"truncated":false,
+   "indexed_at":1793990381,"generation":3,"persisted":true,"meta_durable":true,"meta_skipped":0,
+   "power":"mains","roots":["/home/me"]}
+```
+
+`progress` appears while a job runs: `{"phase":"walk","done":251,"total":812}`, the phases being `copy`,
+`walk`, `sizes`, `hash`, `group` and `save`. During a walk `total` is the last walk's count, and 0 the
+first time.
+
+| state | meaning |
+|---|---|
+| (no connection) | daimon is not running |
+| `none` | daimon holds no index. No root is configured, so every route below but this one answers 409 |
+| `building` | none is ready yet, and one is coming |
+| `catching_up` | one is served, and a newer one is coming |
+| `paused` | a job is waiting for mains power (`power` says `battery`). Linux only: on AGNOS `power` is `unknown`, and a walk runs |
+| `fresh` | one is served, and nothing is running |
+
+`truncated` means a walk ran out of room (`serve --index-max N`, default 262,144 records, 65,536 on
+AGNOS). `persisted` false means the index will not outlive this run, and `meta_durable` false the same
+of tags, ratings and saved queries. Those live in a journal, and `meta_skipped` counts its lines that
+could not be read.
+
+```
+# Re-index a path, or with no body every root. 202: it is queued. A path keeps what lies outside it.
+POST /v1/files/index    {"path":"/home/me/photos"}
+→ 202 {"ok":true} · 400 · 403 outside the roots · 409 no index
+```
+
+### Listing and queries
+
+```
+GET /v1/files?untagged=1&under=/home/me&limit=100&offset=0
+→ {"files":[{"path":"/home/me/a.txt","size":5,"mtime":1793990000,"rating":0,"tags":["wip"],
+             "duplicate_group":3}],
+   "total":318,"next_offset":100,"generation":3}
+```
+
+`next_offset` is 0 on the last page. A page ends at `limit` (default 100, at most 1000) or about 64 KB
+of rows, 8 KB on AGNOS. `generation` changes when a new index is swapped in, which moves rows under a
+client that is paging. Rows come in index order, so sort what you fetch. `duplicate_group` is 0 for
+none: files sharing one have the same content, by a whole SHA-256 of the whole file. Empty files are
+not duplicates of each other.
+
+A query is query-string text, and filters combine. An unknown key answers 400: a misspelled filter must
+not answer with every file.
+
+| key | value |
+|---|---|
+| `tag` | carrying this tag, matched exactly |
+| `untagged`, `unrated` | `1`: carrying none |
+| `rating` | rated at least this |
+| `duplicates` | `1`: sharing their content with another file |
+| `under` | at or below this path |
+| `ext` | any of these extensions, comma-separated, in any case |
+| `min_size` | at least this many bytes |
+| `newer_days`, `older_days` | modified within, or before, this many days |
+| `limit`, `offset` | paging |
+
+```
+# One file: as a row, or {"path","rating","tags","indexed":false} for one a person tagged that the
+# index no longer holds. What a person gave is kept against the path.
+GET /v1/files/meta?path=/home/me/a.txt
+→ a row · 400 · 403 · 404 nothing known
+```
+
+### Tags and ratings
+
+A tag is 1 to 64 bytes of UTF-8 with no control byte and no space at either end, and matches exactly.
+A file carries at most 32. A request names `path`, or `paths` (up to 256), and all are checked before
+anything changes. A path must be spelled one way: absolute, with no empty, `.` or `..` component and
+no trailing slash. A tag follows the path, so a rename outside daimon's sight loses it.
+
+```
+POST /v1/files/tags     {"paths":["/home/me/a.txt"],"add":["wip"],"remove":["old"]}
+→ {"ok":true,"files":1}
+GET /v1/files/tags
+→ {"tags":[{"tag":"wip","files":3}]}
+
+# What the files at this folder carry, or those beside this file, most used first.
+GET /v1/files/tags/suggest?path=/home/me
+→ {"suggested":[{"tag":"wip","files":3}]}
+
+# 0 to 5. 0 clears it.
+POST /v1/files/rating   {"path":"/home/me/a.txt","rating":5}
+→ {"ok":true,"files":1}
+```
+
+Each write answers 400 for a bad path or tag, 403 for a path outside the roots, and 409 at a limit:
+65,536 files with a tag or rating, 4,096 tags, or a journal at 64 MiB, which a restart compacts.
+
+### Smart folders
+
+A smart folder is a saved query, with a count. Six ship, and saving a query under a name replaces it:
+
+| name | query |
+|---|---|
+| Recent | `newer_days=7` |
+| Duplicates | `duplicates=1` |
+| Untagged | `untagged=1` |
+| Large & old | `min_size=104857600&older_days=365` |
+| Raw only | `ext=arw,cr2,cr3,dng,nef,orf,raf,rw2` |
+| Unrated | `unrated=1` |
+
+```
+GET /v1/files/smart
+→ {"folders":[{"name":"Untagged","query":"untagged=1","files":318,"builtin":true},...]}
+
+POST /v1/files/smart    {"name":"Work","query":"tag=wip&under=/home/me"}
+→ 201 {"ok":true} · 400 · 409 at 64 folders
+
+# A page of what it holds, as GET /v1/files. Percent-encode the name.
+GET /v1/files/smart/Large%20%26%20old?limit=50
+
+# A folder that ships cannot be deleted (409). Deleting one you redefined puts the shipped query back.
+DELETE /v1/files/smart/Work
+```
+
+The rate limit below applies, so poll `GET /v1/files/smart` and `/v1/files/index` a few times a minute,
+not per frame. Counts are kept until something they read changes. The index, tags and queries all
+survive a restart, in `<data_dir>/files` (`serve --data-dir DIR`, default `/var/lib/agnos`). See ADR-010.
 
 ## RAG Pipeline
 

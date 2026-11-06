@@ -67,7 +67,7 @@ fn _l_report(name, code) {
 
 var g = _l_run("/bin/guest");
 if (g >= 0) { _l_report("guest", _l_wait_exit(g, 120000)); }
-var d = _l_run("/bin/daimon serve 8090 --agents-dir /agents");
+var d = _l_run("/bin/daimon serve 8090 --agents-dir /agents --data-dir /data --index-root /agents --index-max 4096");
 _l_wait_ms(1500);
 var c = _l_run("/bin/client");
 if (c >= 0) { _l_report("client", _l_wait_exit(c, 120000)); }

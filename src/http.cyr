@@ -285,10 +285,11 @@ fn http_json_text(root, key) {
 # Status-code → reason-phrase. Centralized so http_send_response
 # (sandhi-backed shim) can hand the right RFC 7231 phrase to
 # sandhi_server_send_response. Codes daimon emits today: 200, 201,
-# 204, 400, 403, 404, 405, 409, 413, 422, 429, 500, 501, 502, 503, 504.
+# 202, 204, 400, 403, 404, 405, 409, 413, 422, 429, 500, 501, 502, 503, 504.
 fn _http_reason(status) {
     if (status == 200) { return "OK"; }
     if (status == 201) { return "Created"; }
+    if (status == 202) { return "Accepted"; }    # 2.5.4: a re-index is queued
     if (status == 204) { return "No Content"; }
     if (status == 400) { return "Bad Request"; }
     if (status == 403) { return "Forbidden"; }

@@ -77,6 +77,10 @@ main.cyr             CLI: serve [port] [--async] [--trace] [--agents-dir DIR] [-
 │   ├── McpHostRegistry    Builtin + external maps; an external registration never takes a builtin's name
 │   ├── mcp_manifest_json  GET /v1/mcp/tools
 │   └── validate_callback_url   http:// or https:// only (a scheme check, not a host allowlist)
+├── mcp_pin.cyr      (2.5.4, ADR-009) Each tool's definition at first sight, kept across restarts
+│   ├── mcp_definition_sha256   name \0 description \0 inputSchema, the bytes a client receives
+│   ├── mcp_pin_tool       First sight, unchanged or changed; a registration never moves a pin
+│   └── mcp_pins_open      <data_dir>/mcp/toolpins, refused whole on any failed check
 ├── mcp_builtin.cyr  The 13 builtin tools, dispatched in-process
 │   ├── mcp_libro_init     bote's five libro tools, bound to daimon's audit chain
 │   ├── mcp_web_init       bote's web_fetch / web_search (these run in a detached child)
@@ -119,10 +123,17 @@ main.cyr             CLI: serve [port] [--async] [--trace] [--agents-dir DIR] [-
 ├── api.cyr          Service-level endpoints (health, metrics)
 ├── api_agent.cyr    Agent lifecycle, message and output endpoints
 ├── api_mcp.cyr      MCP endpoints: tools, resources, prompts, calls (forwards run in a child)
+├── api_files.cyr    (2.5.4) File index, tags, ratings and smart folder endpoints
 ├── api_rag.cyr      RAG ingest/query endpoints
 ├── api_edge.cyr     Edge fleet endpoints
 ├── api_sched.cyr    Scheduler endpoints, incl. task start/complete + a node's work list
-├── router.cyr       http_route — 44 method + path routes; agent and task control refuse Origin (403)
+├── router.cyr       http_route — 57 method + path routes; agent and task control, and /v1/files, refuse Origin (403)
+├── files.cyr        (2.5.4, ADR-010) An index of the operator's roots. Off with no --index-root
+│   ├── files_tick         One slice of a walk, on the loop: 3 ms, or a count of steps
+│   ├── two generations    Reserved at open; a walk fills the one not served, then swaps it in
+│   ├── duplicates         Same size, then a whole SHA-256 of the whole content
+│   ├── meta               Tags, ratings, saved queries: a synced journal under <data_dir>/files
+│   └── files_query_parse  Query-string text, shared by GET /v1/files and smart folders
 └── server.cyr       Server lifecycle
     ├── rate_check         120 requests a minute per IP, a fixed window; one shared bucket for
     │                      peers with no address (every client on agnos)
@@ -190,7 +201,7 @@ Every AGNOS agent (over the HTTP API and, once started by daimon, its channel on
 
 ## Key Design Decisions
 
-1. **Single compilation unit, multi-file source** — `src/main.cyr` `include`s 29 per-domain `src/*.cyr` modules. Cyrius flattens the includes into one global scope and compiles in one pass; no separate library crate. The 1.2.8 split kept the monolith's source order; later modules came with their features (`mcp_builtin.cyr` / `audit.cyr` at 1.3.0, `secmem.cyr` at 1.3.2, `trace.cyr` at 1.3.3, `syscalls.cyr` at 2.1.6, `sched.cyr` at 2.3.1). At 2.5.3 `src/` is 10,120 lines; the largest modules are `agent.cyr` (1,668), `server.cyr` (1,230) and `ipc.cyr` (1,086).
+1. **Single compilation unit, multi-file source** — `src/main.cyr` `include`s 32 per-domain `src/*.cyr` modules. Cyrius flattens the includes into one global scope and compiles in one pass; no separate library crate. The 1.2.8 split kept the monolith's source order; later modules came with their features (`mcp_builtin.cyr` / `audit.cyr` at 1.3.0, `secmem.cyr` at 1.3.2, `trace.cyr` at 1.3.3, `syscalls.cyr` at 2.1.6, `sched.cyr` at 2.3.1). At 2.5.4 `src/` is 13,351 lines; the largest modules are `files.cyr` (2,216), `agent.cyr` (1,683) and `server.cyr` (1,244).
 2. **daimon's own event loop, sandhi's HTTP** (2.3.4, ADR-006) — `server_loop` owns accept and reads (one thread, epoll). Requests are framed, smuggling-checked and answered with sandhi's public functions, as sandhi's own loops did through 2.3.3. `serve --async` is accepted and runs the same loop. On AGNOS (2.4.0, ADR-007) the loop polls instead of waiting on epoll, and yields with `pause`. Single trust domain.
 3. **Bump allocator** — fast allocation, no individual free. Single trust domain (see VULN-007 security gate for multi-tenant). So upkeep on the loop's tick must not allocate: `agents_tick` allocates nothing, idle or with a live agent (measured at 2.4.2).
 4. **Everything is i64** — Cyrius type system. Structs are manually laid out with `alloc()` + `store64()`/`load64()` at fixed offsets.

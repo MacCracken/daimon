@@ -1,6 +1,6 @@
 # Benchmarks
 
-daimon's benchmarks call its real code: 28 in `tests/daimon.bcyr` (`./scripts/bench-history.sh`)
+daimon's benchmarks call its real code: 33 in `tests/daimon.bcyr` (`./scripts/bench-history.sh`)
 and 2 in `tests/rag_ingest.bcyr` (`cyrius bench tests/rag_ingest.bcyr`). The file is laid out as
 follows:
 - **The baseline** is daimon 2.2.3's, the first release whose benchmarks called daimon's own
@@ -44,6 +44,53 @@ those numbers are not comparable.
 | trace_id_hex | 47ns | 46ns | 100000 | 43ns |
 
 `tests/rag_ingest.bcyr` (real since 2.1.6): `rag_ingest_real_5k` 133.1µs, `rag_chunk_only_5k` 508ns.
+
+### 2.5.4 — tool definition pins and the file index
+
+2.5.3 against 2.5.4, both on cyrius 6.7.18, `tests/daimon.bcyr` and `tests/rag_ingest.bcyr`: 20
+interleaved runs with the order alternating, medians, at a load average of 1.6–2.7. 27 of the 29 rows
+are within ±2.0%. The other two are the rows that moved at 2.5.1 – 2.5.3:
+- `config_default` 93 → 102 ns (+9.7%, spreads 22% / 11%);
+- `trace_id_hex` 50 → 46 ns (−8.0%, spreads 8% / 7%).
+
+Neither path changed. `mcp_manifest_100_tools` (+0.2%) and `mcp_register_100_tools` (+0.7%) register
+tools the pin code has not seen, so they do not measure it: a manifest entry with a pin is 237 bytes
+longer, and a first sight costs a digest, below, and a write of the store.
+
+Five new rows, each a median of the same 20 runs but the one marked:
+
+| Benchmark | median | what it is |
+|---|---:|---|
+| mcp_definition_sha256 | 973.5ns | one tool's digest, of a typical definition |
+| files_find_in_41k | 138ns | a path to its record |
+| files_count_flags_41k | 762µs | a query on flags, over 41,200 records (18 ns each) |
+| files_count_ext_41k | 3.14ms | a query on 8 extensions, over the same † |
+| files_list_100_of_41k | 882µs | a page of 100, counting every match for `total` |
+
+† 8.46 → 3.14 ms (−63%) from comparing an extension's first byte before anything else, found by
+this row. 7 interleaved runs at a load average of 1.9–2.5, spreads 5% / 6%.
+
+
+**The index under load.** The linked binary with the rate limit lifted in a scratch copy (the limit is
+120 requests a minute, and a latency sample needs more). A client timed `GET /v1/health` over a new
+connection each time, alternating with `GET /v1/files/index` until `fresh`. On tmpfs, x86_64, at a load
+average of 2–4. The first row is no index at all, 400 samples.
+
+| job | to `fresh` | RSS | health p50 | p99 | max |
+|---|---:|---:|---:|---:|---:|
+| none (idle, no root) | | 5 MB | 0.16 ms | 0.23 ms | 1.88 ms |
+| 41,200 small files in 200 directories, most sharing a size with another | 0.69 s | 31 MB | 0.16 ms | 1.21 ms | 3.99 ms |
+| one directory of 60,000 entries | 0.30 s | 29 MB | 1.04 ms | 3.81 ms | 7.51 ms |
+| 40 files of 32 MiB, one size, half identical (1.3 GB read) | 4.55 s | 21 MB | 2.90 ms | 3.11 ms | 5.36 ms |
+
+A slice is 3 ms, and the third job shows it: a client waits for the one running. The second is the
+one step a slice cannot divide, one directory's `getdents`, and 60,000 entries cost 7.5 ms at worst.
+
+| answer, over 41,200 files | p50 | max |
+|---|---:|---:|
+| `GET /v1/files/smart`, 50 calls: the first does the six counts, the rest reuse them | 0.17 ms | 13.47 ms |
+| `GET /v1/files?untagged=1&limit=100` | 1.22 ms | 1.51 ms |
+| a restart, to the first answer, reading 8.9 MB of `index` | 92 ms | |
 
 ### 2.5.3 — bote 3.8.9 and nein 1.9.1
 

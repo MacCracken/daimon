@@ -4,6 +4,170 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.5.4] - 2026-11-06
+
+**Tool definition pins, a file index with tags, ratings and smart folders, bote 3.8.15 and agnos
+1.57.17.** Items 1–3 of thoth's filing and M7 of crab's. **1556 tests** across 19 suites, **233 HTTP smoke checks** (80 new) and 8 fuzz harnesses, all green on
+Linux. On a real aarch64 kernel: all 1556 checks and the binary's 20-check smoke. The AGNOS guest test
+passes 106 checks on agnos 1.57.17 (61 + 45; eleven new). fmt, lint and vet are clean; x86_64, aarch64
+and agnos build; `cyrius.lock` verifies 91 of 91.
+
+### Added — tool definition pins (thoth's filing, ADR-009)
+
+An MCP tool's description is read by a model as guidance, so swapping one after it was approved is
+prompt injection with an approval already granted. A client that pins definitions had nothing to
+repair from when it lost its pins. `GET /v1/mcp/tools` now gives it that.
+- **Each entry carries** `definition_sha256`, `pin_state` (`pinned`, `changed`, `unpinned`),
+  `pinned_sha256`, `pinned_at` and `pin_from_store`, builtins and externals alike. `pins` says what the
+  store is (`loaded`, `new`, `rejected`, `unavailable`) and whether it lasts (`durable`).
+- **The digest covers the bytes a client receives**: SHA-256 over `name \0 description \0 inputSchema`,
+  which is thoth's form. bayan's compact text is a fixed point, so a client that re-serialises the
+  schema gets the same bytes. `tests/mcp_pin.tcyr` holds vectors computed by Python's hashlib, the smoke
+  checks the running binary against `sha256sum`, and `fuzz/tool_pin.fcyr` makes 80,000 draws of documents
+  and numbers, of which none that bayan accepts moved.
+- **A pin is the first definition daimon saw, and a registration cannot move it.** A later one that
+  differs is served, marked `changed`, audited `mcp.tool.changed`, and the registrant is told (`201
+  {"ok":true,"pin_state":"changed"}`). Deregistering keeps the pin, and so does a restart.
+- **A registration now leaves a record**: `mcp.tool.register`, `mcp.tool.deregister`.
+- **A builtin's pin follows the binary**, audited `mcp.pin.builtin.moved`.
+- **`POST /v1/mcp/tools/{name}/accept` moves a pin, and is refused** (403, `mcp.pin.accept.deny`), as
+  `nein_allow` and `libro_retention` are, unless the operator passes `serve --mcp-pin-accept`.
+  Per-consumer acceptance through t-ron needs caller identity (roadmap 2.6.x), so thoth's item 4 stays open.
+- **The store is `<data_dir>/mcp/toolpins`**, one JSON line per pin under a whole-file SHA-256. A file
+  that fails any check is refused whole, left untouched as evidence, and never written over.
+- Past 1,024 pins, or for a name over 256 bytes, a tool is served `unpinned`, not refused: the table
+  fills through the same unauthenticated route, and refusing would let a flood deny tools across restarts.
+
+### Added — the file index (crab's filing, items 1–4, ADR-010)
+
+`/v1/files`: an index of the files under the operator's roots, with tags, ratings and smart folders,
+surviving a restart. Item 5, ranked search, is crab's next release and is on the roadmap.
+- ⛔ **It is off unless the operator passes `serve --index-root DIR`.** The API has no caller
+  authentication until 2.6.x, so anything local can read what the index holds. With no root it is
+  `none`, nothing is reserved and nothing is written. A path outside the roots is refused, and every
+  route here refuses a browser, reads included.
+- **The walk runs on the loop, in slices** of 3 ms or a count of steps, so no thread and no process slot.
+  Numbers under *Performance*. It follows no symlink, and passes over hidden directories, `/proc`, `/sys`,
+  `/dev`, `/run`, its own data directory, and any name that is not UTF-8, counting what it skips.
+- **Two generations are reserved at open.** A walk fills the one not being served, so a query never sees
+  half of one, and neither a walk nor a client polling allocates. `tests/files.tcyr` checks both with
+  `alloc_used`. A re-walk runs at start, hourly and on request, for a path or everything.
+- **Duplicates compare a whole SHA-256 of the whole content**, because crab offers to delete them. Only
+  files sharing a size are read, and a digest is reused while path, size and mtime match.
+- **`GET /v1/files/index`** tells apart `none`, `building`, `catching_up`, `paused` and `fresh`, with
+  progress. A job pauses on battery on Linux. On AGNOS `power` is `unknown` and a walk runs: the kernel
+  has no power source to read (filed with agnos, 2026-11-06).
+- **Queries are query-string text**, shared by `GET /v1/files` and saved smart folders, and an unknown key
+  is refused. Filters: `tag` (exact), `untagged`, `unrated`, `rating`, `duplicates`, `under`, `ext`,
+  `min_size`, `newer_days`, `older_days`. Answers are paged and bounded, and built in a kept buffer.
+- **Tags and ratings** per file, batched up to 256 paths a request, with counts and suggestions drawn from
+  what a folder's files carry. **Six smart folders ship** as queries, with counts. Crab's canvas names them
+  and defines none, so "Large & old" and "Raw only" are daimon's reading, and saving a query replaces one.
+- **What a person gave is a journal** (`<data_dir>/files/meta`), synced per request: a line that cannot be
+  read costs only itself, the file is then not rewritten, and a restart compacts it. **`index` is derived**,
+  so one that fails a check is dropped and rebuilt, as is one holding anything outside today's roots.
+
+### Added — flags
+
+- `serve --data-dir DIR`: what outlives a restart (default `/var/lib/agnos`). The agent memory store
+  follows it.
+- `serve --index-root DIR` (repeatable), `--index-max N`, `--mcp-pin-accept`.
+
+### Changed — dependency and kernel pins
+
+| pin | was | now |
+|---|---|---|
+| bote | 3.8.9 | **3.8.15** |
+| agnos, in the guest test | 1.57.14 | **1.57.17** |
+| gnoboot, in the guest test | 0.7.2 | **0.9.0** |
+
+Every other pin was already its repo's latest tag, and cyrius 6.7.18 is the latest. The lock moves by
+two lines, re-resolved from an empty `lib/`.
+
+- **bote 3.8.15** (3.8.10 – 3.8.15). JSON Schema keywords in bote's dispatcher, which daimon does not use.
+  **Of the 114 bote functions reachable from what daimon calls, none changed.** 71 others did, 257 were
+  added and 4 removed, and the binary grows by what comes in with them (see *Sizes*). nein 1.9.1 asks for
+  bote-core 3.8.9, and daimon's root pin wins, as `cyrius deps` notes.
+- **agnos 1.57.17**: `rename#31` replaces an existing file on ext2, crash-atomically. A store is written
+  more than once, so it needs this: on 1.57.14 the guest test's second write failed, and the store said
+  `unavailable`, as designed. daimon does not work around it with an unlink, which would give up crash
+  atomicity. ⚠ **Tool pins and the index need agnos 1.57.17 to keep updating**; on an older kernel they
+  say what will not last, and everything else runs as before. Both releases' hashes match their
+  `SHA256SUMS`.
+
+### Fixed before shipping
+
+- **An empty pin store read as no store**, so truncating it reset every pin to a first sight and wrote
+  over the evidence: the hole thoth filed, reopened by the fix for it. `tests/mcp_pin.tcyr` found it on
+  its first run. (TP-1)
+- **A snapshot offset near 2⁶³ wrapped its bounds check.** The first test used 2⁴⁰ and passed on the wrong
+  code; review found it. (FX-1)
+- **`meta` had no size bound**: re-tagging one file appends, so a local caller could grow it at about
+  34 MB a minute. It stops at 64 MiB, answers 409, and a restart compacts it. (FX-2)
+- **A file name that is not UTF-8 would have broken every page holding it** for a strict client. (FX-3)
+- ⚠ **16 assertions in the new suites passed vacuously.** `strstr` answers an index or -1, and they tested
+  `!= 0`. The file index's held. The pin suite's did not, because they passed a `Str` where a C string
+  goes, which the vacuous check had hidden; the smoke had checked the same manifest through `grep`, so no
+  shipped behaviour was wrong. All 16 are fixed, and a mutation in a scratch copy shows one failing.
+
+### Security
+
+See [the audit](docs/audit/2026-11-06-tool-pins-and-file-index-audit.md). Open by design until 2.6.x: any
+local process can read and edit the index once an operator names a root (R-1, R-2).
+
+### Tests
+
+- **`tests/mcp_pin.tcyr`** (new, 159): the digest against hashlib's vectors, the schema's fixed point, a
+  registration against its pin, a deregistration, a restart, a builtin, accepting, the limits, and each way
+  a store is refused, with the file compared byte for byte to show nothing wrote over it.
+- **`tests/files.tcyr`** (new, 303): a real tree with a real FIFO and symlinks, a name that is not UTF-8,
+  duplicates, tags and exact matching, ratings, every query key and refusal, pages, smart folders, a restart,
+  a re-walk, a scoped re-index, pausing on battery, the journal's bound, damaged journals and indexes
+  including offsets that lie under a passing digest, a root narrowed by the operator, and `alloc_used`.
+- **`fuzz/tool_pin.fcyr`** (new): the schema's fixed point over generated documents and numbers, two
+  spellings of one schema, and `_pin_load` on noise, with guards that fail if a property ran on nothing.
+- **Smoke** (153 → 233): 28 on pins, with `sha256sum` as the other client and a real restart of the process,
+  and 52 on `/v1/files`, through every route. **AGNOS guest** (+11): both features on the real kernel,
+  through its own `getdents#29`, `lstat#102` and `rename#31`.
+
+### Sizes and performance
+
+| target | 2.5.3 | with bote 3.8.15 alone | 2.5.4 | |
+|---|---:|---:|---:|---:|
+| x86_64 | 2,269,352 | 2,402,376 | 2,489,760 | +9.7% |
+| aarch64 | 5,054,280 | 5,404,400 | 5,475,408 | +8.3% |
+| agnos | 2,177,872 | 2,315,008 | 2,398,280 | +10.1% |
+
+Most of it is bote: 133,024 of the 220,408 bytes on x86_64.
+
+2.5.3 against 2.5.4, both on cyrius 6.7.18, `tests/daimon.bcyr` and `tests/rag_ingest.bcyr`: 20
+interleaved runs with the order alternating, medians, at a load average of 1.6–2.7. 27 of the 29 rows
+are within ±2.0%. The other two are the rows that moved at 2.5.1 – 2.5.3, in code that did not change:
+- `config_default` 93 → 102 ns (+9.7%, spreads 22% / 11%);
+- `trace_id_hex` 50 → 46 ns (−8.0%, spreads 8% / 7%).
+
+Five new rows, among them `mcp_definition_sha256` at 973.5 ns, and over 41,200 records:
+
+| query | cost |
+|---|---:|
+| by flags (`untagged=1&unrated=1`) | 762 µs |
+| by 8 extensions | 3.14 ms |
+| a page of 100, counting every match | 882 µs |
+
+The extension row found its own fix: comparing a first byte first took it from 8.46 ms to 3.14 ms
+(−63%; 7 interleaved runs, load 1.9–2.5, spreads 5% / 6%).
+
+**The index under load**, in a scratch copy with only the rate limit lifted, on tmpfs, at a load average
+of 2–4. `/v1/health` while a job ran, against p99 0.23 ms and max 1.88 ms with no index:
+
+| job | to `fresh` | RSS | p99 | max |
+|---|---:|---:|---:|---:|
+| 41,200 small files | 0.69 s | 31 MB | 1.21 ms | 3.99 ms |
+| one directory of 60,000 entries | 0.30 s | 29 MB | 3.81 ms | 7.51 ms |
+| 1.3 GB read for digests | 4.55 s | 21 MB | 3.11 ms | 5.36 ms |
+
+A restart serves the 41,200-file index in 92 ms. See BENCHMARKS.md.
+
 ## [2.5.3] - 2026-11-04
 
 **bote 3.8.9 and nein 1.9.1.** **1094 tests** across 17 suites, **153 HTTP smoke checks** (two new)

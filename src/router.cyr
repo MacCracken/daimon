@@ -145,11 +145,30 @@ fn http_route(fd, method, path, buf, buf_len) {
         return 0;
     }
 
-    # DELETE /v1/mcp/tools/{name}
+    # DELETE /v1/mcp/tools/{name}, POST /v1/mcp/tools/{name}/accept (2.5.4)
     if (memeq(path, "/v1/mcp/tools/", 14) == 1) {
         if (method == 3) { api_mcp_deregister(fd, path + 14); return 0; }
+        if (method == 1) {
+            var pn = _route_id_before(path + 14, strlen(path + 14), "/accept", 7);
+            if (pn != 0) {
+                if (_route_refuse_browser(fd, buf, buf_len, "tool") == 1) { return 0; }
+                api_mcp_pin_accept(fd, pn);
+                return 0;
+            }
+        }
         http_method_not_allowed(fd);
         return 0;
+    }
+
+    # /v1/files (2.5.4). A read is guarded too, unlike the rest of the API: what
+    # it answers is the names of a person's files.
+    if (memeq(path, "/v1/files", 9) == 1) {
+        var fb = load8(path + 9);
+        if ((fb == 0) || (fb == 47)) {
+            if (_route_refuse_browser(fd, buf, buf_len, "file") == 1) { return 0; }
+            api_files_route(fd, method, path, buf, buf_len);
+            return 0;
+        }
     }
 
     # --- MCP resources + prompts (2.1.0) ---

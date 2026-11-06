@@ -1,0 +1,2216 @@
+# =========================================================================
+# files — an index of the files under the operator's roots, with each file's
+#         tags and rating, and saved queries over them (2.5.4)
+# =========================================================================
+#
+# The surface crab's M7 asks for: docs/development/issues/2026-09-23-crab-needs-
+# a-file-index-tags-and-ranked-search.md. ADR-010 records the decisions; the API
+# is in docs/guides/api.md. A file's identity is its absolute path.
+#
+# ⛔ NOTHING IS INDEXED UNLESS THE OPERATOR NAMED A ROOT (`serve --index-root`).
+# The HTTP API has no caller authentication until roadmap 2.6.x, so whatever this
+# holds, any local process can read: the same exposure that keeps the agent
+# memory API without a route. A disk-wide index of every user's file names,
+# offered by default, would be a disclosure. With no root the index is `none`,
+# and a path outside the roots is refused. The walk does not follow a symlink, so
+# a link inside a root cannot lead it outside one.
+#
+# ON THE LOOP, IN SLICES. daimon is one thread (ADR-006), and a handler that
+# blocks holds everything. Each slice stops at FILES_SLICE_MS, or at a count of
+# steps should a clock stand still (agnos, daimon_now_ms). A thread would arm the
+# heap lock for good, and a child would take one of agnos's 16 process slots for
+# as long as a walk lasts, and could not pause as simply as not stepping.
+#
+# NOTHING HERE ALLOCATES PER FILE. alloc never frees, so an index that re-walked
+# through it would grow daimon for as long as it ran. All of it is reserved when
+# the index opens, as two GENERATIONS: a walk fills the one not being served and
+# is swapped in whole, so a query never sees half a walk. tests/files.tcyr checks
+# that a re-walk leaves alloc_used where it was. A tag or a rating does allocate:
+# it is a person's act, one per request.
+#
+# DUPLICATES COMPARE A WHOLE SHA-256 of each file's whole content, never a sample
+# or a truncated digest. crab offers to delete them, so a false match loses data.
+# A size is compared first, so only files sharing one are read, and a digest is
+# reused from the generation before when a file's path, size and mtime still match.
+#
+# THE FILES, under <data_dir>/files (0700):
+# - `index`, the served generation as written, under a SHA-256. It is derived, so
+#   one that fails its checks is dropped and rebuilt; it is not synced.
+# - `meta`, an append-only journal of JSON lines, one per change, the last line
+#   for a path or a smart folder winning. It holds what a person gave and nothing
+#   rebuilds it, so a line that cannot be read is skipped and counted rather than
+#   costing the rest, and the file is then not compacted. Each append is synced.
+
+#ifdef CYRIUS_TARGET_AGNOS
+var FILES_MAX = 65536;            # agnos's mmap#27 is zero-filled, so what is reserved is held
+#else
+var FILES_MAX = 262144;           # files and directories in a generation (--index-max)
+#endif
+var FILES_POOL_PER = 96;          # bytes of path pool reserved per record
+var FILES_SLICE_MS = 3;           # the longest one slice runs by the clock
+var FILES_SLICE_ENTRIES = 256;    # ... and by a count: a clock can stand still on agnos
+var FILES_SLICE_READS = 16;       # reads per slice, each up to FILES_IO_BYTES
+var FILES_IO_BYTES = 65536;
+var FILES_SAVE_CHUNK = 262144;    # bytes of `index` written per slice
+var FILES_REWALK_SECS = 3600;     # nothing watches the disk, so an hour is how stale it gets
+var FILES_POWER_POLL_MS = 10000;
+var FILES_ROOTS_MAX = 16;
+var FILES_PATH_MAX = 1023;        # xmkdir_p's bound; a longer path is counted as skipped
+var FILES_DIR_ENTRIES = 65536;    # one directory; a larger one is counted as skipped
+var FILES_DIR_NAMES = 2097152;
+var FILES_META_MAX = 65536;       # files with a tag or a rating
+var FILES_JOURNAL_MAX = 67108864; # bytes in `meta`: a restart compacts it. See files_journal_full
+var FILES_TAGS_MAX = 4096;        # distinct tags
+var FILES_FILE_TAGS_MAX = 32;     # tags on one file
+var FILES_TAG_MAX = 64;           # bytes in a tag
+var FILES_SMART_MAX = 64;
+var FILES_SMART_NAME_MAX = 64;
+var FILES_QUERY_MAX = 1024;
+var FILES_RATING_MAX = 5;
+#ifdef CYRIUS_TARGET_AGNOS
+var FILES_PAGE_BYTES = 8192;      # an answer is written 512 bytes at a time there, holding the loop
+#else
+var FILES_PAGE_BYTES = 65536;
+#endif
+#ifdef CYRIUS_TARGET_AGNOS
+var FILES_O_NONBLOCK = 0;         # file_open has no such bit to bridge, and agnos has no FIFO to open
+#else
+var FILES_O_NONBLOCK = O_NONBLOCK;
+#endif
+var FILES_OUT_SLACK = 32768;      # the longest row, past the page's end
+var FILES_LIMIT_DEFAULT = 100;
+var FILES_LIMIT_MAX = 1000;
+
+# A record, in a generation's array and as written to `index`.
+var FX_REC = 56;
+var FX_R_PATH = 0;     # offset into the pool of a NUL-terminated path
+var FX_R_SIZE = 8;
+var FX_R_MTIME = 16;
+var FX_R_DIGEST = 24;  # offset into the pool of a 32-byte SHA-256, or 0
+var FX_R_GROUP = 32;   # duplicates share a group; 0 is none
+var FX_R_FLAGS = 40;   # u8
+var FX_R_RATING = 41;  # u8
+var FX_R_PLEN = 42;    # u16
+var FX_R_META = 48;    # FileMeta, or 0. Not meaningful on disk.
+
+var FX_F_DIR = 1;
+var FX_F_CAND = 2;     # shares its size with another file
+var FX_F_DUP = 4;      # shares its content with another file
+var FX_F_TAGGED = 8;
+var FX_F_RATED = 16;
+var FX_F_DISK = 5;     # what `index` may say: DIR and DUP. The rest is resolved here.
+
+# A generation.
+var FX_G_RECS = 0;
+var FX_G_N = 8;
+var FX_G_POOL = 16;
+var FX_G_USED = 24;
+var FX_G_TABLE = 32;   # open addressing, path to record: u32 index + 1
+var FX_G_TABLE2 = 40;  # the same, for sizes and digests during a job
+var FX_G_FILES = 48;
+var FX_G_BYTES = 56;
+var FX_G_TRUNC = 64;
+var FX_G_SKIPPED = 72;
+var FX_G_DUPS = 80;
+var FX_G_SIZE = 88;
+
+# The phases of a job.
+var FX_IDLE = 0;
+var FX_COPY = 1;       # a scoped job keeps what lies outside its path
+var FX_WALK = 2;
+var FX_SIZES = 3;
+var FX_HASH = 4;
+var FX_GROUP = 5;
+var FX_SAVE = 6;
+
+var FILES_INDEX_MAGIC = "DAIMON-FILEIDX-1\n";
+var FILES_INDEX_MAGIC_LEN = 17;
+var FILES_INDEX_HDR = 64;
+
+var _fx_roots = 0;         # vec of cstr
+var _fx_enabled = 0;       # the index is open
+var _fx_dir = 0;           # <data_dir>/files, cstr, or 0 when nothing can be kept
+var _fx_index_path = 0;
+var _fx_tmp_path = 0;
+var _fx_meta_path = 0;
+var _fx_data_dir = 0;      # cstr: the index never walks its own files
+var _fx_cap = 0;
+var _fx_tbl = 0;           # entries in a table, a power of two
+var _fx_pool_cap = 0;
+var _fx_seed = 0;
+var _fx_gen_a = 0;
+var _fx_gen_b = 0;
+var _fx_active = 0;        # the generation being served
+var _fx_next = 0;          # the one a job fills
+var _fx_generation = 0;    # bumps at each swap; a client paging can see one
+var _fx_version = 1;       # bumps when anything a query reads changes
+var _fx_indexed_at = 0;
+var _fx_persisted = 0;     # `index` holds the served generation
+var _fx_phase = 0;
+var _fx_want = 0;          # a job is wanted
+var _fx_want_path = 0;     # ... scoped to this path (cstr), or 0 for every root
+var _fx_scope = 0;
+var _fx_scope_len = 0;
+var _fx_seeds_left = 0;
+var _fx_done = 0;          # progress within the phase
+var _fx_total = 0;
+var _fx_next_at = 0;       # epoch secs: the next re-walk
+var _fx_paused = 0;
+var _fx_power_next = 0;
+var _fx_power_files = 0;   # vec of cstr: battery status files
+var _fx_power_state = 0;   # 0 unknown, 1 mains, 2 battery
+
+var _fx_cursor = 0;        # record reached, per phase
+var _fx_path = 0;          # kept: the path being built
+var _fx_plen = 0;
+var _fx_stat = 0;
+var _fx_str = 0;           # kept Str, so listing a directory allocates nothing
+var _fx_scratch = 0;
+var _fx_names = 0;
+var _fx_offs = 0;
+var _fx_list_n = 0;
+var _fx_list_i = 0;
+var _fx_io = 0;
+var _fx_ctx = 0;           # kept SHA-256 state
+var _fx_hash_fd = 0 - 1;
+var _fx_hash_left = 0;
+var _fx_hashed = 0;        # files read for a digest, since the index opened
+var _fx_groups = 0;
+var _fx_hdr = 0;
+var _fx_save_fd = 0 - 1;
+var _fx_save_stage = 0;
+var _fx_save_off = 0;
+
+var _fx_meta = 0;          # map<path_cstr, FileMeta>
+var _fx_meta_list = 0;     # vec of FileMeta
+var _fx_tagset = 0;        # map<tag_cstr, FileTag>
+var _fx_tag_list = 0;      # vec of FileTag
+var _fx_meta_skipped = 0;  # journal lines that could not be read
+var _fx_meta_failed = 0;   # an append failed: what follows lasts for this run
+var _fx_journal_bytes = 0;
+var _fx_smart = 0;         # vec of SmartFolder
+var _fx_counts_version = 0;
+
+var _fx_out = 0;           # kept: an answer is built here, so polling grows nothing
+var _fx_out_cap = 0;
+var _fx_o = 0;
+
+fn files_init() {
+    _fx_roots = vec_new();
+    _fx_meta = map_new();
+    _fx_meta_list = vec_new();
+    _fx_tagset = map_new();
+    _fx_tag_list = vec_new();
+    _fx_smart = vec_new();
+    _fx_power_files = vec_new();
+    return 0;
+}
+
+fn files_set_max(n) { FILES_MAX = n; return 0; }
+
+# --- paths -----------------------------------------------------------------
+
+# 1 if these bytes are well-formed UTF-8 (RFC 3629: no overlong form, surrogate,
+# or code point past U+10FFFF). A file name can hold any byte and JSON cannot, so
+# a name that is not text cannot be a path a client gets back: it would make every
+# page holding it unreadable to a strict parser. The walk counts one as skipped.
+fn files_utf8_ok(p, n) {
+    var i = 0;
+    while (i < n) {
+        var c = load8(p + i);
+        var more = 0;
+        var lo = 128;
+        var hi = 191;
+        if (c < 128) { more = 0; }
+        elif ((c >= 194) && (c <= 223)) { more = 1; }
+        elif (c == 224) { more = 2; lo = 160; }
+        elif ((c >= 225) && (c <= 239)) {
+            more = 2;
+            if (c == 237) { hi = 159; }
+        }
+        elif (c == 240) { more = 3; lo = 144; }
+        elif ((c >= 241) && (c <= 243)) { more = 3; }
+        elif (c == 244) { more = 3; hi = 143; }
+        else { return 0; }
+        i = i + 1;
+        if (i + more > n) { return 0; }
+        while (more > 0) {
+            var b = load8(p + i);
+            if ((b < lo) || (b > hi)) { return 0; }
+            lo = 128;
+            hi = 191;
+            i = i + 1;
+            more = more - 1;
+        }
+    }
+    return 1;
+}
+
+# 1 for an absolute path spelled one way: no empty, `.` or `..` component, no
+# trailing slash, and no control byte. "/" is one. This is what makes a string
+# comparison a containment test: there is no second spelling of a path.
+fn files_path_ok(p, n) {
+    if (n < 1) { return 0; }
+    if (n > FILES_PATH_MAX) { return 0; }
+    if (load8(p) != 47) { return 0; }
+    if (files_utf8_ok(p, n) == 0) { return 0; }
+    if (n == 1) { return 1; }
+    if (load8(p + n - 1) == 47) { return 0; }
+    var i = 0;
+    var seg = 1;
+    while (i < n) {
+        var c = load8(p + i);
+        if (c < 32) { return 0; }
+        if (c == 47) {
+            if (i > 0) {
+                if (i - seg == 0) { return 0; }
+                if ((i - seg == 1) && (load8(p + seg) == 46)) { return 0; }
+                if ((i - seg == 2) && (load8(p + seg) == 46) && (load8(p + seg + 1) == 46)) { return 0; }
+            }
+            seg = i + 1;
+        }
+        i = i + 1;
+    }
+    if ((n - seg == 1) && (load8(p + seg) == 46)) { return 0; }
+    if ((n - seg == 2) && (load8(p + seg) == 46) && (load8(p + seg + 1) == 46)) { return 0; }
+    return 1;
+}
+
+# 1 if `p` is `dir` or lies under it. Both are in files_path_ok's form.
+fn files_under(p, n, dir, dn) {
+    if (n < dn) { return 0; }
+    if (memeq(p, dir, dn) != 1) { return 0; }
+    if (n == dn) { return 1; }
+    if (dn == 1) { return 1; }      # "/"
+    if (load8(p + dn) == 47) { return 1; }
+    return 0;
+}
+
+fn files_in_roots(p, n) {
+    var i = 0;
+    while (i < vec_len(_fx_roots)) {
+        var r = vec_get(_fx_roots, i);
+        if (files_under(p, n, r, strlen(r)) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Add a root (`serve --index-root`). Returns 1, or 0 for a path not in the form
+# files_path_ok asks for, or one too many.
+fn files_add_root(p) {
+    if (files_path_ok(p, strlen(p)) == 0) { return 0; }
+    if (vec_len(_fx_roots) >= FILES_ROOTS_MAX) { return 0; }
+    vec_push(_fx_roots, p);
+    return 1;
+}
+
+# Pseudo-filesystems, and daimon's own directory, are not files a person has.
+fn _fx_excluded(p, n) {
+    if (n == 5) {
+        if (memeq(p, "/proc", 5) == 1) { return 1; }
+    }
+    if (n == 4) {
+        if (memeq(p, "/sys", 4) == 1) { return 1; }
+        if (memeq(p, "/dev", 4) == 1) { return 1; }
+        if (memeq(p, "/run", 4) == 1) { return 1; }
+    }
+    if (_fx_data_dir != 0) {
+        if (files_under(p, n, _fx_data_dir, strlen(_fx_data_dir)) == 1) { return 1; }
+    }
+    return 0;
+}
+
+# --- a generation ----------------------------------------------------------
+
+fn _fx_rec(g, i) { return load64(g + FX_G_RECS) + i * FX_REC; }
+fn _fx_rec_path(g, r) { return load64(g + FX_G_POOL) + load64(r + FX_R_PATH); }
+fn _fx_rec_plen(r) { return load16(r + FX_R_PLEN); }
+fn _fx_rec_flags(r) { return load8(r + FX_R_FLAGS); }
+fn _fx_rec_set_flag(r, f) { store8(r + FX_R_FLAGS, load8(r + FX_R_FLAGS) | f); return 0; }
+fn _fx_rec_clear_flag(r, f) { store8(r + FX_R_FLAGS, load8(r + FX_R_FLAGS) & (255 - f)); return 0; }
+
+fn _fx_gen_new() {
+    var g = alloc(FX_G_SIZE);
+    var recs = alloc(_fx_cap * FX_REC);
+    var pool = alloc(_fx_pool_cap);
+    var t1 = alloc(_fx_tbl * 4);
+    var t2 = alloc(_fx_tbl * 4);
+    if ((g == 0) || (recs == 0) || (pool == 0) || (t1 == 0) || (t2 == 0)) { return 0; }
+    store64(g + FX_G_RECS, recs);
+    store64(g + FX_G_POOL, pool);
+    store64(g + FX_G_TABLE, t1);
+    store64(g + FX_G_TABLE2, t2);
+    return g;
+}
+
+fn _fx_gen_clear(g) {
+    store64(g + FX_G_N, 0);
+    store64(g + FX_G_USED, 8);    # offset 0 means none
+    store64(g + FX_G_FILES, 0);
+    store64(g + FX_G_BYTES, 0);
+    store64(g + FX_G_TRUNC, 0);
+    store64(g + FX_G_SKIPPED, 0);
+    store64(g + FX_G_DUPS, 0);
+    memset(load64(g + FX_G_TABLE), 0, _fx_tbl * 4);
+    return 0;
+}
+
+# Keyed per process, so names a user chooses cannot be made to collide in advance.
+fn _fx_hash(p, n) {
+    var h = _fx_seed;
+    var i = 0;
+    while (i < n) {
+        h = (h ^ load8(p + i)) * 1099511628211;
+        i = i + 1;
+    }
+    return h ^ ((h >> 29) & 0x7FFFFFFFF);
+}
+
+fn _fx_find(g, p, n) {
+    var mask = _fx_tbl - 1;
+    var t = load64(g + FX_G_TABLE);
+    var pool = load64(g + FX_G_POOL);
+    var i = _fx_hash(p, n) & mask;
+    while (1 == 1) {
+        var e = load32(t + i * 4);
+        if (e == 0) { return 0 - 1; }
+        var r = _fx_rec(g, e - 1);
+        if (_fx_rec_plen(r) == n) {
+            if (memeq(pool + load64(r + FX_R_PATH), p, n) == 1) { return e - 1; }
+        }
+        i = (i + 1) & mask;
+    }
+    return 0 - 1;
+}
+
+fn _fx_table_put(g, p, n, idx) {
+    var mask = _fx_tbl - 1;
+    var t = load64(g + FX_G_TABLE);
+    var i = _fx_hash(p, n) & mask;
+    while (load32(t + i * 4) != 0) { i = (i + 1) & mask; }
+    store32(t + i * 4, idx + 1);
+    return 0;
+}
+
+# Append a record. Returns its index, or -1 when the generation is full, which
+# it says: an index that stopped short must not read as complete.
+fn _fx_add(g, p, n, size, mtime, flags) {
+    var idx = load64(g + FX_G_N);
+    var used = load64(g + FX_G_USED);
+    if ((idx >= _fx_cap) || (used + n + 1 > _fx_pool_cap)) {
+        store64(g + FX_G_TRUNC, 1);
+        return 0 - 1;
+    }
+    var pool = load64(g + FX_G_POOL);
+    memcpy(pool + used, p, n);
+    store8(pool + used + n, 0);
+    var r = _fx_rec(g, idx);
+    store64(r + FX_R_PATH, used);
+    store64(r + FX_R_SIZE, size);
+    store64(r + FX_R_MTIME, mtime);
+    store64(r + FX_R_DIGEST, 0);
+    store64(r + FX_R_GROUP, 0);
+    store64(r + FX_R_FLAGS, 0);
+    store8(r + FX_R_FLAGS, flags);
+    store16(r + FX_R_PLEN, n);
+    store64(r + FX_R_META, 0);
+    store64(g + FX_G_N, idx + 1);
+    store64(g + FX_G_USED, (used + n + 8) & (0 - 8));
+    if ((flags & FX_F_DIR) == 0) {
+        store64(g + FX_G_FILES, load64(g + FX_G_FILES) + 1);
+        store64(g + FX_G_BYTES, load64(g + FX_G_BYTES) + size);
+    }
+    _fx_table_put(g, p, n, idx);
+    return idx;
+}
+
+fn _fx_skip(g) {
+    store64(g + FX_G_SKIPPED, load64(g + FX_G_SKIPPED) + 1);
+    return 0;
+}
+
+# --- a walk ----------------------------------------------------------------
+
+# Record the path in _fx_path, as lstat finds it. A symlink, a socket, a device
+# and a FIFO are not files for this index, and a link is not followed.
+fn _fx_visit(g, hidden_ok) {
+    var p = _fx_path;
+    var n = _fx_plen;
+    if (daimon_lstat(p, n, _fx_stat) != 0) { _fx_skip(g); return 0; }
+    var type = load32(_fx_stat + STAT_MODE) & 0xF000;
+    if (type == 0x8000) {
+        if (_fx_find(g, p, n) < 0) {
+            _fx_add(g, p, n, load64(_fx_stat + STAT_SIZE), load64(_fx_stat + STAT_MTIME), 0);
+        }
+        return 0;
+    }
+    if (type != 0x4000) { return 0; }
+    if (_fx_excluded(p, n) == 1) { return 0; }
+    if (hidden_ok == 0) {
+        # A hidden directory is a tool's, not a person's: .git alone can outnumber
+        # everything else in a home directory. Its name is the last component.
+        var i = n;
+        while ((i > 0) && (load8(p + i - 1) != 47)) { i = i - 1; }
+        if (load8(p + i) == 46) { return 0; }
+    }
+    if (_fx_find(g, p, n) < 0) { _fx_add(g, p, n, 0, 0, FX_F_DIR); }
+    return 0;
+}
+
+fn _fx_seed_path(g, p) {
+    var n = strlen(p);
+    memcpy(_fx_path, p, n + 1);
+    _fx_plen = n;
+    _fx_visit(g, 1);
+    return 0;
+}
+
+# List the directory at record `r` into the kept buffers. A kept Str, because
+# dir_list_into takes one and a walk visits every directory.
+fn _fx_list(g, r) {
+    var n = _fx_rec_plen(r);
+    memcpy(_fx_path, _fx_rec_path(g, r), n + 1);
+    _fx_plen = n;
+    store64(_fx_str, _fx_path);
+    store64(_fx_str + 8, n);
+    var c = dir_list_into(_fx_str, _fx_scratch, 16384, _fx_names, FILES_DIR_NAMES, _fx_offs, FILES_DIR_ENTRIES);
+    if (c < 0) {
+        # Unreadable, or larger than the buffers: counted, never read as empty.
+        _fx_skip(g);
+        c = 0;
+    }
+    _fx_list_n = c;
+    _fx_list_i = 0;
+    return 0;
+}
+
+# A name a path can be made of: text, with no control byte (files_path_ok).
+fn _fx_name_ok(name, n) {
+    if (files_utf8_ok(name, n) == 0) { return 0; }
+    var i = 0;
+    while (i < n) {
+        if (load8(name + i) < 32) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn _fx_walk_slice(g, deadline) {
+    var steps = 0;
+    while (steps < FILES_SLICE_ENTRIES) {
+        if (_fx_list_i < _fx_list_n) {
+            var name = _fx_names + load64(_fx_offs + _fx_list_i * 8);
+            _fx_list_i = _fx_list_i + 1;
+            var nlen = strlen(name);
+            var base = load16(_fx_rec(g, _fx_cursor - 1) + FX_R_PLEN);
+            if (base == 1) { base = 0; }     # the root "/": no second slash
+            if (base + 1 + nlen > FILES_PATH_MAX) { _fx_skip(g); }
+            elif (_fx_name_ok(name, nlen) == 0) { _fx_skip(g); }
+            else {
+                store8(_fx_path + base, 47);
+                memcpy(_fx_path + base + 1, name, nlen + 1);
+                _fx_plen = base + 1 + nlen;
+                _fx_visit(g, 0);
+            }
+        } else {
+            var moved = 0;
+            while ((moved == 0) && (_fx_cursor < load64(g + FX_G_N))) {
+                var r = _fx_rec(g, _fx_cursor);
+                _fx_cursor = _fx_cursor + 1;
+                if ((_fx_rec_flags(r) & FX_F_DIR) != 0) {
+                    _fx_list(g, r);
+                    moved = 1;
+                }
+            }
+            if (moved == 0) {
+                _fx_done = load64(g + FX_G_FILES);
+                _fx_phase_next(g, FX_SIZES);
+                return 0;
+            }
+        }
+        steps = steps + 1;
+        if (daimon_now_ms() >= deadline) { break; }
+    }
+    _fx_done = load64(g + FX_G_FILES);
+    return 0;
+}
+
+# A scoped job: everything outside its path carries over, digests included.
+fn _fx_copy_slice(g, deadline) {
+    var a = _fx_active;
+    var n = load64(a + FX_G_N);
+    var steps = 0;
+    while (_fx_cursor < n) {
+        var r = _fx_rec(a, _fx_cursor);
+        _fx_cursor = _fx_cursor + 1;
+        var p = _fx_rec_path(a, r);
+        var plen = _fx_rec_plen(r);
+        if (files_under(p, plen, _fx_scope, _fx_scope_len) == 0) {
+            _fx_add(g, p, plen, load64(r + FX_R_SIZE), load64(r + FX_R_MTIME), _fx_rec_flags(r) & FX_F_DIR);
+        }
+        steps = steps + 1;
+        if (steps >= FILES_SLICE_ENTRIES) {
+            steps = 0;
+            if (daimon_now_ms() >= deadline) { return 0; }
+        }
+    }
+    # The copied directories are not listed again: the walk starts past them.
+    _fx_cursor = load64(g + FX_G_N);
+    _fx_seed_path(g, _fx_scope);
+    _fx_list_n = 0;
+    _fx_list_i = 0;
+    _fx_phase = FX_WALK;
+    return 0;
+}
+
+# --- duplicates ------------------------------------------------------------
+
+fn _fx_phase_next(g, phase) {
+    _fx_phase = phase;
+    _fx_cursor = 0;
+    _fx_done = 0;
+    if ((phase == FX_SIZES) || (phase == FX_GROUP)) {
+        memset(load64(g + FX_G_TABLE2), 0, _fx_tbl * 4);
+    }
+    if (phase == FX_GROUP) { _fx_groups = 0; }
+    if (phase == FX_SAVE) { _fx_save_start(g); }
+    return 0;
+}
+
+# Two files of one size are candidates; every other file is left unread.
+fn _fx_sizes_slice(g, deadline) {
+    var n = load64(g + FX_G_N);
+    var mask = _fx_tbl - 1;
+    var t2 = load64(g + FX_G_TABLE2);
+    var steps = 0;
+    while (_fx_cursor < n) {
+        var r = _fx_rec(g, _fx_cursor);
+        var size = load64(r + FX_R_SIZE);
+        if (((_fx_rec_flags(r) & FX_F_DIR) == 0) && (size > 0)) {
+            var i = (size * 1099511628211) & mask;
+            var placed = 0;
+            while (placed == 0) {
+                var e = load32(t2 + i * 4);
+                if (e == 0) {
+                    store32(t2 + i * 4, _fx_cursor + 1);
+                    placed = 1;
+                } else {
+                    var other = _fx_rec(g, e - 1);
+                    if (load64(other + FX_R_SIZE) == size) {
+                        if ((_fx_rec_flags(other) & FX_F_CAND) == 0) {
+                            _fx_rec_set_flag(other, FX_F_CAND);
+                            _fx_total = _fx_total + 1;
+                        }
+                        _fx_rec_set_flag(r, FX_F_CAND);
+                        _fx_total = _fx_total + 1;
+                        placed = 1;
+                    }
+                    i = (i + 1) & mask;
+                }
+            }
+        }
+        _fx_cursor = _fx_cursor + 1;
+        steps = steps + 1;
+        if (steps >= FILES_SLICE_ENTRIES) {
+            steps = 0;
+            if (daimon_now_ms() >= deadline) { return 0; }
+        }
+    }
+    _fx_phase_next(g, FX_HASH);
+    return 0;
+}
+
+fn _fx_hash_abandon(r) {
+    if (_fx_hash_fd >= 0) { file_close(_fx_hash_fd); }
+    _fx_hash_fd = 0 - 1;
+    store64(r + FX_R_DIGEST, 0);
+    _fx_rec_clear_flag(r, FX_F_CAND);
+    return 0;
+}
+
+# The digest of the served generation's record for this path, when the file it
+# read is still the same one by size and mtime. Copied into `g`'s pool, or 0.
+fn _fx_digest_reuse(g, r) {
+    var a = _fx_active;
+    if ((a == 0) || (a == g)) { return 0; }
+    var idx = _fx_find(a, _fx_rec_path(g, r), _fx_rec_plen(r));
+    if (idx < 0) { return 0; }
+    var o = _fx_rec(a, idx);
+    if (load64(o + FX_R_DIGEST) == 0) { return 0; }
+    if (load64(o + FX_R_SIZE) != load64(r + FX_R_SIZE)) { return 0; }
+    if (load64(o + FX_R_MTIME) != load64(r + FX_R_MTIME)) { return 0; }
+    return load64(a + FX_G_POOL) + load64(o + FX_R_DIGEST);
+}
+
+fn _fx_digest_room(g) {
+    var used = load64(g + FX_G_USED);
+    if (used + 32 > _fx_pool_cap) { return 0; }
+    store64(g + FX_G_USED, used + 32);
+    return used;
+}
+
+fn _fx_hash_slice(g, deadline) {
+    var n = load64(g + FX_G_N);
+    var reads = 0;
+    while (reads < FILES_SLICE_READS) {
+        if (_fx_hash_fd >= 0) {
+            var cur = _fx_rec(g, _fx_cursor);
+            var want = _fx_hash_left;
+            if (want > FILES_IO_BYTES) { want = FILES_IO_BYTES; }
+            var got = file_read(_fx_hash_fd, _fx_io, want);
+            if (got <= 0) { _fx_hash_abandon(cur); _fx_cursor = _fx_cursor + 1; _fx_done = _fx_done + 1; }
+            else {
+                sha256_update(_fx_ctx, _fx_io, got);
+                _fx_hash_left = _fx_hash_left - got;
+                if (_fx_hash_left == 0) {
+                    var off = _fx_digest_room(g);
+                    if (off == 0) { _fx_hash_abandon(cur); }
+                    else {
+                        sha256_finalize(_fx_ctx, load64(g + FX_G_POOL) + off);
+                        store64(cur + FX_R_DIGEST, off);
+                        file_close(_fx_hash_fd);
+                        _fx_hash_fd = 0 - 1;
+                    }
+                    _fx_cursor = _fx_cursor + 1;
+                    _fx_done = _fx_done + 1;
+                }
+            }
+            reads = reads + 1;
+        } else {
+            while ((_fx_cursor < n) && ((_fx_rec_flags(_fx_rec(g, _fx_cursor)) & FX_F_CAND) == 0)) {
+                _fx_cursor = _fx_cursor + 1;
+            }
+            if (_fx_cursor >= n) { _fx_phase_next(g, FX_GROUP); return 0; }
+            var r = _fx_rec(g, _fx_cursor);
+            var old = _fx_digest_reuse(g, r);
+            if (old != 0) {
+                var off2 = _fx_digest_room(g);
+                if (off2 != 0) {
+                    memcpy(load64(g + FX_G_POOL) + off2, old, 32);
+                    store64(r + FX_R_DIGEST, off2);
+                }
+                _fx_cursor = _fx_cursor + 1;
+                _fx_done = _fx_done + 1;
+            } else {
+                # NOFOLLOW and NONBLOCK: this was a regular file when it was lstat'd,
+                # and a FIFO put in its place since must not hold the loop.
+                _fx_hash_fd = file_open(_fx_rec_path(g, r), O_RDONLY | O_NOFOLLOW | FILES_O_NONBLOCK, 0);
+                if (_fx_hash_fd < 0) {
+                    _fx_hash_fd = 0 - 1;
+                    _fx_rec_clear_flag(r, FX_F_CAND);
+                    _fx_cursor = _fx_cursor + 1;
+                    _fx_done = _fx_done + 1;
+                } else {
+                    _fx_hash_left = load64(r + FX_R_SIZE);
+                    _fx_hashed = _fx_hashed + 1;
+                    sha256_init_into(_fx_ctx);
+                }
+            }
+        }
+        if (daimon_now_ms() >= deadline) { return 0; }
+    }
+    return 0;
+}
+
+# Equal size and equal digest make a duplicate.
+fn _fx_group_slice(g, deadline) {
+    var n = load64(g + FX_G_N);
+    var mask = _fx_tbl - 1;
+    var t2 = load64(g + FX_G_TABLE2);
+    var pool = load64(g + FX_G_POOL);
+    var steps = 0;
+    while (_fx_cursor < n) {
+        var r = _fx_rec(g, _fx_cursor);
+        var doff = load64(r + FX_R_DIGEST);
+        if (doff != 0) {
+            var i = load64(pool + doff) & mask;
+            var placed = 0;
+            while (placed == 0) {
+                var e = load32(t2 + i * 4);
+                if (e == 0) {
+                    store32(t2 + i * 4, _fx_cursor + 1);
+                    placed = 1;
+                } else {
+                    var other = _fx_rec(g, e - 1);
+                    if (load64(other + FX_R_SIZE) == load64(r + FX_R_SIZE)) {
+                        if (memeq(pool + load64(other + FX_R_DIGEST), pool + doff, 32) == 1) {
+                            if (load64(other + FX_R_GROUP) == 0) {
+                                _fx_groups = _fx_groups + 1;
+                                store64(other + FX_R_GROUP, _fx_groups);
+                                _fx_rec_set_flag(other, FX_F_DUP);
+                                store64(g + FX_G_DUPS, load64(g + FX_G_DUPS) + 1);
+                            }
+                            store64(r + FX_R_GROUP, load64(other + FX_R_GROUP));
+                            _fx_rec_set_flag(r, FX_F_DUP);
+                            store64(g + FX_G_DUPS, load64(g + FX_G_DUPS) + 1);
+                            placed = 1;
+                        }
+                    }
+                    i = (i + 1) & mask;
+                }
+            }
+        }
+        _fx_cursor = _fx_cursor + 1;
+        steps = steps + 1;
+        if (steps >= FILES_SLICE_ENTRIES) {
+            steps = 0;
+            if (daimon_now_ms() >= deadline) { return 0; }
+        }
+    }
+    _fx_phase_next(g, FX_SAVE);
+    return 0;
+}
+
+# --- `index`: the generation on disk ---------------------------------------
+
+fn _fx_save_fail() {
+    if (_fx_save_fd >= 0) { file_close(_fx_save_fd); }
+    _fx_save_fd = 0 - 1;
+    _fx_persisted = 0;
+    daimon_audit(SEV_WARNING, "files", "files.index.save.fail", "the file index could not be written");
+    return 0;
+}
+
+fn _fx_save_start(g) {
+    _fx_persisted = 0;
+    _fx_save_stage = 3;           # nothing to write unless the file opens
+    if (_fx_dir == 0) { return 0; }
+    _fx_save_fd = file_open(_fx_tmp_path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 384);   # 0600
+    if (_fx_save_fd < 0) { _fx_save_fail(); return 0; }
+    memset(_fx_hdr, 0, FILES_INDEX_HDR);
+    memcpy(_fx_hdr, FILES_INDEX_MAGIC, FILES_INDEX_MAGIC_LEN);
+    store64(_fx_hdr + 24, load64(g + FX_G_N));
+    store64(_fx_hdr + 32, load64(g + FX_G_USED));
+    store64(_fx_hdr + 40, clock_epoch_secs());
+    store64(_fx_hdr + 48, load64(g + FX_G_TRUNC));
+    store64(_fx_hdr + 56, load64(g + FX_G_SKIPPED));
+    sha256_init_into(_fx_ctx);
+    _fx_save_stage = 0;
+    _fx_save_off = 0;
+    return 0;
+}
+
+# Write one chunk of a stage. 1 when the stage is done, -1 on failure.
+fn _fx_save_chunk(buf, len) {
+    var left = len - _fx_save_off;
+    if (left > FILES_SAVE_CHUNK) { left = FILES_SAVE_CHUNK; }
+    if (left > 0) {
+        var wr = file_write(_fx_save_fd, buf + _fx_save_off, left);
+        if (wr <= 0) { return 0 - 1; }
+        sha256_update(_fx_ctx, buf + _fx_save_off, wr);
+        _fx_save_off = _fx_save_off + wr;
+    }
+    if (_fx_save_off >= len) {
+        _fx_save_off = 0;
+        return 1;
+    }
+    return 0;
+}
+
+fn _fx_save_slice(g, deadline) {
+    while (_fx_save_stage < 3) {
+        var st = 0;
+        if (_fx_save_stage == 0) { st = _fx_save_chunk(_fx_hdr, FILES_INDEX_HDR); }
+        elif (_fx_save_stage == 1) { st = _fx_save_chunk(load64(g + FX_G_RECS), load64(g + FX_G_N) * FX_REC); }
+        else { st = _fx_save_chunk(load64(g + FX_G_POOL), load64(g + FX_G_USED)); }
+        if (st < 0) {
+            _fx_save_fail();
+            _fx_save_stage = 3;
+        } elif (st == 1) {
+            _fx_save_stage = _fx_save_stage + 1;
+        }
+        if (daimon_now_ms() >= deadline) { return 0; }
+    }
+    if (_fx_save_fd >= 0) {
+        var d: i64[4];
+        sha256_finalize(_fx_ctx, &d);
+        var wrote = file_write(_fx_save_fd, &d, 32);
+        file_close(_fx_save_fd);
+        _fx_save_fd = 0 - 1;
+        var ok = 0;
+        if (wrote == 32) {
+            var renamed = daimon_rename(_fx_tmp_path, strlen(_fx_tmp_path), _fx_index_path, strlen(_fx_index_path));
+            if (renamed == 0) { ok = 1; }
+        }
+        if (ok == 1) { _fx_persisted = 1; }
+        else { _fx_save_fail(); }
+    }
+    _fx_job_finish(g);
+    return 0;
+}
+
+fn _fx_read_full(fd, buf, n) {
+    var off = 0;
+    while (off < n) {
+        var want = n - off;
+        if (want > FILES_SAVE_CHUNK) { want = FILES_SAVE_CHUNK; }
+        var got = file_read(fd, buf + off, want);
+        if (got <= 0) { return 0; }
+        off = off + got;
+    }
+    return 1;
+}
+
+# Every record of a generation just read: its offsets inside the pool, its path a
+# real one under today's roots (an operator may have narrowed them, and a file
+# must not stay served from a root that is gone), and only what `index` may say.
+fn _fx_load_check(g, n, used) {
+    var i = 0;
+    while (i < n) {
+        var r = _fx_rec(g, i);
+        var off = load64(r + FX_R_PATH);
+        var plen = load16(r + FX_R_PLEN);
+        # `off > used` first: off comes from the file, and off + plen would wrap.
+        if ((off < 8) || (off > used) || (off + plen + 1 > used)) { return 0; }
+        var pool = load64(g + FX_G_POOL);
+        if (load8(pool + off + plen) != 0) { return 0; }
+        if (files_path_ok(pool + off, plen) == 0) { return 0; }
+        if (files_in_roots(pool + off, plen) == 0) { return 0; }
+        var doff = load64(r + FX_R_DIGEST);
+        if (doff != 0) {
+            if ((doff < 8) || (doff > used) || (doff + 32 > used)) { return 0; }
+        }
+        if (load64(r + FX_R_SIZE) < 0) { return 0; }
+        var fl = load8(r + FX_R_FLAGS) & FX_F_DISK;
+        store8(r + FX_R_FLAGS, fl);
+        store8(r + FX_R_RATING, 0);
+        store64(r + FX_R_META, 0);
+        if ((fl & FX_F_DIR) == 0) {
+            store64(g + FX_G_FILES, load64(g + FX_G_FILES) + 1);
+            store64(g + FX_G_BYTES, load64(g + FX_G_BYTES) + load64(r + FX_R_SIZE));
+            if ((fl & FX_F_DUP) != 0) { store64(g + FX_G_DUPS, load64(g + FX_G_DUPS) + 1); }
+        }
+        _fx_table_put(g, pool + off, plen, i);
+        i = i + 1;
+    }
+    return 1;
+}
+
+# Read `index` into `g`. Returns 1, or 0 for no file or one that fails a check.
+fn _fx_load(g) {
+    if ((_fx_dir == 0) || (file_exists(_fx_index_path) != 1)) { return 0; }
+    var fd = file_open(_fx_index_path, O_RDONLY, 0);
+    if (fd < 0) { return 0; }
+    var ok = 0;
+    _fx_gen_clear(g);
+    if (_fx_read_full(fd, _fx_hdr, FILES_INDEX_HDR) == 1) {
+        var n = load64(_fx_hdr + 24);
+        var used = load64(_fx_hdr + 32);
+        var good = 1;
+        if (memeq(_fx_hdr, FILES_INDEX_MAGIC, FILES_INDEX_MAGIC_LEN) != 1) { good = 0; }
+        if ((n < 0) || (n > _fx_cap) || (used < 8) || (used > _fx_pool_cap)) { good = 0; }
+        if (good == 1) {
+            if ((_fx_read_full(fd, load64(g + FX_G_RECS), n * FX_REC) == 1)
+              && (_fx_read_full(fd, load64(g + FX_G_POOL), used) == 1)) {
+                var want: i64[4];
+                var have: i64[4];
+                sha256_init_into(_fx_ctx);
+                sha256_update(_fx_ctx, _fx_hdr, FILES_INDEX_HDR);
+                sha256_update(_fx_ctx, load64(g + FX_G_RECS), n * FX_REC);
+                sha256_update(_fx_ctx, load64(g + FX_G_POOL), used);
+                sha256_finalize(_fx_ctx, &want);
+                if (_fx_read_full(fd, &have, 32) == 1) {
+                    if (memeq(&want, &have, 32) == 1) {
+                        store64(g + FX_G_N, n);
+                        store64(g + FX_G_USED, used);
+                        store64(g + FX_G_TRUNC, load64(_fx_hdr + 48));
+                        store64(g + FX_G_SKIPPED, load64(_fx_hdr + 56));
+                        ok = _fx_load_check(g, n, used);
+                        _fx_indexed_at = load64(_fx_hdr + 40);
+                    }
+                }
+            }
+        }
+    }
+    file_close(fd);
+    if (ok == 0) {
+        _fx_indexed_at = 0;
+        _fx_gen_clear(g);
+        daimon_audit(SEV_WARNING, "files", "files.index.rejected",
+          "the file index failed its checks and will be rebuilt");
+    }
+    return ok;
+}
+
+# --- a job -----------------------------------------------------------------
+
+fn _fx_other(g) {
+    if (g == _fx_gen_a) { return _fx_gen_b; }
+    return _fx_gen_a;
+}
+
+fn _fx_job_start() {
+    var g = _fx_other(_fx_active);
+    _fx_next = g;
+    _fx_gen_clear(g);
+    _fx_total = 0;
+    _fx_done = 0;
+    _fx_cursor = 0;
+    _fx_list_n = 0;
+    _fx_list_i = 0;
+    _fx_scope = _fx_want_path;
+    if (load64(_fx_active + FX_G_N) == 0) { _fx_scope = 0; }   # nothing to keep: a whole walk
+    _fx_want = 0;
+    _fx_want_path = 0;
+    if (_fx_scope != 0) {
+        _fx_scope_len = strlen(_fx_scope);
+        _fx_phase = FX_COPY;
+        return 0;
+    }
+    var i = 0;
+    while (i < vec_len(_fx_roots)) {
+        _fx_seed_path(g, vec_get(_fx_roots, i));
+        i = i + 1;
+    }
+    _fx_phase = FX_WALK;
+    return 0;
+}
+
+fn _fx_job_finish(g) {
+    _fx_active = g;
+    _fx_generation = _fx_generation + 1;
+    _fx_version = _fx_version + 1;
+    _fx_indexed_at = clock_epoch_secs();
+    _fx_next_at = _fx_indexed_at + FILES_REWALK_SECS;
+    _fx_phase = FX_IDLE;
+    _fx_resolve(g);
+    return 0;
+}
+
+# Battery status files, found once. agnos has no such source yet, so its power
+# stays unknown, and a walk runs (filed with agnos, 2026-11-06).
+fn _fx_power_find() {
+    #ifndef CYRIUS_TARGET_AGNOS
+    var base = str_from("/sys/class/power_supply");
+    var names = vec_new();
+    if (dir_list_checked(base, names) != 0) { return 0; }
+    _fx_power_state = 1;
+    var b: u8[16];
+    var i = 0;
+    while (i < vec_len(names)) {
+        var dir = path_join(base, vec_get(names, i));
+        var got = file_read_all(str_cstr(path_join(dir, str_from("type"))), &b, 15);
+        if (got >= 7) {
+            if (memeq(&b, "Battery", 7) == 1) {
+                vec_push(_fx_power_files, str_cstr(path_join(dir, str_from("status"))));
+            }
+        }
+        i = i + 1;
+    }
+    #endif
+    return 0;
+}
+
+# For a test: a status file to read in place of the machine's.
+fn files_power_use(path) {
+    _fx_power_files = vec_new();
+    vec_push(_fx_power_files, path);
+    _fx_power_state = 1;
+    _fx_power_next = 0;
+    return 0;
+}
+
+fn _fx_power_poll(now) {
+    _fx_power_next = now + FILES_POWER_POLL_MS;
+    if (vec_len(_fx_power_files) == 0) { _fx_paused = 0; return 0; }
+    var discharging = 0;
+    var b: u8[16];
+    var i = 0;
+    while (i < vec_len(_fx_power_files)) {
+        var got = file_read_all(vec_get(_fx_power_files, i), &b, 15);
+        if (got >= 11) {
+            if (memeq(&b, "Discharging", 11) == 1) { discharging = 1; }
+        }
+        i = i + 1;
+    }
+    if (discharging == 1) { _fx_power_state = 2; _fx_paused = 1; }
+    else { _fx_power_state = 1; _fx_paused = 0; }
+    return 0;
+}
+
+# 1 while a slice is waiting, so the loop comes back soon.
+fn files_busy() {
+    if (_fx_enabled == 0) { return 0; }
+    if (_fx_paused == 1) { return 0; }
+    if (_fx_phase != FX_IDLE) { return 1; }
+    return _fx_want;
+}
+
+# Run one slice, or see whether one is due. Called from the loop.
+fn files_tick(now) {
+    if (_fx_enabled == 0) { return 0; }
+    if (_fx_phase == FX_IDLE) {
+        if (_fx_want == 0) {
+            if (clock_epoch_secs() < _fx_next_at) { return 0; }
+            _fx_want = 1;
+        }
+    }
+    if (now >= _fx_power_next) { _fx_power_poll(now); }
+    if (_fx_paused == 1) { return 0; }
+    if (_fx_phase == FX_IDLE) { _fx_job_start(); }
+    var g = _fx_next;
+    var deadline = now + FILES_SLICE_MS;
+    if (_fx_phase == FX_COPY) { _fx_copy_slice(g, deadline); }
+    elif (_fx_phase == FX_WALK) { _fx_walk_slice(g, deadline); }
+    elif (_fx_phase == FX_SIZES) { _fx_sizes_slice(g, deadline); }
+    elif (_fx_phase == FX_HASH) { _fx_hash_slice(g, deadline); }
+    elif (_fx_phase == FX_GROUP) { _fx_group_slice(g, deadline); }
+    elif (_fx_phase == FX_SAVE) { _fx_save_slice(g, deadline); }
+    return 0;
+}
+
+# Ask for `path` (a cstr in files_path_ok's form, inside a root), or every root.
+fn files_request(path) {
+    if (_fx_enabled == 0) { return 0; }
+    # A second ask while one waits widens it: a narrower one would drop the wider.
+    if ((_fx_want != 0) && (_fx_want_path == 0)) { return 1; }
+    if (_fx_want != 0) { path = 0; }
+    _fx_want = 1;
+    _fx_want_path = path;
+    return 1;
+}
+
+# --- tags, ratings, smart folders: what a person gave ----------------------
+
+# FileTag: {name: cstr, count: i64}. count is scratch for whoever is tallying.
+# FileMeta: {path: cstr, rating: i64, tags: vec of FileTag, rec: i64}
+# rec is the record's index in the served generation + 1, or 0 when it has none.
+
+fn _fx_tag(name_c, create) {
+    var t = map_get(_fx_tagset, name_c);
+    if (t != 0) { return t; }
+    if (create == 0) { return 0; }
+    if (vec_len(_fx_tag_list) >= FILES_TAGS_MAX) { return 0; }
+    t = alloc(16);
+    store64(t, name_c);
+    store64(t + 8, 0);
+    map_set(_fx_tagset, name_c, t);
+    vec_push(_fx_tag_list, t);
+    return t;
+}
+
+fn _fx_meta_for(path_c, create) {
+    var m = map_get(_fx_meta, path_c);
+    if (m != 0) { return m; }
+    if (create == 0) { return 0; }
+    if (vec_len(_fx_meta_list) >= FILES_META_MAX) { return 0; }
+    m = alloc(32);
+    store64(m, path_c);
+    store64(m + 8, 0);
+    store64(m + 16, vec_new());
+    store64(m + 24, 0);
+    map_set(_fx_meta, path_c, m);
+    vec_push(_fx_meta_list, m);
+    return m;
+}
+
+fn _fx_meta_has(m, tag) {
+    var v = load64(m + 16);
+    var i = 0;
+    while (i < vec_len(v)) {
+        if (vec_get(v, i) == tag) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Put a meta's state on its record, if it has one in `g`.
+fn _fx_meta_apply(g, m) {
+    var path = load64(m);
+    var idx = _fx_find(g, path, strlen(path));
+    store64(m + 24, idx + 1);
+    if (idx < 0) { return 0; }
+    var r = _fx_rec(g, idx);
+    store64(r + FX_R_META, m);
+    store8(r + FX_R_RATING, load64(m + 8));
+    _fx_rec_clear_flag(r, FX_F_TAGGED + FX_F_RATED);
+    if (vec_len(load64(m + 16)) > 0) { _fx_rec_set_flag(r, FX_F_TAGGED); }
+    if (load64(m + 8) > 0) { _fx_rec_set_flag(r, FX_F_RATED); }
+    return 0;
+}
+
+fn _fx_resolve(g) {
+    var i = 0;
+    while (i < vec_len(_fx_meta_list)) {
+        _fx_meta_apply(g, vec_get(_fx_meta_list, i));
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _fx_meta_row(sb, m) {
+    str_builder_add_cstr(sb, "{\"p\":\"");
+    str_builder_add(sb, json_escape_str(str_from(load64(m))));
+    str_builder_add_cstr(sb, "\",\"r\":");
+    str_builder_add_int(sb, load64(m + 8));
+    str_builder_add_cstr(sb, ",\"t\":[");
+    var v = load64(m + 16);
+    var i = 0;
+    while (i < vec_len(v)) {
+        if (i > 0) { str_builder_add_cstr(sb, ","); }
+        str_builder_add_cstr(sb, "\"");
+        str_builder_add(sb, json_escape_str(str_from(load64(vec_get(v, i)))));
+        str_builder_add_cstr(sb, "\"");
+        i = i + 1;
+    }
+    str_builder_add_cstr(sb, "]}\n");
+    return 0;
+}
+
+fn _fx_smart_row(sb, s) {
+    str_builder_add_cstr(sb, "{\"s\":\"");
+    str_builder_add(sb, json_escape_str(str_from(load64(s))));
+    if (load64(s + 8) == 0) { str_builder_add_cstr(sb, "\",\"q\":null}\n"); }
+    else {
+        str_builder_add_cstr(sb, "\",\"q\":\"");
+        str_builder_add(sb, json_escape_str(str_from(load64(s + 8))));
+        str_builder_add_cstr(sb, "\"}\n");
+    }
+    return 0;
+}
+
+# 1 once `meta` has reached its bound. MAX caps files, and re-tagging one file
+# appends all the same, so with no caller authentication a local process could
+# otherwise grow it for as long as the disk lasted, at hundreds of rows a request.
+# Nothing is compacted while serving: that would rewrite the file on the loop, and
+# allocate per row. A person's edits stop, and say so, until a restart compacts it.
+fn files_journal_full() {
+    if (_fx_journal_bytes < FILES_JOURNAL_MAX) { return 0; }
+    return 1;
+}
+
+# Keep a journal line, or say that what follows lasts for this run.
+fn _fx_journal(line) {
+    if (_fx_dir == 0) { _fx_meta_failed = 1; return 0; }
+    var n = str_len(line);
+    _fx_journal_bytes = _fx_journal_bytes + n;
+    if (file_append_locked(_fx_meta_path, str_data(line), n) != n) {
+        if (_fx_meta_failed == 0) {
+            daimon_audit(SEV_WARNING, "files", "files.meta.write.fail", "tags and ratings could not be written");
+        }
+        _fx_meta_failed = 1;
+    }
+    return 0;
+}
+
+# One request's rows, as one append: a batch must not be a sync per file on the loop.
+fn files_journal(sb) {
+    _fx_journal(str_builder_build(sb));
+    return 0;
+}
+
+fn _fx_meta_touch(m) {
+    _fx_meta_apply(_fx_active, m);
+    _fx_version = _fx_version + 1;
+    return 0;
+}
+
+# 1 for a tag: 1 – 64 bytes with no control byte, and not starting or ending in a
+# space, so that two tags which read alike are one.
+fn files_tag_ok(s) {
+    var n = str_len(s);
+    if ((n < 1) || (n > FILES_TAG_MAX)) { return 0; }
+    var d = str_data(s);
+    if (files_utf8_ok(d, n) == 0) { return 0; }
+    if ((load8(d) == 32) || (load8(d + n - 1) == 32)) { return 0; }
+    var i = 0;
+    while (i < n) {
+        if (load8(d + i) < 32) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# Change one file's tags. `add` and `remove` are vecs of cstr already checked by
+# files_tag_ok. Its row joins `sb`, for files_journal. Returns 1, or 0 when a limit
+# is reached (nothing changes).
+fn files_tag(path_c, add, remove, sb) {
+    var m = _fx_meta_for(path_c, 1);
+    if (m == 0) { return 0; }
+    var tags = load64(m + 16);
+    var extra = 0;
+    var a = 0;
+    while (a < vec_len(add)) {
+        var known = _fx_tag(vec_get(add, a), 0);
+        if (known == 0) {
+            if (vec_len(_fx_tag_list) + extra >= FILES_TAGS_MAX) { return 0; }
+            extra = extra + 1;
+        }
+        a = a + 1;
+    }
+    if (vec_len(tags) + vec_len(add) > FILES_FILE_TAGS_MAX) { return 0; }
+    a = 0;
+    while (a < vec_len(add)) {
+        var t = _fx_tag(vec_get(add, a), 1);
+        if (_fx_meta_has(m, t) == 0) { vec_push(tags, t); }
+        a = a + 1;
+    }
+    var rm = 0;
+    while (rm < vec_len(remove)) {
+        var gone = _fx_tag(vec_get(remove, rm), 0);
+        if (gone != 0) {
+            var kept = vec_new();
+            var ti = 0;
+            while (ti < vec_len(tags)) {
+                if (vec_get(tags, ti) != gone) { vec_push(kept, vec_get(tags, ti)); }
+                ti = ti + 1;
+            }
+            store64(m + 16, kept);
+            tags = kept;
+        }
+        rm = rm + 1;
+    }
+    _fx_meta_row(sb, m);
+    _fx_meta_touch(m);
+    return 1;
+}
+
+fn files_rate(path_c, rating, sb) {
+    var m = _fx_meta_for(path_c, 1);
+    if (m == 0) { return 0; }
+    store64(m + 8, rating);
+    _fx_meta_row(sb, m);
+    _fx_meta_touch(m);
+    return 1;
+}
+
+# A journal line. 1, or 0 for one that cannot be read.
+fn _fx_meta_line(line, len) {
+    var root = bayan_json_v_parse_buf(line, len);
+    if (root == 0) { return 0; }
+    if (bayan_json_v_is_obj(root) == 0) { return 0; }
+    var sv = bayan_json_v_obj_get_by_cstr(root, "s");
+    if (sv != 0) {
+        if (bayan_json_v_is_str(sv) == 0) { return 0; }
+        var qv = bayan_json_v_obj_get_by_cstr(root, "q");
+        if (qv == 0) { return 0; }
+        var sname = str_cstr(bayan_json_v_str(sv));
+        if (bayan_json_v_is_str(qv) == 1) { _fx_smart_put(sname, str_cstr(bayan_json_v_str(qv)), 0); }
+        elif (bayan_json_v_is_null(qv) == 1) { _fx_smart_drop(sname); }
+        else { return 0; }
+        return 1;
+    }
+    var pv = bayan_json_v_obj_get_by_cstr(root, "p");
+    var rv = bayan_json_v_obj_get_by_cstr(root, "r");
+    var tv = bayan_json_v_obj_get_by_cstr(root, "t");
+    if ((pv == 0) || (rv == 0) || (tv == 0)) { return 0; }
+    if (bayan_json_v_is_str(pv) == 0) { return 0; }
+    if ((bayan_json_v_is_int(rv) == 0) || (bayan_json_v_is_arr(tv) == 0)) { return 0; }
+    var ps = bayan_json_v_str(pv);
+    if (files_path_ok(str_data(ps), str_len(ps)) == 0) { return 0; }
+    var rating = bayan_json_v_int(rv);
+    if ((rating < 0) || (rating > FILES_RATING_MAX)) { return 0; }
+    var m = _fx_meta_for(str_cstr(ps), 1);
+    if (m == 0) { return 0; }
+    var tags = vec_new();
+    var i = 0;
+    while (i < bayan_json_v_arr_len(tv)) {
+        var one = bayan_json_v_arr_get(tv, i);
+        if (bayan_json_v_is_str(one) == 0) { return 0; }
+        if (files_tag_ok(bayan_json_v_str(one)) == 0) { return 0; }
+        if (vec_len(tags) < FILES_FILE_TAGS_MAX) {
+            var t = _fx_tag(str_cstr(bayan_json_v_str(one)), 1);
+            if (t == 0) { return 0; }
+            vec_push(tags, t);
+        }
+        i = i + 1;
+    }
+    store64(m + 8, rating);
+    store64(m + 16, tags);
+    return 1;
+}
+
+# Replay the journal, then write it back as one line per thing it says. Skipped
+# lines stop the rewrite: they are all that is left of what they held.
+fn _fx_meta_load() {
+    if ((_fx_dir == 0) || (file_exists(_fx_meta_path) != 1)) { return 0; }
+    var st: u8[256];
+    if (xstat(_fx_meta_path, &st) != 0) { _fx_meta_failed = 1; return 0; }
+    var size = load64(&st + STAT_SIZE);
+    if (size == 0) { return 0; }
+    var buf = alloc(size + 1);
+    if (buf == 0) { _fx_meta_failed = 1; return 0; }
+    var n = file_read_all(_fx_meta_path, buf, size);
+    if (n < 0) { _fx_meta_failed = 1; return 0; }
+    var lines = 0;
+    var pos = 0;
+    while (pos < n) {
+        var e = pos;
+        while ((e < n) && (load8(buf + e) != 10)) { e = e + 1; }
+        if (e > pos) {
+            lines = lines + 1;
+            if (_fx_meta_line(buf + pos, e - pos) == 0) { _fx_meta_skipped = _fx_meta_skipped + 1; }
+        }
+        pos = e + 1;
+    }
+    if (_fx_meta_skipped > 0) {
+        _fx_journal_bytes = n;
+        daimon_audit(SEV_WARNING, "files", "files.meta.skipped",
+          "journal lines could not be read; the file is left as it is");
+        return 0;
+    }
+    var sb = str_builder_new();
+    _fx_journal_bytes = n;
+    var kept = 0;
+    var i = 0;
+    while (i < vec_len(_fx_meta_list)) {
+        var m = vec_get(_fx_meta_list, i);
+        if ((load64(m + 8) != 0) || (vec_len(load64(m + 16)) > 0)) {
+            _fx_meta_row(sb, m);
+            kept = kept + 1;
+        }
+        i = i + 1;
+    }
+    var si = 0;
+    while (si < vec_len(_fx_smart)) {
+        var s = vec_get(_fx_smart, si);
+        if (load64(s + 16) == 0) {
+            _fx_smart_row(sb, s);
+            kept = kept + 1;
+        }
+        si = si + 1;
+    }
+    if (kept < lines) {
+        var out = str_builder_build(sb);
+        if (file_write_atomic(_fx_meta_path, str_data(out), str_len(out)) != 0) { _fx_meta_failed = 1; }
+        else { _fx_journal_bytes = str_len(out); }
+    }
+    return 0;
+}
+
+# --- queries ---------------------------------------------------------------
+#
+# A query is query-string text, `untagged=1&under=/home/me`, so one parser reads
+# GET /v1/files and a saved smart folder alike, and saving a search is keeping
+# the text it was. An unknown key refuses the query: a misspelled filter must not
+# answer with every file.
+
+# FileFilter
+var FX_Q_TAG = 0;        # FileTag
+var FX_Q_NOTAG = 8;      # 1: a tag was named that no file carries
+var FX_Q_UNTAGGED = 16;
+var FX_Q_UNRATED = 24;
+var FX_Q_RATING = 32;
+var FX_Q_UNDER = 40;
+var FX_Q_UNDER_LEN = 48;
+var FX_Q_EXTS = 56;      # vec of cstr, lower case, or 0
+var FX_Q_MIN_SIZE = 64;
+var FX_Q_OLDER = 72;     # days
+var FX_Q_NEWER = 80;     # days
+var FX_Q_DUP = 88;
+var FX_Q_LIMIT = 96;
+var FX_Q_OFFSET = 104;
+var FX_Q_TAGNAME = 112;
+var FX_Q_SIZE = 120;
+
+fn _fx_int(s) {
+    var n = strlen(s);
+    if ((n < 1) || (n > 18)) { return 0 - 1; }
+    var v = 0;
+    var i = 0;
+    while (i < n) {
+        var c = load8(s + i);
+        if ((c < 48) || (c > 57)) { return 0 - 1; }
+        v = v * 10 + c - 48;
+        i = i + 1;
+    }
+    return v;
+}
+
+fn _fx_exts_parse(s) {
+    var v = vec_new();
+    var n = strlen(s);
+    var pos = 0;
+    while (pos <= n) {
+        var e = pos;
+        while ((e < n) && (load8(s + e) != 44)) { e = e + 1; }
+        if (e == pos) { return 0; }
+        var one = alloc(e - pos + 1);
+        var i = 0;
+        while (i < e - pos) {
+            var c = load8(s + pos + i);
+            if ((c >= 65) && (c <= 90)) { c = c + 32; }
+            store8(one + i, c);
+            i = i + 1;
+        }
+        store8(one + e - pos, 0);
+        vec_push(v, one);
+        pos = e + 1;
+    }
+    return v;
+}
+
+fn _fx_query_key(f, key, val) {
+    if (streq(key, "tag") == 1) {
+        store64(f + FX_Q_TAGNAME, val);
+        return 1;
+    }
+    if (streq(key, "under") == 1) {
+        var ul = strlen(val);
+        if (files_path_ok(val, ul) == 0) { return 0; }
+        store64(f + FX_Q_UNDER, val);
+        store64(f + FX_Q_UNDER_LEN, ul);
+        return 1;
+    }
+    if (streq(key, "ext") == 1) {
+        var exts = _fx_exts_parse(val);
+        if (exts == 0) { return 0; }
+        store64(f + FX_Q_EXTS, exts);
+        return 1;
+    }
+    var n = _fx_int(val);
+    if (n < 0) { return 0; }
+    if (streq(key, "untagged") == 1) { store64(f + FX_Q_UNTAGGED, n); return 1; }
+    if (streq(key, "unrated") == 1) { store64(f + FX_Q_UNRATED, n); return 1; }
+    if (streq(key, "duplicates") == 1) { store64(f + FX_Q_DUP, n); return 1; }
+    if (streq(key, "rating") == 1) { store64(f + FX_Q_RATING, n); return 1; }
+    if (streq(key, "min_size") == 1) { store64(f + FX_Q_MIN_SIZE, n); return 1; }
+    if (streq(key, "older_days") == 1) { store64(f + FX_Q_OLDER, n); return 1; }
+    if (streq(key, "newer_days") == 1) { store64(f + FX_Q_NEWER, n); return 1; }
+    if (streq(key, "limit") == 1) {
+        if ((n < 1) || (n > FILES_LIMIT_MAX)) { return 0; }
+        store64(f + FX_Q_LIMIT, n);
+        return 1;
+    }
+    if (streq(key, "offset") == 1) { store64(f + FX_Q_OFFSET, n); return 1; }
+    return 0;
+}
+
+# Parse a query's text (`q`, a cstr, or 0 for no filter) into a new FileFilter.
+# Returns 0 for one that cannot be read.
+fn files_query_parse(q) {
+    var f = alloc(FX_Q_SIZE);
+    memset(f, 0, FX_Q_SIZE);
+    store64(f + FX_Q_LIMIT, FILES_LIMIT_DEFAULT);
+    if (q == 0) { return f; }
+    var n = strlen(q);
+    var pos = 0;
+    while (pos < n) {
+        var e = pos;
+        while ((e < n) && (load8(q + e) != 38)) { e = e + 1; }
+        var eq = pos;
+        while ((eq < e) && (load8(q + eq) != 61)) { eq = eq + 1; }
+        if ((eq == pos) || (eq >= e)) { return 0; }
+        var key = alloc(eq - pos + 1);
+        memcpy(key, q + pos, eq - pos);
+        store8(key + eq - pos, 0);
+        var raw = alloc(e - eq);
+        memcpy(raw, q + eq + 1, e - eq - 1);
+        store8(raw + e - eq - 1, 0);
+        var val = sandhi_server_url_decode(raw);
+        if (val == 0) { return 0; }
+        if (_fx_query_key(f, key, val) == 0) { return 0; }
+        pos = e + 1;
+    }
+    return f;
+}
+
+# A tag's record, looked up when a query runs: a saved query can name a tag that
+# does not exist yet, and a tag made later must match it.
+fn _fx_filter_bind(f) {
+    store64(f + FX_Q_TAG, 0);
+    store64(f + FX_Q_NOTAG, 0);
+    var name = load64(f + FX_Q_TAGNAME);
+    if (name != 0) {
+        var t = _fx_tag(name, 0);
+        store64(f + FX_Q_TAG, t);
+        if (t == 0) { store64(f + FX_Q_NOTAG, 1); }
+    }
+    return 0;
+}
+
+fn _fx_ext_of(p, n) {
+    var i = n;
+    while (i > 0) {
+        var c = load8(p + i - 1);
+        if (c == 46) { return i; }
+        if (c == 47) { return 0 - 1; }
+        i = i - 1;
+    }
+    return 0 - 1;
+}
+
+# `e` is lower case (_fx_exts_parse), so only `p`'s side folds.
+fn _fx_ext_eq(p, n, e) {
+    var i = 0;
+    while (i < n) {
+        var c = load8(p + i);
+        if ((c >= 65) && (c <= 90)) { c = c + 32; }
+        if (c != load8(e + i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn _fx_ext_match(p, n, exts) {
+    var s = _fx_ext_of(p, n);
+    if (s < 0) { return 0; }
+    var len = n - s;
+    if (len == 0) { return 0; }
+    # This runs once per extension per record, on the loop. Most differ in their
+    # first byte, so that is compared before anything else: 8 extensions over
+    # 41,200 records took 8.5 ms without it (BENCHMARKS.md).
+    var c0 = load8(p + s);
+    if ((c0 >= 65) && (c0 <= 90)) { c0 = c0 + 32; }
+    var count = vec_len(exts);
+    var i = 0;
+    while (i < count) {
+        var e = vec_get(exts, i);
+        if (load8(e) == c0) {
+            if (strlen(e) == len) {
+                if (_fx_ext_eq(p + s, len, e) == 1) { return 1; }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _fx_match(g, r, f, now) {
+    var fl = _fx_rec_flags(r);
+    if ((fl & FX_F_DIR) != 0) { return 0; }
+    if (load64(f + FX_Q_NOTAG) != 0) { return 0; }
+    if (load64(f + FX_Q_DUP) != 0) {
+        if ((fl & FX_F_DUP) == 0) { return 0; }
+    }
+    if (load64(f + FX_Q_UNTAGGED) != 0) {
+        if ((fl & FX_F_TAGGED) != 0) { return 0; }
+    }
+    if (load64(f + FX_Q_UNRATED) != 0) {
+        if ((fl & FX_F_RATED) != 0) { return 0; }
+    }
+    var v = load64(f + FX_Q_RATING);
+    if (v > 0) {
+        if (load8(r + FX_R_RATING) < v) { return 0; }
+    }
+    v = load64(f + FX_Q_MIN_SIZE);
+    if (v > 0) {
+        if (load64(r + FX_R_SIZE) < v) { return 0; }
+    }
+    v = load64(f + FX_Q_OLDER);
+    if (v > 0) {
+        if (load64(r + FX_R_MTIME) > now - v * 86400) { return 0; }
+    }
+    v = load64(f + FX_Q_NEWER);
+    if (v > 0) {
+        if (load64(r + FX_R_MTIME) < now - v * 86400) { return 0; }
+    }
+    var u = load64(f + FX_Q_UNDER);
+    if (u != 0) {
+        if (files_under(_fx_rec_path(g, r), _fx_rec_plen(r), u, load64(f + FX_Q_UNDER_LEN)) == 0) { return 0; }
+    }
+    var ex = load64(f + FX_Q_EXTS);
+    if (ex != 0) {
+        if (_fx_ext_match(_fx_rec_path(g, r), _fx_rec_plen(r), ex) == 0) { return 0; }
+    }
+    var t = load64(f + FX_Q_TAG);
+    if (t != 0) {
+        if ((fl & FX_F_TAGGED) == 0) { return 0; }
+        if (_fx_meta_has(load64(r + FX_R_META), t) == 0) { return 0; }
+    }
+    return 1;
+}
+
+# Files a filter holds, in the served generation.
+fn files_count(f) {
+    _fx_filter_bind(f);
+    var g = _fx_active;
+    if (g == 0) { return 0; }
+    var now = clock_epoch_secs();
+    var n = load64(g + FX_G_N);
+    var c = 0;
+    var i = 0;
+    while (i < n) {
+        c = c + _fx_match(g, _fx_rec(g, i), f, now);
+        i = i + 1;
+    }
+    return c;
+}
+
+# --- smart folders ---------------------------------------------------------
+
+# SmartFolder: {name: cstr, query: cstr, builtin: i64, filter, count: i64, version: i64}
+fn _fx_smart_find(name) {
+    var i = 0;
+    while (i < vec_len(_fx_smart)) {
+        var s = vec_get(_fx_smart, i);
+        if (streq(load64(s), name) == 1) { return s; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Add or replace. Returns the folder, or 0 for a query that cannot be read or one
+# folder too many.
+fn _fx_smart_put(name, query, builtin) {
+    var f = files_query_parse(query);
+    if (f == 0) { return 0; }
+    var s = _fx_smart_find(name);
+    if (s == 0) {
+        if (vec_len(_fx_smart) >= FILES_SMART_MAX) { return 0; }
+        s = alloc(48);
+        store64(s, name);
+        store64(s + 16, builtin);
+        vec_push(_fx_smart, s);
+    }
+    store64(s + 8, query);
+    store64(s + 24, f);
+    store64(s + 40, 0);
+    store64(s + 16, builtin);
+    return s;
+}
+
+fn _fx_smart_drop(name) {
+    var kept = vec_new();
+    var i = 0;
+    while (i < vec_len(_fx_smart)) {
+        var s = vec_get(_fx_smart, i);
+        if ((streq(load64(s), name) == 0) || (load64(s + 16) == 1)) { vec_push(kept, s); }
+        i = i + 1;
+    }
+    _fx_smart = kept;
+    return 0;
+}
+
+# 1 for a name: 1 – 64 bytes and no control byte or slash, as it rides a URL path.
+fn files_smart_name_ok(s) {
+    var n = str_len(s);
+    if ((n < 1) || (n > FILES_SMART_NAME_MAX)) { return 0; }
+    var d = str_data(s);
+    if (files_utf8_ok(d, n) == 0) { return 0; }
+    var i = 0;
+    while (i < n) {
+        var c = load8(d + i);
+        if ((c < 32) || (c == 47)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn files_smart_save(name, query) {
+    if (_fx_smart_put(name, query, 0) == 0) { return 0; }
+    var sb = str_builder_new();
+    _fx_smart_row(sb, _fx_smart_find(name));
+    _fx_journal(str_builder_build(sb));
+    return 1;
+}
+
+# 1 when it went, 0 for no such folder, -1 for one that ships with daimon.
+fn files_smart_delete(name) {
+    var s = _fx_smart_find(name);
+    if (s == 0) { return 0; }
+    if (load64(s + 16) == 1) { return 0 - 1; }
+    _fx_smart_drop(name);
+    _fx_smart_seed();
+    var tomb = alloc(48);
+    store64(tomb, name);
+    store64(tomb + 8, 0);
+    var sb = str_builder_new();
+    _fx_smart_row(sb, tomb);
+    _fx_journal(str_builder_build(sb));
+    return 1;
+}
+
+fn files_smart_filter(name) {
+    var s = _fx_smart_find(name);
+    if (s == 0) { return 0; }
+    return load64(s + 24);
+}
+
+fn _fx_smart_ship(name, query) {
+    if (_fx_smart_find(name) == 0) { _fx_smart_put(name, query, 1); }
+    return 0;
+}
+
+# What crab's canvas lists, wherever a person has not given one a query of their
+# own. So deleting a redefined one puts this back. The canvas names these and
+# defines none: the sizes, the ages and what counts as raw are daimon's reading,
+# and a saved query replaces any of them.
+fn _fx_smart_seed() {
+    _fx_smart_ship("Recent", "newer_days=7");
+    _fx_smart_ship("Duplicates", "duplicates=1");
+    _fx_smart_ship("Untagged", "untagged=1");
+    _fx_smart_ship("Large & old", "min_size=104857600&older_days=365");
+    _fx_smart_ship("Raw only", "ext=arw,cr2,cr3,dng,nef,orf,raf,rw2");
+    _fx_smart_ship("Unrated", "unrated=1");
+    return 0;
+}
+
+# --- answers, built into a kept buffer -------------------------------------
+
+fn _o_reset() { _fx_o = 0; return 0; }
+fn _o_room(n) { return _fx_o + n <= _fx_out_cap; }
+
+fn _o_bytes(p, n) {
+    if (_o_room(n) == 0) { return 0; }
+    memcpy(_fx_out + _fx_o, p, n);
+    _fx_o = _fx_o + n;
+    return 0;
+}
+
+fn _o_c(s) { _o_bytes(s, strlen(s)); return 0; }
+
+fn _o_i(v) {
+    var b: u8[24];
+    var i = 24;
+    var neg = 0;
+    if (v < 0) { neg = 1; v = 0 - v; }
+    if (v == 0) { i = i - 1; store8(&b + i, 48); }
+    while (v > 0) {
+        i = i - 1;
+        store8(&b + i, 48 + v % 10);
+        v = v / 10;
+    }
+    if (neg == 1) { i = i - 1; store8(&b + i, 45); }
+    _o_bytes(&b + i, 24 - i);
+    return 0;
+}
+
+# As json_escape_str does, without a builder: a page holds a hundred of these.
+fn _o_esc(p, n) {
+    var i = 0;
+    while (i < n) {
+        var c = load8(p + i);
+        if (_o_room(6) == 0) { return 0; }
+        var at = _fx_out + _fx_o;
+        if ((c == 34) || (c == 92)) {
+            store8(at, 92);
+            store8(at + 1, c);
+            _fx_o = _fx_o + 2;
+        } elif (c < 32) {
+            memcpy(at, "\\u00", 4);
+            store8(at + 4, _json_hex_digit(c >> 4));
+            store8(at + 5, _json_hex_digit(c & 15));
+            _fx_o = _fx_o + 6;
+        } else {
+            store8(at, c);
+            _fx_o = _fx_o + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _o_str(key, p, n) {
+    _o_c(",\"");
+    _o_c(key);
+    _o_c("\":\"");
+    _o_esc(p, n);
+    _o_c("\"");
+    return 0;
+}
+
+fn _o_int(key, v) {
+    _o_c(",\"");
+    _o_c(key);
+    _o_c("\":");
+    _o_i(v);
+    return 0;
+}
+
+fn _o_bool(key, v) {
+    _o_c(",\"");
+    _o_c(key);
+    if (v != 0) { _o_c("\":true"); } else { _o_c("\":false"); }
+    return 0;
+}
+
+fn files_out() { return _fx_out; }
+fn files_out_len() { return _fx_o; }
+
+fn _fx_phase_name() {
+    if (_fx_phase == FX_COPY) { return "copy"; }
+    if (_fx_phase == FX_WALK) { return "walk"; }
+    if (_fx_phase == FX_SIZES) { return "sizes"; }
+    if (_fx_phase == FX_HASH) { return "hash"; }
+    if (_fx_phase == FX_GROUP) { return "group"; }
+    return "save";
+}
+
+# none: daimon holds no index. building: it holds none yet, and one is coming.
+# catching_up: one is served, and a newer one is coming. fresh: one is served.
+# paused: a job is waiting for mains power. crab tells these apart for a person.
+fn files_state_name() {
+    if (_fx_enabled == 0) { return "none"; }
+    if ((_fx_phase != FX_IDLE) || (_fx_want != 0)) {
+        if (_fx_paused == 1) { return "paused"; }
+        if (_fx_indexed_at == 0) { return "building"; }
+        return "catching_up";
+    }
+    if (_fx_indexed_at == 0) { return "none"; }
+    return "fresh";
+}
+
+fn files_status_json() {
+    _o_reset();
+    _o_c("{\"state\":\"");
+    _o_c(files_state_name());
+    _o_c("\"");
+    var g = _fx_active;
+    var n_files = 0;
+    var bytes = 0;
+    var trunc = 0;
+    var skipped = 0;
+    var dups = 0;
+    if (g != 0) {
+        n_files = load64(g + FX_G_FILES);
+        bytes = load64(g + FX_G_BYTES);
+        trunc = load64(g + FX_G_TRUNC);
+        skipped = load64(g + FX_G_SKIPPED);
+        dups = load64(g + FX_G_DUPS);
+    }
+    _o_int("files", n_files);
+    _o_int("bytes", bytes);
+    _o_int("duplicates", dups);
+    _o_int("skipped", skipped);
+    _o_bool("truncated", trunc);
+    _o_int("indexed_at", _fx_indexed_at);
+    _o_int("generation", _fx_generation);
+    _o_bool("persisted", _fx_persisted);
+    _o_bool("meta_durable", (_fx_enabled == 1) && (_fx_meta_failed == 0));
+    _o_int("meta_skipped", _fx_meta_skipped);
+    if (_fx_power_state == 2) { _o_str("power", "battery", 7); }
+    elif (_fx_power_state == 1) { _o_str("power", "mains", 5); }
+    else { _o_str("power", "unknown", 7); }
+    _o_c(",\"roots\":[");
+    var i = 0;
+    while ((i < vec_len(_fx_roots)) && (_fx_o < FILES_PAGE_BYTES)) {
+        if (i > 0) { _o_c(","); }
+        var r = vec_get(_fx_roots, i);
+        _o_c("\"");
+        _o_esc(r, strlen(r));
+        _o_c("\"");
+        i = i + 1;
+    }
+    _o_c("]");
+    if (_fx_phase != FX_IDLE) {
+        _o_c(",\"progress\":{\"phase\":\"");
+        _o_c(_fx_phase_name());
+        _o_c("\"");
+        _o_int("done", _fx_done);
+        var total = _fx_total;
+        if ((_fx_phase == FX_WALK) || (_fx_phase == FX_COPY)) {
+            total = 0;                 # not known: the last walk's count, if any
+            if (g != 0) { total = load64(g + FX_G_FILES); }
+        }
+        _o_int("total", total);
+        _o_c("}");
+    }
+    _o_c("}");
+    return 0;
+}
+
+fn _fx_row_tags(m) {
+    _o_c(",\"tags\":[");
+    if (m != 0) {
+        var v = load64(m + 16);
+        var i = 0;
+        while (i < vec_len(v)) {
+            if (i > 0) { _o_c(","); }
+            var t = load64(vec_get(v, i));
+            _o_c("\"");
+            _o_esc(t, strlen(t));
+            _o_c("\"");
+            i = i + 1;
+        }
+    }
+    _o_c("]");
+    return 0;
+}
+
+fn _fx_row(g, r) {
+    _o_c("{\"path\":\"");
+    _o_esc(_fx_rec_path(g, r), _fx_rec_plen(r));
+    _o_c("\"");
+    _o_int("size", load64(r + FX_R_SIZE));
+    _o_int("mtime", load64(r + FX_R_MTIME));
+    _o_int("rating", load8(r + FX_R_RATING));
+    _fx_row_tags(load64(r + FX_R_META));
+    _o_int("duplicate_group", load64(r + FX_R_GROUP));
+    _o_c("}");
+    return 0;
+}
+
+# One page of what a filter holds. `total` counts them all, so a client can say
+# how many, and `next_offset` is 0 at the end. A page ends at its limit or at
+# FILES_PAGE_BYTES. `generation` changes when the index under a client's paging does.
+fn files_list_json(f) {
+    _fx_filter_bind(f);
+    _o_reset();
+    _o_c("{\"files\":[");
+    var g = _fx_active;
+    var total = 0;
+    var shown = 0;
+    var next = 0;
+    var offset = load64(f + FX_Q_OFFSET);
+    var limit = load64(f + FX_Q_LIMIT);
+    if (g != 0) {
+        var now = clock_epoch_secs();
+        var n = load64(g + FX_G_N);
+        var i = 0;
+        while (i < n) {
+            var r = _fx_rec(g, i);
+            if (_fx_match(g, r, f, now) == 1) {
+                total = total + 1;
+                if ((total > offset) && (next == 0)) {
+                    if ((shown >= limit) || (_fx_o >= FILES_PAGE_BYTES)) { next = total - 1; }
+                    else {
+                        if (shown > 0) { _o_c(","); }
+                        _fx_row(g, r);
+                        shown = shown + 1;
+                    }
+                }
+            }
+            i = i + 1;
+        }
+    }
+    _o_c("]");
+    _o_int("total", total);
+    _o_int("next_offset", next);
+    _o_int("generation", _fx_generation);
+    _o_c("}");
+    return 0;
+}
+
+# 1 when `path` is known here, in the index or by a tag or rating.
+fn files_meta_json(path_c) {
+    var n = strlen(path_c);
+    var g = _fx_active;
+    var idx = 0 - 1;
+    if (g != 0) { idx = _fx_find(g, path_c, n); }
+    if (idx >= 0) {
+        var r = _fx_rec(g, idx);
+        if ((_fx_rec_flags(r) & FX_F_DIR) == 0) {
+            _o_reset();
+            _fx_row(g, r);
+            return 1;
+        }
+    }
+    var m = _fx_meta_for(path_c, 0);
+    if (m == 0) { return 0; }
+    _o_reset();
+    _o_c("{\"path\":\"");
+    _o_esc(path_c, n);
+    _o_c("\"");
+    _o_int("rating", load64(m + 8));
+    _fx_row_tags(m);
+    _o_bool("indexed", 0);
+    _o_c("}");
+    return 1;
+}
+
+# Each tag on a file the index holds, with how many it is on.
+fn _fx_tag_counts() {
+    var v = _fx_version;
+    var i = 0;
+    while (i < vec_len(_fx_tag_list)) {
+        store64(vec_get(_fx_tag_list, i) + 8, 0);
+        i = i + 1;
+    }
+    var mi = 0;
+    while (mi < vec_len(_fx_meta_list)) {
+        var m = vec_get(_fx_meta_list, mi);
+        if (load64(m + 24) != 0) {
+            var tags = load64(m + 16);
+            var ti = 0;
+            while (ti < vec_len(tags)) {
+                var t = vec_get(tags, ti);
+                store64(t + 8, load64(t + 8) + 1);
+                ti = ti + 1;
+            }
+        }
+        mi = mi + 1;
+    }
+    return v;
+}
+
+fn files_tags_json() {
+    _fx_tag_counts();
+    _o_reset();
+    _o_c("{\"tags\":[");
+    var shown = 0;
+    var i = 0;
+    while (i < vec_len(_fx_tag_list)) {
+        var t = vec_get(_fx_tag_list, i);
+        if ((load64(t + 8) > 0) && (_fx_o < FILES_PAGE_BYTES)) {
+            if (shown > 0) { _o_c(","); }
+            _o_c("{\"tag\":\"");
+            _o_esc(load64(t), strlen(load64(t)));
+            _o_c("\"");
+            _o_int("files", load64(t + 8));
+            _o_c("}");
+            shown = shown + 1;
+        }
+        i = i + 1;
+    }
+    _o_c("]}");
+    return 0;
+}
+
+fn files_smart_json() {
+    _o_reset();
+    _o_c("{\"folders\":[");
+    var shown = 0;
+    var i = 0;
+    while (i < vec_len(_fx_smart)) {
+        var s = vec_get(_fx_smart, i);
+        # A count holds until something it read changes: a client polls this.
+        if (load64(s + 40) != _fx_version) {
+            store64(s + 32, files_count(load64(s + 24)));
+            store64(s + 40, _fx_version);
+        }
+        if (_fx_o < FILES_PAGE_BYTES) {
+            if (shown > 0) { _o_c(","); }
+            _o_c("{\"name\":\"");
+            _o_esc(load64(s), strlen(load64(s)));
+            _o_c("\"");
+            _o_str("query", load64(s + 8), strlen(load64(s + 8)));
+            _o_int("files", load64(s + 32));
+            _o_bool("builtin", load64(s + 16));
+            _o_c("}");
+            shown = shown + 1;
+        }
+        i = i + 1;
+    }
+    _o_c("]}");
+    return 0;
+}
+
+# Tags to offer for `path`: what the files at it carry (for a file, the files
+# beside it), most used first, leaving out what it already has. Nothing here reads
+# a file: this is an offer from what a person has already done, and says how many.
+fn files_suggest_json(path_c) {
+    var n = strlen(path_c);
+    var scope = path_c;
+    var slen = n;
+    var g = _fx_active;
+    if (g != 0) {
+        var idx = _fx_find(g, path_c, n);
+        var isdir = 0;
+        if (idx >= 0) { isdir = _fx_rec_flags(_fx_rec(g, idx)) & FX_F_DIR; }
+        if (isdir == 0) {
+            while ((slen > 1) && (load8(scope + slen - 1) != 47)) { slen = slen - 1; }
+            if (slen > 1) { slen = slen - 1; }
+        }
+    }
+    var own = _fx_meta_for(path_c, 0);
+    var i = 0;
+    while (i < vec_len(_fx_tag_list)) {
+        store64(vec_get(_fx_tag_list, i) + 8, 0);
+        i = i + 1;
+    }
+    var mi = 0;
+    while (mi < vec_len(_fx_meta_list)) {
+        var m = vec_get(_fx_meta_list, mi);
+        var mp = load64(m);
+        if (files_under(mp, strlen(mp), scope, slen) == 1) {
+            var tags = load64(m + 16);
+            var ti = 0;
+            while (ti < vec_len(tags)) {
+                var t = vec_get(tags, ti);
+                store64(t + 8, load64(t + 8) + 1);
+                ti = ti + 1;
+            }
+        }
+        mi = mi + 1;
+    }
+    _o_reset();
+    _o_c("{\"suggested\":[");
+    var shown = 0;
+    while (shown < 8) {
+        var best = 0;
+        var bi = 0;
+        while (bi < vec_len(_fx_tag_list)) {
+            var c = vec_get(_fx_tag_list, bi);
+            var take = 1;
+            if (load64(c + 8) == 0) { take = 0; }
+            if (own != 0) {
+                if (_fx_meta_has(own, c) == 1) { take = 0; }
+            }
+            if (take == 1) {
+                if (best == 0) { best = c; }
+                elif (load64(c + 8) > load64(best + 8)) { best = c; }
+            }
+            bi = bi + 1;
+        }
+        if (best == 0) { break; }
+        if (shown > 0) { _o_c(","); }
+        _o_c("{\"tag\":\"");
+        _o_esc(load64(best), strlen(load64(best)));
+        _o_c("\"");
+        _o_int("files", load64(best + 8));
+        _o_c("}");
+        store64(best + 8, 0);
+        shown = shown + 1;
+    }
+    _o_c("]}");
+    return 0;
+}
+
+# --- opening ---------------------------------------------------------------
+
+fn _fx_tbl_for(cap) {
+    var t = 1024;
+    while (t < cap * 2) { t = t * 2; }
+    return t;
+}
+
+# Open the index under `data_dir` (a cstr). Call before serving. With no root
+# there is nothing to reserve, and the index stays `none`.
+fn files_open(data_dir) {
+    if (vec_len(_fx_roots) == 0) { return 0; }
+    _fx_cap = FILES_MAX;
+    _fx_pool_cap = _fx_cap * FILES_POOL_PER;
+    _fx_tbl = _fx_tbl_for(_fx_cap);
+    _fx_seed = clock_now_ns() | 1;
+    _fx_gen_a = _fx_gen_new();
+    _fx_gen_b = _fx_gen_new();
+    _fx_path = alloc(FILES_PATH_MAX + 2);
+    _fx_stat = alloc(256);
+    _fx_str = str_new(_fx_path, 0);
+    _fx_scratch = alloc(16384);
+    _fx_names = alloc(FILES_DIR_NAMES);
+    _fx_offs = alloc(FILES_DIR_ENTRIES * 8);
+    _fx_io = alloc(FILES_IO_BYTES);
+    _fx_ctx = alloc(144);
+    _fx_hdr = alloc(FILES_INDEX_HDR);
+    _fx_out_cap = FILES_PAGE_BYTES + FILES_OUT_SLACK;
+    _fx_out = alloc(_fx_out_cap);
+    if ((_fx_gen_a == 0) || (_fx_gen_b == 0) || (_fx_names == 0) || (_fx_out == 0)) {
+        sakshi_warn("no memory for the file index; it stays off", 42);
+        daimon_audit(SEV_WARNING, "files", "files.index.unavailable", "no memory for the file index");
+        return 0;
+    }
+    _fx_data_dir = data_dir;
+    var dir = path_join(str_from(data_dir), str_from("files"));
+    if (xmkdir_p(str_cstr(dir), 448) == 0) {
+        _fx_dir = str_cstr(dir);
+        _fx_index_path = str_cstr(path_join(dir, str_from("index")));
+        _fx_tmp_path = str_cstr(path_join(dir, str_from("index.tmp")));
+        _fx_meta_path = str_cstr(path_join(dir, str_from("meta")));
+    } else {
+        sakshi_warn("no data directory for the file index; it lasts for this run", 59);
+        daimon_audit(SEV_WARNING, "files", "files.index.unkept", "no data directory for the file index");
+        _fx_meta_failed = 1;
+    }
+    _fx_meta_load();
+    _fx_smart_seed();
+    _fx_gen_clear(_fx_gen_a);
+    _fx_gen_clear(_fx_gen_b);
+    _fx_active = _fx_gen_a;
+    if (_fx_load(_fx_active) == 1) {
+        _fx_persisted = 1;
+        _fx_generation = 1;
+        _fx_resolve(_fx_active);
+    }
+    _fx_power_find();
+    _fx_enabled = 1;
+    # A restart may have missed anything, so the walk starts at once. What was read
+    # is served meanwhile: that is the point of having kept it.
+    _fx_want = 1;
+    daimon_audit(SEV_INFO, "files", "files.index.open", "the file index is open");
+    return 1;
+}
+
+fn files_enabled() { return _fx_enabled; }

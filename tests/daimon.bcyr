@@ -54,6 +54,8 @@ include "src/sched.cyr"
 include "src/vector_store.cyr"
 include "src/rag.cyr"
 include "src/mcp.cyr"
+include "src/mcp_pin.cyr"
+include "src/files.cyr"
 include "src/edge.cyr"
 
 var _cos_a = 0;
@@ -144,6 +146,33 @@ fn bench_mcp_register_100() {
 # The GET /v1/mcp/tools body for 100 tools, exactly as the route builds it.
 fn bench_mcp_manifest_100() {
     mcp_manifest_json(_mcp_reg);
+    return 0;
+}
+
+# 2.5.4: a digest is taken once per registration, and a first sight writes the store.
+fn bench_mcp_definition_sha256() {
+    mcp_definition_sha256(_bench_pin_tool);
+    return 0;
+}
+
+# 2.5.4: a query runs on the loop, over every record of the served generation.
+fn bench_files_count_flags_41k() {
+    files_count(_bench_fx_untagged);
+    return 0;
+}
+
+fn bench_files_count_ext_41k() {
+    files_count(_bench_fx_ext);
+    return 0;
+}
+
+fn bench_files_list_100_of_41k() {
+    files_list_json(_bench_fx_page);
+    return 0;
+}
+
+fn bench_files_find_41k() {
+    _fx_find(_fx_active, _bench_fx_path, _bench_fx_plen);
     return 0;
 }
 
@@ -354,6 +383,44 @@ fn bench_bus_broadcast_take_100() {
 # ================================================================
 # Main
 # ================================================================
+
+var _bench_pin_tool = 0;
+var _bench_fx_untagged = 0;
+var _bench_fx_ext = 0;
+var _bench_fx_page = 0;
+var _bench_fx_path = 0;
+var _bench_fx_plen = 0;
+
+# A generation of 41,200 records with paths of crab's shape, built with no disk:
+# a query's cost is what is measured here. The walk's is in BENCHMARKS.md.
+fn bench_files_setup() {
+    files_init();
+    files_add_root("/home/me");
+    files_set_max(65536);
+    files_open("build/bench_files");
+    _fx_enabled = 0;
+    _fx_want = 0;
+    var i = 0;
+    while (i < 41200) {
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, "/home/me/projects/d");
+        str_builder_add_int(sb, i / 200);
+        str_builder_add_cstr(sb, "/file");
+        str_builder_add_int(sb, i);
+        if (i % 7 == 0) { str_builder_add_cstr(sb, ".cr2"); } else { str_builder_add_cstr(sb, ".txt"); }
+        var p = str_builder_build(sb);
+        _fx_add(_fx_active, str_data(p), str_len(p), i * 37, 1790000000 + i, 0);
+        if (i == 20000) {
+            _bench_fx_path = str_data(p);
+            _bench_fx_plen = str_len(p);
+        }
+        i = i + 1;
+    }
+    _bench_fx_untagged = files_query_parse("untagged=1&unrated=1");
+    _bench_fx_ext = files_query_parse("ext=arw,cr2,cr3,dng,nef,orf,raf,rw2");
+    _bench_fx_page = files_query_parse("limit=100&offset=20000");
+    return 0;
+}
 
 fn main() {
     alloc_init();
@@ -616,6 +683,27 @@ fn main() {
     var b26 = bench_new("bus_broadcast_take_100");
     bench_run(b26, &bench_bus_broadcast_take_100, 10000);
     vec_push(benches, b26);
+
+    # 2.5.4: tool definition digests, and queries over a 41,200-file index.
+    _bench_pin_tool = mcp_tool_new(str_from("scan"), str_from("a tool of about the usual length of description"),
+      str_from("{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}"));
+    var b27 = bench_new("mcp_definition_sha256");
+    bench_run(b27, &bench_mcp_definition_sha256, 100000);
+    vec_push(benches, b27);
+
+    bench_files_setup();
+    var b28 = bench_new("files_count_flags_41k");
+    bench_run(b28, &bench_files_count_flags_41k, 1000);
+    vec_push(benches, b28);
+    var b29 = bench_new("files_count_ext_41k");
+    bench_run(b29, &bench_files_count_ext_41k, 1000);
+    vec_push(benches, b29);
+    var b30 = bench_new("files_list_100_of_41k");
+    bench_run(b30, &bench_files_list_100_of_41k, 1000);
+    vec_push(benches, b30);
+    var b31 = bench_new("files_find_in_41k");
+    bench_run(b31, &bench_files_find_41k, 100000);
+    vec_push(benches, b31);
 
     bench_report_all(benches);
     if (_bench_cg_agent == 0) {

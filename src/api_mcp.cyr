@@ -38,14 +38,57 @@ fn api_mcp_register(fd, body) {
         http_error(fd, 409, str_from("a builtin tool already has that name"));
         return 0;
     }
-    http_send_response(fd, 201, "{\"ok\":true}", 11);
+    # The pin, its audit entry and the store (2.5.4). A registration that differs
+    # from its pin is served, and marked, and this tells the registrant so.
+    var name_c = str_cstr(name);
+    var verdict = mcp_pin_external(_mcp_registry, name_c);
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"ok\":true,\"pin_state\":\"");
+    if (verdict == MCP_PIN_V_CHANGED) { str_builder_add_cstr(sb, "changed"); }
+    elif (verdict == MCP_PIN_V_UNPINNED) { str_builder_add_cstr(sb, "unpinned"); }
+    else { str_builder_add_cstr(sb, "pinned"); }
+    str_builder_add_cstr(sb, "\"}");
+    var out = str_builder_build(sb);
+    http_send_response(fd, 201, str_data(out), str_len(out));
     return 0;
 }
 
-# DELETE /v1/mcp/tools/{name}
+# DELETE /v1/mcp/tools/{name}. The pin stays: a tool that vanishes and returns
+# with a new definition is the swap it exists to show (src/mcp_pin.cyr).
 fn api_mcp_deregister(fd, name_cstr) {
+    if (mcp_find_external_url(_mcp_registry, name_cstr) != 0) {
+        daimon_audit(SEV_INFO, "mcp", "mcp.tool.deregister", name_cstr);
+    }
     mcp_deregister(_mcp_registry, name_cstr);
     http_ok(fd, str_from("{\"ok\":true}"));
+    return 0;
+}
+
+# POST /v1/mcp/tools/{name}/accept — make what an external tool now serves its
+# pinned definition. ⛔ REFUSED BY DEFAULT, as nein_allow and libro_retention are:
+# with no caller authentication, accepting from the API would let the same caller
+# who swapped a definition approve it. `serve --mcp-pin-accept` reopens it for an
+# operator on a trusted single-tenant host. Per-consumer acceptance through t-ron
+# needs caller identity (roadmap 2.6.x).
+fn api_mcp_pin_accept(fd, name_c) {
+    if (_mcp_pin_accept_enabled == 0) {
+        daimon_audit(SEV_SECURITY, "mcp", "mcp.pin.accept.deny", name_c);
+        http_error(fd, 403,
+          str_from("accepting a tool definition is refused until callers are identified; see serve --mcp-pin-accept"));
+        return 0;
+    }
+    var t = mcp_find_tool(_mcp_registry, name_c);
+    if (t == 0) { http_error(fd, 404, str_from("tool not found")); return 0; }
+    if (mcp_is_builtin(_mcp_registry, name_c) == 1) {
+        http_error(fd, 409, str_from("a builtin's pin follows the binary"));
+        return 0;
+    }
+    if (mcp_pin_accept(t) == 0) {
+        http_error(fd, 409, str_from("this tool has no pin to move"));
+        return 0;
+    }
+    daimon_audit(SEV_SECURITY, "mcp", "mcp.pin.accept", name_c);
+    http_ok(fd, str_from("{\"ok\":true,\"pin_state\":\"pinned\"}"));
     return 0;
 }
 

@@ -305,7 +305,7 @@ jobs:
 
   agnos-guest:
     # 2.4.1. daimon's AGNOS guest test on every push. tests/agnos/run.sh --release
-    # downloads agnos 1.57.14 (1.57.5 until 2.4.4) and gnoboot 0.7.2 from their GitHub releases, refuses
+    # downloads agnos 1.57.17 (1.57.14 until 2.5.4) and gnoboot 0.9.0 from their GitHub releases, refuses
     # them unless they match the SHA-256 pinned in the script, boots them under
     # QEMU (TCG; no KVM needed), and runs daimon's agent lifecycle (guest.cyr) and
     # the real daimon binary over HTTP (http_client.cyr) inside the guest. Until

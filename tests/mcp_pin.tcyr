@@ -1,0 +1,389 @@
+# =========================================================================
+# mcp_pin — tests against THE REAL src/mcp_pin.cyr (2.5.4)
+#
+# docs/development/issues/2026-11-06-a-client-that-loses-its-tool-pins-has-
+# nothing-to-repair-from.md. The digest vectors were computed outside cyrius, by
+# Python's hashlib, so they are what another client computes and not what this
+# code computes twice. A "restart" here is mcp_pins_init and a fresh registry:
+# all a process holds of a store is what it read.
+# =========================================================================
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/io.cyr"
+include "lib/fs.cyr"
+include "lib/hashmap.cyr"
+include "lib/tagged.cyr"
+include "lib/bayan.cyr"
+include "lib/syscalls.cyr"
+include "lib/chrono.cyr"
+include "lib/sigil.cyr"
+include "lib/assert.cyr"
+
+# strstr answers an index or -1, so 0 is a match at the start and -1 is truthy.
+fn holds(hay, needle) {
+    if (strstr(hay, needle) >= 0) { return 1; }
+    return 0;
+}
+
+# What src/audit.cyr supplies in the linked binary. This records, so a test can
+# say what was audited.
+var SEV_INFO = 1;
+var SEV_WARNING = 2;
+var SEV_SECURITY = 5;
+var _audit_last = 0;
+var _audit_last_detail = 0;
+var _audit_n = 0;
+fn daimon_audit(sev, source, action, details) {
+    _audit_last = action;
+    _audit_last_detail = details;
+    _audit_n = _audit_n + 1;
+    return 0;
+}
+
+include "src/error.cyr"
+include "src/mcp.cyr"
+include "src/mcp_pin.cyr"
+
+alloc_init();
+
+fn _tool(name, desc, schema) {
+    return mcp_tool_new(str_from(name), str_from(desc), str_from(schema));
+}
+
+var DIR = "build/mcp_pin_test";
+var FILE = "build/mcp_pin_test/mcp/toolpins";
+
+# An empty data directory.
+fn fresh_dir() {
+    sys_unlink(FILE);
+    sys_rmdir("build/mcp_pin_test/mcp");
+    sys_rmdir(DIR);
+    return 0;
+}
+
+# A process starting over the same directory, with one builtin of `desc`.
+fn restart(desc) {
+    mcp_pins_init();
+    var reg = mcp_registry_new();
+    mcp_register_builtin(reg, _tool("libro_verify", desc, "{\"type\":\"object\"}"));
+    mcp_pins_open(DIR, reg);
+    return reg;
+}
+
+fn reg_ext(reg, name, desc) {
+    mcp_register_external(reg, _tool(name, desc, "{}"), str_from("http://127.0.0.1:1/x"));
+    return mcp_pin_external(reg, name);
+}
+
+# Write `body` to the store under a digest it passes.
+fn write_store(body) {
+    var n = strlen(body);
+    var b = alloc(n + 80);
+    memcpy(b, body, n);
+    var hex = sha256_hex(b, n);
+    memcpy(b + n, "DIGEST\t", 7);
+    memcpy(b + n + 7, hex, 64);
+    store8(b + n + 71, 10);
+    xmkdir_p("build/mcp_pin_test/mcp", 448);
+    file_write_atomic(FILE, b, n + 72);
+    return n + 72;
+}
+
+fn file_text() {
+    var b = alloc(65536);
+    var n = file_read_all(FILE, b, 65535);
+    if (n < 0) { n = 0; }
+    store8(b + n, 0);
+    return b;
+}
+
+# --- the digest: the bytes a client receives ------------------------------
+test_group("mcp_definition_sha256");
+assert_streq(mcp_definition_sha256(_tool("scan", "scanner", "{\"type\":\"object\"}")),
+    "04219c8d4af27476868f85ed80a9253c53d734556e90c71f2124f65d31427ba7",
+    "digest matches hashlib: name, NUL, description, NUL, schema");
+assert_streq(mcp_definition_sha256(_tool("t", "", "{}")),
+    "d65c0ce0fecfd733464b8d2cd30eed68d48bd8602bf02af9675c95120928b669",
+    "an empty description still contributes its separator");
+assert_streq(mcp_definition_sha256(_tool("café", "quote \" and \n newline", "{\"a\":[1,2.5,\"\\u0001\"]}")),
+    "1869471552797eda7910bf6c2cd249246f2c669d6a71e48ea87bb08d62fb9fc7",
+    "UTF-8 and control bytes are hashed decoded, the schema as served");
+# The two ways to split the same bytes differ only by where the separator falls.
+var dab = mcp_definition_sha256(_tool("ab", "c", "{}"));
+var dac = mcp_definition_sha256(_tool("a", "bc", "{}"));
+assert(streq(dab, dac) == 0, "the separator keeps two splits of the same bytes apart");
+# A tool with no schema is served {"type":"object"}, so that is what is hashed.
+assert_streq(mcp_definition_sha256(mcp_tool_new(str_from("scan"), str_from("scanner"), 0)),
+    "04219c8d4af27476868f85ed80a9253c53d734556e90c71f2124f65d31427ba7",
+    "the digest covers the schema the manifest serves, not the stored field");
+
+# What a client does to the schema it receives must land on the bytes served.
+fn rebuilt(schema_text) {
+    var v = bayan_json_v_parse(str_from(schema_text));
+    assert(v != 0, "the schema parses");
+    return bayan_json_v_build(v);
+}
+fn fixed_point(body, what) {
+    var served = mcp_extract_input_schema(str_from(body));
+    assert(str_eq(rebuilt(str_cstr(served)), served) == 1, what);
+    return 0;
+}
+test_group("schema round trip");
+fixed_point("{\"inputSchema\":{ \"type\" : \"object\" , \"required\" : [ \"a\" ] }}", "whitespace");
+fixed_point("{\"inputSchema\":{\"z\":1,\"a\":2}}", "key order survives");
+fixed_point("{\"inputSchema\":{\"a\":1.10,\"b\":1e3,\"c\":0.1,\"d\":5e-324,\"e\":-0.0}}", "number spellings");
+fixed_point("{\"inputSchema\":{\"s\":\"\\u00e9\\ud83d\\ude00\\/\\u0001\"}}", "string escapes");
+fixed_point("{\"input_schema\":{\"a\":null,\"b\":[],\"c\":{}}}", "the alias, and empty members");
+
+# --- first sight, unchanged, changed --------------------------------------
+test_group("a registration against its pin");
+fresh_dir();
+var reg = restart("verify");
+assert_streq(mcp_pin_state_name(mcp_pin_state()), "new", "an empty directory is a new store");
+assert_eq(mcp_pin_count(), 1, "the builtin is pinned at open");
+assert(file_exists(FILE) == 1, "and is on disk before a request is served");
+
+assert_eq(reg_ext(reg, "scan", "one"), MCP_PIN_V_FIRST, "first sight pins");
+assert_streq(_audit_last, "mcp.tool.register", "a registration leaves a record");
+var pinned = mcp_pin_sha(mcp_pin_find("scan"));
+assert_eq(reg_ext(reg, "scan", "one"), MCP_PIN_V_SAME, "the same definition again is unchanged");
+assert_streq(_audit_last, "mcp.tool.register", "and is recorded as one");
+
+assert_eq(reg_ext(reg, "scan", "two"), MCP_PIN_V_CHANGED, "a different definition is changed");
+assert_streq(_audit_last, "mcp.tool.changed", "a change is audited as one");
+assert_streq(_audit_last_detail, "scan", "naming the tool");
+assert_streq(mcp_pin_sha(mcp_pin_find("scan")), pinned, "⛔ a registration does not move the pin");
+var served = mcp_find_tool(reg, "scan");
+assert(str_eq(mcp_tool_desc(served), str_from("two")) == 1, "the new definition is what is served");
+
+var m = mcp_manifest_json(reg);
+var root = bayan_json_v_parse(m);
+assert(root != 0, "the manifest parses");
+var tools = bayan_json_v_obj_get_by_cstr(root, "tools");
+var e = 0;
+var ti = 0;
+while (ti < bayan_json_v_arr_len(tools)) {
+    var c = bayan_json_v_arr_get(tools, ti);
+    if (str_eq(http_str(c, "name"), str_from("scan")) == 1) { e = c; }
+    ti = ti + 1;
+}
+fn http_str(o, k) { return bayan_json_v_str(bayan_json_v_obj_get_by_cstr(o, k)); }
+assert(e != 0, "the manifest lists the tool");
+assert(str_eq(http_str(e, "pin_state"), str_from("changed")) == 1, "manifest: pin_state changed");
+assert(str_eq(http_str(e, "pinned_sha256"), str_from(pinned)) == 1, "manifest: the digest it was pinned at");
+assert(str_eq(http_str(e, "definition_sha256"), str_from(mcp_tool_sha(served))) == 1,
+    "manifest: the digest of what it serves");
+assert(bayan_json_v_obj_get_by_cstr(e, "pinned_at") != 0, "manifest: when");
+var pins = bayan_json_v_obj_get_by_cstr(root, "pins");
+assert(str_eq(http_str(pins, "state"), str_from("new")) == 1, "manifest: the store's state");
+assert_eq(bayan_json_v_bool(bayan_json_v_obj_get_by_cstr(pins, "durable")), 1, "manifest: durable");
+assert_eq(bayan_json_v_int(bayan_json_v_obj_get_by_cstr(pins, "count")), 2, "manifest: how many");
+
+# Back to the pinned definition: unchanged again, and the state says so.
+assert_eq(reg_ext(reg, "scan", "one"), MCP_PIN_V_SAME, "back to the pinned definition is unchanged");
+
+# --- a deregistration keeps the pin ---------------------------------------
+test_group("vanish and return");
+mcp_deregister(reg, "scan");
+assert(mcp_pin_find("scan") != 0, "deregistering keeps the pin");
+assert_eq(reg_ext(reg, "scan", "swapped while gone"), MCP_PIN_V_CHANGED,
+    "⛔ returning with a new definition is the swap");
+
+# --- a restart ------------------------------------------------------------
+test_group("a restart");
+var reg2 = restart("verify");
+assert_streq(mcp_pin_state_name(mcp_pin_state()), "loaded", "a previous run's store loads");
+assert_eq(mcp_pin_count(), 2, "with every pin, one whose tool is not registered");
+assert_streq(mcp_pin_sha(mcp_pin_find("scan")), pinned, "the pin means the same thing tomorrow");
+assert((mcp_pin_flags(mcp_pin_find("scan")) & MCP_PIN_FROM_STORE) != 0, "and says it came from the store");
+assert(mcp_tool_sha(mcp_find_tool(reg2, "libro_verify")) != 0, "builtins are compared at open");
+assert_eq(reg_ext(reg2, "scan", "still swapped"), MCP_PIN_V_CHANGED, "a swap across a restart is seen");
+assert_eq(reg_ext(reg2, "scan", "one"), MCP_PIN_V_SAME, "and the original still matches");
+assert(holds(str_cstr(mcp_manifest_json(reg2)), "\"pin_from_store\":true") == 1,
+    "a client can tell a repaired pin from a first sight");
+
+# A pin taken this run is not from the store.
+reg_ext(reg2, "fresh", "x");
+assert_eq(mcp_pin_flags(mcp_pin_find("fresh")) & MCP_PIN_FROM_STORE, 0, "a first sight this run is not from the store");
+
+# --- a new binary moves a builtin's pin -----------------------------------
+test_group("a builtin");
+var before = str_cstr(str_from(mcp_pin_sha(mcp_pin_find("libro_verify"))));
+_audit_last = 0;
+var reg3 = restart("verify, reworded by a new binary");
+assert(streq(mcp_pin_sha(mcp_pin_find("libro_verify")), before) == 0, "a new binary moves its builtin's pin");
+assert_streq(_audit_last, "mcp.pin.builtin.moved", "and says so");
+assert_streq(mcp_pin_sha(mcp_pin_find("libro_verify")),
+    mcp_tool_sha(mcp_find_tool(reg3, "libro_verify")), "so a builtin serves what it is pinned at");
+assert_eq(mcp_pin_flags(mcp_pin_find("libro_verify")) & MCP_PIN_FROM_STORE, 0, "and the moved pin is not a stored one");
+var reg4 = restart("verify, reworded by a new binary");
+assert_eq(mcp_pin_flags(mcp_pin_find("libro_verify")) & MCP_PIN_BUILTIN, MCP_PIN_BUILTIN,
+    "the file keeps what is a builtin");
+
+# --- accepting ------------------------------------------------------------
+test_group("mcp_pin_accept");
+reg_ext(reg4, "scan", "the upgrade");
+var old = mcp_pin_sha(mcp_pin_find("scan"));
+assert_eq(mcp_pin_accept(mcp_find_tool(reg4, "scan")), 1, "an accept moves the pin");
+assert(streq(mcp_pin_sha(mcp_pin_find("scan")), old) == 0, "to what is served");
+assert_eq(reg_ext(reg4, "scan", "the upgrade"), MCP_PIN_V_SAME, "which is then unchanged");
+var reg5 = restart("verify, reworded by a new binary");
+assert_eq(reg_ext(reg5, "scan", "the upgrade"), MCP_PIN_V_SAME, "and stays accepted across a restart");
+assert_eq(_mcp_pin_accept_enabled, 0, "the route is refused unless the operator opens it");
+assert_eq(mcp_pin_accept(_tool("never-seen", "d", "{}")), 0, "a tool with no pin has nothing to accept");
+
+# --- limits: a tool past them is served and said to be unpinned -----------
+test_group("limits");
+var longname = alloc(MCP_PIN_NAME_MAX + 2);
+memset(longname, 97, MCP_PIN_NAME_MAX + 1);
+store8(longname + MCP_PIN_NAME_MAX + 1, 0);
+var n0 = mcp_pin_count();
+assert_eq(reg_ext(reg5, longname, "d"), MCP_PIN_V_UNPINNED, "a name past the limit is unpinned");
+assert_eq(mcp_pin_count(), n0, "and takes no row");
+assert_streq(_audit_last, "mcp.tool.unpinned", "and is audited");
+assert(mcp_find_tool(reg5, longname) != 0, "and is still served");
+assert(holds(str_cstr(mcp_manifest_json(reg5)), "\"pin_state\":\"unpinned\"") == 1, "and says so");
+# Control bytes and quotes survive the file, which is one line a row.
+assert_eq(reg_ext(reg5, "odd\n\"name\t", "d"), MCP_PIN_V_FIRST, "an awkward name is pinned");
+var reg6 = restart("verify, reworded by a new binary");
+assert_streq(mcp_pin_state_name(mcp_pin_state()), "loaded", "and the file still loads");
+assert(mcp_pin_find("odd\n\"name\t") != 0, "with the name as it was");
+
+# The table's limit, as a registry flood would reach it.
+var fi = mcp_pin_count();
+var numbered = 0;
+while (fi < MCP_PINS_MAX) {
+    numbered = str_builder_new();
+    str_builder_add_cstr(numbered, "t");
+    str_builder_add_int(numbered, fi);
+    mcp_pin_tool(mcp_tool_new(str_builder_build(numbered), str_from("d"), str_from("{}")), 0);
+    fi = fi + 1;
+}
+assert_eq(mcp_pin_tool(_tool("one-too-many", "d", "{}"), 0), MCP_PIN_V_UNPINNED,
+    "past the table it is unpinned, not refused");
+assert_eq(mcp_pin_tool(_tool("scan", "the upgrade", "{}"), 0), MCP_PIN_V_SAME,
+    "a pinned tool still compares when the table is full");
+
+# --- a store that fails its checks ----------------------------------------
+fn rejected(what) {
+    var before_text = file_text();
+    _audit_last = 0;
+    var r = restart("verify");
+    assert_streq(mcp_pin_state_name(mcp_pin_state()), "rejected", what);
+    assert_streq(_audit_last, "mcp.pin.store.rejected", "... and audited");
+    assert_eq(mcp_pin_find("scan"), 0, "... and no row of it is taken");
+    assert(mcp_pin_count() == 1, "... the builtin is pinned for this run");
+    reg_ext(r, "another", "d");
+    assert_streq(file_text(), before_text, "⛔ ... and nothing writes over it");
+    assert(holds(str_cstr(mcp_manifest_json(r)), "\"state\":\"rejected\",\"durable\":false") == 1,
+        "... and the manifest says so");
+    return 0;
+}
+
+test_group("a store refused whole");
+# A row in the writer's shape: `name_json` is the JSON text of a name.
+fn row_for(name_json, at) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"name\":\"");
+    str_builder_add_cstr(sb, name_json);
+    str_builder_add_cstr(sb, "\",\"sha256\":\"");
+    var i = 0;
+    while (i < 64) { str_builder_add_cstr(sb, "0"); i = i + 1; }
+    str_builder_add_cstr(sb, "\",\"pinned_at\":");
+    str_builder_add_cstr(sb, at);
+    str_builder_add_cstr(sb, "}\n");
+    return str_data(str_builder_build(sb));
+}
+var goodrow = row_for("scan", "1");
+fn with_magic(rows) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "DAIMON-TOOLPIN-1\n");
+    str_builder_add_cstr(sb, rows);
+    return str_data(str_builder_build(sb));
+}
+fresh_dir();
+write_store(with_magic(goodrow));
+restart("verify");
+assert_streq(mcp_pin_state_name(mcp_pin_state()), "loaded", "a store written by the format's rules loads");
+
+# A byte changed under the digest.
+var good = file_text();
+store8(good + 30, load8(good + 30) + 1);
+file_write_atomic(FILE, good, strlen(good));
+rejected("an edited byte fails the digest");
+
+file_write_atomic(FILE, "DAIMON-TOOLPIN-1\n", 17);
+rejected("a truncated file");
+file_write_atomic(FILE, "garbage", 7);
+rejected("a file that is not a store");
+# ⛔ Truncating the store must not read as having none: that would reset every pin.
+file_write_atomic(FILE, "", 0);
+rejected("an empty file");
+write_store("DAIMON-TOOLPIN-2\n");
+rejected("a format this daimon does not read");
+
+# Each of these passes the digest: a foreign writer's rows, not a torn write.
+write_store(with_magic("not json\n"));
+rejected("a row that is not JSON");
+write_store(with_magic("{\"name\":\"scan\"}\n"));
+rejected("a row with fields missing");
+write_store(with_magic("{\"name\":\"scan\",\"sha256\":\"zz\",\"pinned_at\":1}\n"));
+rejected("a digest that is not 64 hex digits");
+write_store(with_magic(row_for("scan", "-1")));
+rejected("a negative time");
+write_store(with_magic(row_for("a\\u0000b", "1")));
+rejected("a NUL in a name");
+var twice = str_builder_new();
+str_builder_add_cstr(twice, goodrow);
+str_builder_add_cstr(twice, goodrow);
+write_store(with_magic(str_data(str_builder_build(twice))));
+rejected("a name twice");
+write_store(with_magic("\n"));
+rejected("an empty row");
+
+# ⛔ One good row beside a bad one takes neither.
+var mixed = str_builder_new();
+str_builder_add_cstr(mixed, goodrow);
+str_builder_add_cstr(mixed, "not json\n");
+write_store(with_magic(str_data(str_builder_build(mixed))));
+rejected("a good row beside a bad one");
+
+sys_unlink(FILE);
+var lt = sys_symlink("/etc/passwd", FILE);
+assert_eq(lt, 0, "(the fixture symlink is made)");
+_audit_last = 0;
+restart("verify");
+assert_streq(mcp_pin_state_name(mcp_pin_state()), "rejected", "a symlink at the path is refused");
+assert_streq(_audit_last, "mcp.pin.store.rejected", "... and audited");
+sys_unlink(FILE);
+
+# --- nothing to keep them in ----------------------------------------------
+test_group("no store");
+mcp_pins_init();
+var reg7 = mcp_registry_new();
+mcp_register_builtin(reg7, _tool("libro_verify", "d", "{}"));
+mcp_pins_open("/proc/no-such-dir/data", reg7);
+assert_streq(mcp_pin_state_name(mcp_pin_state()), "unavailable", "a directory that cannot be made is unavailable");
+assert_eq(mcp_pin_count(), 1, "pins still work for the run");
+assert_eq(reg_ext(reg7, "scan", "one"), MCP_PIN_V_FIRST, "first sight");
+assert_eq(reg_ext(reg7, "scan", "two"), MCP_PIN_V_CHANGED, "and a change is still seen");
+assert(holds(str_cstr(mcp_manifest_json(reg7)), "\"state\":\"unavailable\",\"durable\":false") == 1,
+    "the manifest says they will not last");
+
+# A write that fails later ends durability, and says so.
+fresh_dir();
+var reg8 = restart("verify");
+sys_unlink(FILE);
+sys_rmdir("build/mcp_pin_test/mcp");
+_audit_last = 0;
+reg_ext(reg8, "scan", "one");
+assert_streq(mcp_pin_state_name(mcp_pin_state()), "unavailable", "a failed write ends durability");
+assert(holds(str_cstr(mcp_manifest_json(reg8)), "\"durable\":false") == 1, "and the manifest says so");
+assert_eq(mcp_pin_tool(_tool("scan", "two", "{}"), 0), MCP_PIN_V_CHANGED, "pins still compare after it");
+
+fresh_dir();
+syscall(SYS_EXIT, assert_summary());

@@ -760,6 +760,224 @@ else
 fi
 if [ $SL_OK -ne 1 ]; then echo "  slot smoke FAILED"; SMOKE_EXIT=1; fi
 
+echo "=== 2.5.4 tool definition pins ==="
+# A client repairs its pins from these, so what matters is what ANOTHER program
+# computes from the bytes it receives (sha256sum here, not daimon's own code),
+# and that a pin survives a real restart of the process. tests/mcp_pin.tcyr has
+# the store's refusals; this is the route, the manifest and the process.
+TP_OK=1
+TP_PORT=18094
+TP_DIR=$(mktemp -d)
+tp_check() {
+    printf "  %s: " "$1"
+    if [ "$2" = "$3" ]; then echo "PASS"; else echo "FAIL (got '$2', want '$3')"; TP_OK=0; fi
+}
+tp_has() {
+    printf "  %s: " "$1"
+    if printf '%s' "$2" | grep -qF "$3"; then echo "PASS"; else echo "FAIL"; TP_OK=0; fi
+}
+tp_serve() {
+    ./build/daimon serve $TP_PORT --data-dir "$TP_DIR" "$@" >/dev/null 2>&1 &
+    TP_SRV=$!
+    i=0
+    while [ $i -lt 25 ]; do
+        if curl -s --max-time 1 "http://127.0.0.1:$TP_PORT/v1/health" >/dev/null 2>&1; then break; fi
+        i=$((i + 1)); sleep 0.1
+    done
+}
+tp_stop() { kill $TP_SRV 2>/dev/null; wait $TP_SRV 2>/dev/null; }
+tp_reg() {
+    curl -s --max-time 2 -X POST "http://127.0.0.1:$TP_PORT/v1/mcp/tools" \
+      -d "{\"name\":\"scan\",\"description\":\"$1\",\"callback_url\":\"http://127.0.0.1:1/x\",\"inputSchema\":{ \"type\" : \"object\" }}"
+}
+# One tool's entry from the manifest, by name.
+tp_entry() {
+    curl -s --max-time 2 "http://127.0.0.1:$TP_PORT/v1/mcp/tools" | sed 's/},{"name"/}\n{"name"/g' | grep "\"name\":\"$1\""
+}
+tp_field() { printf '%s' "$1" | sed -n "s/.*\"$2\":\"\{0,1\}\([^,\"}]*\).*/\1/p"; }
+tp_digest() { printf '%s\0%s\0%s' "$1" "$2" "$3" | sha256sum | cut -d' ' -f1; }
+
+tp_serve
+tp_has "the manifest says what the store is" "$(curl -s --max-time 2 "http://127.0.0.1:$TP_PORT/v1/mcp/tools")" '"pins":{"state":"new","durable":true'
+tp_has "a builtin carries a digest and a date" "$(tp_entry libro_verify)" '"pinned_at":'
+tp_check "a builtin's digest is what sha256sum computes" "$(tp_field "$(tp_entry libro_verify)" definition_sha256)" \
+  "$(tp_digest libro_verify "Verify the libro chain's hash-link integrity" '{"type":"object"}')"
+tp_has "a registration says it is pinned" "$(tp_reg first)" '"pin_state":"pinned"'
+TP_E1=$(tp_entry scan)
+TP_PIN=$(tp_field "$TP_E1" pinned_sha256)
+tp_check "an external's digest is what sha256sum computes, over the compact schema" "$(tp_field "$TP_E1" definition_sha256)" \
+  "$(tp_digest scan first '{"type":"object"}')"
+tp_check "... and is the pin" "$TP_PIN" "$(tp_field "$TP_E1" definition_sha256)"
+tp_has "a registration that differs says so" "$(tp_reg swapped)" '"pin_state":"changed"'
+TP_E2=$(tp_entry scan)
+tp_has "the manifest marks it changed" "$TP_E2" '"pin_state":"changed"'
+tp_check "⛔ the pin did not move" "$(tp_field "$TP_E2" pinned_sha256)" "$TP_PIN"
+tp_check "... and what is served is what is hashed" "$(tp_field "$TP_E2" definition_sha256)" \
+  "$(tp_digest scan swapped '{"type":"object"}')"
+tp_has "the new definition is served" "$TP_E2" '"description":"swapped"'
+tp_has "accepting is refused by default" "$(curl -s --max-time 2 -X POST "http://127.0.0.1:$TP_PORT/v1/mcp/tools/scan/accept")" 'refused until callers are identified'
+TP_AUDIT=$(curl -s --max-time 2 -X POST "http://127.0.0.1:$TP_PORT/v1/mcp/call" -d '{"name":"libro_export","arguments":{}}')
+tp_has "a registration is on the audit chain" "$TP_AUDIT" 'mcp.tool.register'
+tp_has "a change is on the audit chain" "$TP_AUDIT" 'mcp.tool.changed'
+tp_has "a refused accept is on the audit chain" "$TP_AUDIT" 'mcp.pin.accept.deny'
+tp_has "a NUL in a description is refused (the digest's separator)" \
+  "$(curl -s --max-time 2 -X POST "http://127.0.0.1:$TP_PORT/v1/mcp/tools" -d '{"name":"n","description":"a\u0000b","callback_url":"http://127.0.0.1:1/"}')" 'U+0000'
+curl -s --max-time 2 -X DELETE "http://127.0.0.1:$TP_PORT/v1/mcp/tools/scan" >/dev/null
+tp_stop
+
+tp_serve
+tp_has "a restart reads the previous run's store" "$(curl -s --max-time 2 "http://127.0.0.1:$TP_PORT/v1/mcp/tools")" '"pins":{"state":"loaded","durable":true'
+tp_has "a builtin's pin came from the store" "$(tp_entry libro_verify)" '"pin_from_store":true'
+tp_has "⛔ a swap across a restart and a deregistration is still seen" "$(tp_reg 'swapped again')" '"pin_state":"changed"'
+tp_check "... against the original pin" "$(tp_field "$(tp_entry scan)" pinned_sha256)" "$TP_PIN"
+tp_stop
+
+tp_serve --mcp-pin-accept
+tp_reg upgraded >/dev/null
+tp_has "the operator can open accepting" "$(curl -s --max-time 2 -X POST "http://127.0.0.1:$TP_PORT/v1/mcp/tools/scan/accept")" '"pin_state":"pinned"'
+TP_E3=$(tp_entry scan)
+tp_check "... which moves the pin to what is served" "$(tp_field "$TP_E3" pinned_sha256)" "$(tp_field "$TP_E3" definition_sha256)"
+tp_has "... and is audited" "$(curl -s --max-time 2 -X POST "http://127.0.0.1:$TP_PORT/v1/mcp/call" -d '{"name":"libro_export","arguments":{}}')" '"mcp.pin.accept"'
+tp_has "a builtin's pin is not accepted over the API" "$(curl -s --max-time 2 -X POST "http://127.0.0.1:$TP_PORT/v1/mcp/tools/libro_verify/accept")" 'follows the binary'
+tp_has "a page from another site cannot accept" "$(curl -s --max-time 2 -X POST -H 'Origin: https://evil.example' "http://127.0.0.1:$TP_PORT/v1/mcp/tools/scan/accept")" 'other sites'
+tp_stop
+
+printf 'edited' >> "$TP_DIR/mcp/toolpins"
+TP_BEFORE=$(sha256sum < "$TP_DIR/mcp/toolpins")
+tp_serve
+tp_has "an edited store is refused, and the manifest says so" "$(curl -s --max-time 2 "http://127.0.0.1:$TP_PORT/v1/mcp/tools")" '"pins":{"state":"rejected","durable":false'
+tp_reg 'after the refusal' >/dev/null
+tp_check "⛔ nothing writes over it" "$(sha256sum < "$TP_DIR/mcp/toolpins")" "$TP_BEFORE"
+tp_has "... and the refusal is audited" "$(curl -s --max-time 2 -X POST "http://127.0.0.1:$TP_PORT/v1/mcp/call" -d '{"name":"libro_export","arguments":{}}')" 'mcp.pin.store.rejected'
+tp_stop
+rm -rf "$TP_DIR"
+if [ $TP_OK -ne 1 ]; then echo "  tool pin smoke FAILED"; SMOKE_EXIT=1; fi
+
+echo "=== 2.5.4 file index, tags, ratings, smart folders ==="
+# crab's M7 surface through the real routes and a real restart of the process.
+# tests/files.tcyr has the walk, the refusals of a damaged file and the limits.
+FX_OK=1
+FX_PORT=18095
+FX_DIR=$(mktemp -d)
+FX_ROOT="$FX_DIR/root"
+FX_URL="http://127.0.0.1:$FX_PORT/v1/files"
+fx_has() {
+    printf "  %s: " "$1"
+    if printf '%s' "$2" | grep -qF "$3"; then echo "PASS"; else echo "FAIL (in: $(printf '%s' "$2" | cut -c1-200))"; FX_OK=0; fi
+}
+fx_hasnt() {
+    printf "  %s: " "$1"
+    if printf '%s' "$2" | grep -qF "$3"; then echo "FAIL"; FX_OK=0; else echo "PASS"; fi
+}
+fx_code() {
+    printf "  %s: " "$1"
+    if [ "$2" = "$3" ]; then echo "PASS"; else echo "FAIL (got $2, want $3)"; FX_OK=0; fi
+}
+fx_serve() {
+    ./build/daimon serve $FX_PORT --data-dir "$FX_DIR/data" "$@" >/dev/null 2>&1 &
+    FX_SRV=$!
+    i=0
+    while [ $i -lt 25 ]; do
+        if curl -s --max-time 1 "http://127.0.0.1:$FX_PORT/v1/health" >/dev/null 2>&1; then break; fi
+        i=$((i + 1)); sleep 0.1
+    done
+}
+fx_stop() { kill $FX_SRV 2>/dev/null; wait $FX_SRV 2>/dev/null; }
+fx_fresh() {
+    i=0
+    while [ $i -lt 100 ]; do
+        if curl -s --max-time 2 "$FX_URL/index" | grep -qF '"state":"fresh"'; then return 0; fi
+        i=$((i + 1)); sleep 0.05
+    done
+    return 1
+}
+fx_get() { curl -s --max-time 2 "$FX_URL$1"; }
+fx_post() { curl -s --max-time 2 -X POST "$FX_URL$1" -d "$2"; }
+fx_status() { curl -s --max-time 2 -o /dev/null -w '%{http_code}' "$@"; }
+
+# Three kinds of nothing, the first two here.
+fx_serve
+fx_has "no root: daimon says it holds no index" "$(fx_get /index)" '"state":"none"'
+fx_code "no root: a read says why it cannot answer" "$(fx_status "$FX_URL")" 409
+fx_code "no root: so does a write" "$(fx_status -X POST "$FX_URL/tags" -d '{"path":"/x","add":["a"]}')" 409
+fx_stop
+
+mkdir -p "$FX_ROOT/sub" "$FX_DIR/outside"
+printf 'hello' > "$FX_ROOT/a.txt"
+printf 'hello' > "$FX_ROOT/sub/b.txt"
+printf 'world' > "$FX_ROOT/c.txt"
+printf 'old and large enough' > "$FX_ROOT/old.dat"
+touch -d '2 years ago' "$FX_ROOT/old.dat"
+ln -s "$FX_DIR/outside" "$FX_ROOT/escape"
+printf 'secret' > "$FX_DIR/outside/secret.txt"
+fx_serve --index-root "$FX_ROOT"
+fx_code "with a root the index comes to fresh" "$(fx_fresh; echo $?)" 0
+FX_ST=$(fx_get /index)
+fx_has "... counting its files" "$FX_ST" '"files":4'
+fx_has "... and saying it is kept" "$FX_ST" '"persisted":true'
+fx_has "... and its root" "$FX_ST" "\"roots\":[\"$FX_ROOT\"]"
+FX_LIST=$(fx_get '?limit=100')
+fx_has "the files answer with paths a client can use" "$FX_LIST" "\"path\":\"$FX_ROOT/a.txt\""
+fx_has "... and how many" "$FX_LIST" '"total":4'
+fx_hasnt "⛔ a symlink out of the root is not followed" "$FX_LIST" 'secret.txt'
+fx_has "a duplicate is found across directories" "$(fx_get '?duplicates=1')" '"total":2'
+fx_has "... and not by size alone" "$(fx_get '?duplicates=1')" 'sub/b.txt'
+fx_hasnt "... c.txt has the same size and other content" "$(fx_get '?duplicates=1')" 'c.txt'
+fx_has "an old file by age" "$(fx_get '?older_days=365')" 'old.dat'
+fx_has "a query can be spelled with percent-escapes" "$(fx_get "?under=$(printf '%s' "$FX_ROOT/sub" | sed 's#/#%2F#g')")" '"total":1'
+fx_code "⛔ an unknown filter is refused, not ignored" "$(fx_status "$FX_URL?untaged=1")" 400
+
+fx_has "a tag is added" "$(fx_post /tags "{\"path\":\"$FX_ROOT/a.txt\",\"add\":[\"wip\",\"specs\"]}")" '"ok":true'
+fx_has "... to several files at once" "$(fx_post /tags "{\"paths\":[\"$FX_ROOT/c.txt\",\"$FX_ROOT/old.dat\"],\"add\":[\"wip\"]}")" '"files":2'
+fx_has "a file's tags are read" "$(fx_get "/meta?path=$FX_ROOT/a.txt")" '"tags":["wip","specs"]'
+fx_has "the files carrying a tag" "$(fx_get '?tag=wip')" '"total":3'
+fx_has "⛔ a tag matches exactly" "$(fx_get '?tag=wi')" '"total":0'
+fx_has "the tags that exist, with counts" "$(fx_get /tags)" '{"tag":"wip","files":3}'
+fx_has "a rating is set" "$(fx_post /rating "{\"path\":\"$FX_ROOT/a.txt\",\"rating\":5}")" '"ok":true'
+fx_code "... from 0 to 5" "$(fx_status -X POST "$FX_URL/rating" -d "{\"path\":\"$FX_ROOT/a.txt\",\"rating\":6}")" 400
+fx_has "which files have none" "$(fx_get '?unrated=1')" '"total":3'
+fx_has "tags are suggested from what a folder holds" "$(fx_get "/tags/suggest?path=$FX_ROOT")" '{"tag":"wip","files":3}'
+fx_has "smart folders, each with a count" "$(fx_get /smart)" '"name":"Duplicates","query":"duplicates=1","files":2'
+fx_has "... Untagged" "$(fx_get /smart)" '"name":"Untagged","query":"untagged=1","files":1'
+fx_has "... and what one holds" "$(fx_get /smart/Large%20%26%20old)" '"total":0'
+fx_has "a query is saved" "$(fx_post /smart '{"name":"Work","query":"tag=wip"}')" '"ok":true'
+fx_has "... and answers" "$(fx_get /smart/Work)" '"total":3'
+fx_code "... a query that cannot be read is not saved" "$(fx_status -X POST "$FX_URL/smart" -d '{"name":"X","query":"nope=1"}')" 400
+
+fx_code "⛔ a path outside the roots is refused" "$(fx_status -X POST "$FX_URL/tags" -d "{\"path\":\"$FX_DIR/outside/secret.txt\",\"add\":[\"x\"]}")" 403
+fx_code "⛔ ... a sibling sharing the root's prefix too" "$(fx_status -X POST "$FX_URL/tags" -d "{\"path\":\"$FX_ROOT-evil/x\",\"add\":[\"x\"]}")" 403
+fx_code "⛔ a .. in a path is refused" "$(fx_status -X POST "$FX_URL/tags" -d "{\"path\":\"$FX_ROOT/../outside/secret.txt\",\"add\":[\"x\"]}")" 400
+fx_code "⛔ so is one in a read" "$(fx_status "$FX_URL/meta?path=$FX_ROOT/../outside/secret.txt")" 400
+fx_code "⛔ a page from another site cannot read file names" "$(fx_status -H 'Origin: https://evil.example' "$FX_URL")" 403
+fx_code "... a plain GET does not change state" "$(fx_status "$FX_URL/rating")" 405
+fx_code "... and an unknown route is a 404" "$(fx_status "$FX_URL/nope")" 404
+fx_has "a refusal is audited" "$(curl -s --max-time 2 -X POST "http://127.0.0.1:$FX_PORT/v1/mcp/call" -d '{"name":"libro_export","arguments":{}}')" 'files.path.refused'
+
+printf 'new' > "$FX_ROOT/sub/new.txt"
+fx_code "a re-index is queued" "$(fx_status -X POST "$FX_URL/index" -d "{\"path\":\"$FX_ROOT/sub\"}")" 202
+fx_code "... and ends" "$(fx_fresh; echo $?)" 0
+fx_has "... finding what is new" "$(fx_get "/meta?path=$FX_ROOT/sub/new.txt")" '"size":3'
+fx_code "⛔ a re-index outside the roots is refused" "$(fx_status -X POST "$FX_URL/index" -d "{\"path\":\"$FX_DIR/outside\"}")" 403
+fx_stop
+
+fx_serve --index-root "$FX_ROOT"
+FX_AFTER=$(fx_get /index)
+fx_has "⛔ after a restart the index is there at once" "$FX_AFTER" '"files":5'
+fx_has "... and a person's tags" "$(fx_get "/meta?path=$FX_ROOT/a.txt")" '"tags":["wip","specs"]'
+fx_has "... ratings" "$(fx_get "/meta?path=$FX_ROOT/a.txt")" '"rating":5'
+fx_has "... and saved queries" "$(fx_get /smart/Work)" '"total":3'
+fx_has "... and duplicates" "$(fx_get '?duplicates=1')" '"total":2'
+fx_code "... and it comes to fresh again" "$(fx_fresh; echo $?)" 0
+fx_stop
+
+# ⛔ Narrowing the roots must take what lay outside them off the air at once.
+fx_serve --index-root "$FX_ROOT/sub"
+fx_hasnt "⛔ a narrower root serves nothing from the wider one" "$(fx_get '?limit=100')" "$FX_ROOT/a.txt"
+fx_code "⛔ and its paths are refused" "$(fx_status "$FX_URL/meta?path=$FX_ROOT/a.txt")" 403
+fx_stop
+rm -rf "$FX_DIR"
+if [ $FX_OK -ne 1 ]; then echo "  file index smoke FAILED"; SMOKE_EXIT=1; fi
+
 echo "=== 2.4.2 agent containment (a cgroup per agent) ==="
 # tests/containment.sh: a stop reaches a process that left the agent's group, an
 # agent's leftovers are ended, and a dead daimon's are ended by the next. It needs

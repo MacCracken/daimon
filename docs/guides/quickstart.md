@@ -68,6 +68,21 @@ See [agent-ipc.md](agent-ipc.md).
 To see what agents print, start daimon with `serve --agent-output capture` and read
 `GET /v1/agents/1/output`.
 
+## Keep State, and Index Files
+
+What outlives a restart goes under `--data-dir` (default `/var/lib/agnos`). Without one daimon can
+write, it still runs, and says what will not last: the manifest's `pins.state` reads `unavailable`.
+
+```bash
+# Index a directory. Off by default: anything local can read what the index holds (see the API guide).
+./build/daimon serve --data-dir ~/.local/share/daimon --index-root "$HOME/Documents"
+
+curl -s 127.0.0.1:8090/v1/files/index            # none, building, catching_up, paused or fresh
+curl -s '127.0.0.1:8090/v1/files?untagged=1&limit=20'
+curl -s -X POST 127.0.0.1:8090/v1/files/tags -d "{\"path\":\"$HOME/Documents/a.txt\",\"add\":[\"wip\"]}"
+curl -s 127.0.0.1:8090/v1/files/smart            # saved queries, each with a count
+```
+
 ## Run Tests
 
 ```bash
@@ -90,13 +105,13 @@ cyrius bench tests/daimon.bcyr
 ## Project Structure
 
 ```
-src/                  Source: 30 modules, entry src/main.cyr
-tests/*.tcyr          17 test suites, 1094 checks, each including the real src/ module it tests
-tests/smoke.sh        HTTP smoke checks against the built binary (143); runs tests/containment.sh
+src/                  Source: 33 modules, entry src/main.cyr
+tests/*.tcyr          19 test suites, 1556 checks, each including the real src/ module it tests
+tests/smoke.sh        HTTP smoke checks against the built binary (233); runs tests/containment.sh
 tests/agnos/          The AGNOS guest test: sh tests/agnos/run.sh --release boots agnos under QEMU
 tests/aarch64/        The aarch64 VM test: every suite and a smoke of the binary under a real kernel
-tests/daimon.bcyr     Benchmarks (28; tests/rag_ingest.bcyr has 2 more)
-fuzz/                 Property-based fuzz harnesses (7), sharing fuzz/rng.cyr
-build/daimon          The binary: 2,269,352 bytes, static; unreachable code removed (2.5.1)
+tests/daimon.bcyr     Benchmarks (33; tests/rag_ingest.bcyr has 2 more)
+fuzz/                 Property-based fuzz harnesses (8), sharing fuzz/rng.cyr
+build/daimon          The binary: 2,489,760 bytes, static; unreachable code removed (2.5.1)
 docs/                 Architecture, guides, ADRs, audit reports, roadmap
 ```

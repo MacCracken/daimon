@@ -23,14 +23,15 @@
 set -u
 cd "$(dirname "$0")/../.."
 ROOT=$(pwd)
-# The releases --release boots (2.4.1). gnoboot is byte-identical to the build 2.4.0
-# was first measured on; agnos moved 1.57.5 -> 1.57.14 at 2.4.4, the latest release,
-# whose 1.57.7 is the first that can listen on loopback only. Move a pin by changing
-# the version and its SHA-256 together, from the release's own SHA256SUMS.
-AGNOS_RELEASE=1.57.14
-AGNOS_RELEASE_SHA256=e7d3c6a92bc4666986de4639dcbc23a79dd777ef8fd966a8febd560dcacbb4a9
-GNOBOOT_RELEASE=0.7.2
-GNOBOOT_RELEASE_SHA256=7420e59dcd26da498babc8ad0ff24d37b3bea8d832f670be3225ea5162c6d7e3
+# The releases --release boots (2.4.1). agnos moved 1.57.5 -> 1.57.14 at 2.4.4, whose
+# 1.57.7 is the first that can listen on loopback only, and to 1.57.17 at 2.5.4, the
+# first whose rename#31 replaces a file: a store written twice needs it. gnoboot moved
+# 0.7.2 -> 0.9.0 at 2.5.4. Move a pin by changing the version and its SHA-256 together,
+# from the release's own SHA256SUMS.
+AGNOS_RELEASE=1.57.17
+AGNOS_RELEASE_SHA256=eeba53f48b3bb99ef6f3d76986f465231cafcf39e460bf44b5bd8da17ebba05b
+GNOBOOT_RELEASE=0.9.0
+GNOBOOT_RELEASE_SHA256=76999a8255768d5c4cd6ad6fee899f0dee681f1f82c34ef320002ac05a5f8cda
 KERNEL=${AGNOS_KERNEL:-$ROOT/../agnos/build/agnos}
 GNOBOOT=${GNOBOOT_EFI:-$ROOT/../gnoboot/build/BOOTX64.EFI}
 WORK=$ROOT/build/agnos-guest

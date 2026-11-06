@@ -8,20 +8,40 @@
 # registry itself stays bote-agnostic: it stores name/description/schema and
 # routes builtin calls to mcp_dispatch_builtin.
 
-# McpToolDescription: {name: Str, description: Str, input_schema: Str}
-# 3 fields x 8 = 24 bytes
+# McpToolDescription: {name: Str, description: Str, input_schema: Str,
+#                      sha256: cstr, pin: McpPin}
+# 5 fields x 8 = 40 bytes. sha256 and pin are 0 until src/mcp_pin.cyr has seen
+# the tool (2.5.4); a tool it has not seen is served without them.
 
 fn mcp_tool_new(name, desc, schema) {
-    var t = alloc(24);
+    var t = alloc(40);
     store64(t, name);
     store64(t + 8, desc);
     store64(t + 16, schema);
+    store64(t + 24, 0);
+    store64(t + 32, 0);
     return t;
 }
 
 fn mcp_tool_name(t) { return load64(t); }
 fn mcp_tool_desc(t) { return load64(t + 8); }
 fn mcp_tool_schema(t) { return load64(t + 16); }
+fn mcp_tool_sha(t) { return load64(t + 24); }
+fn mcp_tool_pin(t) { return load64(t + 32); }
+fn mcp_tool_set_sha(t, sha) { store64(t + 24, sha); }
+fn mcp_tool_set_pin(t, pin) { store64(t + 32, pin); }
+
+# McpPin: {name: cstr, sha256: cstr, pinned_at: i64, flags: i64, row: Str}
+# 5 fields x 8 = 40 bytes. What daimon held a tool's definition to be. Made and
+# stored by src/mcp_pin.cyr; defined here because the manifest reads it.
+var MCP_PIN_BUILTIN = 1;      # flags: the tool ships in this binary
+var MCP_PIN_FROM_STORE = 2;   # flags: read from the store, so a previous run's
+
+fn mcp_pin_name(p) { return load64(p); }
+fn mcp_pin_sha(p) { return load64(p + 8); }
+fn mcp_pin_at(p) { return load64(p + 16); }
+fn mcp_pin_flags(p) { return load64(p + 24); }
+fn mcp_pin_row(p) { return load64(p + 32); }
 
 # Extract the MCP `inputSchema` from a registration body as compact JSON text.
 # inputSchema is a nested JSON object (e.g. {"type":"object","properties":{…}})
@@ -130,7 +150,40 @@ fn mcp_tool_count(reg) {
     return map_count(load64(reg)) + map_count(load64(reg + 8));
 }
 
-# One manifest entry: {"name":…,"description":…,"inputSchema":…}.
+# The JSON text of the pin store's state ({"state":…,"durable":…,"count":…}), or
+# 0 before a store is opened. src/mcp_pin.cyr keeps it current, so a manifest
+# builds nothing for it.
+var _mcp_pin_summary = 0;
+
+# A tool's identity in its manifest entry, when src/mcp_pin.cyr has seen it.
+# docs/guides/api.md states the bytes `definition_sha256` covers.
+fn _mcp_manifest_pin(sb, t) {
+    var sha = mcp_tool_sha(t);
+    if (sha == 0) { return 0; }
+    str_builder_add_cstr(sb, ",\"definition_sha256\":\"");
+    str_builder_add_cstr(sb, sha);
+    var p = mcp_tool_pin(t);
+    if (p == 0) {
+        str_builder_add_cstr(sb, "\",\"pin_state\":\"unpinned\"");
+        return 0;
+    }
+    if (streq(mcp_pin_sha(p), sha) == 1) {
+        str_builder_add_cstr(sb, "\",\"pin_state\":\"pinned\",\"pinned_sha256\":\"");
+    } else {
+        str_builder_add_cstr(sb, "\",\"pin_state\":\"changed\",\"pinned_sha256\":\"");
+    }
+    str_builder_add_cstr(sb, mcp_pin_sha(p));
+    str_builder_add_cstr(sb, "\",\"pinned_at\":");
+    str_builder_add_int(sb, mcp_pin_at(p));
+    if ((mcp_pin_flags(p) & MCP_PIN_FROM_STORE) != 0) {
+        str_builder_add_cstr(sb, ",\"pin_from_store\":true");
+    } else {
+        str_builder_add_cstr(sb, ",\"pin_from_store\":false");
+    }
+    return 0;
+}
+
+# One manifest entry: {"name":…,"description":…,"inputSchema":…, and its pin}.
 fn _mcp_manifest_entry(sb, t) {
     str_builder_add_cstr(sb, "{\"name\":\"");
     str_builder_add(sb, json_escape_str(mcp_tool_name(t)));
@@ -138,10 +191,11 @@ fn _mcp_manifest_entry(sb, t) {
     str_builder_add(sb, json_escape_str(mcp_tool_desc(t)));
     str_builder_add_cstr(sb, "\",\"inputSchema\":");
     str_builder_add(sb, mcp_manifest_schema(t));
+    _mcp_manifest_pin(sb, t);
     str_builder_add_cstr(sb, "}");
 }
 
-# The GET /v1/mcp/tools body: {"tools":[…builtins, …externals],"count":N}.
+# The GET /v1/mcp/tools body: {"tools":[…builtins, …externals],"count":N,"pins":{…}}.
 #
 # Moved here from api_mcp_manifest at 2.2.3. It was built inline in the HTTP
 # handler, so no test could reach the one response every MCP client reads
@@ -169,6 +223,10 @@ fn mcp_manifest_json(reg) {
     }
     str_builder_add_cstr(sb, "],\"count\":");
     str_builder_add_int(sb, mcp_tool_count(reg));
+    if (_mcp_pin_summary != 0) {
+        str_builder_add_cstr(sb, ",\"pins\":");
+        str_builder_add_cstr(sb, _mcp_pin_summary);
+    }
     str_builder_add_cstr(sb, "}");
     return str_builder_build(sb);
 }

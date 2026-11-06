@@ -446,6 +446,32 @@ if (ca2 >= 0) { s2 = _c_finish(ca2); }
 _c_check(s2 == 200 && _c_has("xxxxxxxxxxEND") == 1, "... and the waiting call is answered once its server is");
 _c_check(_c_req("DELETE", "/v1/mcp/tools/remote", "") == 200, "the MCP server is deregistered");
 
+# --- tool pins and the file index on the real kernel (2.5.4) -------------------
+# Both write a data directory through agnos's own open, rename and mkdir, and the
+# index walks with getdents#29 and lstat#102, whose record is agnos's own.
+_c_check(_c_req("GET", "/v1/mcp/tools", "") == 200 && _c_has("\"pins\":{\"state\":\"new\",\"durable\":true") == 1,
+  "tool pins are kept on agnos");
+_c_check(_c_has("\"definition_sha256\":\"") == 1 && _c_has("\"pin_state\":\"pinned\"") == 1,
+  "... and every tool carries its digest");
+var fx_t = _c_now_ms();
+var fx_up = 0;
+while ((fx_up == 0) && (_c_now_ms() - fx_t < 30000)) {
+    if ((_c_req("GET", "/v1/files/index", "") == 200) && (_c_has("\"state\":\"fresh\"") == 1)) { fx_up = 1; }
+    else { _c_wait_ms(50); }
+}
+_c_check(fx_up == 1, "the file index comes to fresh on agnos");
+_c_check(_c_has("\"files\":3") == 1, "... holding the three agent fixtures");
+_c_check(_c_has("\"persisted\":true") == 1, "... and kept in the data directory");
+_c_check(_c_req("GET", "/v1/files?limit=10", "") == 200 && _c_has("/agents/agnos-agent-user-agent") == 1,
+  "the files answer with their paths");
+_c_check(_c_has("\"size\":0") == 0, "... and lstat#102's sizes");
+var fx_tag = "{\"path\":\"/agents/agnos-agent-user-agent\",\"add\":[\"fixture\"]}";
+_c_check(_c_req("POST", "/v1/files/tags", fx_tag) == 200, "a file is tagged");
+_c_check(_c_req("GET", "/v1/files?tag=fixture", "") == 200 && _c_has("\"total\":1") == 1, "... and found by its tag");
+_c_check(_c_req("GET", "/v1/files/smart", "") == 200 && _c_has("\"name\":\"Untagged\"") == 1, "smart folders answer");
+_c_check(_c_req("POST", "/v1/files/tags", "{\"path\":\"/bin/daimon\",\"add\":[\"x\"]}") == 403,
+  "a path outside the roots is refused");
+
 # --- an answer larger than a connection's 2 KB receive ring (2.4.1) ------------
 # One write of it would stop the guest: sock_send#48 holds the CPU while it waits
 # for room this client cannot make without running. daimon writes in 1 KB pieces

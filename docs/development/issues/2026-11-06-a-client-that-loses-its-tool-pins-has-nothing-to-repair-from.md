@@ -1,8 +1,14 @@
 # A client that loses its tool pins has nothing to repair trust from
 
-**Status:** 🔴 **OPEN.** A consumer need, not a defect: daimon does what it says. daimon decides the
-mechanism; this filing states what thoth has to be able to ask and get back, and the constraints the
-answer has to fit.
+**Status:** 🟡 **Items 1–3 shipped in daimon 2.5.4; item 4 is open, and needs caller identity (roadmap
+2.6.x).** Each entry of `GET /v1/mcp/tools` carries `definition_sha256`, `pinned_sha256`, `pinned_at`,
+`pin_state` and `pin_from_store`, and the manifest says what the store is (`pins`). The bytes hashed are
+stated in `docs/guides/api.md`, and are thoth's form: `tests/smoke.sh` checks them against `sha256sum`.
+A pin outlives a restart, a registration cannot move it, and a change is audited `mcp.tool.changed` and
+served marked `changed`. Accepting one exists and is refused, unless the operator passes `serve
+--mcp-pin-accept`, as one decision for the host. What is left of item 4 is per-consumer acceptance through
+t-ron, which cannot mean anything until callers are identified. See ADR-009. *(Was: 🔴 OPEN.)*
+This filing states what thoth has to be able to ask and get back, and the constraints the answer has to fit.
 **Filed:** 2026-11-06, by thoth, against daimon 2.5.3. Line numbers are from that tree.
 **Affects:** every daimon consumer that shows registered tools to a model.
 **Severity:** daimon's to rank. It holds no thoth release: thoth ships as it is and takes this up when it lands.

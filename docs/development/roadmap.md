@@ -4,10 +4,10 @@
 >
 > **Severity legend**: **P0** blocking (security / correctness — must-fix before ship) · **P1** high (must-have for the current arc) · **P2** medium (schedule when capacity opens) · **P3 / Low** nice-to-have, no urgency. Upstream-blocker items quote the upstream tracker's own severity.
 
-**Where daimon stands** — `2.5.3`, cyrius 6.7.18, every dependency at a release for that toolchain
-(nein 1.9.1, bote 3.8.9). It builds for x86_64, aarch64 and AGNOS, and CI runs the suites, the HTTP
-smoke and the fuzz harnesses on Linux, every suite and the binary's smoke on a real aarch64 kernel,
-and the AGNOS guest test on agnos 1.57.14.
+**Where daimon stands** — `2.5.4`, cyrius 6.7.18, every dependency at its latest release (bote 3.8.15,
+nein 1.9.1). It builds for x86_64, aarch64 and AGNOS, and CI runs the suites, the HTTP smoke and the
+fuzz harnesses on Linux, every suite and the binary's smoke on a real aarch64 kernel, and the AGNOS
+guest test on agnos 1.57.17.
 - Agents are registered, started under their limits, stopped, paused, resumed and deleted through
   the API, each in a cgroup of its own where daimon can make one. They talk to daimon on a channel.
 - Scheduled tasks are placed by samay, started and completed through the API.
@@ -15,6 +15,8 @@ and the AGNOS guest test on agnos 1.57.14.
 - The API binds 127.0.0.1 unless `--listen` says otherwise, refuses other sites' pages, and has no
   caller authentication. Everything that changes the firewall, reads its live state, or archives
   the audit chain is refused until it does (2.6.x).
+- Each MCP tool's first definition is pinned across restarts, and a change is marked and audited.
+- With `--index-root`, daimon holds an index of the files there, with tags, ratings and smart folders.
 
 ## The releases ahead
 
@@ -50,14 +52,23 @@ Refused until this lands, each with an operator flag that reopens it on a truste
 - `nein_allow` / `nein_deny` (change the firewall; `_nein_admin_enabled`, since 2.1.8);
 - `nein_status` / `nein_list` / `nein_diff` (run `nft` as root, return the live ruleset;
   `_nein_live_reads_enabled`, since 2.5.2);
-- `libro_retention` (archives the audit chain; `_libro_retention_enabled`, since 2.5.1).
+- `libro_retention` (archives the audit chain; `_libro_retention_enabled`, since 2.5.1);
+- accepting a changed tool definition (`POST /v1/mcp/tools/{name}/accept`; `serve --mcp-pin-accept`,
+  since 2.5.4).
 
 Also waiting on identity:
 - **The agent memory API.** The store works, but no route reaches it, and one must not until a caller
   can be tied to an agent: otherwise any client reads any agent's memory. Its records also need the
   Rust original's `tags` field: `list_by_tag` is a substring search over the record today.
-- **Who may replace an external MCP registration.** Re-registering a name replaces it, whoever
-  registered it first. (Taking a builtin's name is refused since 2.2.3.)
+- **Who may replace an external MCP registration.** Re-registering a name replaces what is served,
+  whoever registered it first. (Taking a builtin's name is refused since 2.2.3. Since 2.5.4 it cannot
+  move the pin, and is marked and audited.)
+- **Who may accept a tool definition, per consumer, through t-ron.** What is left of thoth's filing:
+  2.5.4's accept is one decision for the host. It also closes trust on first use's gap: identity can
+  say who made a first registration.
+- **Who may see the file index.** Any local process reads what an operator's roots hold, and edits
+  tags, ratings and saved queries. Decide per caller, and whether a caller sees only what its own
+  permissions would show.
 - **Who may report a task** (VULN-016). Any caller can mark any task running, completed or failed,
   and completing one early returns its capacity while the work may still run.
 - **`libro_export` / `libro_query`** answer the whole audit chain to any caller (bote's consumer
@@ -77,6 +88,7 @@ Still to adopt, each verified in the guest test:
 | `child-inherits-every-fd-and-spawn-arms-leak` | `--agent-output capture` refused at startup | `SPAWN_F_CLEANFD` with the redirect armed; capture stdout and stderr |
 | `sock-send-and-connect-hold-the-cpu` (P1 for daimon) | answers written 512 bytes at a time, 1 ms apart | measure a whole-answer write on 1.57.14 under a CPU quota; one write per answer if it holds |
 | `tcp-server-cannot-be-loopback-only` | loopback-only listener (2.4.4), one rate-limit bucket for every client | per-client rate limiting, if agnos gives a peer address |
+| `no-way-to-read-the-power-source` (filed 2026-11-06, **open** in agnos) | `power` is `unknown`, and a file walk runs on battery | an agnos arm in `_fx_power_find`, once a source exists |
 | `inbound-tcp-syn-dropped-by-isr-drain`, `socket-ids-have-no-owner` | nothing in daimon | re-measure accept from the host; close audit AG-1 and AG-8 |
 
 Nothing to change in daimon for `sleep-ms-holds-the-cpu`, `sock-recv-never-reports-eof-after-peer-fin`
@@ -103,6 +115,9 @@ and `tsc-calibration-refused-stops-the-us-clock` (`daimon_now_ms` stays for olde
 - [ ] **nein's live readers on the loop.** If an operator sets `_nein_live_reads_enabled`, each call
   waits on `nft` on the loop, up to 60 s since nein 1.8.2. Detach them (`mcp_builtin_waits`), with
   the gate's audit entry made before the child is forked.
+- [ ] **A digest through a swapped directory** (2.5.4 audit R-3). `O_NOFOLLOW` covers a file's final
+  component, so a directory replaced by a link after the walk can have a file outside a root read for
+  its digest. `openat2(RESOLVE_NO_SYMLINKS)` closes it on Linux; agnos would need a peer.
 - [ ] P3: CI resolves with `cyrius deps --no-lock` then `--verify`; `cyrius deps --locked` (cyrius
   6.7.6) checks the resolve against the lock in one step. Rehearse it in CI's own steps first.
 
@@ -126,6 +141,10 @@ prerequisite. Needs 2.6.x to know what a tenant is.
 
 Severity assigned when one is scheduled.
 
+- [ ] **Ranked file search** — crab's M8 (item 5 of its filing, the half 2.5.4 left): a question in words
+  answered with ranked files and why each matched. It needs a local embedding that can rank by meaning,
+  which RAG's 32-slot hash cannot, and should share the file index with mneme, whose README names
+  `/v1/knowledge/*`, which no route serves.
 - [ ] jnana integration — grounded knowledge queries backed by verified AGNOS science data
 - [ ] gRPC transport option alongside HTTP
 - [ ] WebSocket streaming for real-time agent events

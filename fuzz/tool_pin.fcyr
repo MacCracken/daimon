@@ -1,0 +1,238 @@
+# Fuzz: tool definition pins (2.5.4)
+#
+# A client repairs its pins from daimon's digests, and compares its own with them
+# on every probe, so the digest has to be one it can compute. It hashes what it
+# gets after parsing and re-serialising the schema (thoth does), so the first
+# three properties are about bayan's compact form, and the last about the store:
+#   1. a generated schema, however it was spelled, reaches a fixed point in one
+#      pass: what daimon serves rebuilds to the same bytes;
+#   2. a float survives the same trip, whatever bayan prints for it. This is the
+#      value most likely to move: a printer and a parser need not agree;
+#   3. two spellings of one schema serve the same bytes, so whitespace in a
+#      registration is not a change;
+#   4. _pin_load survives any bytes, with or without a digest that passes, and
+#      takes nothing unless it answers 1.
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/io.cyr"
+include "lib/fs.cyr"
+include "lib/hashmap.cyr"
+include "lib/tagged.cyr"
+include "lib/bayan.cyr"
+include "lib/syscalls.cyr"
+include "lib/chrono.cyr"
+include "lib/sigil.cyr"
+
+var SEV_INFO = 1;
+var SEV_WARNING = 2;
+var SEV_SECURITY = 5;
+fn daimon_audit(sev, source, action, details) { return 0; }
+
+include "src/error.cyr"
+include "src/mcp.cyr"
+include "src/mcp_pin.cyr"
+include "fuzz/rng.cyr"
+
+alloc_init();
+
+fn rebuild(s) {
+    var v = bayan_json_v_parse(s);
+    if (v == 0) { return 0; }
+    return bayan_json_v_build(v);
+}
+
+fn gen_string(sb) {
+    str_builder_add_cstr(sb, "\"");
+    var n = fz_below(8);
+    var i = 0;
+    while (i < n) {
+        var k = fz_below(8);
+        if (k == 0) { str_builder_add_cstr(sb, "\\n"); }
+        elif (k == 1) { str_builder_add_cstr(sb, "\\u00e9"); }
+        elif (k == 2) { str_builder_add_cstr(sb, "\\/"); }
+        elif (k == 3) { str_builder_add_cstr(sb, "\\ud83d\\ude00"); }
+        elif (k == 4) { str_builder_add_cstr(sb, "\\u0001"); }
+        elif (k == 5) { str_builder_add_cstr(sb, "é"); }
+        else {
+            var b = alloc(2);
+            store8(b, 97 + fz_below(26));
+            store8(b + 1, 0);
+            str_builder_add_cstr(sb, b);
+        }
+        i = i + 1;
+    }
+    str_builder_add_cstr(sb, "\"");
+    return 0;
+}
+
+fn gen_number(sb) {
+    var k = fz_below(6);
+    if (k == 0) { str_builder_add_int(sb, fz_below(1000000) - 500000); }
+    elif (k == 1) {
+        str_builder_add_int(sb, fz_below(1000));
+        str_builder_add_cstr(sb, ".");
+        str_builder_add_int(sb, fz_below(100000) + 1);
+    }
+    elif (k == 2) {
+        str_builder_add_int(sb, fz_below(1000) + 1);
+        str_builder_add_cstr(sb, "e");
+        str_builder_add_int(sb, fz_below(600) - 300);
+    }
+    elif (k == 3) {
+        str_builder_add_cstr(sb, "0.");
+        var z = fz_below(20);
+        var i = 0;
+        while (i < z) { str_builder_add_cstr(sb, "0"); i = i + 1; }
+        str_builder_add_int(sb, fz_below(1000000000) + 1);
+    }
+    elif (k == 4) { str_builder_add_cstr(sb, "-0.0"); }
+    else {
+        str_builder_add_int(sb, fz_below(10));
+        str_builder_add_cstr(sb, ".");
+        str_builder_add_int(sb, fz_below(1000000000));
+        str_builder_add_int(sb, fz_below(1000000000));
+        str_builder_add_cstr(sb, "E+");
+        str_builder_add_int(sb, fz_below(50));
+    }
+    return 0;
+}
+
+fn ws(sb, spaced) { if (spaced == 1) { str_builder_add_cstr(sb, " "); } return 0; }
+
+fn gen_value(sb, depth, spaced) {
+    var k = fz_below(7);
+    if (depth > 3) { k = fz_below(3); }
+    if (k == 0) { gen_string(sb); }
+    elif (k == 1) { gen_number(sb); }
+    elif (k == 2) {
+        var lit = fz_below(3);
+        if (lit == 0) { str_builder_add_cstr(sb, "null"); }
+        elif (lit == 1) { str_builder_add_cstr(sb, "true"); }
+        else { str_builder_add_cstr(sb, "false"); }
+    }
+    elif (k <= 4) {
+        str_builder_add_cstr(sb, "[");
+        ws(sb, spaced);
+        var n = fz_below(4);
+        var i = 0;
+        while (i < n) {
+            if (i > 0) { str_builder_add_cstr(sb, ","); ws(sb, spaced); }
+            gen_value(sb, depth + 1, spaced);
+            i = i + 1;
+        }
+        ws(sb, spaced);
+        str_builder_add_cstr(sb, "]");
+    }
+    else { gen_object(sb, depth + 1, spaced); }
+    return 0;
+}
+
+fn gen_object(sb, depth, spaced) {
+    str_builder_add_cstr(sb, "{");
+    ws(sb, spaced);
+    var n = fz_below(4);
+    var i = 0;
+    while (i < n) {
+        if (i > 0) { str_builder_add_cstr(sb, ","); ws(sb, spaced); }
+        # Distinct keys: bayan refuses a key twice at any depth.
+        str_builder_add_cstr(sb, "\"k");
+        str_builder_add_int(sb, i);
+        str_builder_add_cstr(sb, "\"");
+        ws(sb, spaced);
+        str_builder_add_cstr(sb, ":");
+        ws(sb, spaced);
+        gen_value(sb, depth, spaced);
+        i = i + 1;
+    }
+    ws(sb, spaced);
+    str_builder_add_cstr(sb, "}");
+    return 0;
+}
+
+fn main() {
+    var N = 40000;
+    var taken = 0;
+    # 1 and 3: a generated schema, in both spellings. The same draw makes both.
+    var n = 0;
+    while (n < N) {
+        var seed = fz_next();
+        _fz_state = seed;
+        var sa = str_builder_new();
+        gen_object(sa, 0, 0);
+        var plain = str_builder_build(sa);
+        _fz_state = seed;
+        var sb = str_builder_new();
+        gen_object(sb, 0, 1);
+        var spaced = str_builder_build(sb);
+        var served = rebuild(plain);
+        if (served != 0) {
+            taken = taken + 1;
+            var again = rebuild(served);
+            if (again == 0) { sys_exit(1); }
+            if (str_eq(again, served) != 1) { sys_exit(2); }
+            var other = rebuild(spaced);
+            if (other == 0) { sys_exit(3); }
+            if (str_eq(other, served) != 1) { sys_exit(4); }
+        }
+        _fz_state = seed + 1;
+        fz_next();
+        n = n + 1;
+    }
+    if (taken * 2 < N) { sys_exit(5); }   # a harness that refuses everything proves nothing
+
+    # 2: numbers on their own, so a printer's disagreement is not lost in a tree.
+    var ftaken = 0;
+    n = 0;
+    while (n < N) {
+        var sf = str_builder_new();
+        str_builder_add_cstr(sf, "{\"n\":");
+        gen_number(sf);
+        str_builder_add_cstr(sf, "}");
+        var first = rebuild(str_builder_build(sf));
+        if (first != 0) {
+            ftaken = ftaken + 1;
+            var second = rebuild(first);
+            if (second == 0) { sys_exit(6); }
+            if (str_eq(second, first) != 1) { sys_exit(7); }
+        }
+        n = n + 1;
+    }
+    if (ftaken * 10 < N * 9) { sys_exit(9); }   # as property 1's guard: it must have run
+
+    # 4: the store's reader, on noise and on noise under a digest that passes.
+    mcp_pins_init();
+    n = 0;
+    while (n < 20000) {
+        var len = fz_below(400);
+        var body = fz_bytes(len, 0, 255);
+        var buf = alloc(len + 200);
+        var off = 0;
+        if (fz_below(2) == 0) {
+            memcpy(buf, MCP_PIN_MAGIC, MCP_PIN_MAGIC_LEN);
+            off = MCP_PIN_MAGIC_LEN;
+        }
+        memcpy(buf + off, str_data(body), len);
+        off = off + len;
+        if (fz_below(2) == 0) {
+            store8(buf + off, 10);
+            off = off + 1;
+            var hex = sha256_hex(buf, off);
+            memcpy(buf + off, MCP_PIN_DIGEST_TAG, 7);
+            memcpy(buf + off + 7, hex, 64);
+            store8(buf + off + 71, 10);
+            off = off + 72;
+        }
+        var before = vec_len(_pin_list);
+        var ok = _pin_load(buf, off);
+        if ((ok == 0) && (vec_len(_pin_list) != before)) { sys_exit(8); }
+        n = n + 1;
+    }
+    return 0;
+}
+
+var r = main();
+fz_done("tool_pin", 40000);
+sys_exit(r);

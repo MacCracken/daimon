@@ -41,11 +41,11 @@ External (non-stdlib) deps used by daimon:
 | Dep | Purpose |
 |--------|--------|
 | `sakshi` (2.5.10) | Structured logging/tracing — git-pinned via `[deps.sakshi]` in `cyrius.cyml`; resolved into `lib/sakshi.cyr` (gitignored) by `cyrius deps`. The 2.4.x line carries the daimon-class slot-array fix (`ts[2]` timespec → `i64[N]`; requires pin ≥ 6.2.1), arch-portable syscalls (x86_64 + aarch64), opt-in `sakshi_clock_recalibrate()`, and the agnos x86-TSC-calibration guard. **2.4.4** adds 128-bit trace-id support (`sakshi_trace_set_128`/`_hi`/`_lo`) that daimon's tracing (`src/trace.cyr`) adopts for full W3C `traceparent` round-trip. The `msg_len`-required call surface is unchanged since 2.0.0. |
-| `bote` (3.8.9) | MCP core service. daimon hosts **13 builtin MCP tools** (`src/mcp_builtin.cyr`): bote's five `libro_*` audit tools (1.3.0), bote's `web_fetch` / `web_search` (1.4.0) and nein's six firewall tools (2.1.8). Vendored as the full `dist/bote.cyr` bundle, which references libro and majra without bundling them, so both are declared before it in `cyrius.cyml`. **Since 2.5.0 it is declared as `[deps.bote-core]` with `modules = ["dist/bote.cyr"]`, vendored as `lib/bote-core_bote.cyr`**: nein pulls bote's core bundle (`bote-core`), and from bote 3.4 the two bundles cannot both be compiled (each declares `const BOTE_LOG_LINE_BYTES`; a duplicate `const` is an error where a duplicate `fn` only warned). A root `[deps.X]` naming its own `modules` replaces a transitive one's, as the `sigil` pin does, so exactly one packaging is vendored; the full bundle defines every symbol of the core one. ⚠ `modules = []` does NOT do this: it only stops the root block vendoring, and nein's selection resolves anyway (tried at 2.5.0). daimon calls the handlers directly rather than bote's `dispatcher_dispatch`, keeping its own MCP registry and response shape. An external registration can never take a builtin's name (2.2.3). |
+| `bote` (3.8.15) | MCP core service. daimon hosts **13 builtin MCP tools** (`src/mcp_builtin.cyr`): bote's five `libro_*` audit tools (1.3.0), bote's `web_fetch` / `web_search` (1.4.0) and nein's six firewall tools (2.1.8). Vendored as the full `dist/bote.cyr` bundle, which references libro and majra without bundling them, so both are declared before it in `cyrius.cyml`. **Since 2.5.0 it is declared as `[deps.bote-core]` with `modules = ["dist/bote.cyr"]`, vendored as `lib/bote-core_bote.cyr`**: nein pulls bote's core bundle (`bote-core`), and from bote 3.4 the two bundles cannot both be compiled (each declares `const BOTE_LOG_LINE_BYTES`; a duplicate `const` is an error where a duplicate `fn` only warned). A root `[deps.X]` naming its own `modules` replaces a transitive one's, as the `sigil` pin does, so exactly one packaging is vendored; the full bundle defines every symbol of the core one. ⚠ `modules = []` does NOT do this: it only stops the root block vendoring, and nein's selection resolves anyway (tried at 2.5.0). daimon calls the handlers directly rather than bote's `dispatcher_dispatch`, keeping its own MCP registry and response shape. An external registration can never take a builtin's name (2.2.3). |
 | `libro` (2.11.3) | Hash-linked audit chain (chain / merkle / query / retention / proof) backing bote's libro tools. daimon owns one `chain_new()` chain in `src/audit.cyr` (genesis-seeded at `daimon_audit_init`); the `daimon_audit` / `daimon_audit_agent` helpers append daimon's own lifecycle + security events (agent spawn/stop/exit, agent-channel faults `ipc.frame.*`, Host / Origin refusals `http.host.reject` / `http.origin.reject`, rate-limit, MCP SSRF-reject, external MCP call) to it, and the libro_* MCP tools read the same chain. **`libro_retention` is gated shut** (2.5.1, `_mcp_libro_retention` in `src/mcp_builtin.cyr`): it archives entries off the chain, and on the unauthenticated API one call emptied it. It stays registered and answers nein's refusal, audited `libro.retention.deny`, until caller authentication (roadmap 2.6.x), as `nein_allow` / `nein_deny` do. Vendored `dist/libro.cyr`; pulls the `ct` / `keccak` / `random` / `slice` / `thread_local` / `sync` stdlib modules. |
 | `majra` (2.13.0) | Event-sink dep of bote's bundle (`events_majra.cyr`). Present for compile-time resolution of the full bote bundle; daimon does not use it at runtime today. **Owns `ERR_IPC = 4`** — historically daimon renamed its own IPC error `ERR_IPC_FAULT` (1.3.0) to dodge this collision; at 1.4.2 every daimon error constant was namespaced `DAIMON_ERR_*` (now `DAIMON_ERR_IPC_FAULT`), so no daimon constant can collide with a vendored `ERR_*` and the rename satisfies cyrlint's `lint_error_enum_namespace` rule (6.4.51). |
 | `samay` (1.5.1) | Task scheduler — the extraction of daimon's own `scheduler.cyr`/`cron.cyr`, which daimon 2.0.0 replaced with this library. Resolved from its tag with no `path` since daimon 2.4.4: the sibling checkout had moved to samay 1.5.x, built for cyrius 6.7.x, and a local build vendored it in place of the pin (it calls a bayan function bayan 1.5.6 lacked, so the build failed). samay has no scheduler-level "start": daimon's task start / complete live in `src/sched.cyr` (2.3.1). ⚠ `task_scheduler_complete_task` answers `Err(1)` both for an unknown id and for a refused transition, so look the task up first. |
-| `nein` (1.9.1) | Firewall MCP tools (2.1.8, `dist/nein-mcp.cyr`). It is declared after `bote` and `sigil` in `cyrius.cyml` because its bundle leaves their symbols for the host to supply. Every tool but `nein_validate` is **gated shut** until caller authentication (roadmap 2.6.x; below). Resolved from its tag with no `path` since 2.4.4, like samay. Its manifest declares `bote-core` (bote's core profile); daimon's root `[deps.bote-core]` supplies bote's full bundle in its place (see `bote`). 1.9.1 pins the same 6.7.18 set daimon does (bote-core 3.8.9, libro 2.11.3, majra 2.13.0, sigil 3.13.15, patra 1.16.6). **The gate (`daimon_nein_gate`) answers `NEIN_GATE_PERMIT` to permit since nein 1.9.0; any other answer, `1` included, denies.** It classifies with `nein_tool_class(nein_tool_index(name))`: `NEIN_TOOL_OFFLINE` (`nein_validate`) runs; `NEIN_TOOL_READS_LIVE` (`nein_status` / `_list` / `_diff`, which run `nft` as root and return the ruleset) and `NEIN_TOOL_MUTATES` are refused and audited `nein.gate.deny` until caller authentication (2.5.2; flags `_nein_live_reads_enabled`, `_nein_admin_enabled`). `nein_mcp_set_gate` answers 1 when it refuses the gate, and daimon audits that. The smoke covers each class: a nein contract change failed nothing in 2.5.2's first build. Keep nein's pins in step with daimon's when either moves. |
+| `nein` (1.9.1) | Firewall MCP tools (2.1.8, `dist/nein-mcp.cyr`). It is declared after `bote` and `sigil` in `cyrius.cyml` because its bundle leaves their symbols for the host to supply. Every tool but `nein_validate` is **gated shut** until caller authentication (roadmap 2.6.x; below). Resolved from its tag with no `path` since 2.4.4, like samay. Its manifest declares `bote-core` (bote's core profile); daimon's root `[deps.bote-core]` supplies bote's full bundle in its place (see `bote`). 1.9.1 pins the same 6.7.18 set daimon does (libro 2.11.3, majra 2.13.0, sigil 3.13.15, patra 1.16.6) but for bote-core: it asks for 3.8.9, and daimon's root pin, 3.8.15, wins (`cyrius deps` says so in a note). Measured at 2.5.4: none of the 114 bote functions reachable from what daimon calls differs between the two. **The gate (`daimon_nein_gate`) answers `NEIN_GATE_PERMIT` to permit since nein 1.9.0; any other answer, `1` included, denies.** It classifies with `nein_tool_class(nein_tool_index(name))`: `NEIN_TOOL_OFFLINE` (`nein_validate`) runs; `NEIN_TOOL_READS_LIVE` (`nein_status` / `_list` / `_diff`, which run `nft` as root and return the ruleset) and `NEIN_TOOL_MUTATES` are refused and audited `nein.gate.deny` until caller authentication (2.5.2; flags `_nein_live_reads_enabled`, `_nein_admin_enabled`). `nein_mcp_set_gate` answers 1 when it refuses the gate, and daimon audits that. The smoke covers each class: a nein contract change failed nothing in 2.5.2's first build. Keep nein's pins in step with daimon's when either moves. |
 | `ai-hwaccel` (2.5.6) | samay's hardware-acceleration dependency (samay's own `[deps.ai-hwaccel]`), declared here since 2.0.0 so the full `dist/samay.cyr` bundle resolves at compile time. daimon calls nothing in it directly. Resolved from its tag with no `path` since daimon 2.4.0: with a `path`, the tag is inert and every build re-copies the sibling checkout, which leaked one mid-change into the lock at 2.3.4. |
 
 **ADR-002 is superseded by ADR-006** (2.3.4). ADR-002 assumed Cyrius had no async runtime, but
@@ -118,12 +118,12 @@ Every AGNOS agent, every consumer app, hoosh, agnoshi, aethersafha.
 - **Fixed local arrays: use element-typed `var a: i64[N]` for slot arrays** (and `u8[N]` / `i32[N]` / `u32[N]` for sized byte/scalar buffers). Since cyrius 6.2.1, bare `var a[N]` is **N bytes in a function** (N i64 slots only at top level) — an address-taken `var a[N]` written via `store64(&a + i*8)` under-reserves and silently corrupts adjacent memory. This caused the 1.2.6 routing-404 bug; swept in 1.2.7. Before re-testing any "fixed" compiler footgun, **read the cyrius language CHANGELOG** — fixes there are often language changes, not silent codegen patches.
 - Original Rust implementations are in git history at tags `0.5.0` / `0.6.0` (e.g. `git show 0.6.0:src/agent.rs`). The Cyrius port starts at `0.7.0`.
 
-## Commands (verified at 2.5.3)
+## Commands (verified at 2.5.4)
 
 ```sh
 export CYRIUS_NO_WARN_SHADOW_LIB=1 CYRIUS_DCE=1   # what CI sets
 cyrius build src/main.cyr build/daimon           # also: --agnos build/daimon-agnos, --aarch64 build/daimon-aarch64
-cyrius test tests/<suite>.tcyr                   # one suite (17 suites, each includes its real src/ module)
+cyrius test tests/<suite>.tcyr                   # one suite (19 suites, each includes its real src/ module)
 sh tests/test.sh                                 # every suite + tests/smoke.sh (the linked binary over HTTP) + cyrius fuzz
 cyrius vet src/main.cyr
 cyrius fmt <file> --check                        # CI runs this on src/*.cyr tests/*.tcyr tests/*.bcyr tests/agnos/*.cyr fuzz/*
@@ -197,9 +197,24 @@ that names a file a clean checkout does not vendor fails there.
     loopback host (`http_host_allowed`, in `handle_request`);
   - state changes are POST / DELETE only (`route_method`), and one from another site's page is
     refused on every route (`http_origin_foreign`, in `handle_request`);
-  - agent and task control answer 403 to any request carrying `Origin` (`_route_refuse_browser`).
+  - agent and task control, and every route under `/v1/files`, reads too, answer 403 to any request
+    carrying `Origin` (`_route_refuse_browser`).
 
-  Keep all of these for new routes.
+  Keep all of these for new routes. Anything a local process must not read waits for 2.6.x, or is off
+  until an operator opens it: `serve --index-root` (ADR-010), `serve --mcp-pin-accept` (ADR-009).
+- **What outlives a restart lives under `config_data_dir`** (`serve --data-dir`, default
+  `/var/lib/agnos`; 2.5.4): `mcp/toolpins` and `files/`. Open it in `serve`, not `app_init`, which runs
+  before the arguments are read. Say what a store's failure means in an answer (`pins.state`,
+  `persisted`), and decide by what it holds: a security record is refused whole and left as evidence
+  (`src/mcp_pin.cyr`), a derived file is rebuilt, and what a person gave costs one bad line at most
+  (`src/files.cyr`). Absent and empty are different answers: reading an empty store as no store
+  turned truncation into a reset of every pin (2.5.4's first test run).
+- **The file index walks in slices and allocates nothing per file** (`files_tick`, ADR-010). Reserve at
+  `files_open`, and keep `tests/files.tcyr`'s `alloc_used` checks true. Duplicates compare a whole
+  SHA-256: crab offers to delete them.
+- **`strstr` answers an index or -1**, so `strstr(...) != 0` is true when nothing matched. A test
+  built on it passed 16 checks vacuously at 2.5.4. Use `>= 0`, and make a helper in a test. An assert
+  should be seen to fail once.
 - **The event loop (2.3.4, ADR-006)**: daimon is ONE thread running `server_loop` (`src/server.cyr`)
   over one epoll set: the listener, connections being read, agent channels and output pipes
   (`src/ipc.cyr` registers those). Upkeep runs on its tick (`agents_tick`: reap, advance stops).
@@ -237,7 +252,7 @@ that names a file a clean checkout does not vendor fails there.
   not the cyrius peer `lib/syscalls_x86_64_agnos.cyr`, which mirrors an older kernel.
   - **daimon 2.4.4 needs agnos 1.57.7 or later** for its default listener: since cyrius 6.6.7 a
     127.0.0.1 bind is loopback only there, and an older kernel refuses it (`--listen 0.0.0.0` does
-    not need it). The guest test runs the latest release, 1.57.14. agnos 1.57.6 and 1.57.7 closed
+    not need it). The guest test runs the latest release, 1.57.17. agnos 1.57.6 and 1.57.7 closed
     every gap daimon filed; the rules below that name one hold until daimon adopts the fix
     (roadmap, 2.4.x).
   - **Read a pipe with `sys_read_nb`** (a4 = 1, answers -2 for "nothing yet"). `sys_read` passes
@@ -250,6 +265,9 @@ that names a file a clean checkout does not vendor fails there.
   - **Never `sleep_ms` / `sys_nanosleep` on agnos**: both are `sleep_ms`#41, which through agnos
     1.57.6 disabled preemption for the whole sleep, so the agents daimon waits for did not run. Wait
     with `daimon_yield_ms` (`pause`#14 until the deadline).
+  - **A `rename#31` onto an existing file needs agnos 1.57.17.** Before that ext2 refuses it, so
+    `file_write_atomic` works once and fails from the second write. A store then says `unavailable`.
+    Do not work around it with an unlink: that gives up crash atomicity.
   - **Never write more than 512 bytes at once on agnos**, and never two pieces back to back (2.4.1;
     512 and the timed gap since 2.4.3). A TCP receive ring there is 2048 bytes and
     `sock_send`#48 holds the CPU while it waits for room, so a write the receiver has no room for
@@ -307,7 +325,7 @@ docs/ (required):
   development/roadmap.md — completed, backlog, future, v1.0 criteria
 
 docs/ (when earned):
-  adr/ — architectural decision records, 001–008 (each one's Status line says what superseded it)
+  adr/ — architectural decision records, 001–010 (each one's Status line says what superseded it)
   audit/ — security audit reports (ADR-003; required after security-touching work)
   guides/ — usage guides, integration patterns
   examples/ — worked examples

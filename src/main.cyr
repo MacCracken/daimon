@@ -16,6 +16,8 @@
 #   vector_store — in-memory cosine-similarity vector index
 #   rag        — text chunking, bag-of-words embedding, retrieval pipeline
 #   mcp        — MCP tool registry and dispatch types
+#   mcp_pin    — what each tool's definition was at first sight; its store
+#   files      — an index of the operator's roots; tags, ratings, smart folders
 #   screen     — capture permissions, rate limiting, recording sessions
 #   sched      — task start / complete over samay (the scheduler since 2.0.0)
 #   federation — multi-node clustering, Raft-like election, placement
@@ -44,7 +46,9 @@ include "src/memory.cyr"
 include "src/vector_store.cyr"
 include "src/rag.cyr"
 include "src/mcp.cyr"
+include "src/mcp_pin.cyr"
 include "src/mcp_builtin.cyr"
+include "src/files.cyr"
 include "src/screen.cyr"
 include "src/federation.cyr"
 include "src/fed_vector_store.cyr"
@@ -55,6 +59,7 @@ include "src/http.cyr"
 include "src/api.cyr"
 include "src/api_agent.cyr"
 include "src/api_mcp.cyr"
+include "src/api_files.cyr"
 include "src/api_rag.cyr"
 include "src/api_edge.cyr"
 include "src/api_sched.cyr"
@@ -106,6 +111,46 @@ fn main() {
                         return 1;
                     }
                     agent_set_agents_dir(argv(argi));
+                }
+                elif (streq(arg, "--data-dir") == 1) {
+                    # 2.5.4: where what must outlive a restart is kept.
+                    argi = argi + 1;
+                    if (argi >= argc()) {
+                        println("serve: --data-dir needs a directory");
+                        return 1;
+                    }
+                    config_set_data_dir(_config, str_from(argv(argi)));
+                }
+                elif (streq(arg, "--index-root") == 1) {
+                    # 2.5.4: a directory the file index may cover. None by default:
+                    # the API has no caller authentication until roadmap 2.6.x.
+                    argi = argi + 1;
+                    if (argi >= argc()) {
+                        println("serve: --index-root needs a directory");
+                        return 1;
+                    }
+                    if (files_add_root(argv(argi)) == 0) {
+                        println("serve: --index-root takes an absolute path with no trailing slash, sixteen at most");
+                        return 1;
+                    }
+                }
+                elif (streq(arg, "--index-max") == 1) {
+                    argi = argi + 1;
+                    if (argi >= argc()) {
+                        println("serve: --index-max needs a number");
+                        return 1;
+                    }
+                    var im = _fx_int(argv(argi));
+                    if ((im < 1024) || (im > 16777216)) {
+                        println("serve: --index-max takes a number from 1024 to 16777216");
+                        return 1;
+                    }
+                    files_set_max(im);
+                }
+                elif (streq(arg, "--mcp-pin-accept") == 1) {
+                    # 2.5.4: reopens POST /v1/mcp/tools/{name}/accept, which is
+                    # refused until callers are identified (roadmap 2.6.x).
+                    _mcp_pin_accept_enabled = 1;
                 }
                 elif (streq(arg, "--agent-output") == 1) {
                     # 2.3.4: agents' stdout and stderr: daimon's own, or captured.
@@ -184,6 +229,8 @@ fn main() {
             println("");
             println("Commands:");
             println("  serve [port] [--async] [--trace] [--agents-dir DIR] [--listen ADDR]");
+            println("        [--data-dir DIR] [--mcp-pin-accept]");
+            println("        [--index-root DIR]... [--index-max N]");
             println("        [--agent-env inherit|minimal] [--agent-output inherit|capture]");
             println("                          Start HTTP API server (default: 127.0.0.1:8090)");
             println("  version                 Print version");
