@@ -1,6 +1,6 @@
 # Benchmarks
 
-daimon's benchmarks call its real code: 33 in `tests/daimon.bcyr` (`./scripts/bench-history.sh`)
+daimon's benchmarks call its real code: 37 in `tests/daimon.bcyr` (`./scripts/bench-history.sh`)
 and 2 in `tests/rag_ingest.bcyr` (`cyrius bench tests/rag_ingest.bcyr`). The file is laid out as
 follows:
 - **The baseline** is daimon 2.2.3's, the first release whose benchmarks called daimon's own
@@ -44,6 +44,39 @@ those numbers are not comparable.
 | trace_id_hex | 47ns | 46ns | 100000 | 43ns |
 
 `tests/rag_ingest.bcyr` (real since 2.1.6): `rag_ingest_real_5k` 133.1µs, `rag_chunk_only_5k` 508ns.
+
+### 2.5.5 — ranked file search, and a consumer's accept through t-ron
+
+2.5.4 against 2.5.5, both on cyrius 6.7.18, `tests/daimon.bcyr` and `tests/rag_ingest.bcyr`: 20 interleaved runs with
+the order alternating, medians, at a load average of 1.6–3.6, which rose near the end. 28 of the 34 rows are within ±3%.
+Of the other six, two are this release's cost, and the rest are the usual suspects:
+- ⚠ `files_count_flags_41k` 740 → 798 µs (+7.9%) and `files_list_100_of_41k` 871 → 936 µs (+7.5%): `_fx_match` gained two
+  checks, `max_size` and `kind`, on every record.
+- `trace_id_hex` 45 → 50 ns (+11.1%, spreads 7% / 12%), in code that did not change.
+- `files_find_in_41k` −5.1%, `rag_chunk_5k_chars` +3.8%, `mcp_register_100_tools` +3.2%: inside their spreads.
+
+Four new rows, medians of the same runs:
+
+| Benchmark | median | what it is |
+|---|---:|---|
+| files_search_41k | 11.5µs | a question with one hit, over 41,200 records |
+| files_search_common_41k | 10.75ms | a word in most of them, about 35,000 hits: the worst a question costs the loop at this size |
+| files_tokenize_64k | 653µs | one file's worth of words |
+| mcp_consumer_refused | 7.5µs | a token nobody holds, reading the file, allocating nothing |
+
+**Search under load.** As in 2.5.4's table: a scratch copy with only the rate limit lifted, tmpfs, x86_64, at a load
+average of about 2. `serve --index-root --index-content`, over 41,200 files of 200 words each, 161 MB:
+
+| measure | result |
+|---|---:|
+| to `fresh` | 3.13 s |
+| `/v1/health` during it, p50 / p99 / max | 0.35 / 3.02 / 3.93 ms |
+| ... with no index | 0.13 / 0.21 / 2.21 ms |
+| RSS | 103 MB |
+| postings, of a reserve of 16.8M | 8.2M |
+| a question, 2,616 hits, p50 / max | 5.72 / 6.10 ms |
+| a question, 1,329 hits, p50 / max | 3.07 / 3.30 ms |
+| a restart to the first answer, 75 MB of `index` | 358 ms |
 
 ### 2.5.4 — tool definition pins and the file index
 

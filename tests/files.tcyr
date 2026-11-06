@@ -41,8 +41,10 @@ fn daimon_audit(sev, source, action, details) { _audit_last = action; return 0; 
 include "src/syscalls.cyr"
 include "src/error.cyr"
 include "src/files.cyr"
+include "src/files_search.cyr"
 
 alloc_init();
+files_set_max(8192);
 
 var BASE = "build/files_test";
 var ROOT = 0;      # absolute: a root must be
@@ -809,7 +811,7 @@ assert_eq(load64(_fx_active + FX_G_TRUNC), 1, "⛔ a walk that stopped short say
 files_status_json();
 assert(holds(answer(), "\"truncated\":true") == 1, "to a client");
 assert_eq(load64(_fx_active + FX_G_N), 4, "and stops at the limit");
-files_set_max(262144);
+files_set_max(8192);
 
 # --- nowhere to keep it ---------------------------------------------------
 test_group("nowhere to keep it");

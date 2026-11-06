@@ -6,8 +6,8 @@
 # after it was approved is prompt injection with an approval already granted
 # (the CVE-2025-54136 shape). A client defends with its own pins, and when it
 # loses them it has nothing to compare against. daimon holds a second record it
-# can rebuild from: docs/development/issues/2026-11-06-a-client-that-loses-its-
-# tool-pins-has-nothing-to-repair-from.md. docs/adr/009-tool-definition-pins.md
+# can rebuild from: docs/development/issues/archive/2026-11-06-a-client-that-loses-
+# its-tool-pins-has-nothing-to-repair-from.md. docs/adr/009-tool-definition-pins.md
 # records why it has this shape.
 #
 # THE DIGEST covers the bytes a client receives, so a client computes the same
@@ -37,10 +37,18 @@
 # Only two things move a pin:
 # - a new binary, for a builtin: its definition is the binary's, and installing
 #   one is the deliberate act. Audited `mcp.pin.builtin.moved`.
-# - mcp_pin_accept, for an external tool: POST /v1/mcp/tools/{name}/accept, which
-#   is refused unless the operator passed `serve --mcp-pin-accept`. It is one
-#   decision for the whole host; per-consumer acceptance through t-ron needs
-#   callers to be identified (roadmap 2.6.x).
+# - mcp_pin_accept, for an external tool: POST /v1/mcp/tools/{name}/accept with no
+#   token, which is refused unless the operator passed `serve --mcp-pin-accept`.
+#   It is one decision for the whole host.
+#
+# A CONSUMER ACCEPTS FOR ITSELF (2.5.5). The operator issues a named token with
+# `daimon consumer add NAME`, and only its digest is kept, in <data_dir>/mcp/consumers.
+# A consumer that presents it can accept the definition it reviewed. That moves no
+# pin: it is one more record, read only by that consumer, so one client's approval
+# is never another's. It must name the digest it reviewed, so a swap landing between
+# the review and the accept is refused rather than approved unread. Every accept
+# passes _pin_gate, which is t-ron: its per-agent policy, its payload scanner and its
+# prompt-injection detector, over the definition being accepted.
 #
 # THE STORE is `<data_dir>/mcp/toolpins`, one line per pin under a whole-file
 # digest:
@@ -58,7 +66,11 @@
 
 var MCP_PINS_MAX = 1024;          # thoth's TOOLPIN_MAX. Past it a tool is served `unpinned`
 var MCP_PIN_NAME_MAX = 256;       # a longer name is served `unpinned`; it bounds the file
-var MCP_PIN_STORE_MAX = 2097152;  # 1024 rows of the longest name, escaped, fit in this
+var MCP_ACCEPTS_MAX = 4096;       # consumer acceptances, across every consumer
+var MCP_PIN_STORE_MAX = 10485760; # every pin and acceptance, of the longest name, escaped, fit in this
+var MCP_CONSUMER_NAME_MAX = 64;
+var MCP_CONSUMER_FILE = "mcp/consumers";
+var MCP_CONSUMERS_MAX = 65536;    # bytes in that file
 var MCP_PIN_MAGIC = "DAIMON-TOOLPIN-1\n";
 var MCP_PIN_MAGIC_LEN = 17;
 var MCP_PIN_DIGEST_TAG = "DIGEST\t";
@@ -86,6 +98,10 @@ var _pin_path = 0;            # the store's path (cstr), 0 when none can be writ
 var _pin_buf = 0;             # kept: a flush rebuilds the whole file into it
 var _pin_buf_cap = 0;
 var _pin_dropped = 0;         # tools served `unpinned`
+var _pin_accepts = 0;         # vec of McpAccept, in order: they follow the pins in the file
+var _pin_data_dir = 0;        # cstr: where the consumers file is
+var _pin_tron = 0;            # TRon, from `serve --tron-policy`, or 0: nobody may accept
+var _pin_gate_why = 0;
 var _mcp_pin_accept_enabled = 0;   # `serve --mcp-pin-accept`
 
 fn mcp_pins_init() {
@@ -95,6 +111,9 @@ fn mcp_pins_init() {
     _pin_path = 0;
     _pin_dropped = 0;
     _mcp_pin_summary = 0;
+    _mcp_accepts = map_new();
+    _pin_accepts = vec_new();
+    _mcp_manifest_consumer = 0;
     return 0;
 }
 
@@ -171,6 +190,39 @@ fn _pin_new(name_c, sha, at, flags) {
     return p;
 }
 
+fn _pin_accept_row(a) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"consumer\":\"");
+    str_builder_add_cstr(sb, mcp_accept_consumer(a));
+    str_builder_add_cstr(sb, "\",\"name\":\"");
+    str_builder_add(sb, json_escape_str(str_from(mcp_accept_name(a))));
+    str_builder_add_cstr(sb, "\",\"sha256\":\"");
+    str_builder_add_cstr(sb, mcp_accept_sha(a));
+    str_builder_add_cstr(sb, "\",\"accepted_at\":");
+    str_builder_add_int(sb, mcp_accept_at(a));
+    str_builder_add_cstr(sb, "}\n");
+    store64(a + 32, str_builder_build(sb));
+    return 0;
+}
+
+# Record that `consumer` accepts `sha` for `name`, over anything it accepted before.
+fn _pin_accept_put(consumer_c, name_c, sha, at) {
+    var key = mcp_accept_key(consumer_c, name_c);
+    var a = map_get(_mcp_accepts, key);
+    if (a == 0) {
+        if (vec_len(_pin_accepts) >= MCP_ACCEPTS_MAX) { return 0; }
+        a = alloc(40);
+        store64(a + 16, consumer_c);
+        store64(a + 24, name_c);
+        map_set(_mcp_accepts, key, a);
+        vec_push(_pin_accepts, a);
+    }
+    store64(a, sha);
+    store64(a + 8, at);
+    _pin_accept_row(a);
+    return a;
+}
+
 # Room for `want` bytes in the kept buffer. It doubles, so what growing leaves
 # behind on the bump allocator stays below the buffer's own size.
 fn _pin_buf_room(want) {
@@ -195,6 +247,11 @@ fn _pin_flush() {
         want = want + str_len(mcp_pin_row(vec_get(_pin_list, i)));
         i = i + 1;
     }
+    i = 0;
+    while (i < vec_len(_pin_accepts)) {
+        want = want + str_len(mcp_accept_row(vec_get(_pin_accepts, i)));
+        i = i + 1;
+    }
     if ((want > MCP_PIN_STORE_MAX) || (_pin_buf_room(want) == 0)) {
         _pin_write_failed("the tool pin store would not fit");
         return 0;
@@ -206,6 +263,13 @@ fn _pin_flush() {
         var row = mcp_pin_row(vec_get(_pin_list, i));
         memcpy(_pin_buf + off, str_data(row), str_len(row));
         off = off + str_len(row);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < vec_len(_pin_accepts)) {
+        var ar = mcp_accept_row(vec_get(_pin_accepts, i));
+        memcpy(_pin_buf + off, str_data(ar), str_len(ar));
+        off = off + str_len(ar);
         i = i + 1;
     }
     var hex = sha256_hex(_pin_buf, off);
@@ -243,12 +307,44 @@ fn _pin_hex_ok(s) {
     return 1;
 }
 
-# One row of a verified file into `out` (a vec of McpPin not yet published).
-# Returns 1, or 0 for a row the store's writer could not have made.
-fn _pin_parse_row(line, len, seen, out) {
+# A row naming a consumer: what it accepted. Held in `accepts` until the whole file
+# passes. Returns 1, or 0 for one the store's writer could not have made.
+fn _pin_parse_accept(root, cv, seen, accepts) {
+    var nv = bayan_json_v_obj_get_by_cstr(root, "name");
+    var sv = bayan_json_v_obj_get_by_cstr(root, "sha256");
+    var av = bayan_json_v_obj_get_by_cstr(root, "accepted_at");
+    if ((nv == 0) || (sv == 0) || (av == 0)) { return 0; }
+    if ((bayan_json_v_is_str(cv) == 0) || (bayan_json_v_is_str(nv) == 0)) { return 0; }
+    if ((bayan_json_v_is_str(sv) == 0) || (bayan_json_v_is_int(av) == 0)) { return 0; }
+    var consumer = str_cstr(bayan_json_v_str(cv));
+    var name = bayan_json_v_str(nv);
+    if (mcp_consumer_name_ok(consumer) == 0) { return 0; }
+    if ((str_len(name) == 0) || (str_len(name) > MCP_PIN_NAME_MAX)) { return 0; }
+    var sha = bayan_json_v_str(sv);
+    if (_pin_hex_ok(sha) == 0) { return 0; }
+    if (bayan_json_v_int(av) < 0) { return 0; }
+    var name_c = str_cstr(name);
+    if (strlen(name_c) != str_len(name)) { return 0; }
+    var key = mcp_accept_key(consumer, name_c);
+    if (map_get(seen, key) != 0) { return 0; }
+    map_set(seen, key, 1);
+    var a = alloc(40);
+    store64(a, str_cstr(sha));
+    store64(a + 8, bayan_json_v_int(av));
+    store64(a + 16, consumer);
+    store64(a + 24, name_c);
+    vec_push(accepts, a);
+    return 1;
+}
+
+# One row of a verified file into `out` (a vec of McpPin not yet published), or
+# `accepts`. Returns 1, or 0 for a row the store's writer could not have made.
+fn _pin_parse_row(line, len, seen, out, accepts) {
     var root = bayan_json_v_parse_buf(line, len);
     if (root == 0) { return 0; }
     if (bayan_json_v_is_obj(root) == 0) { return 0; }
+    var cv = bayan_json_v_obj_get_by_cstr(root, "consumer");
+    if (cv != 0) { return _pin_parse_accept(root, cv, seen, accepts); }
     var nv = bayan_json_v_obj_get_by_cstr(root, "name");
     var sv = bayan_json_v_obj_get_by_cstr(root, "sha256");
     var av = bayan_json_v_obj_get_by_cstr(root, "pinned_at");
@@ -293,12 +389,14 @@ fn _pin_load(buf, n) {
     if (memeq(buf + end + 7, hex, 64) != 1) { return 0; }
     var seen = map_new();
     var taken = vec_new();
+    var accepts = vec_new();
     var pos = MCP_PIN_MAGIC_LEN;
     while (pos < end) {
         var e = pos;
         while ((e < end) && (load8(buf + e) != 10)) { e = e + 1; }
-        if (_pin_parse_row(buf + pos, e - pos, seen, taken) == 0) { return 0; }
+        if (_pin_parse_row(buf + pos, e - pos, seen, taken, accepts) == 0) { return 0; }
         if (vec_len(taken) > MCP_PINS_MAX) { return 0; }
+        if (vec_len(accepts) > MCP_ACCEPTS_MAX) { return 0; }
         pos = e + 1;
     }
     var i = 0;
@@ -307,6 +405,12 @@ fn _pin_load(buf, n) {
         _pin_row_build(p);
         map_set(_pins, mcp_pin_name(p), p);
         vec_push(_pin_list, p);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < vec_len(accepts)) {
+        var a = vec_get(accepts, i);
+        _pin_accept_put(mcp_accept_consumer(a), mcp_accept_name(a), mcp_accept_sha(a), mcp_accept_at(a));
         i = i + 1;
     }
     return 1;
@@ -337,6 +441,7 @@ fn _pin_read(path) {
 # Open the store under `data_dir` (a cstr). Call before serving, once the
 # builtins are registered: mcp_pin_builtins compares them with what it holds.
 fn mcp_pins_open(data_dir, reg) {
+    _pin_data_dir = data_dir;
     var dir = path_join(str_from(data_dir), str_from("mcp"));
     var path = path_join(str_from(data_dir), str_from(MCP_PIN_FILE));
     _pin_state = MCP_PIN_NEW;
@@ -453,5 +558,231 @@ fn mcp_pin_accept(t) {
     _pin_move(p, mcp_tool_sha(t), mcp_pin_flags(p) & MCP_PIN_BUILTIN);
     _pin_flush();
     _pin_summary_update();
+    return 1;
+}
+
+# --- consumers (2.5.5) -----------------------------------------------------
+#
+# <data_dir>/mcp/consumers holds one `name\tsha256(token)` line per consumer, for
+# the operator to manage with `daimon consumer`. It is read for each use, so adding
+# or removing one needs no restart, and a removed token stops working at once. It
+# holds no token: reading the file gives nobody a way in.
+
+# 1 for a consumer's name: 1 – 64 of a-z 0-9 . _ -. Short and plain, because it is
+# also what t-ron will read as an agent id.
+fn mcp_consumer_name_ok(s) {
+    var n = strlen(s);
+    if ((n < 1) || (n > MCP_CONSUMER_NAME_MAX)) { return 0; }
+    var i = 0;
+    while (i < n) {
+        var c = load8(s + i);
+        var ok = 0;
+        if ((c >= 97) && (c <= 122)) { ok = 1; }
+        if ((c >= 48) && (c <= 57)) { ok = 1; }
+        if ((c == 46) || (c == 95) || (c == 45)) { ok = 1; }
+        if (ok == 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn _consumers_path(data_dir) {
+    return str_cstr(path_join(str_from(data_dir), str_from(MCP_CONSUMER_FILE)));
+}
+
+# The file, whole, into a kept buffer with its length at `lenp`. Answers 0 with a
+# length of 0 for no file, and 0 with -1 for one that is a link, unreadable or past
+# its bound, which is not a list of who may act, and not an empty one either: a
+# writer that took it for empty would erase every other consumer.
+#
+# ⛔ KEPT, because a check runs before anyone is known. A buffer per check, on an
+# allocator that never frees, would let a caller with no token grow daimon by 64 KB
+# a request (tests/mcp_pin.tcyr counts this).
+var _consumers_buf = 0;
+var _consumers_path_c = 0;
+var _consumers_path_s = 0;
+var _consumers_path_for = 0;
+
+fn _consumers_read(data_dir, lenp) {
+    store64(lenp, 0);
+    if (_consumers_path_for != data_dir) {
+        _consumers_path_c = _consumers_path(data_dir);
+        _consumers_path_s = str_from(_consumers_path_c);
+        _consumers_path_for = data_dir;
+    }
+    var path = _consumers_path_c;
+    if (is_symlink(_consumers_path_s) == 1) { store64(lenp, 0 - 1); return 0; }
+    if (file_exists(path) != 1) { return 0; }
+    if (_consumers_buf == 0) { _consumers_buf = alloc(MCP_CONSUMERS_MAX + 1); }
+    if (_consumers_buf == 0) { store64(lenp, 0 - 1); return 0; }
+    var n = file_read_all(path, _consumers_buf, MCP_CONSUMERS_MAX + 1);
+    if ((n < 0) || (n > MCP_CONSUMERS_MAX)) { store64(lenp, 0 - 1); return 0; }
+    store64(lenp, n);
+    return _consumers_buf;
+}
+
+# 32 bytes as 64 lowercase hex digits at `out`, without hex_encode's allocation.
+fn _pin_hex_into(bytes, out) {
+    var i = 0;
+    while (i < 32) {
+        var b = load8(bytes + i);
+        var hi = (b >> 4) & 15;
+        var lo = b & 15;
+        if (hi < 10) { store8(out + i * 2, 48 + hi); } else { store8(out + i * 2, 87 + hi); }
+        if (lo < 10) { store8(out + i * 2 + 1, 48 + lo); } else { store8(out + i * 2 + 1, 87 + lo); }
+        i = i + 1;
+    }
+    store8(out + 64, 0);
+    return 0;
+}
+
+# The consumer holding this token (a cstr), as a new cstr, or 0.
+fn mcp_consumer_of(data_dir, token) {
+    var n = 0;
+    var b = _consumers_read(data_dir, &n);
+    if (b == 0) { return 0; }
+    var d: i64[4];
+    var hex: u8[65];
+    sha256(token, strlen(token), &d);
+    _pin_hex_into(&d, &hex);
+    var want = &hex;
+    var found = 0;
+    var pos = 0;
+    while (pos < n) {
+        var e = pos;
+        while ((e < n) && (load8(b + e) != 10)) { e = e + 1; }
+        var tab = pos;
+        while ((tab < e) && (load8(b + tab) != 9)) { tab = tab + 1; }
+        if ((tab < e) && (e - tab - 1 == 64)) {
+            # Every line, whoever matches: how far this read says nothing.
+            if (ct_eq_bytes(b + tab + 1, want, 64) == 1) {
+                var name = alloc(tab - pos + 1);
+                memcpy(name, b + pos, tab - pos);
+                store8(name + tab - pos, 0);
+                if (mcp_consumer_name_ok(name) == 1) { found = name; }
+            }
+        }
+        pos = e + 1;
+    }
+    return found;
+}
+
+# 1 when `name` is in the file, with the offsets of its line at `sp` and `ep`.
+fn _consumer_line(b, n, name, sp, ep) {
+    var nl = strlen(name);
+    var pos = 0;
+    while (pos < n) {
+        var e = pos;
+        while ((e < n) && (load8(b + e) != 10)) { e = e + 1; }
+        if ((e - pos > nl) && (load8(b + pos + nl) == 9)) {
+            if (memeq(b + pos, name, nl) == 1) {
+                store64(sp, pos);
+                store64(ep, e);
+                return 1;
+            }
+        }
+        pos = e + 1;
+    }
+    return 0;
+}
+
+# Issue a token for `name`. Returns the token (a cstr) to show once, or 0.
+fn mcp_consumer_add(data_dir, name) {
+    if (mcp_consumer_name_ok(name) == 0) { return 0; }
+    if (xmkdir_p(str_cstr(path_join(str_from(data_dir), str_from("mcp"))), 448) != 0) { return 0; }
+    var n = 0;
+    var b = _consumers_read(data_dir, &n);
+    if (n < 0) { return 0; }
+    var sp = 0;
+    var ep = 0;
+    if (b != 0) {
+        if (_consumer_line(b, n, name, &sp, &ep) == 1) { return 0; }
+    }
+    var raw: i64[4];
+    if (random_bytes(&raw, 32) != 32) { return 0; }
+    var token = hex_encode(&raw, 32);
+    var sb = str_builder_new();
+    if (b != 0) { str_builder_add(sb, str_new(b, n)); }
+    str_builder_add_cstr(sb, name);
+    str_builder_add_cstr(sb, "\t");
+    str_builder_add_cstr(sb, sha256_hex(token, 64));
+    str_builder_add_cstr(sb, "\n");
+    var out = str_builder_build(sb);
+    if (str_len(out) > MCP_CONSUMERS_MAX) { return 0; }
+    if (file_write_atomic(_consumers_path(data_dir), str_data(out), str_len(out)) != 0) { return 0; }
+    return token;
+}
+
+# 1 when `name` was removed, 0 when it was not there or could not be.
+fn mcp_consumer_remove(data_dir, name) {
+    var n = 0;
+    var b = _consumers_read(data_dir, &n);
+    if (b == 0) { return 0; }
+    var sp = 0;
+    var ep = 0;
+    if (_consumer_line(b, n, name, &sp, &ep) == 0) { return 0; }
+    var sb = str_builder_new();
+    str_builder_add(sb, str_new(b, sp));
+    if (ep + 1 < n) { str_builder_add(sb, str_new(b + ep + 1, n - ep - 1)); }
+    var out = str_builder_build(sb);
+    if (file_write_atomic(_consumers_path(data_dir), str_data(out), str_len(out)) != 0) { return 0; }
+    return 1;
+}
+
+# Load t-ron's policy (`serve --tron-policy FILE`). 1, or 0 for a file t-ron refuses:
+# the caller stops, because an operator who named a policy did not ask for none.
+fn mcp_pin_tron_open(path) {
+    var t = tron_new(tron_config_default());
+    if (tron_load_policy_file(t, path) != TRON_ERR_NONE) { return 0; }
+    _pin_tron = t;
+    return 1;
+}
+
+# Why the gate last refused, for the answer and the audit entry.
+fn mcp_pin_gate_why() { return _pin_gate_why; }
+
+# Whether `consumer` may accept the definition `t` serves. ⛔ DENIED UNLESS t-ron SAYS
+# ALLOW: with no policy loaded nobody may, and a FLAG is not an allow. t-ron denies by
+# default an agent or a tool its policy does not name. The action it judges is
+# `mcp_accept.<tool>`, so a policy reads `allow = ["mcp_accept.*"]`.
+#
+# tron_check sees the definition as its parameters, so its scanner reads them for SQL,
+# shell, template and path injection. A swapped description is more often a prompt
+# injection, which that scanner does not look for and injection_detector_check does.
+fn _pin_gate(consumer, t) {
+    if (_pin_tron == 0) {
+        _pin_gate_why = "no t-ron policy is loaded: see serve --tron-policy";
+        return 0;
+    }
+    var action = str_builder_new();
+    str_builder_add_cstr(action, "mcp_accept.");
+    str_builder_add(action, mcp_tool_name(t));
+    var params = str_builder_new();
+    _mcp_manifest_entry(params, t);
+    var call = tool_call_new(consumer, str_cstr(str_builder_build(action)),
+      str_cstr(str_builder_build(params)), clock_epoch_ns());
+    var v = tron_check(_pin_tron, call);
+    if (verdict_kind(v) != VK_ALLOW) {
+        _pin_gate_why = verdict_reason(v);
+        return 0;
+    }
+    var scan = injection_detector_check(str_cstr(mcp_tool_desc(t)));
+    if (injection_result_safe(scan) != 1) {
+        _pin_gate_why = "t-ron reads this description as a prompt injection";
+        return 0;
+    }
+    return 1;
+}
+
+# `consumer` accepts the definition `t` now serves, having reviewed `reviewed` (a
+# cstr). Returns 1, 0 when the definition is not that one any more, -1 when the gate
+# refuses, and -2 at MCP_ACCEPTS_MAX.
+fn mcp_pin_consumer_accept(consumer, t, reviewed) {
+    var sha = mcp_tool_sha(t);
+    if ((sha == 0) || (streq(sha, reviewed) == 0)) { return 0; }
+    if (_pin_gate(consumer, t) != 1) { return 0 - 1; }
+    var name_c = str_cstr(mcp_tool_name(t));
+    if (_pin_accept_put(consumer, name_c, sha, clock_epoch_secs()) == 0) { return 0 - 2; }
+    _pin_flush();
     return 1;
 }

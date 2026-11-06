@@ -67,7 +67,15 @@ fn _l_report(name, code) {
 
 var g = _l_run("/bin/guest");
 if (g >= 0) { _l_report("guest", _l_wait_exit(g, 120000)); }
-var d = _l_run("/bin/daimon serve 8090 --agents-dir /agents --data-dir /data --index-root /agents --index-max 4096");
+var _l_cmd: u8[160];
+fn _l_join(a, b) {
+    var n = strlen(a);
+    memcpy(&_l_cmd, a, n);
+    memcpy(&_l_cmd + n, b, strlen(b) + 1);
+    return &_l_cmd;
+}
+var d = _l_run(_l_join("/bin/daimon serve --agents-dir /agents --data-dir /d --index-root /agents ",
+    "--index-content --index-max 4096 --tron-policy /d/p"));
 _l_wait_ms(1500);
 var c = _l_run("/bin/client");
 if (c >= 0) { _l_report("client", _l_wait_exit(c, 120000)); }

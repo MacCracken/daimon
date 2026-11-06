@@ -46,6 +46,7 @@ External (non-stdlib) deps used by daimon:
 | `majra` (2.13.0) | Event-sink dep of bote's bundle (`events_majra.cyr`). Present for compile-time resolution of the full bote bundle; daimon does not use it at runtime today. **Owns `ERR_IPC = 4`** — historically daimon renamed its own IPC error `ERR_IPC_FAULT` (1.3.0) to dodge this collision; at 1.4.2 every daimon error constant was namespaced `DAIMON_ERR_*` (now `DAIMON_ERR_IPC_FAULT`), so no daimon constant can collide with a vendored `ERR_*` and the rename satisfies cyrlint's `lint_error_enum_namespace` rule (6.4.51). |
 | `samay` (1.5.1) | Task scheduler — the extraction of daimon's own `scheduler.cyr`/`cron.cyr`, which daimon 2.0.0 replaced with this library. Resolved from its tag with no `path` since daimon 2.4.4: the sibling checkout had moved to samay 1.5.x, built for cyrius 6.7.x, and a local build vendored it in place of the pin (it calls a bayan function bayan 1.5.6 lacked, so the build failed). samay has no scheduler-level "start": daimon's task start / complete live in `src/sched.cyr` (2.3.1). ⚠ `task_scheduler_complete_task` answers `Err(1)` both for an unknown id and for a refused transition, so look the task up first. |
 | `nein` (1.9.1) | Firewall MCP tools (2.1.8, `dist/nein-mcp.cyr`). It is declared after `bote` and `sigil` in `cyrius.cyml` because its bundle leaves their symbols for the host to supply. Every tool but `nein_validate` is **gated shut** until caller authentication (roadmap 2.6.x; below). Resolved from its tag with no `path` since 2.4.4, like samay. Its manifest declares `bote-core` (bote's core profile); daimon's root `[deps.bote-core]` supplies bote's full bundle in its place (see `bote`). 1.9.1 pins the same 6.7.18 set daimon does (libro 2.11.3, majra 2.13.0, sigil 3.13.15, patra 1.16.6) but for bote-core: it asks for 3.8.9, and daimon's root pin, 3.8.15, wins (`cyrius deps` says so in a note). Measured at 2.5.4: none of the 114 bote functions reachable from what daimon calls differs between the two. **The gate (`daimon_nein_gate`) answers `NEIN_GATE_PERMIT` to permit since nein 1.9.0; any other answer, `1` included, denies.** It classifies with `nein_tool_class(nein_tool_index(name))`: `NEIN_TOOL_OFFLINE` (`nein_validate`) runs; `NEIN_TOOL_READS_LIVE` (`nein_status` / `_list` / `_diff`, which run `nft` as root and return the ruleset) and `NEIN_TOOL_MUTATES` are refused and audited `nein.gate.deny` until caller authentication (2.5.2; flags `_nein_live_reads_enabled`, `_nein_admin_enabled`). `nein_mcp_set_gate` answers 1 when it refuses the gate, and daimon audits that. The smoke covers each class: a nein contract change failed nothing in 2.5.2's first build. Keep nein's pins in step with daimon's when either moves. |
+| `t-ron` (2.2.5) | The gate on a consumer's accept (`_pin_gate`, `src/mcp_pin.cyr`, 2.5.5): `tron_check` with the consumer as agent, `mcp_accept.<tool>` as the action and the definition as parameters, then `injection_detector_check` on the description. Only `VK_ALLOW` passes, and with no `serve --tron-policy` nobody may accept. 2.2.5 renamed `tron_agent_policy_new` and `tron_policy_engine_new`, which collided with nein's in one global scope. **Before adding any bundle, compare its top-level names with `lib/`**: a duplicate `fn` of one arity only warns, and the last definition wins. |
 | `ai-hwaccel` (2.5.6) | samay's hardware-acceleration dependency (samay's own `[deps.ai-hwaccel]`), declared here since 2.0.0 so the full `dist/samay.cyr` bundle resolves at compile time. daimon calls nothing in it directly. Resolved from its tag with no `path` since daimon 2.4.0: with a `path`, the tag is inert and every build re-copies the sibling checkout, which leaked one mid-change into the lock at 2.3.4. |
 
 **ADR-002 is superseded by ADR-006** (2.3.4). ADR-002 assumed Cyrius had no async runtime, but
@@ -118,12 +119,12 @@ Every AGNOS agent, every consumer app, hoosh, agnoshi, aethersafha.
 - **Fixed local arrays: use element-typed `var a: i64[N]` for slot arrays** (and `u8[N]` / `i32[N]` / `u32[N]` for sized byte/scalar buffers). Since cyrius 6.2.1, bare `var a[N]` is **N bytes in a function** (N i64 slots only at top level) — an address-taken `var a[N]` written via `store64(&a + i*8)` under-reserves and silently corrupts adjacent memory. This caused the 1.2.6 routing-404 bug; swept in 1.2.7. Before re-testing any "fixed" compiler footgun, **read the cyrius language CHANGELOG** — fixes there are often language changes, not silent codegen patches.
 - Original Rust implementations are in git history at tags `0.5.0` / `0.6.0` (e.g. `git show 0.6.0:src/agent.rs`). The Cyrius port starts at `0.7.0`.
 
-## Commands (verified at 2.5.4)
+## Commands (verified at 2.5.5)
 
 ```sh
 export CYRIUS_NO_WARN_SHADOW_LIB=1 CYRIUS_DCE=1   # what CI sets
 cyrius build src/main.cyr build/daimon           # also: --agnos build/daimon-agnos, --aarch64 build/daimon-aarch64
-cyrius test tests/<suite>.tcyr                   # one suite (19 suites, each includes its real src/ module)
+cyrius test tests/<suite>.tcyr                   # one suite (20 suites, each includes its real src/ module)
 sh tests/test.sh                                 # every suite + tests/smoke.sh (the linked binary over HTTP) + cyrius fuzz
 cyrius vet src/main.cyr
 cyrius fmt <file> --check                        # CI runs this on src/*.cyr tests/*.tcyr tests/*.bcyr tests/agnos/*.cyr fuzz/*
@@ -201,7 +202,9 @@ that names a file a clean checkout does not vendor fails there.
     carrying `Origin` (`_route_refuse_browser`).
 
   Keep all of these for new routes. Anything a local process must not read waits for 2.6.x, or is off
-  until an operator opens it: `serve --index-root` (ADR-010), `serve --mcp-pin-accept` (ADR-009).
+  until an operator opens it: `serve --index-root` and `--index-content` (ADR-010), `serve --mcp-pin-accept`
+  (ADR-009). A consumer's token (`daimon consumer`, 2.5.5) means something on the accept route and in a
+  manifest, and nowhere else: it is not 2.6.x's identity. Its accept passes t-ron (`--tron-policy`).
 - **What outlives a restart lives under `config_data_dir`** (`serve --data-dir`, default
   `/var/lib/agnos`; 2.5.4): `mcp/toolpins` and `files/`. Open it in `serve`, not `app_init`, which runs
   before the arguments are read. Say what a store's failure means in an answer (`pins.state`,
@@ -212,6 +215,13 @@ that names a file a clean checkout does not vendor fails there.
 - **The file index walks in slices and allocates nothing per file** (`files_tick`, ADR-010). Reserve at
   `files_open`, and keep `tests/files.tcyr`'s `alloc_used` checks true. Duplicates compare a whole
   SHA-256: crab offers to delete them.
+- **Search ranks by words, and says so** (`src/files_search.cyr`, `cost.method`). No local embedding model
+  exists: do not ship a hash and call it one, which is what the crab filing faults RAG for. Reading content
+  is `--index-content`, an opt-in of its own, because it makes a word in a file an oracle.
+- **A check that runs before anyone is known must not allocate.** `alloc` never frees, so 64 KB per token
+  check was a leak any caller could drive. Same for answering a refusal.
+- **A file that is absent and a file that is bad are different answers.** TP-1 and C-2 were one bug, twice:
+  0 for both, so a truncated store reset every pin and a symlinked consumers file would have lost everyone.
 - **`strstr` answers an index or -1**, so `strstr(...) != 0` is true when nothing matched. A test
   built on it passed 16 checks vacuously at 2.5.4. Use `>= 0`, and make a helper in a test. An assert
   should be seen to fail once.

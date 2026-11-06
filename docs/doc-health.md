@@ -6,7 +6,7 @@ type: state
 
 # Documentation Health — daimon
 
-> **Last refresh**: 2026-11-06 (2.5.4: the bote and kernel pin moves; tool definition pins and the file index, with ADR-009, ADR-010, an audit and their guides; both open issues' Status). Before that, 2026-11-04 (2.5.3: the bote and nein pin moves; api.md's builtin results). Before that, 2026-11-03 (2.5.0 – 2.5.2: the cyrius 6.7.x pin moves, the gates and the roadmap rewrite touched the rows dated 2026-11-03). Before that, 2026-11-02 (2.4.4: the cyrius 6.6.20 pin move). Before that, 2026-09-23 (after 2.4.3 — a full sweep, riding the next release: every guide read against the running binary, the README rewritten, the module map, ADR status lines, CLAUDE.md's sandhi row. Before that, 2.4.3 — the QEMU round.)
+> **Last refresh**: 2026-11-06 (2.5.5: search, consumers, the t-ron gate, ADR addenda, the audit addendum, thoth's filing archived). Before that, 2026-11-06 (2.5.4: the bote and kernel pin moves; tool definition pins and the file index, with ADR-009, ADR-010, an audit and their guides; both open issues' Status). Before that, 2026-11-04 (2.5.3: the bote and nein pin moves; api.md's builtin results). Before that, 2026-11-03 (2.5.0 – 2.5.2: the cyrius 6.7.x pin moves, the gates and the roadmap rewrite touched the rows dated 2026-11-03). Before that, 2026-11-02 (2.4.4: the cyrius 6.6.20 pin move). Before that, 2026-09-23 (after 2.4.3 — a full sweep, riding the next release: every guide read against the running binary, the README rewritten, the module map, ADR status lines, CLAUDE.md's sandhi row. Before that, 2.4.3 — the QEMU round.)
 > **Refresh cadence**: when docs are touched, update the affected row. Full re-audit at each minor cut.
 > **Scope**: this repo only (`daimon`) — root-level files plus the entire `docs/` tree.
 
@@ -25,8 +25,16 @@ Daimon is the AGNOS agent orchestrator — every consumer (hoosh, agnoshi, aethe
 | ✅ **Fresh — checked against the code on 2026-09-23** | 25 | The root six (README, CHANGELOG, CLAUDE.md, CONTRIBUTING, SECURITY, BENCHMARKS); the overview, roadmap and this file; the three guides; the ten ADRs; the lifecycle, AGNOS and 2.5.4 audits, which take addenda. |
 | 🟡 **Stale — refresh in place** | 0 | None known after the sweep. See **Stale set** below. |
 | 🔵 **Probably evergreen** | 1 (+ `LICENSE`) | `CODE_OF_CONDUCT.md`. No version-tied claims. Re-read yearly. |
-| 📦 **Frozen by design** | 10 | The 2026-04-13 and 2026-04-27 audits, and the eight filings in `development/issues/archive/`. |
+| 📦 **Frozen by design** | 11 | The 2026-04-13 and 2026-04-27 audits, and the nine filings in `development/issues/archive/`. |
 | ❓ **Open strategic question** | 0 | None outstanding. See [Open questions](#open-strategic-questions). |
+
+**Doc work shipped in 2.5.5 (2026-11-06):**
+- ✅ ADR-009 and ADR-010 — a 2.5.5 addendum each: a consumer accepts for itself, and a question in words.
+- ✅ The 2026-11-06 audit — an addendum: C-1 – C-3, R-6 – R-8.
+- ✅ `docs/guides/api.md` — consumers and **Search**, each answer driven against the binary.
+- ✅ `docs/development/issues/` — thoth's filing resolved and moved to `archive/`. crab's stays open: it
+  asks for ranking by meaning, which needs a local model, and its Status says so.
+- ✅ `README.md`, `SECURITY.md`, `CLAUDE.md`, the overview, the quickstart, the roadmap, BENCHMARKS.md.
 
 **Doc work shipped in 2.5.4 (2026-11-06):**
 - ✅ `docs/adr/009-tool-definition-pins.md` — **new**: daimon pins each tool's first definition, a

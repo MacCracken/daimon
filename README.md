@@ -24,11 +24,15 @@ Rust. AGNOS is its primary target; it also runs on Linux, x86_64 and aarch64.
   and prompts, and daimon forwards calls to them.
 - **Tool definition pins** (2.5.4). daimon keeps a digest of the first definition it saw under each
   tool name, across restarts, and a registration cannot move it. A definition that changes is served
-  marked `changed` and audited, so a client that lost its own pins can rebuild from daimon's
-  ([ADR-009](docs/adr/009-tool-definition-pins.md)).
+  marked `changed` and audited, so a client that lost its own pins can rebuild from daimon's. A consumer
+  with a token the operator issued can accept a definition for itself, gated by
+  [t-ron](https://github.com/MacCracken/t-ron) (2.5.5,
+  [ADR-009](docs/adr/009-tool-definition-pins.md)).
 - **File index** (2.5.4), off unless the operator names a root with `serve --index-root`. An index of
   the files under it, built in the background, with tags, ratings, duplicates by content, and saved
-  queries with counts, all surviving a restart ([ADR-010](docs/adr/010-file-index.md)).
+  queries with counts, all surviving a restart. A question in words answers with ranked files and why
+  each matched (2.5.5): by name, and by content with `--index-content`. It ranks by words, not meaning,
+  and stays on the machine ([ADR-010](docs/adr/010-file-index.md)).
 - **Audit trail.** daimon records its lifecycle and security events on a hash-linked
   [libro](https://github.com/MacCracken/libro) chain, which the `libro_*` tools query, verify and
   export.
@@ -62,7 +66,7 @@ The API has **no authentication** until roadmap 2.6.x. To limit who can reach it
 - refuses agent and task control, and every route under `/v1/files`, from any browser.
 
 So anything local can do everything, which is why the file index serves nothing until an operator
-names a root, and only what lies under it.
+names a root, and only what lies under it, and why reading files' contents is a second opt-in.
 
 See [SECURITY.md](SECURITY.md) and the audit reports in [docs/audit/](docs/audit/).
 
@@ -77,7 +81,7 @@ cyrius build src/main.cyr build/daimon  # also --aarch64 build/daimon-aarch64, -
 ./build/daimon help                     # every flag (--agents-dir, --agent-env, --agent-output, --trace, ...)
 ```
 
-`cyrius deps` resolves sakshi, bote, libro, majra, sigil, bayan, samay, nein and ai-hwaccel at the
+`cyrius deps` resolves sakshi, bote, libro, majra, sigil, bayan, samay, nein, t-ron and ai-hwaccel at the
 tags in `cyrius.cyml`, and every build runs it first. None of them names a sibling checkout (since
 2.4.4), so a local build compiles what CI compiles.
 
@@ -90,10 +94,10 @@ Each tagged release publishes:
 
 ```bash
 sh tests/test.sh                    # every suite, the HTTP smoke and the fuzz harnesses
-cyrius test tests                   # every suite in tests/: 1556 checks, 19 files
+cyrius test tests                   # every suite in tests/: 1881 checks, 20 files
 cyrius fuzz                         # 7 property-based harnesses, 176,349 generated cases
 cyrius bench tests/daimon.bcyr      # 28 benchmarks, one only where agents can be contained (+2 in tests/rag_ingest.bcyr)
-sh tests/smoke.sh                   # the linked binary over HTTP, 233 checks: libro, tracing, regressions,
+sh tests/smoke.sh                   # the linked binary over HTTP, 274 checks: libro, tracing, regressions,
                                     # the agent lifecycle, the bind address, task start/complete,
                                     # request-string decoding, agent channels and messages,
                                     # the event loop, hosts and origins, captured output,
@@ -119,14 +123,14 @@ found.
 
 ## Status
 
-At 2.5.4, `src/` is 13,351 lines in 33 modules. The port (0.7.0) turned 9,724 lines of Rust into
+At 2.5.5, `src/` is 15,151 lines in 34 modules. The port (0.7.0) turned 9,724 lines of Rust into
 4,141 of Cyrius. The binaries are statically linked:
 
 | target | bytes |
 |---|---:|
-| x86_64 | 2,489,760 |
-| aarch64 | 5,475,408 |
-| agnos | 2,398,280 |
+| x86_64 | 2,636,472 |
+| aarch64 | 5,749,088 |
+| agnos | 2,549,096 |
 
 Since cyrius 6.7.18 (daimon 2.5.1) the x86_64 and agnos builds remove unreachable code, about 2 MB
 of it; until then it was NOPed in place (CHANGELOG 1.2.4). The aarch64 build still NOPs it, which is

@@ -304,13 +304,47 @@ served, marked `changed`, and audited `mcp.tool.changed`. What to do with it is 
 Deregistering keeps the pin. A pin is kept in `<data_dir>/mcp/toolpins`, so it outlives a restart;
 a registration does not, and a server registers again.
 
-Two things move a pin: a new binary, for a builtin (audited `mcp.pin.builtin.moved`), and accepting:
+Two things move a pin: a new binary, for a builtin (audited `mcp.pin.builtin.moved`), and an operator:
 
 ```
 POST /v1/mcp/tools/{name}/accept
 → 403 until callers are identified (roadmap 2.6.x), audited mcp.pin.accept.deny
 → with `serve --mcp-pin-accept`: {"ok":true,"pin_state":"pinned"} · 404 · 409 a builtin, or no pin
 ```
+
+**A consumer accepts for itself** (2.5.5), which moves no pin. The operator issues it a token, shown
+once. Only the token's digest is kept, and `remove` stops it at once, with no restart:
+
+```bash
+daimon consumer add thoth --data-dir /var/lib/agnos
+```
+
+```
+# Name the digest you reviewed: a definition that has changed since answers 409.
+POST /v1/mcp/tools/{name}/accept     Authorization: Bearer <token>
+{"definition_sha256":"<64 hex>"}
+→ {"ok":true,"pin_state":"accepted"} · 400 · 401 a token that names nobody · 403 t-ron refused · 404 · 409
+
+# With the token, a manifest says what you accepted.
+GET /v1/mcp/tools                    Authorization: Bearer <token>
+→ entries add "accepted_sha256" and "accepted_at"; "pin_state":"accepted" where it is what is served
+```
+
+`accepted` reaches that consumer alone: the same tool reads `changed` for everyone else. A further swap
+reads `changed` again.
+
+**Every accept passes t-ron**, and only an allow passes. Name a policy with `serve --tron-policy FILE`: with
+none, no consumer may accept (403), and a file t-ron refuses stops `serve`. t-ron denies by default a
+consumer or a tool the policy does not name, and the action it judges is `mcp_accept.<tool>`:
+
+```toml
+[agent."thoth"]
+allow = ["mcp_accept.*"]
+deny = ["mcp_accept.firewall_*"]
+```
+
+t-ron also reads the definition, so a description it takes for a prompt injection, or a definition carrying
+SQL, shell, template or path injection, answers 403 with the reason, whatever the policy allows.
 
 `pins.state` in the manifest says how far to trust all this. `durable` is false in the last two:
 
@@ -392,12 +426,12 @@ that is not valid UTF-8, which JSON could not carry. `skipped` counts what it co
 ```
 GET /v1/files/index
 → {"state":"fresh","files":41208,"bytes":8123456,"duplicates":12,"skipped":0,"truncated":false,
-   "indexed_at":1793990381,"generation":3,"persisted":true,"meta_durable":true,"meta_skipped":0,
+   "content":true,"terms":8228414,"terms_truncated":false,"indexed_at":1793990381,"generation":3,"persisted":true,"meta_durable":true,"meta_skipped":0,
    "power":"mains","roots":["/home/me"]}
 ```
 
 `progress` appears while a job runs: `{"phase":"walk","done":251,"total":812}`, the phases being `copy`,
-`walk`, `sizes`, `hash`, `group` and `save`. During a walk `total` is the last walk's count, and 0 the
+`walk`, `sizes`, `hash`, `group`, `terms`, `read`, `sort` and `save`. During a walk `total` is the last walk's count, and 0 the
 first time.
 
 | state | meaning |
@@ -436,7 +470,7 @@ none: files sharing one have the same content, by a whole SHA-256 of the whole f
 not duplicates of each other.
 
 A query is query-string text, and filters combine. An unknown key answers 400: a misspelled filter must
-not answer with every file.
+not answer with every file. Add `q` to ask a question: see [Search](#search-255).
 
 | key | value |
 |---|---|
@@ -446,7 +480,9 @@ not answer with every file.
 | `duplicates` | `1`: sharing their content with another file |
 | `under` | at or below this path |
 | `ext` | any of these extensions, comma-separated, in any case |
-| `min_size` | at least this many bytes |
+| `q` | a question in words (2.5.5) |
+| `kind` | `document`, `image`, `audio`, `video`, `archive`, `code` or `other` |
+| `min_size`, `max_size` | at least, or at most, this many bytes |
 | `newer_days`, `older_days` | modified within, or before, this many days |
 | `limit`, `offset` | paging |
 
@@ -508,6 +544,41 @@ GET /v1/files/smart/Large%20%26%20old?limit=50
 # A folder that ships cannot be deleted (409). Deleting one you redefined puts the shipped query back.
 DELETE /v1/files/smart/Work
 ```
+
+### Search (2.5.5)
+
+`q` is a question in words, and the answer is files, ranked. It is local: no byte leaves daimon.
+
+```
+GET /v1/files?q=paid+invoices+last+month&limit=20
+→ {"files":[{"path":"/home/me/bills/march-invoice.txt","rank":1,"score":2954,"size":59,"mtime":1793990000,
+             "rating":0,"tags":["finance"],"duplicate_group":0,
+             "why":"Contains \"paid\" and \"invoices\"; its name or folder has \"invoices\"; modified last month",
+             "folders":["Recent","Unrated"]}],
+   "total":3,"next_offset":0,"generation":3,"words":["paid","invoices"],"window":"last month",
+   "facets":{"kind":[{"label":"document","files":3,"query":"kind=document"}],
+             "date":[...],"size":[...],"location":[{"label":"/home/me/bills","files":2,"query":"under=/home/me/bills"}]},
+   "duplicates":{"groups":0,"files":0},
+   "cost":{"ms":6,"hits":3,"method":"words + name","local":true}}
+```
+
+⛔ **It ranks by words, not by meaning, and `cost.method` says so.** `invoices` finds `invoice`, and
+`receipt` does not. Ranking by meaning needs a local embedding model, which does not exist yet.
+
+**What is searched** depends on the operator. With `--index-root`, the file's name and its folder's:
+`method` is `name`. With `serve --index-content` too, the first 64 KB of each file with no NUL in its
+first 4 KB: `method` is `words + name`. That is a second opt-in, because a local process can then ask
+whether a file it could not open holds a word. So a PDF is found by name alone. Status says which
+(`content`), and `terms_truncated` if the reserve for words ran out.
+
+A file with more of the question's words ranks first, and a name match counts for more than saying a
+word often. Words are folded and lightly stemmed (`invoicing` meets `invoice`, in English), and at most
+8 count. Words like `the` and `find` do not. `why` is built from what matched, and infers nothing.
+`today`, `yesterday`, and `this` or `last` with `week`, `month` or `year` are windows, rolling rather than
+by the calendar (`last month` is 30 to 60 days ago), and every other filter works beside a question.
+
+Ranking stops at 1,200 results. Add a facet's `query` to your own to refine by it: each gives the count it
+shows. A question can be saved: `POST /v1/files/smart {"name":"Money","query":"q=paid+invoices"}`.
 
 The rate limit below applies, so poll `GET /v1/files/smart` and `/v1/files/index` a few times a minute,
 not per frame. Counts are kept until something they read changes. The index, tags and queries all

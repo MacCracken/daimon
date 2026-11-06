@@ -4,6 +4,110 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.5.5] - 2026-11-06
+
+**A question in words answered with ranked files; a consumer that accepts a tool definition for itself,
+gated through t-ron.** Thoth's filing is closed and archived. Crab's stays open: every item it lists is
+answered, but it asks for ranking by meaning, and this ranks by words. **1881 tests** across 20 suites, **274
+HTTP smoke checks** (41 new) and 9 fuzz harnesses, all green on Linux. On a real aarch64 kernel: all 1881 checks and
+the binary's 20-check smoke. The AGNOS guest test passes 117 checks on agnos 1.57.17 (61 + 56; eleven new), real t-ron
+verdicts among them. fmt, lint and vet are clean; x86_64, aarch64 and agnos build; `cyrius.lock` verifies 93 of 93.
+
+### Added — ranked file search (crab's item 5, ADR-010)
+
+`GET /v1/files?q=paid+invoices+last+month`. It is local: no byte leaves daimon.
+- ⛔ **It ranks by words, not by meaning, and every answer says so** (`cost.method`). `invoices` finds
+  `invoice`, and `receipt` does not. No local embedding model exists to rank by meaning, and a hash of a
+  word's bytes is not an embedding, so daimon did not ship one and call it that.
+- ⛔ **Content is a second opt-in**, `serve --index-content`. `--index-root` alone searches names. With content,
+  a local process can ask whether a file it could not open holds a word.
+- **Each result carries** its rank and score, `why` as a sentence built from what matched, and the tags and
+  smart folders it appears in. **The answer carries** facets (`kind`, `date`, `size`, `location`), each with a
+  `query` to refine by, duplicates among the results, and `cost`: the time, the hits and the method.
+- **New query keys**: `q`, `kind`, `max_size`. A window in words (`last week`) is understood. `POST
+  /v1/files/smart` saves a question as a folder.
+- **An inverted index in the generation**, BM25 in integers, with a name match worth more than saying a word
+  often, and more of the question's words ranking first. A query costs what its words' postings cost, not the
+  size of the disk. Like the walk it runs in slices and allocates nothing per file, and an unchanged file keeps
+  its postings, so a re-walk reads only what changed. `index` is format 2: a 2.5.4 file is dropped and rebuilt.
+- Content is the first 64 KB of a file with no NUL in its first 4 KB, so a PDF is found by name alone. 256
+  distinct words are kept per file. Stemming is English.
+
+### Added — a consumer accepts for itself (thoth's item 4, ADR-009's addendum)
+
+- **`daimon consumer add|remove NAME`**: a token of 256 bits, shown once. Only its digest is kept, in
+  `<data_dir>/mcp/consumers`, read for each use, so a removal takes effect at once.
+- **`POST /v1/mcp/tools/{name}/accept` with `Authorization: Bearer`** and `{"definition_sha256":"…"}`. It moves no
+  pin: the tool reads `accepted` for that consumer and `changed` for everyone else. It must name the digest it
+  reviewed, so a swap landing in between answers 409, unread. It is audited `mcp.pin.accept.consumer`.
+- **`GET /v1/mcp/tools` with the token** adds `accepted_sha256` and `accepted_at`. A wrong token is 401, never
+  read as no token. Acceptances outlive a restart, in the store.
+- **Every accept passes t-ron, and fails closed.** `serve --tron-policy FILE` names its policy, by consumer, over
+  the action `mcp_accept.<tool>`. With none nobody may accept, a `FLAG` is not an accept, and a policy t-ron refuses
+  stops `serve`. t-ron reads the definition as well: a description it takes for a prompt injection cannot be accepted.
+
+### Changed — dependency pins
+
+| dep | was | now |
+|---|---|---|
+| t-ron | not a dep | **2.2.5** |
+
+- **t-ron 2.2.5** renames `agent_policy_new` and `policy_engine_new`, which collided with nein's in one global scope:
+  a compile error by arity, and, for the second, a silent replacement of a hashmap by a vec. It also moves
+  bote-core to 3.8.15, the same bote as daimon. Every other pin is still its repo's latest tag.
+
+### Fixed before shipping
+
+- **A check of a token allocated 64 KB** on an allocator that never frees, so a caller with no token could grow
+  daimon by about 8 MB a minute. A kept buffer, and a refused token allocates nothing. (C-1)
+- **A bad consumers file read as an empty one**, so adding one consumer to a symlinked or oversized file would have
+  erased the others: an absent thing and a bad thing given one answer, again. (C-2)
+- **`next_offset` was 0 when a page ran out of the heap**, so a client would have stopped at page one.
+- **t-ron's prompt-injection check was not in `tron_check`**, whose scanner looks for SQL, shell, template and path
+  injection: the attack this gate exists for would have passed it. `_pin_gate` calls `injection_detector_check` too.
+- **A map lookup per word** cost more than the rest of tokenizing. A stop word is now checked the first time a file
+  says it. **`--index-content`'s reserve** was 98% full at 41,200 files of 200 words, and is doubled on Linux.
+
+### Tests
+
+- **`tests/files_search.tcyr`** (new, 247): stemming and the hash against published vectors, names alone and with
+  content, the order of a ranking and not only its members, windows, every facet's query against the count it shows,
+  pages, a sort stopped at every chance, a re-walk that neither loses nor doubles a posting, a restart, and postings that
+  lie under a passing digest. Mutation: a sort that drops a bit fails it; one that only rescans is equivalent, and survives.
+- **`tests/mcp_pin.tcyr`** (159 → 237): consumers, 200 refused tokens allocating nothing, a file that is a link or too
+  large, isolation between consumers, a stale review, and **real `tron_check` verdicts**: no policy, a consumer it does
+  not name, a tool it denies, a prompt injection, a payload injection, a name it will not judge.
+- **`fuzz/files_search.fcyr`** (new): noise as content and as a query, every question leaving no score behind, and corrupted
+  postings, which must be refused or harmless.
+- **Smoke** (233 → 274): 18 on consumers and the gate, and 23 on search, through the real routes and a real restart.
+  **AGNOS guest** (+11): search on the real kernel, and the gate: a wrong token, a stale digest, an allow, and
+  `accepted` read by that consumer alone.
+
+### Sizes and performance
+
+| target | 2.5.4 | 2.5.5 | |
+|---|---:|---:|---:|
+| x86_64 | 2,489,760 | 2,636,472 | +5.9% |
+| aarch64 | 5,475,408 | 5,749,088 | +5.0% |
+| agnos | 2,398,280 | 2,549,096 | +6.3% |
+
+2.5.4 against 2.5.5, both on cyrius 6.7.18: 20 interleaved runs with the order alternating, medians, at a load average
+of 1.6–3.6, which rose near the end. 28 of the 34 rows are within ±3%, and the binary under the tag is byte-identical to
+the one measured. Of the other six:
+- ⚠ `files_count_flags_41k` 740 → 798 µs (+7.9%) and `files_list_100_of_41k` 871 → 936 µs (+7.5%) are real: `_fx_match`
+  gained two checks, for `max_size` and `kind`, on every record.
+- `trace_id_hex` 45 → 50 ns (+11.1%, spreads 7% / 12%), one of the rows that has moved at each release, in code that did
+  not change. `files_find_in_41k` −5.1%, `rag_chunk_5k_chars` +3.8% and `mcp_register_100_tools` +3.2% are inside their
+  spreads.
+
+New rows: a question with one hit over 41,200 files 11.5 µs, a word in most of them (35,000 hits) 10.7 ms, which is
+the worst a question costs the loop at that size; 64 KB tokenized 653 µs; a refused token 7.5 µs.
+
+**Under load**, in a scratch copy with only the rate limit lifted, on tmpfs: 41,200 files of 200 words each, 161 MB, read
+to `fresh` in 3.13 s, with `/v1/health` at p99 3.02 ms and max 3.93 ms, against 0.21 and 2.21 with no index. 8.2M
+postings and 103 MB of RSS. Questions with 1,300 to 2,600 hits answered in 3–6 ms. A restart serves that index in 358
+ms. See BENCHMARKS.md.
+
 ## [2.5.4] - 2026-11-06
 
 **Tool definition pins, a file index with tags, ratings and smart folders, bote 3.8.15 and agnos

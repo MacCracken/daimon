@@ -91,6 +91,7 @@ var FX_R_GROUP = 32;   # duplicates share a group; 0 is none
 var FX_R_FLAGS = 40;   # u8
 var FX_R_RATING = 41;  # u8
 var FX_R_PLEN = 42;    # u16
+var FX_R_DL = 44;      # u32: words read from the file's content
 var FX_R_META = 48;    # FileMeta, or 0. Not meaningful on disk.
 
 var FX_F_DIR = 1;
@@ -98,6 +99,7 @@ var FX_F_CAND = 2;     # shares its size with another file
 var FX_F_DUP = 4;      # shares its content with another file
 var FX_F_TAGGED = 8;
 var FX_F_RATED = 16;
+var FX_F_TERMS = 32;   # its postings are in this generation (src/files_search.cyr)
 var FX_F_DISK = 5;     # what `index` may say: DIR and DUP. The rest is resolved here.
 
 # A generation.
@@ -112,7 +114,13 @@ var FX_G_BYTES = 56;
 var FX_G_TRUNC = 64;
 var FX_G_SKIPPED = 72;
 var FX_G_DUPS = 80;
-var FX_G_SIZE = 88;
+var FX_G_POST = 88;    # postings: (term << 32) | (record << 8) | tf, grouped by bucket
+var FX_G_POST_N = 96;
+var FX_G_HEADS = 104;  # u32 * 65537: where each bucket of postings starts
+var FX_G_WORDS = 112;  # words read from content, across the generation
+var FX_G_PTRUNC = 120; # postings ran out of room
+var FX_G_CONTENT = 128;# 1 when content was read: postings are not reused across a change
+var FX_G_SIZE = 136;
 
 # The phases of a job.
 var FX_IDLE = 0;
@@ -122,13 +130,18 @@ var FX_SIZES = 3;
 var FX_HASH = 4;
 var FX_GROUP = 5;
 var FX_SAVE = 6;
+var FX_REMAP = 7;      # which records carry over unchanged
+var FX_POSTS = 8;      # ... with their postings
+var FX_READ = 9;       # tokenize what is new
+var FX_SORT = 10;      # group postings by bucket
 
-var FILES_INDEX_MAGIC = "DAIMON-FILEIDX-1\n";
+var FILES_INDEX_MAGIC = "DAIMON-FILEIDX-2\n";
 var FILES_INDEX_MAGIC_LEN = 17;
-var FILES_INDEX_HDR = 64;
+var FILES_INDEX_HDR = 96;
 
 var _fx_roots = 0;         # vec of cstr
 var _fx_enabled = 0;       # the index is open
+var _fx_content = 0;       # read files' content for search (--index-content)
 var _fx_dir = 0;           # <data_dir>/files, cstr, or 0 when nothing can be kept
 var _fx_index_path = 0;
 var _fx_tmp_path = 0;
@@ -137,6 +150,7 @@ var _fx_data_dir = 0;      # cstr: the index never walks its own files
 var _fx_cap = 0;
 var _fx_tbl = 0;           # entries in a table, a power of two
 var _fx_pool_cap = 0;
+var _fx_post_cap = 0;      # postings in a generation
 var _fx_seed = 0;
 var _fx_gen_a = 0;
 var _fx_gen_b = 0;
@@ -336,7 +350,12 @@ fn _fx_gen_new() {
     var pool = alloc(_fx_pool_cap);
     var t1 = alloc(_fx_tbl * 4);
     var t2 = alloc(_fx_tbl * 4);
+    var post = alloc(_fx_post_cap * 8);
+    var heads = alloc(FX_BUCKETS * 4 + 4);
     if ((g == 0) || (recs == 0) || (pool == 0) || (t1 == 0) || (t2 == 0)) { return 0; }
+    if ((post == 0) || (heads == 0)) { return 0; }
+    store64(g + FX_G_POST, post);
+    store64(g + FX_G_HEADS, heads);
     store64(g + FX_G_RECS, recs);
     store64(g + FX_G_POOL, pool);
     store64(g + FX_G_TABLE, t1);
@@ -352,6 +371,11 @@ fn _fx_gen_clear(g) {
     store64(g + FX_G_TRUNC, 0);
     store64(g + FX_G_SKIPPED, 0);
     store64(g + FX_G_DUPS, 0);
+    store64(g + FX_G_POST_N, 0);
+    store64(g + FX_G_WORDS, 0);
+    store64(g + FX_G_PTRUNC, 0);
+    store64(g + FX_G_CONTENT, _fx_content);
+    memset(load64(g + FX_G_HEADS), 0, FX_BUCKETS * 4 + 4);
     memset(load64(g + FX_G_TABLE), 0, _fx_tbl * 4);
     return 0;
 }
@@ -574,6 +598,7 @@ fn _fx_phase_next(g, phase) {
         memset(load64(g + FX_G_TABLE2), 0, _fx_tbl * 4);
     }
     if (phase == FX_GROUP) { _fx_groups = 0; }
+    if (phase == FX_SORT) { _fx_sort_stage = 0; }
     if (phase == FX_SAVE) { _fx_save_start(g); }
     return 0;
 }
@@ -758,7 +783,7 @@ fn _fx_group_slice(g, deadline) {
             if (daimon_now_ms() >= deadline) { return 0; }
         }
     }
-    _fx_phase_next(g, FX_SAVE);
+    _fx_phase_next(g, FX_REMAP);
     return 0;
 }
 
@@ -774,7 +799,7 @@ fn _fx_save_fail() {
 
 fn _fx_save_start(g) {
     _fx_persisted = 0;
-    _fx_save_stage = 3;           # nothing to write unless the file opens
+    _fx_save_stage = 5;           # nothing to write unless the file opens
     if (_fx_dir == 0) { return 0; }
     _fx_save_fd = file_open(_fx_tmp_path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 384);   # 0600
     if (_fx_save_fd < 0) { _fx_save_fail(); return 0; }
@@ -785,6 +810,10 @@ fn _fx_save_start(g) {
     store64(_fx_hdr + 40, clock_epoch_secs());
     store64(_fx_hdr + 48, load64(g + FX_G_TRUNC));
     store64(_fx_hdr + 56, load64(g + FX_G_SKIPPED));
+    store64(_fx_hdr + 64, load64(g + FX_G_POST_N));
+    store64(_fx_hdr + 72, load64(g + FX_G_WORDS));
+    store64(_fx_hdr + 80, load64(g + FX_G_CONTENT));
+    store64(_fx_hdr + 88, load64(g + FX_G_PTRUNC));
     sha256_init_into(_fx_ctx);
     _fx_save_stage = 0;
     _fx_save_off = 0;
@@ -809,14 +838,16 @@ fn _fx_save_chunk(buf, len) {
 }
 
 fn _fx_save_slice(g, deadline) {
-    while (_fx_save_stage < 3) {
+    while (_fx_save_stage < 5) {
         var st = 0;
         if (_fx_save_stage == 0) { st = _fx_save_chunk(_fx_hdr, FILES_INDEX_HDR); }
         elif (_fx_save_stage == 1) { st = _fx_save_chunk(load64(g + FX_G_RECS), load64(g + FX_G_N) * FX_REC); }
-        else { st = _fx_save_chunk(load64(g + FX_G_POOL), load64(g + FX_G_USED)); }
+        elif (_fx_save_stage == 2) { st = _fx_save_chunk(load64(g + FX_G_POOL), load64(g + FX_G_USED)); }
+        elif (_fx_save_stage == 3) { st = _fx_save_chunk(load64(g + FX_G_HEADS), FX_BUCKETS * 4 + 4); }
+        else { st = _fx_save_chunk(load64(g + FX_G_POST), load64(g + FX_G_POST_N) * 8); }
         if (st < 0) {
             _fx_save_fail();
-            _fx_save_stage = 3;
+            _fx_save_stage = 5;
         } elif (st == 1) {
             _fx_save_stage = _fx_save_stage + 1;
         }
@@ -897,18 +928,24 @@ fn _fx_load(g) {
     if (_fx_read_full(fd, _fx_hdr, FILES_INDEX_HDR) == 1) {
         var n = load64(_fx_hdr + 24);
         var used = load64(_fx_hdr + 32);
+        var post_n = load64(_fx_hdr + 64);
         var good = 1;
         if (memeq(_fx_hdr, FILES_INDEX_MAGIC, FILES_INDEX_MAGIC_LEN) != 1) { good = 0; }
         if ((n < 0) || (n > _fx_cap) || (used < 8) || (used > _fx_pool_cap)) { good = 0; }
+        if ((post_n < 0) || (post_n > _fx_post_cap)) { good = 0; }
         if (good == 1) {
             if ((_fx_read_full(fd, load64(g + FX_G_RECS), n * FX_REC) == 1)
-              && (_fx_read_full(fd, load64(g + FX_G_POOL), used) == 1)) {
+              && (_fx_read_full(fd, load64(g + FX_G_POOL), used) == 1)
+              && (_fx_read_full(fd, load64(g + FX_G_HEADS), FX_BUCKETS * 4 + 4) == 1)
+              && (_fx_read_full(fd, load64(g + FX_G_POST), post_n * 8) == 1)) {
                 var want: i64[4];
                 var have: i64[4];
                 sha256_init_into(_fx_ctx);
                 sha256_update(_fx_ctx, _fx_hdr, FILES_INDEX_HDR);
                 sha256_update(_fx_ctx, load64(g + FX_G_RECS), n * FX_REC);
                 sha256_update(_fx_ctx, load64(g + FX_G_POOL), used);
+                sha256_update(_fx_ctx, load64(g + FX_G_HEADS), FX_BUCKETS * 4 + 4);
+                sha256_update(_fx_ctx, load64(g + FX_G_POST), post_n * 8);
                 sha256_finalize(_fx_ctx, &want);
                 if (_fx_read_full(fd, &have, 32) == 1) {
                     if (memeq(&want, &have, 32) == 1) {
@@ -916,7 +953,12 @@ fn _fx_load(g) {
                         store64(g + FX_G_USED, used);
                         store64(g + FX_G_TRUNC, load64(_fx_hdr + 48));
                         store64(g + FX_G_SKIPPED, load64(_fx_hdr + 56));
+                        store64(g + FX_G_POST_N, post_n);
+                        store64(g + FX_G_WORDS, load64(_fx_hdr + 72));
+                        store64(g + FX_G_CONTENT, load64(_fx_hdr + 80));
+                        store64(g + FX_G_PTRUNC, load64(_fx_hdr + 88));
                         ok = _fx_load_check(g, n, used);
+                        if (ok == 1) { ok = _fx_posts_check(g, n, post_n); }
                         _fx_indexed_at = load64(_fx_hdr + 40);
                     }
                 }
@@ -1056,6 +1098,10 @@ fn files_tick(now) {
     elif (_fx_phase == FX_SIZES) { _fx_sizes_slice(g, deadline); }
     elif (_fx_phase == FX_HASH) { _fx_hash_slice(g, deadline); }
     elif (_fx_phase == FX_GROUP) { _fx_group_slice(g, deadline); }
+    elif (_fx_phase == FX_REMAP) { _fx_remap_slice(g, deadline); }
+    elif (_fx_phase == FX_POSTS) { _fx_posts_slice(g, deadline); }
+    elif (_fx_phase == FX_READ) { _fx_read_slice(g, deadline); }
+    elif (_fx_phase == FX_SORT) { _fx_sort_slice(g, deadline); }
     elif (_fx_phase == FX_SAVE) { _fx_save_slice(g, deadline); }
     return 0;
 }
@@ -1402,7 +1448,10 @@ var FX_Q_DUP = 88;
 var FX_Q_LIMIT = 96;
 var FX_Q_OFFSET = 104;
 var FX_Q_TAGNAME = 112;
-var FX_Q_SIZE = 120;
+var FX_Q_MAX_SIZE = 120;
+var FX_Q_KIND = 128;     # FX_KIND_* + 1, or 0 for any
+var FX_Q_TEXT = 136;     # a question in words (`q`): src/files_search.cyr ranks it
+var FX_Q_SIZE = 144;
 
 fn _fx_int(s) {
     var n = strlen(s);
@@ -1453,6 +1502,17 @@ fn _fx_query_key(f, key, val) {
         store64(f + FX_Q_UNDER_LEN, ul);
         return 1;
     }
+    if (streq(key, "q") == 1) {
+        if (strlen(val) == 0) { return 0; }
+        store64(f + FX_Q_TEXT, val);
+        return 1;
+    }
+    if (streq(key, "kind") == 1) {
+        var kind = files_kind_named(val);
+        if (kind == 0) { return 0; }
+        store64(f + FX_Q_KIND, kind);
+        return 1;
+    }
     if (streq(key, "ext") == 1) {
         var exts = _fx_exts_parse(val);
         if (exts == 0) { return 0; }
@@ -1466,6 +1526,11 @@ fn _fx_query_key(f, key, val) {
     if (streq(key, "duplicates") == 1) { store64(f + FX_Q_DUP, n); return 1; }
     if (streq(key, "rating") == 1) { store64(f + FX_Q_RATING, n); return 1; }
     if (streq(key, "min_size") == 1) { store64(f + FX_Q_MIN_SIZE, n); return 1; }
+    if (streq(key, "max_size") == 1) {
+        if (n == 0) { return 0; }
+        store64(f + FX_Q_MAX_SIZE, n);
+        return 1;
+    }
     if (streq(key, "older_days") == 1) { store64(f + FX_Q_OLDER, n); return 1; }
     if (streq(key, "newer_days") == 1) { store64(f + FX_Q_NEWER, n); return 1; }
     if (streq(key, "limit") == 1) {
@@ -1588,6 +1653,14 @@ fn _fx_match(g, r, f, now) {
     if (v > 0) {
         if (load64(r + FX_R_SIZE) < v) { return 0; }
     }
+    v = load64(f + FX_Q_MAX_SIZE);
+    if (v > 0) {
+        if (load64(r + FX_R_SIZE) > v) { return 0; }
+    }
+    v = load64(f + FX_Q_KIND);
+    if (v > 0) {
+        if (_fx_kind_of(_fx_rec_path(g, r), _fx_rec_plen(r)) + 1 != v) { return 0; }
+    }
     v = load64(f + FX_Q_OLDER);
     if (v > 0) {
         if (load64(r + FX_R_MTIME) > now - v * 86400) { return 0; }
@@ -1617,6 +1690,7 @@ fn files_count(f) {
     _fx_filter_bind(f);
     var g = _fx_active;
     if (g == 0) { return 0; }
+    if (load64(f + FX_Q_TEXT) != 0) { return files_search_count(f); }
     var now = clock_epoch_secs();
     var n = load64(g + FX_G_N);
     var c = 0;
@@ -1825,6 +1899,9 @@ fn _fx_phase_name() {
     if (_fx_phase == FX_SIZES) { return "sizes"; }
     if (_fx_phase == FX_HASH) { return "hash"; }
     if (_fx_phase == FX_GROUP) { return "group"; }
+    if ((_fx_phase == FX_REMAP) || (_fx_phase == FX_POSTS)) { return "terms"; }
+    if (_fx_phase == FX_READ) { return "read"; }
+    if (_fx_phase == FX_SORT) { return "sort"; }
     return "save";
 }
 
@@ -1865,6 +1942,15 @@ fn files_status_json() {
     _o_int("duplicates", dups);
     _o_int("skipped", skipped);
     _o_bool("truncated", trunc);
+    var posts = 0;
+    var ptrunc = 0;
+    if (g != 0) {
+        posts = load64(g + FX_G_POST_N);
+        ptrunc = load64(g + FX_G_PTRUNC);
+    }
+    _o_bool("content", _fx_content);
+    _o_int("terms", posts);
+    _o_bool("terms_truncated", ptrunc);
     _o_int("indexed_at", _fx_indexed_at);
     _o_int("generation", _fx_generation);
     _o_bool("persisted", _fx_persisted);
@@ -1937,6 +2023,7 @@ fn _fx_row(g, r) {
 # FILES_PAGE_BYTES. `generation` changes when the index under a client's paging does.
 fn files_list_json(f) {
     _fx_filter_bind(f);
+    if (load64(f + FX_Q_TEXT) != 0) { return files_search_json(f); }
     _o_reset();
     _o_c("{\"files\":[");
     var g = _fx_active;
@@ -2163,6 +2250,8 @@ fn files_open(data_dir) {
     _fx_cap = FILES_MAX;
     _fx_pool_cap = _fx_cap * FILES_POOL_PER;
     _fx_tbl = _fx_tbl_for(_fx_cap);
+    _fx_post_cap = _fx_cap * FILES_POST_PER_NAME;
+    if (_fx_content == 1) { _fx_post_cap = _fx_cap * FILES_POST_PER_CONTENT; }
     _fx_seed = clock_now_ns() | 1;
     _fx_gen_a = _fx_gen_new();
     _fx_gen_b = _fx_gen_new();
@@ -2177,7 +2266,7 @@ fn files_open(data_dir) {
     _fx_hdr = alloc(FILES_INDEX_HDR);
     _fx_out_cap = FILES_PAGE_BYTES + FILES_OUT_SLACK;
     _fx_out = alloc(_fx_out_cap);
-    if ((_fx_gen_a == 0) || (_fx_gen_b == 0) || (_fx_names == 0) || (_fx_out == 0)) {
+    if ((_fx_gen_a == 0) || (_fx_gen_b == 0) || (_fx_names == 0) || (_fx_out == 0) || (files_search_open() == 0)) {
         sakshi_warn("no memory for the file index; it stays off", 42);
         daimon_audit(SEV_WARNING, "files", "files.index.unavailable", "no memory for the file index");
         return 0;
@@ -2214,3 +2303,6 @@ fn files_open(data_dir) {
 }
 
 fn files_enabled() { return _fx_enabled; }
+
+# `serve --index-content`: read what files hold, not only what they are called.
+fn files_set_content(on) { _fx_content = on; return 0; }

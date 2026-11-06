@@ -56,6 +56,7 @@ include "src/rag.cyr"
 include "src/mcp.cyr"
 include "src/mcp_pin.cyr"
 include "src/files.cyr"
+include "src/files_search.cyr"
 include "src/edge.cyr"
 
 var _cos_a = 0;
@@ -168,6 +169,29 @@ fn bench_files_count_ext_41k() {
 
 fn bench_files_list_100_of_41k() {
     files_list_json(_bench_fx_page);
+    return 0;
+}
+
+# 2.5.5: a question over the same records, postings of about the shape names make.
+fn bench_files_search_41k() {
+    files_list_json(_bench_fx_search);
+    return 0;
+}
+
+# A word most files hold: what a question can cost the loop.
+fn bench_files_search_common_41k() {
+    files_list_json(_bench_fx_common);
+    return 0;
+}
+
+fn bench_files_tokenize_64k() {
+    _fx_tf_begin();
+    _fx_scan(_bench_fx_text, 65536, 0);
+    return 0;
+}
+
+fn bench_mcp_consumer_of() {
+    mcp_consumer_of("build/bench_files", "not a token anyone was given");
     return 0;
 }
 
@@ -389,6 +413,9 @@ var _bench_fx_untagged = 0;
 var _bench_fx_ext = 0;
 var _bench_fx_page = 0;
 var _bench_fx_path = 0;
+var _bench_fx_search = 0;
+var _bench_fx_common = 0;
+var _bench_fx_text = 0;
 var _bench_fx_plen = 0;
 
 # A generation of 41,200 records with paths of crab's shape, built with no disk:
@@ -409,7 +436,10 @@ fn bench_files_setup() {
         str_builder_add_int(sb, i);
         if (i % 7 == 0) { str_builder_add_cstr(sb, ".cr2"); } else { str_builder_add_cstr(sb, ".txt"); }
         var p = str_builder_build(sb);
-        _fx_add(_fx_active, str_data(p), str_len(p), i * 37, 1790000000 + i, 0);
+        var bi = _fx_add(_fx_active, str_data(p), str_len(p), i * 37, 1790000000 + i, 0);
+        _fx_tf_begin();
+        _fx_scan_names(str_data(p), str_len(p));
+        _fx_tf_flush(_fx_active, bi);
         if (i == 20000) {
             _bench_fx_path = str_data(p);
             _bench_fx_plen = str_len(p);
@@ -419,6 +449,23 @@ fn bench_files_setup() {
     _bench_fx_untagged = files_query_parse("untagged=1&unrated=1");
     _bench_fx_ext = files_query_parse("ext=arw,cr2,cr3,dng,nef,orf,raf,rw2");
     _bench_fx_page = files_query_parse("limit=100&offset=20000");
+    # Grouped as a job leaves them; the deadline is far off, so it runs to the end.
+    _fx_phase = FX_SORT;
+    _fx_sort_stage = 0;
+    _fx_data_dir = 0;
+    var far = daimon_now_ms() + 3600000;
+    while (_fx_phase == FX_SORT) { _fx_sort_slice(_fx_active, far); }
+    if (_fx_save_fd >= 0) { file_close(_fx_save_fd); _fx_save_fd = 0 - 1; }
+    _fx_phase = FX_IDLE;
+    _bench_fx_search = files_query_parse("q=file20000&limit=50");
+    _bench_fx_common = files_query_parse("q=txt&limit=50");
+    mcp_consumer_add("build/bench_files", "bench");   # a refused token has a file to read
+    _bench_fx_text = alloc(65536);
+    var j = 0;
+    while (j < 65536) {
+        memcpy(_bench_fx_text + j, "lorem ipsum dolor sit amet invoice paid ", 40);
+        j = j + 40;
+    }
     return 0;
 }
 
@@ -704,6 +751,18 @@ fn main() {
     var b31 = bench_new("files_find_in_41k");
     bench_run(b31, &bench_files_find_41k, 100000);
     vec_push(benches, b31);
+    var b32 = bench_new("files_search_41k");
+    bench_run(b32, &bench_files_search_41k, 1000);
+    vec_push(benches, b32);
+    var b32c = bench_new("files_search_common_41k");
+    bench_run(b32c, &bench_files_search_common_41k, 100);
+    vec_push(benches, b32c);
+    var b33 = bench_new("files_tokenize_64k");
+    bench_run(b33, &bench_files_tokenize_64k, 1000);
+    vec_push(benches, b33);
+    var b34 = bench_new("mcp_consumer_refused");
+    bench_run(b34, &bench_mcp_consumer_of, 10000);
+    vec_push(benches, b34);
 
     bench_report_all(benches);
     if (_bench_cg_agent == 0) {

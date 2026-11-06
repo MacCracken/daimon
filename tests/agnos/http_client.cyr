@@ -181,6 +181,37 @@ fn _c_wait_ms(ms) {
 }
 
 # 1 if the last response contains `needle`.
+var _c_auth = 0;    # a token for the requests that follow, or 0
+
+# Where `needle` starts in the response, or -1.
+fn _c_find(needle) {
+    var nl = strlen(needle);
+    var i = 0;
+    while (i + nl <= _c_resp_n) {
+        if (memeq(_c_resp + i, needle, nl) == 1) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+# The definition_sha256 that follows offset `at`, as a cstr, or "".
+fn _c_digest_after(at) {
+    if (at < 0) { return ""; }
+    var key = "\"definition_sha256\":\"";
+    var kl = strlen(key);
+    var i = at;
+    while (i + kl + 64 <= _c_resp_n) {
+        if (memeq(_c_resp + i, key, kl) == 1) {
+            var d = alloc(65);
+            memcpy(d, _c_resp + i + kl, 64);
+            store8(d + 64, 0);
+            return d;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
 fn _c_has(needle) {
     var nl = strlen(needle);
     var i = 0;
@@ -247,6 +278,10 @@ fn _c_open(method, path, body) {
     str_builder_add_cstr(sb, path);
     str_builder_add_cstr(sb, " HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: ");
     str_builder_add_int(sb, strlen(body));
+    if (_c_auth != 0) {
+        str_builder_add_cstr(sb, "\r\nAuthorization: Bearer ");
+        str_builder_add_cstr(sb, _c_auth);
+    }
     str_builder_add_cstr(sb, "\r\n\r\n");
     str_builder_add_cstr(sb, body);
     var r = str_builder_build(sb);
@@ -471,6 +506,38 @@ _c_check(_c_req("GET", "/v1/files?tag=fixture", "") == 200 && _c_has("\"total\":
 _c_check(_c_req("GET", "/v1/files/smart", "") == 200 && _c_has("\"name\":\"Untagged\"") == 1, "smart folders answer");
 _c_check(_c_req("POST", "/v1/files/tags", "{\"path\":\"/bin/daimon\",\"add\":[\"x\"]}") == 403,
   "a path outside the roots is refused");
+# 2.5.5: a question, ranked, over names (the fixtures are binaries, so no content).
+_c_check(_c_req("GET", "/v1/files?q=system+agent", "") == 200 && _c_has("\"total\":3") == 1,
+  "a question finds the fixtures by name");
+_c_check(_c_has("\"rank\":1") == 1 && _c_has("\"path\":\"/agents/agnos-agent-system-agent\"") == 1,
+  "... and ranks the one with both words first");
+_c_check(_c_has("\"local\":true") == 1, "... and says it stayed on the machine");
+
+# 2.5.5: the t-ron gate on the real kernel. run.sh seeds a consumer and a policy.
+var gt_one = "{\"name\":\"gt\",\"description\":\"one\",\"callback_url\":\"http://127.0.0.1:1/x\"}";
+var gt_two = "{\"name\":\"gt\",\"description\":\"two\",\"callback_url\":\"http://127.0.0.1:1/x\"}";
+_c_check(_c_req("POST", "/v1/mcp/tools", gt_one) == 201, "a tool is registered for the gate");
+_c_check(_c_req("POST", "/v1/mcp/tools", gt_two) == 201 && _c_has("\"pin_state\":\"changed\"") == 1,
+  "... and changed");
+_c_check(_c_req("GET", "/v1/mcp/tools", "") == 200, "... and read back");
+var gt_at = _c_find("\"name\":\"gt\"");
+var gt_sha = _c_digest_after(gt_at);
+var gt_body = str_builder_new();
+str_builder_add_cstr(gt_body, "{\"definition_sha256\":\"");
+str_builder_add_cstr(gt_body, gt_sha);
+str_builder_add_cstr(gt_body, "\"}");
+var gt_json = str_data(str_builder_build(gt_body));
+_c_auth = "wrong-token";
+_c_check(_c_req("POST", "/v1/mcp/tools/gt/accept", gt_json) == 401, "a wrong token is refused");
+_c_auth = "guest-token";
+_c_check(_c_req("POST", "/v1/mcp/tools/gt/accept", "{\"definition_sha256\":\"deadbeef\"}") == 409,
+  "... a stale digest too");
+_c_check(_c_req("POST", "/v1/mcp/tools/gt/accept", gt_json) == 200, "t-ron allows the consumer its policy names");
+_c_check(_c_req("GET", "/v1/mcp/tools", "") == 200 && _c_has("\"pin_state\":\"accepted\"") == 1,
+  "... which reads accepted");
+_c_auth = 0;
+_c_check(_c_req("GET", "/v1/mcp/tools", "") == 200 && _c_has("\"pin_state\":\"accepted\"") == 0,
+  "... and nobody else does");
 
 # --- an answer larger than a connection's 2 KB receive ring (2.4.1) ------------
 # One write of it would stop the guest: sock_send#48 holds the CPU while it waits

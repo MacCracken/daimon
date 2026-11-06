@@ -53,9 +53,13 @@ The HTTP API has no caller authentication until roadmap 2.6.x. Two surfaces adde
 that outlives a restart, under `serve --data-dir` (default `/var/lib/agnos`, created 0700):
 - **`mcp/toolpins`**, the pinned digest of each tool definition. A pin is trust on first use: whoever
   registers a name first sets it. It is protected against corruption, not against daimon's own uid.
+- **`mcp/consumers`** (2.5.5), a digest of each consumer's token, never the token. Treat a token as a
+  password: daimon speaks plain HTTP, so one sent past loopback can be read. A consumer's accept also
+  needs a t-ron policy to allow it (`serve --tron-policy`); with none, nobody may accept.
 - **The file index**, off unless an operator passes `serve --index-root`. Any local process can then
   read the names, sizes and times of the files under that root, which are identical, and their tags,
-  as the user daimon runs as. Do not name a root that crosses a trust boundary, such as `/home` on a
+  as the user daimon runs as. With `--index-content` it can also ask whether a file holds a word, even
+  one it could not open. Do not name a root that crosses a trust boundary, such as `/home` on a
   shared machine with daimon running as root. See
   [the 2.5.4 audit](docs/audit/2026-11-06-tool-pins-and-file-index-audit.md).
 

@@ -122,6 +122,64 @@ A process with daimon's uid can rewrite a store and recompute its digest. A MAC 
 the file under the same uid, so it would add nothing. The directory is 0700. thoth's ADR-0022 reaches
 the same conclusion for the same reason.
 
+## Addendum — 2.5.5: consumers and search
+
+The scope widens to `mcp_consumer_*`, `_mcp_consumer_accept` and `src/files_search.cyr`.
+
+### C-1: A check of a token allocated 64 KB, before anyone was known (HIGH) — fixed before shipping
+
+`_consumers_read` took a new buffer per check, and `alloc` never frees. So `Authorization: Bearer x` in a
+loop grew daimon by about 8 MB a minute, with no valid token and through the rate limit.
+**CWE**: [CWE-770](https://cwe.mitre.org/data/definitions/770.html). **Found by** review.
+**Fixed**: a kept buffer and no allocation on a refusal. `tests/mcp_pin.tcyr` counts `alloc_used` across
+200 refused tokens, and asserts 0.
+
+### C-2: A bad consumers file read as an empty one (HIGH) — fixed before shipping
+
+`_consumers_read` answered 0 for "no file" and for a file that was a symlink, unreadable or past its
+bound. `mcp_consumer_add` would then have rewritten it holding one consumer, erasing every other. This
+is TP-1's shape again, an absent thing and a bad thing given one answer, in the fix's own neighbour.
+**Found by** `tests/mcp_pin.tcyr`. **Fixed**: refusal is its own answer, and a writer stops at it.
+
+### C-3: t-ron and nein could not both be linked (HIGH for item 4) — fixed in t-ron 2.2.5
+
+Both defined `agent_policy_new` and `policy_engine_new`. The first was a compile error, by arity. The second
+had one arity and two meanings, so alone it would have compiled, and `tron_new` would have stored a vec where
+`policy_check` reads a hashmap. **Fixed** in t-ron 2.2.5, which renames its two. Linked: no duplicate warning.
+
+### Checked, and found sound
+
+- **The gate fails closed.** No policy, a consumer the policy does not name, a denied tool, a `FLAG`, a name t-ron
+  will not judge, and a policy file t-ron refuses each deny, by real `tron_check` verdicts in `tests/mcp_pin.tcyr`, in
+  the smoke, and on the AGNOS kernel. A prompt injection in a description cannot be accepted.
+- **Tokens** are 256 bits from `random_bytes`, kept as digests, and compared with `ct_eq_bytes`, reading
+  every line.
+- **Isolation.** One consumer's accept changes nothing another reads, and the shared pin does not move.
+- **A stale review.** A digest that is not what is served answers 409, and records nothing.
+- **The postings' trust.** A query trusts a posting's bucket and record without looking, so `_fx_posts_check`
+  checks both at load, under a digest that passes. `fuzz/files_search.fcyr` corrupts postings and checks
+  that what passes names a real record.
+- **An interrupted sort** loses and doubles nothing: `tests/files_search.tcyr` stops it at every check.
+- **Scores do not leak between queries.** The same question scores the same after another has run.
+- **Binary files.** A NUL in the first 4 KB ends a file's content. A random binary produced no terms.
+
+### R-6: With `--index-content`, a word in a file is an oracle (MEDIUM, by design until 2.6.x)
+
+A local process can ask whether a file holds a word, and read which ones do, even for a file it could
+not open, as the user daimon runs as. `why` names only the words it asked. This is why content is a second
+opt-in, apart from `--index-root`. ([CWE-200](https://cwe.mitre.org/data/definitions/200.html).)
+
+### R-7: A token travels in the clear (LOW on loopback)
+
+daimon speaks plain HTTP. On loopback that is the kernel's own memory; `serve --listen` widens it to the
+network, where a token can be read, and where every other route is open anyway.
+
+### R-8: A file named to collide lengthens one bucket (LOW)
+
+A term hash is unkeyed, because it is persisted. A user who can create files under a root can fill one
+bucket, and a query on those words scans it. The cost is bounded by the reserve, and is in a query
+that the same user chose to make slow.
+
 ## Sources
 
 - [CVE-2025-54136 (MCPoison)](https://nvd.nist.gov/vuln/detail/CVE-2025-54136): an approved MCP

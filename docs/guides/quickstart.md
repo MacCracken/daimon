@@ -81,7 +81,11 @@ curl -s 127.0.0.1:8090/v1/files/index            # none, building, catching_up, 
 curl -s '127.0.0.1:8090/v1/files?untagged=1&limit=20'
 curl -s -X POST 127.0.0.1:8090/v1/files/tags -d "{\"path\":\"$HOME/Documents/a.txt\",\"add\":[\"wip\"]}"
 curl -s 127.0.0.1:8090/v1/files/smart            # saved queries, each with a count
+curl -s '127.0.0.1:8090/v1/files?q=quarterly+report'   # a question, ranked. Names only, unless:
 ```
+
+`serve --index-content` also searches what files say. That is a second opt-in: anything local can then
+ask whether a file holds a word.
 
 ## Run Tests
 
@@ -105,13 +109,13 @@ cyrius bench tests/daimon.bcyr
 ## Project Structure
 
 ```
-src/                  Source: 33 modules, entry src/main.cyr
-tests/*.tcyr          19 test suites, 1556 checks, each including the real src/ module it tests
-tests/smoke.sh        HTTP smoke checks against the built binary (233); runs tests/containment.sh
+src/                  Source: 34 modules, entry src/main.cyr
+tests/*.tcyr          20 test suites, 1881 checks, each including the real src/ module it tests
+tests/smoke.sh        HTTP smoke checks against the built binary (274); runs tests/containment.sh
 tests/agnos/          The AGNOS guest test: sh tests/agnos/run.sh --release boots agnos under QEMU
 tests/aarch64/        The aarch64 VM test: every suite and a smoke of the binary under a real kernel
-tests/daimon.bcyr     Benchmarks (33; tests/rag_ingest.bcyr has 2 more)
-fuzz/                 Property-based fuzz harnesses (8), sharing fuzz/rng.cyr
-build/daimon          The binary: 2,489,760 bytes, static; unreachable code removed (2.5.1)
+tests/daimon.bcyr     Benchmarks (37; tests/rag_ingest.bcyr has 2 more)
+fuzz/                 Property-based fuzz harnesses (9), sharing fuzz/rng.cyr
+build/daimon          The binary: 2,636,472 bytes, static; unreachable code removed (2.5.1)
 docs/                 Architecture, guides, ADRs, audit reports, roadmap
 ```

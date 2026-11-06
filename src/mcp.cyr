@@ -150,6 +150,31 @@ fn mcp_tool_count(reg) {
     return map_count(load64(reg)) + map_count(load64(reg + 8));
 }
 
+# What each consumer has accepted (2.5.5): "consumer\ttool" to an McpAccept
+# {sha256: cstr, accepted_at: i64, consumer: cstr, name: cstr, row: Str}, 40 bytes.
+# Kept here because a consumer's manifest reads it. src/mcp_pin.cyr fills it.
+var _mcp_accepts = 0;
+var _mcp_manifest_consumer = 0;   # cstr: whose manifest is being built, or 0 for nobody's
+
+fn mcp_accept_sha(a) { return load64(a); }
+fn mcp_accept_at(a) { return load64(a + 8); }
+fn mcp_accept_consumer(a) { return load64(a + 16); }
+fn mcp_accept_name(a) { return load64(a + 24); }
+fn mcp_accept_row(a) { return load64(a + 32); }
+
+fn mcp_accept_key(consumer_c, name_c) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, consumer_c);
+    str_builder_add_cstr(sb, "\t");
+    str_builder_add_cstr(sb, name_c);
+    return str_data(str_builder_build(sb));
+}
+
+fn mcp_accept_find(consumer_c, name_c) {
+    if (_mcp_accepts == 0) { return 0; }
+    return map_get(_mcp_accepts, mcp_accept_key(consumer_c, name_c));
+}
+
 # The JSON text of the pin store's state ({"state":…,"durable":…,"count":…}), or
 # 0 before a store is opened. src/mcp_pin.cyr keeps it current, so a manifest
 # builds nothing for it.
@@ -162,16 +187,32 @@ fn _mcp_manifest_pin(sb, t) {
     if (sha == 0) { return 0; }
     str_builder_add_cstr(sb, ",\"definition_sha256\":\"");
     str_builder_add_cstr(sb, sha);
+    str_builder_add_cstr(sb, "\"");
+    # A consumer's own acceptance (2.5.5). It changes what this consumer reads, and
+    # no one else's: another client's approval is no approval of yours.
+    var acc = 0;
+    if (_mcp_manifest_consumer != 0) {
+        acc = mcp_accept_find(_mcp_manifest_consumer, str_cstr(mcp_tool_name(t)));
+    }
+    if (acc != 0) {
+        str_builder_add_cstr(sb, ",\"accepted_sha256\":\"");
+        str_builder_add_cstr(sb, mcp_accept_sha(acc));
+        str_builder_add_cstr(sb, "\",\"accepted_at\":");
+        str_builder_add_int(sb, mcp_accept_at(acc));
+    }
     var p = mcp_tool_pin(t);
     if (p == 0) {
-        str_builder_add_cstr(sb, "\",\"pin_state\":\"unpinned\"");
+        str_builder_add_cstr(sb, ",\"pin_state\":\"unpinned\"");
         return 0;
     }
     if (streq(mcp_pin_sha(p), sha) == 1) {
-        str_builder_add_cstr(sb, "\",\"pin_state\":\"pinned\",\"pinned_sha256\":\"");
+        str_builder_add_cstr(sb, ",\"pin_state\":\"pinned\"");
+    } elif ((acc != 0) && (streq(mcp_accept_sha(acc), sha) == 1)) {
+        str_builder_add_cstr(sb, ",\"pin_state\":\"accepted\"");
     } else {
-        str_builder_add_cstr(sb, "\",\"pin_state\":\"changed\",\"pinned_sha256\":\"");
+        str_builder_add_cstr(sb, ",\"pin_state\":\"changed\"");
     }
+    str_builder_add_cstr(sb, ",\"pinned_sha256\":\"");
     str_builder_add_cstr(sb, mcp_pin_sha(p));
     str_builder_add_cstr(sb, "\",\"pinned_at\":");
     str_builder_add_int(sb, mcp_pin_at(p));

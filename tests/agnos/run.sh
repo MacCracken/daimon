@@ -81,6 +81,11 @@ cp "$WORK/http_client" "$WORK/seed/bin/client"
 cp "$WORK/agent_user" "$WORK/seed/agents/agnos-agent-user-agent"
 cp "$WORK/agent_system" "$WORK/seed/agents/agnos-agent-system-agent"
 cp "$WORK/agent_service" "$WORK/seed/agents/agnos-agent-service-agent"
+# 2.5.5: a consumer and a t-ron policy, so the gate runs on the real kernel. The
+# client presents the token whose digest this is.
+mkdir -p "$WORK/seed/d/mcp"
+printf 'guest\t%s\n' "$(printf 'guest-token' | sha256sum | cut -d' ' -f1)" > "$WORK/seed/d/mcp/consumers"
+printf '[agent."guest"]\nallow = ["mcp_accept.*"]\n' > "$WORK/seed/d/p"
 
 IMG="$WORK/agnos.img"
 PART_OFFSET=$(( 33 * 1048576 )); PART_BYTES=$(( 67 * 1048576 )); PART_BLOCKS=$(( PART_BYTES / 4096 ))

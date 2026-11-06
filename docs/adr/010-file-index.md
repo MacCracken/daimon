@@ -4,7 +4,7 @@
 **Date**: 2026-11-06 (2.5.4)
 **Context**: crab, the AGNOS file manager, needs a persisted, disk-wide view of files: an index, tags,
 ratings and smart folders ([the filing](../development/issues/2026-09-23-crab-needs-a-file-index-tags-and-ranked-search.md),
-items 1–4; item 5, ranked search, is crab's next release). None of it existed. Four things constrain
+items 1–4; the addendum below covers item 5, ranked search). None of it existed. Four things constrain
 the answer: the HTTP API has no caller authentication until 2.6.x, daimon is one thread whose handlers
 must not block (ADR-006), `alloc` never frees, and on agnos the machine has 16 process slots.
 
@@ -70,5 +70,40 @@ running, `none` that it holds no index, and `building` that one is coming.
   and a person's re-index does not wait.
 - `Power` on agnos is `unknown` and a walk runs, because the kernel has no power source to read (filed
   with agnos, 2026-11-06).
-- Item 5 needs a real embedding, and a query cannot rank by meaning on what RAG has today. It is on
-  the roadmap. Whatever is built there should share this index with mneme, as the filing asks.
+
+## Addendum — 2.5.5: a question in words
+
+`GET /v1/files?q=paid+invoices`, ranked, with why each file matched, where it appears, facets, duplicates
+among the results and what it cost. `src/files_search.cyr`.
+
+**It ranks by words, not by meaning, and every answer says so** (`cost.method`). It finds `invoices` for
+`invoice`, and will not find `receipt` for `invoice`. Meaning needs an embedding model, and none exists
+to run locally: mneme's embedder is a stub that defers to the same stack, hoosh forwards to Ollama,
+and this machine has no model to test one against. A hash of a word's bytes is not an embedding,
+which is the filing's complaint about RAG, so daimon did not ship another and call it one. crab prints
+"no external service" only if it is true, and it is: no byte leaves daimon. Ranking by meaning is on the
+roadmap for when a local model exists.
+
+**Content is a second opt-in** (`serve --index-content`). `--index-root` offers names. Content offers more:
+with no caller authentication, a local process can ask whether a file it could not open holds a word.
+An operator who passes `--index-root` has not agreed to that. Without the flag no file is opened for its
+words, and a question searches names.
+
+**An inverted index in the generation.** Each posting is one u64, `(term << 32) | (record << 8) | byte`.
+They are grouped by the term's top 16 bits with an in-place sort that can stop anywhere, so a query
+scans only its words' buckets, and costs what those cost rather than the size of the disk: 3–6 ms at
+41,200 files with thousands of hits. Scores and masks are kept per record, and reset through the list of
+what a query touched. Like the walk, all of it is reserved at open, and an unchanged file keeps its
+postings through a pass over the served generation, so a re-walk reads only what changed. A 32-bit term
+can collide, and two words then rank as one: the cost of a wrong rank, not of a wrong file.
+
+**Ranking is BM25 in integers** (k1 1.2, b 0.75), the same on every target, with a name match worth three
+times a word's weight, and multiplied by how many of the question's words a file has, so a file with
+two ranks above one that says one of them often. `why` is built from what matched: nothing in it is
+inferred. A window in words (`last week`) is rolling, as the rest of the query language is.
+
+**A smart folder can be a question** (`q=paid+invoices`), because a query is text. A facet's `query` is
+what to add to the question, and `tests/files_search.tcyr` checks each one gives the count it claims.
+
+What it does not do: a PDF or an office file is found by name alone, since content is the first 64 KB of a
+file with no NUL in it. Stemming is English. 256 distinct words are kept per file, first seen first.

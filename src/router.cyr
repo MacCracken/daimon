@@ -134,14 +134,14 @@ fn http_route(fd, method, path, buf, buf_len) {
 
     # /v1/mcp/tools
     if (streq(path, "/v1/mcp/tools") == 1) {
-        if (method == 0) { api_mcp_manifest(fd); return 0; }
+        if (method == 0) { api_mcp_manifest(fd, buf, buf_len); return 0; }
         if (method == 1) { api_mcp_register(fd, http_parse_body(buf, buf_len)); return 0; }
         http_method_not_allowed(fd);
         return 0;
     }
     if (streq(path, "/v1/mcp/manifest") == 1) {
         if (route_method(fd, method, 0) == 0) { return 0; }
-        api_mcp_manifest(fd);
+        api_mcp_manifest(fd, buf, buf_len);
         return 0;
     }
 
@@ -152,7 +152,7 @@ fn http_route(fd, method, path, buf, buf_len) {
             var pn = _route_id_before(path + 14, strlen(path + 14), "/accept", 7);
             if (pn != 0) {
                 if (_route_refuse_browser(fd, buf, buf_len, "tool") == 1) { return 0; }
-                api_mcp_pin_accept(fd, pn);
+                api_mcp_pin_accept(fd, pn, buf, buf_len);
                 return 0;
             }
         }

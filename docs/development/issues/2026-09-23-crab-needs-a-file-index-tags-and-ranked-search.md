@@ -1,13 +1,19 @@
 # crab needs a file index, per-file tags and ranked file search — and daimon has no surface for any of them
 
-**Status:** 🟡 **M7 (items 1–4) shipped in daimon 2.5.4; M8 (item 5) is open, on the roadmap.** `/v1/files`
-answers paths, persists across a restart, and is reachable from a GUI client on agnos, in bounded pages,
-so *What would close it* holds for items 1–4. ⚠ Two things crab should read before building on it:
-**it is off unless the operator passes `serve --index-root`**, because the API has no caller authentication
-until 2.6.x (`docs/adr/010-file-index.md`), and `Pauses on battery` holds on Linux only: on agnos `power` is
-`unknown` and a walk runs (filed with agnos, 2026-11-06). The canvas defines no smart folder, so "Large & old"
-and "Raw only" are daimon's reading, and saving a query replaces either. *(Was: 🔴 OPEN.)*
-This filing states what crab has to be able to ask and get back, and the constraints the answer has to fit.
+**Status:** 🟡 **M7 (items 1–4) shipped in daimon 2.5.4. M8 (item 5) shipped in 2.5.5 by words, not by meaning, so this
+stays open.** `/v1/files` answers paths, tags, ratings, smart folders and ranked questions, survives a restart, and
+reaches a GUI client on agnos in bounded pages (`docs/guides/api.md`, `docs/adr/010-file-index.md`). The filing also asks
+for a local embedding, and faults RAG for not ranking by meaning. No local embedding model exists to do that, so
+`invoices` finds `invoice`, and `receipt` does not, and `cost.method` says `words + name`, where the canvas says
+*"vector + name match"*. ⚠ What crab should read before building on it:
+- **It is off unless the operator passes `serve --index-root`**, and reading file contents for search is a second
+  opt-in, `--index-content`, because the API has no caller authentication until 2.6.x.
+- *"no external service · index stays on device"* is true: no byte leaves daimon.
+- `why` is built from what matched: *"Contains "paid" and "invoices"; its name or folder has "invoices""*. It will not
+  say *"a paid stamp"* unless the question did.
+- `Pauses on battery` holds on Linux. On agnos `power` is `unknown` and a walk runs (filed with agnos, 2026-11-06).
+- The canvas defines no smart folder, so "Large & old" and "Raw only" are daimon's reading. A saved query replaces either.
+*(Was: 🔴 OPEN.)* This filing states what crab has to be able to ask and get back, and the constraints the answer has to fit.
 **Filed:** 2026-09-23, by crab (the AGNOS file manager), at the daimon 2.1.4 → 2.4.3 pin move —
 the first pin at which daimon builds and runs on agnos.
 **Affects:** crab's M7 (the index: disk-wide index, tags, smart folders) and M8 (assisted search).

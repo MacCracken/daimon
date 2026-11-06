@@ -4,7 +4,7 @@
 >
 > **Severity legend**: **P0** blocking (security / correctness — must-fix before ship) · **P1** high (must-have for the current arc) · **P2** medium (schedule when capacity opens) · **P3 / Low** nice-to-have, no urgency. Upstream-blocker items quote the upstream tracker's own severity.
 
-**Where daimon stands** — `2.5.4`, cyrius 6.7.18, every dependency at its latest release (bote 3.8.15,
+**Where daimon stands** — `2.5.5`, cyrius 6.7.18, every dependency at its latest release (bote 3.8.15,
 nein 1.9.1). It builds for x86_64, aarch64 and AGNOS, and CI runs the suites, the HTTP smoke and the
 fuzz harnesses on Linux, every suite and the binary's smoke on a real aarch64 kernel, and the AGNOS
 guest test on agnos 1.57.17.
@@ -16,7 +16,8 @@ guest test on agnos 1.57.17.
   caller authentication. Everything that changes the firewall, reads its live state, or archives
   the audit chain is refused until it does (2.6.x).
 - Each MCP tool's first definition is pinned across restarts, and a change is marked and audited.
-- With `--index-root`, daimon holds an index of the files there, with tags, ratings and smart folders.
+- With `--index-root`, daimon holds an index of the files there, with tags, ratings and smart folders, and
+  answers a question in words with ranked files (names, and content with `--index-content`).
 
 ## The releases ahead
 
@@ -53,8 +54,8 @@ Refused until this lands, each with an operator flag that reopens it on a truste
 - `nein_status` / `nein_list` / `nein_diff` (run `nft` as root, return the live ruleset;
   `_nein_live_reads_enabled`, since 2.5.2);
 - `libro_retention` (archives the audit chain; `_libro_retention_enabled`, since 2.5.1);
-- accepting a changed tool definition (`POST /v1/mcp/tools/{name}/accept`; `serve --mcp-pin-accept`,
-  since 2.5.4).
+- accepting a changed tool definition for everyone (`POST /v1/mcp/tools/{name}/accept` with no token;
+  `serve --mcp-pin-accept`, since 2.5.4).
 
 Also waiting on identity:
 - **The agent memory API.** The store works, but no route reaches it, and one must not until a caller
@@ -63,12 +64,12 @@ Also waiting on identity:
 - **Who may replace an external MCP registration.** Re-registering a name replaces what is served,
   whoever registered it first. (Taking a builtin's name is refused since 2.2.3. Since 2.5.4 it cannot
   move the pin, and is marked and audited.)
-- **Who may accept a tool definition, per consumer, through t-ron.** What is left of thoth's filing:
-  2.5.4's accept is one decision for the host. It also closes trust on first use's gap: identity can
-  say who made a first registration.
-- **Who may see the file index.** Any local process reads what an operator's roots hold, and edits
-  tags, ratings and saved queries. Decide per caller, and whether a caller sees only what its own
-  permissions would show.
+- **Consumer tokens across the API.** 2.5.5's tokens mean something on one route and in a manifest.
+  Identity should reuse them, and can close trust on first use's gap: it can say who made a first
+  registration.
+- **Who may see the file index.** Any local process reads what an operator's roots hold, edits tags,
+  ratings and saved queries, and with `--index-content` can ask whether a file holds a word. Decide per
+  caller, and whether a caller sees only what its own permissions would show.
 - **Who may report a task** (VULN-016). Any caller can mark any task running, completed or failed,
   and completing one early returns its capacity while the work may still run.
 - **`libro_export` / `libro_query`** answer the whole audit chain to any caller (bote's consumer
@@ -86,7 +87,7 @@ Still to adopt, each verified in the guest test:
 | `no-per-process-resource-limits` | agents run without limits, audited `agent.limits.unenforced` | arm `spawn_limits`#107 (pages, ms) before the spawn; `limits_enforced:true`; refuse a start whose arm fails; a CPU-burning fixture to see SIGXCPU (wait status 280) |
 | `parent-cannot-end-stop-or-continue-a-child` | pause / resume answer 501 | signals 19 / 18; the guest test reads `PROCLIST_STOPPED`; reach an agent's descendants |
 | `child-inherits-every-fd-and-spawn-arms-leak` | `--agent-output capture` refused at startup | `SPAWN_F_CLEANFD` with the redirect armed; capture stdout and stderr |
-| `sock-send-and-connect-hold-the-cpu` (P1 for daimon) | answers written 512 bytes at a time, 1 ms apart | measure a whole-answer write on 1.57.14 under a CPU quota; one write per answer if it holds |
+| `sock-send-and-connect-hold-the-cpu` (P1 for daimon) | answers written 512 bytes at a time, 1 ms apart | measure a whole-answer write on the pinned kernel under a CPU quota; one write per answer if it holds |
 | `tcp-server-cannot-be-loopback-only` | loopback-only listener (2.4.4), one rate-limit bucket for every client | per-client rate limiting, if agnos gives a peer address |
 | `no-way-to-read-the-power-source` (filed 2026-11-06, **open** in agnos) | `power` is `unknown`, and a file walk runs on battery | an agnos arm in `_fx_power_find`, once a source exists |
 | `inbound-tcp-syn-dropped-by-isr-drain`, `socket-ids-have-no-owner` | nothing in daimon | re-measure accept from the host; close audit AG-1 and AG-8 |
@@ -141,10 +142,11 @@ prerequisite. Needs 2.6.x to know what a tenant is.
 
 Severity assigned when one is scheduled.
 
-- [ ] **Ranked file search** — crab's M8 (item 5 of its filing, the half 2.5.4 left): a question in words
-  answered with ranked files and why each matched. It needs a local embedding that can rank by meaning,
-  which RAG's 32-slot hash cannot, and should share the file index with mneme, whose README names
-  `/v1/knowledge/*`, which no route serves.
+- [ ] **Ranking files by meaning.** 2.5.5's search ranks by words: `receipt` does not find `invoice`. Meaning
+  needs a local embedding model, and none exists to run (mneme's embedder is a stub, hoosh forwards to Ollama).
+  With one, a vector beside each file's postings; share it with mneme, whose README names `/v1/knowledge/*`,
+  which no route serves.
+- [ ] Search inside PDFs and office files, which 2.5.5 finds by name alone.
 - [ ] jnana integration — grounded knowledge queries backed by verified AGNOS science data
 - [ ] gRPC transport option alongside HTTP
 - [ ] WebSocket streaming for real-time agent events

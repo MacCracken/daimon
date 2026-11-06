@@ -91,6 +91,11 @@ git = "https://github.com/MacCracken/bote.git"
 tag = "3.8.15"
 modules = ["dist/bote.cyr"]
 
+[deps.t-ron]
+git = "https://github.com/MacCracken/t-ron.git"
+tag = "2.2.5"
+modules = ["dist/t-ron.cyr"]
+
 [deps.nein]
 git = "https://github.com/MacCracken/nein.git"
 tag = "1.9.1"

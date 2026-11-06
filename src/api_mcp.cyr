@@ -4,8 +4,41 @@
 
 # The body is built by mcp_manifest_json (src/mcp.cyr) since 2.2.3, where a test
 # and a benchmark can reach it; this handler only sends it.
-fn api_mcp_manifest(fd) {
-    http_ok(fd, mcp_manifest_json(_mcp_registry));
+fn api_mcp_manifest(fd, buf, len) {
+    # With a token the manifest also says what that consumer has accepted (2.5.5).
+    var consumer = 0;
+    if (_mcp_bearer(buf, len) != 0) {
+        consumer = _mcp_consumer_or_answer(fd, buf, len);
+        if (consumer == 0) { return 0; }
+    }
+    _mcp_manifest_consumer = consumer;
+    var out = mcp_manifest_json(_mcp_registry);
+    _mcp_manifest_consumer = 0;
+    http_ok(fd, out);
+}
+
+# The token in `Authorization: Bearer …`, as a cstr, or 0 for no such header.
+fn _mcp_bearer(buf, len) {
+    var h = _http_header(buf, len, "Authorization");
+    if (h == 0) { return 0; }
+    if (strlen(h) < 8) { return h; }
+    if (_http_ieq(h, 7, "bearer ") == 0) { return h; }
+    return h + 7;
+}
+
+# The consumer a request's token names, or answers 401 and returns 0. A wrong token
+# is never read as no token: that would turn a mistyped one into an anonymous answer.
+fn _mcp_consumer_or_answer(fd, buf, len) {
+    var token = _mcp_bearer(buf, len);
+    var consumer = 0;
+    if (token != 0) {
+        consumer = mcp_consumer_of(str_cstr(config_data_dir(_config)), token);
+    }
+    if (consumer == 0) {
+        daimon_audit(SEV_SECURITY, "mcp", "mcp.consumer.deny", "a token named no consumer");
+        http_error(fd, 401, str_from("that token names no consumer"));
+    }
+    return consumer;
 }
 
 # POST /v1/mcp/tools — register external tool
@@ -64,13 +97,49 @@ fn api_mcp_deregister(fd, name_cstr) {
     return 0;
 }
 
+# POST /v1/mcp/tools/{name}/accept with a consumer's token and
+# {"definition_sha256": "<what it reviewed>"} (2.5.5): this consumer accepts that
+# definition for itself. It moves no pin, and no other client reads it.
+fn _mcp_consumer_accept(fd, name_c, buf, len) {
+    var consumer = _mcp_consumer_or_answer(fd, buf, len);
+    if (consumer == 0) { return 0; }
+    var root = http_body_json(http_parse_body(buf, len));
+    if (root == 0) { http_bad_body(fd); return 0; }
+    var reviewed = http_json_str(root, "definition_sha256");
+    if (reviewed == 0) {
+        http_bad_request(fd, str_from("missing definition_sha256: name what you reviewed"));
+        return 0;
+    }
+    var t = mcp_find_tool(_mcp_registry, name_c);
+    if (t == 0) { http_error(fd, 404, str_from("tool not found")); return 0; }
+    var r = mcp_pin_consumer_accept(consumer, t, str_cstr(reviewed));
+    if (r == 0) {
+        daimon_audit(SEV_SECURITY, "mcp", "mcp.pin.accept.stale", name_c);
+        http_error(fd, 409, str_from("the definition is not the one you reviewed; read it again"));
+        return 0;
+    }
+    if (r == 0 - 1) {
+        daimon_audit_agent(SEV_SECURITY, "mcp", "mcp.pin.accept.deny", mcp_pin_gate_why(), consumer);
+        http_error(fd, 403, str_from(mcp_pin_gate_why()));
+        return 0;
+    }
+    if (r < 0) {
+        http_error(fd, 409, str_from("a limit was reached: too many acceptances"));
+        return 0;
+    }
+    daimon_audit_agent(SEV_SECURITY, "mcp", "mcp.pin.accept.consumer", name_c, consumer);
+    http_ok(fd, str_from("{\"ok\":true,\"pin_state\":\"accepted\"}"));
+    return 0;
+}
+
 # POST /v1/mcp/tools/{name}/accept — make what an external tool now serves its
 # pinned definition. ⛔ REFUSED BY DEFAULT, as nein_allow and libro_retention are:
 # with no caller authentication, accepting from the API would let the same caller
 # who swapped a definition approve it. `serve --mcp-pin-accept` reopens it for an
 # operator on a trusted single-tenant host. Per-consumer acceptance through t-ron
 # needs caller identity (roadmap 2.6.x).
-fn api_mcp_pin_accept(fd, name_c) {
+fn api_mcp_pin_accept(fd, name_c, buf, len) {
+    if (_mcp_bearer(buf, len) != 0) { return _mcp_consumer_accept(fd, name_c, buf, len); }
     if (_mcp_pin_accept_enabled == 0) {
         daimon_audit(SEV_SECURITY, "mcp", "mcp.pin.accept.deny", name_c);
         http_error(fd, 403,

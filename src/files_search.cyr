@@ -1,0 +1,1208 @@
+# =========================================================================
+# files_search — a question in words, answered with ranked files (2.5.5)
+# =========================================================================
+#
+# crab's M8: docs/development/issues/2026-09-23-crab-needs-a-file-index-tags-and-
+# ranked-search.md, item 5. `GET /v1/files?q=paid+invoices`. ADR-010
+# records the decisions.
+#
+# ⛔ THIS RANKS BY WORDS, NOT BY MEANING, AND EVERY ANSWER SAYS SO (`cost.method`).
+# It finds `invoices` for `invoice`, and it will not find `receipt` for `invoice`.
+# Meaning needs an embedding model, and none exists to run locally: mneme's own
+# embedder is a stub that defers to the same stack, hoosh forwards to Ollama, and a
+# hash of a word's bytes is not an embedding, which is the complaint the filing
+# makes of RAG. crab prints "no external service" only if that is true, and here it
+# is: no byte leaves daimon. Roadmap: ranking by meaning, once a local model exists.
+#
+# ⛔ CONTENT IS A SECOND OPT-IN (`serve --index-content`). A name is what --index-root
+# already offers. Content is more: with no caller authentication, a local process can
+# ask whether a file it could not open holds a word, and read which ones do.
+#
+# AN INVERTED INDEX IN THE GENERATION. Each posting is one u64,
+#     (term << 32) | (record << 8) | byte
+# where term is a 32-bit hash, and byte is 0x80 for a name match plus the times the
+# word occurs in the content, up to 127. They are grouped by the term's top 16 bits,
+# with an in-place sort, because a bucket holds about a hundred and a scan of that is
+# all a query does. So a query costs what its words' postings cost, not the size of
+# the disk, and the score table it fills is reset by the list of what it touched.
+#
+# LIKE THE WALK: in slices, and nothing per file allocates. An unchanged file keeps
+# its postings by a pass over the served generation's (FX_REMAP, FX_POSTS), so a
+# re-walk reads only what changed.
+#
+# A word is ASCII letters and digits, or bytes of UTF-8, between 2 and 32 long. It is
+# folded and lightly stemmed (`_fx_stem`), which is English. A name's words come from
+# the file's name and its folder's. Content is the first FILES_TEXT_BYTES of a file
+# with no NUL in it: a PDF or an office file is found by name alone.
+
+var FX_BUCKETS = 65536;
+var FILES_POST_PER_NAME = 8;      # postings reserved per record, on names alone
+#ifdef CYRIUS_TARGET_AGNOS
+var FILES_POST_PER_CONTENT = 16;  # ... and with content. Memory there is real once reserved
+#else
+var FILES_POST_PER_CONTENT = 64;  # ... and with content: 200 words a file took 41,200 of 262,144 to 98% of 32
+#endif
+var FILES_TEXT_BYTES = 65536;     # read from a file, from its start
+var FILES_BINARY_PROBE = 4096;    # a NUL this early says it is not text
+var FILES_FILE_TERMS = 256;       # distinct words kept per file, first seen first
+var FILES_QUERY_TERMS = 8;        # words in a question that count
+var FILES_SEARCH_TOP = 1200;      # results ranked; offset + limit stay inside it
+var FILES_SORT_STEPS = 4096;      # steps between clock reads in a sort
+var FX_TF_SLOTS = 1024;           # the per-file table: twice FILES_FILE_TERMS, a power of two
+var FX_WORD_MAX = 32;
+
+var FX_KIND_DOCUMENT = 0;
+var FX_KIND_IMAGE = 1;
+var FX_KIND_AUDIO = 2;
+var FX_KIND_VIDEO = 3;
+var FX_KIND_ARCHIVE = 4;
+var FX_KIND_CODE = 5;
+var FX_KIND_OTHER = 6;
+var FX_KINDS = 7;
+
+var _fx_remap = 0;         # u32: a served record's index in the new generation, + 1
+var _fx_sort_next = 0;     # u32 * FX_BUCKETS
+var _fx_sort_stage = 0;
+var _fx_sort_bucket = 0;
+var _fx_text_read = 0;     # files opened for content since the index opened
+var _fx_word = 0;          # kept: the word being read
+var _fx_tf_term = 0;       # the per-file table: u32 term
+var _fx_tf_val = 0;        # ... u32 (stamp << 8) | byte
+var _fx_tf_list = 0;       # ... u32 slot, in first-seen order
+var _fx_tf_n = 0;
+var _fx_tf_stamp = 0;
+var _fx_tf_words = 0;      # words read from this file's content
+var _fx_stops = 0;         # map<word, 1 both, 2 only in a question>
+var _fx_kind_map = 0;      # map<ext, kind + 1>
+var _s_score = 0;          # per record, for the query running
+var _s_mask = 0;           # u16 per record: bit i term i in content, bit 8 + i in a name
+var _s_touched = 0;        # u32
+var _s_touched_n = 0;
+var _s_heap = 0;           # (score, record) pairs: the best so far, least on top
+var _s_heap_n = 0;
+var _s_gcount = 0;         # u32 per record: hits in a duplicate group
+var _s_gcount_used = 0;
+var _s_words = 0;          # kept: FILES_QUERY_TERMS * (FX_WORD_MAX + 1)
+var _s_terms: i64[8];
+var _s_term_n = 0;
+var _s_lo = 0;             # the window a question asked for, as mtimes; 0 for none
+var _s_hi = 0;
+var _s_window = 0;         # its words, or 0
+var _s_total = 0;
+var _s_ms = 0;
+var _s_stem = 0;
+var _s_facet: i64[32];     # kind 0–6, date 7–11, size 12–14
+var _s_loc_p: i64[8];      # location: where its name starts
+var _s_loc_n: i64[8];      # ... how long it is
+var _s_loc_c: i64[8];      # ... how many
+var _s_loc_used = 0;
+var _s_dup_groups = 0;
+var _s_dup_files = 0;
+
+# --- words -----------------------------------------------------------------
+
+# A plain suffix stripper, not Porter's: enough that invoice, invoices, invoiced and
+# invoicing are one word, and short words are left alone. Returns the new length.
+fn _fx_stem(w, n) {
+    if ((n > 4) && (load8(w + n - 3) == 105) && (load8(w + n - 2) == 101) && (load8(w + n - 1) == 115)) {
+        store8(w + n - 3, 121);              # ies -> y
+        return n - 2;
+    }
+    if ((n > 3) && (load8(w + n - 1) == 115)) {
+        var c = load8(w + n - 2);
+        if ((c != 115) && (c != 117) && (c != 105)) { n = n - 1; }   # not ss, us, is
+    }
+    if ((n > 5) && (load8(w + n - 3) == 105) && (load8(w + n - 2) == 110) && (load8(w + n - 1) == 103)) {
+        n = n - 3;                           # ing
+    } elif ((n > 4) && (load8(w + n - 2) == 101) && (load8(w + n - 1) == 100)) {
+        n = n - 2;                           # ed
+    }
+    if ((n > 4) && (load8(w + n - 1) == 101)) { n = n - 1; }   # e, so invoice meets invoic
+    return n;
+}
+
+# 32-bit FNV-1a. Persisted, so it has no per-process key. A file named to collide
+# lengthens one bucket, which a query scans.
+fn _fx_term(w, n) {
+    var h = 2166136261;
+    var i = 0;
+    while (i < n) {
+        h = ((h ^ load8(w + i)) * 16777619) & 0xFFFFFFFF;
+        i = i + 1;
+    }
+    return h;
+}
+
+fn _fx_tf_begin() {
+    _fx_tf_stamp = _fx_tf_stamp + 1;
+    if (_fx_tf_stamp >= 16777215) {
+        memset(_fx_tf_val, 0, FX_TF_SLOTS * 4);
+        _fx_tf_stamp = 1;
+    }
+    _fx_tf_n = 0;
+    _fx_tf_words = 0;
+    return 0;
+}
+
+# Count one word for this file, `w` being it unstemmed. A name sets the byte's top
+# bit and counts no occurrence; what a file says is what `contains` means.
+#
+# A stop word is checked here, the first time a file says it, and held in the table
+# with a byte of 0, which no real word has. Asking the map for every word cost more
+# than the rest of a file's tokenizing put together.
+fn _fx_tf_add(term, is_name, w) {
+    var mask = FX_TF_SLOTS - 1;
+    var i = term & mask;
+    var probes = 0;
+    while (probes < FX_TF_SLOTS) {
+        var v = load32(_fx_tf_val + i * 4);
+        if ((v >> 8) != _fx_tf_stamp) {
+            if (_fx_tf_n >= FILES_FILE_TERMS) { return 0; }
+            store32(_fx_tf_term + i * 4, term);
+            v = _fx_tf_stamp << 8;
+            if (_fx_stop_kind(w) == 1) {
+                store32(_fx_tf_val + i * 4, v);
+                return 0;
+            }
+            store32(_fx_tf_list + _fx_tf_n * 4, i);
+            _fx_tf_n = _fx_tf_n + 1;
+            if (is_name == 1) { store32(_fx_tf_val + i * 4, v | 128); }
+            else { store32(_fx_tf_val + i * 4, v | 1); }
+            return 0;
+        }
+        if (load32(_fx_tf_term + i * 4) == term) {
+            if ((v & 255) == 0) { return 0; }    # a stop word
+            if (is_name == 1) { store32(_fx_tf_val + i * 4, v | 128); }
+            elif ((v & 127) < 127) { store32(_fx_tf_val + i * 4, v + 1); }
+            return 0;
+        }
+        i = (i + 1) & mask;
+        probes = probes + 1;
+    }
+    return 0;
+}
+
+# The words in `n` bytes at `p`, into the per-file table. Stop words go no further.
+fn _fx_scan(p, n, is_name) {
+    var i = 0;
+    var w = _fx_word;
+    while (i < n) {
+        var len = 0;
+        var c = load8(p + i);
+        while (i < n) {
+            c = load8(p + i);
+            if ((c >= 65) && (c <= 90)) { c = c + 32; }
+            elif ((c >= 97) && (c <= 122)) { }
+            elif ((c >= 48) && (c <= 57)) { }
+            elif (c < 128) { break; }
+            if (len < FX_WORD_MAX + 1) {
+                store8(w + len, c);
+                len = len + 1;
+            }
+            i = i + 1;
+        }
+        i = i + 1;
+        if ((len >= 2) && (len <= FX_WORD_MAX)) {
+            store8(w + len, 0);
+            var m = _fx_stem(w, len);
+            _fx_tf_add(_fx_term(w, m), is_name, w);
+            if (is_name == 0) { _fx_tf_words = _fx_tf_words + 1; }
+        }
+    }
+    return 0;
+}
+
+# 1 for a word that means nothing anywhere, 2 for one that means nothing in a
+# question ("find", "files") but may be a name, 0 for any other.
+fn _fx_stop_kind(w) {
+    return map_get(_fx_stops, w);
+}
+
+# The file's name and its folder's name.
+fn _fx_scan_names(p, n) {
+    var e = n;
+    var s = e;
+    while ((s > 0) && (load8(p + s - 1) != 47)) { s = s - 1; }
+    _fx_scan(p + s, e - s, 1);
+    if (s > 1) {
+        e = s - 1;
+        s = e;
+        while ((s > 0) && (load8(p + s - 1) != 47)) { s = s - 1; }
+        _fx_scan(p + s, e - s, 1);
+    }
+    return 0;
+}
+
+# The per-file table's words, as postings for record `idx`. Past the reserve the
+# generation says so: a search that cannot find everything must not read as one
+# that can.
+fn _fx_tf_flush(g, idx) {
+    var post = load64(g + FX_G_POST);
+    var pn = load64(g + FX_G_POST_N);
+    var i = 0;
+    while (i < _fx_tf_n) {
+        if (pn >= _fx_post_cap) {
+            store64(g + FX_G_PTRUNC, 1);
+            break;
+        }
+        var slot = load32(_fx_tf_list + i * 4);
+        var term = load32(_fx_tf_term + slot * 4);
+        var byte = load32(_fx_tf_val + slot * 4) & 255;
+        store64(post + pn * 8, (term << 32) | (idx << 8) | byte);
+        pn = pn + 1;
+        i = i + 1;
+    }
+    store64(g + FX_G_POST_N, pn);
+    var r = _fx_rec(g, idx);
+    store32(r + FX_R_DL, _fx_tf_words);
+    store64(g + FX_G_WORDS, load64(g + FX_G_WORDS) + _fx_tf_words);
+    return 0;
+}
+
+# --- phases of a job -------------------------------------------------------
+
+# Which served records carry over: the same path, size and mtime, as for a digest.
+# Across a change of --index-content nothing does, as the postings mean another thing.
+fn _fx_remap_slice(g, deadline) {
+    var a = _fx_active;
+    var n = load64(a + FX_G_N);
+    if (load64(a + FX_G_CONTENT) != _fx_content) { n = 0; }
+    var steps = 0;
+    while (_fx_cursor < n) {
+        var old = _fx_rec(a, _fx_cursor);
+        var to = 0;
+        if ((_fx_rec_flags(old) & FX_F_DIR) == 0) {
+            var j = _fx_find(g, _fx_rec_path(a, old), _fx_rec_plen(old));
+            if (j >= 0) {
+                var r = _fx_rec(g, j);
+                if ((load64(r + FX_R_SIZE) == load64(old + FX_R_SIZE))
+                  && (load64(r + FX_R_MTIME) == load64(old + FX_R_MTIME))) {
+                    to = j + 1;
+                    _fx_rec_set_flag(r, FX_F_TERMS);
+                    store32(r + FX_R_DL, load32(old + FX_R_DL));
+                    store64(g + FX_G_WORDS, load64(g + FX_G_WORDS) + load32(old + FX_R_DL));
+                }
+            }
+        }
+        store32(_fx_remap + _fx_cursor * 4, to);
+        _fx_cursor = _fx_cursor + 1;
+        steps = steps + 1;
+        if (steps >= FILES_SLICE_ENTRIES) {
+            steps = 0;
+            if (daimon_now_ms() >= deadline) { return 0; }
+        }
+    }
+    _fx_phase_next(g, FX_POSTS);
+    return 0;
+}
+
+fn _fx_posts_slice(g, deadline) {
+    var a = _fx_active;
+    var n = load64(a + FX_G_POST_N);
+    if (load64(a + FX_G_CONTENT) != _fx_content) { n = 0; }
+    var from = load64(a + FX_G_POST);
+    var to = load64(g + FX_G_POST);
+    var pn = load64(g + FX_G_POST_N);
+    var steps = 0;
+    while (_fx_cursor < n) {
+        var e = load64(from + _fx_cursor * 8);
+        var rec = (e >> 8) & 0xFFFFFF;
+        var nj = load32(_fx_remap + rec * 4);
+        if (nj != 0) {
+            if (pn >= _fx_post_cap) { store64(g + FX_G_PTRUNC, 1); }
+            else {
+                store64(to + pn * 8, (e & (0 - 4294967296)) | ((nj - 1) << 8) | (e & 255));
+                pn = pn + 1;
+            }
+        }
+        _fx_cursor = _fx_cursor + 1;
+        steps = steps + 1;
+        if (steps >= FILES_SORT_STEPS) {
+            steps = 0;
+            if (daimon_now_ms() >= deadline) {
+                store64(g + FX_G_POST_N, pn);
+                return 0;
+            }
+        }
+    }
+    store64(g + FX_G_POST_N, pn);
+    _fx_phase_next(g, FX_READ);
+    return 0;
+}
+
+# The content of a file, or nothing. NOFOLLOW and NONBLOCK, as for a digest.
+fn _fx_read_content(g, r) {
+    if (_fx_content == 0) { return 0; }
+    if (load64(r + FX_R_SIZE) == 0) { return 0; }
+    var fd = file_open(_fx_rec_path(g, r), O_RDONLY | O_NOFOLLOW | FILES_O_NONBLOCK, 0);
+    if (fd < 0) { return 0; }
+    _fx_text_read = _fx_text_read + 1;
+    var got = file_read(fd, _fx_io, FILES_TEXT_BYTES);
+    file_close(fd);
+    if (got <= 0) { return 0; }
+    var probe = got;
+    if (probe > FILES_BINARY_PROBE) { probe = FILES_BINARY_PROBE; }
+    var i = 0;
+    while (i < probe) {
+        if (load8(_fx_io + i) == 0) { return 0; }
+        i = i + 1;
+    }
+    _fx_scan(_fx_io, got, 0);
+    return 0;
+}
+
+fn _fx_read_slice(g, deadline) {
+    var n = load64(g + FX_G_N);
+    var steps = 0;
+    while (_fx_cursor < n) {
+        var r = _fx_rec(g, _fx_cursor);
+        var fl = _fx_rec_flags(r);
+        if ((fl & (FX_F_DIR + FX_F_TERMS)) == 0) {
+            _fx_tf_begin();
+            _fx_scan_names(_fx_rec_path(g, r), _fx_rec_plen(r));
+            _fx_read_content(g, r);
+            _fx_tf_flush(g, _fx_cursor);
+            _fx_rec_set_flag(r, FX_F_TERMS);
+            _fx_done = _fx_done + 1;
+            _fx_cursor = _fx_cursor + 1;
+            steps = steps + 1;
+            if (daimon_now_ms() >= deadline) { return 0; }
+            if (steps >= FILES_SLICE_ENTRIES) { return 0; }
+        } else {
+            _fx_cursor = _fx_cursor + 1;
+        }
+    }
+    _fx_phase_next(g, FX_SORT);
+    return 0;
+}
+
+fn _fx_bucket_of(e) { return (e >> 48) & 0xFFFF; }
+
+# Group postings by bucket in place: count, then swap each into its bucket, with
+# where each bucket has reached kept, so a slice can stop anywhere. tests/files_search
+# .tcyr checks every posting survives and lands in its bucket.
+fn _fx_sort_slice(g, deadline) {
+    var post = load64(g + FX_G_POST);
+    var heads = load64(g + FX_G_HEADS);
+    var n = load64(g + FX_G_POST_N);
+    var steps = 0;
+    if (_fx_sort_stage == 0) {
+        memset(heads, 0, FX_BUCKETS * 4 + 4);
+        _fx_cursor = 0;
+        _fx_sort_stage = 1;
+    }
+    if (_fx_sort_stage == 1) {
+        while (_fx_cursor < n) {
+            var b0 = _fx_bucket_of(load64(post + _fx_cursor * 8));
+            store32(heads + (b0 + 1) * 4, load32(heads + (b0 + 1) * 4) + 1);
+            _fx_cursor = _fx_cursor + 1;
+            steps = steps + 1;
+            if (steps >= FILES_SORT_STEPS) {
+                steps = 0;
+                if (daimon_now_ms() >= deadline) { return 0; }
+            }
+        }
+        var i = 0;
+        while (i < FX_BUCKETS) {
+            store32(heads + (i + 1) * 4, load32(heads + (i + 1) * 4) + load32(heads + i * 4));
+            store32(_fx_sort_next + i * 4, load32(heads + i * 4));
+            i = i + 1;
+        }
+        _fx_sort_bucket = 0;
+        _fx_sort_stage = 2;
+        return 0;
+    }
+    while (_fx_sort_bucket < FX_BUCKETS) {
+        var b = _fx_sort_bucket;
+        var end = load32(heads + (b + 1) * 4);
+        var at = load32(_fx_sort_next + b * 4);
+        while (at < end) {
+            var e = load64(post + at * 8);
+            var c = _fx_bucket_of(e);
+            if (c == b) { at = at + 1; }
+            else {
+                var slot = load32(_fx_sort_next + c * 4);
+                store64(post + at * 8, load64(post + slot * 8));
+                store64(post + slot * 8, e);
+                store32(_fx_sort_next + c * 4, slot + 1);
+            }
+            steps = steps + 1;
+            if (steps >= FILES_SORT_STEPS) {
+                store32(_fx_sort_next + b * 4, at);
+                if (daimon_now_ms() >= deadline) { return 0; }
+                steps = 0;
+            }
+        }
+        store32(_fx_sort_next + b * 4, at);
+        _fx_sort_bucket = b + 1;
+    }
+    _fx_phase_next(g, FX_SAVE);
+    return 0;
+}
+
+# Postings just read from `index`. Heads must rise to the count, and each posting lie
+# in its bucket and name a record: a query trusts both without looking.
+fn _fx_posts_check(g, n, post_n) {
+    var heads = load64(g + FX_G_HEADS);
+    var post = load64(g + FX_G_POST);
+    if (load32(heads) != 0) { return 0; }
+    if (load32(heads + FX_BUCKETS * 4) != post_n) { return 0; }
+    var b = 0;
+    var last = 0;
+    while (b < FX_BUCKETS) {
+        var start = load32(heads + b * 4);
+        var end = load32(heads + (b + 1) * 4);
+        if ((start < last) || (end < start) || (end > post_n)) { return 0; }
+        var i = start;
+        while (i < end) {
+            var e = load64(post + i * 8);
+            if (_fx_bucket_of(e) != b) { return 0; }
+            if (((e >> 8) & 0xFFFFFF) >= n) { return 0; }
+            i = i + 1;
+        }
+        last = start;
+        b = b + 1;
+    }
+    return 1;
+}
+
+# --- kinds -----------------------------------------------------------------
+
+fn _fx_kind_add(kind, exts) {
+    var v = _fx_exts_parse(exts);
+    var i = 0;
+    while (i < vec_len(v)) {
+        map_set(_fx_kind_map, vec_get(v, i), kind + 1);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _fx_kind_name(k) {
+    if (k == FX_KIND_DOCUMENT) { return "document"; }
+    if (k == FX_KIND_IMAGE) { return "image"; }
+    if (k == FX_KIND_AUDIO) { return "audio"; }
+    if (k == FX_KIND_VIDEO) { return "video"; }
+    if (k == FX_KIND_ARCHIVE) { return "archive"; }
+    if (k == FX_KIND_CODE) { return "code"; }
+    return "other";
+}
+
+# FX_KIND_* + 1 for its name, or 0.
+fn files_kind_named(s) {
+    var k = 0;
+    while (k < FX_KINDS) {
+        if (streq(s, _fx_kind_name(k)) == 1) { return k + 1; }
+        k = k + 1;
+    }
+    return 0;
+}
+
+fn _fx_kind_of(p, n) {
+    var s = _fx_ext_of(p, n);
+    if (s < 0) { return FX_KIND_OTHER; }
+    var len = n - s;
+    if ((len < 1) || (len > 8)) { return FX_KIND_OTHER; }
+    var b: i64[2];
+    var i = 0;
+    while (i < len) {
+        var c = load8(p + s + i);
+        if ((c >= 65) && (c <= 90)) { c = c + 32; }
+        store8(&b + i, c);
+        i = i + 1;
+    }
+    store8(&b + len, 0);
+    var k = map_get(_fx_kind_map, &b);
+    if (k == 0) { return FX_KIND_OTHER; }
+    return k - 1;
+}
+
+# --- a question ------------------------------------------------------------
+
+fn _fx_stop_add(words, kind) {
+    var v = _fx_exts_parse(words);
+    var i = 0;
+    while (i < vec_len(v)) {
+        map_set(_fx_stops, vec_get(v, i), kind);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Reserve what search keeps. Called once, from files_open.
+fn files_search_open() {
+    _fx_remap = alloc(_fx_cap * 4);
+    _fx_sort_next = alloc(FX_BUCKETS * 4);
+    _fx_word = alloc(FX_WORD_MAX + 2);
+    _fx_tf_term = alloc(FX_TF_SLOTS * 4);
+    _fx_tf_val = alloc(FX_TF_SLOTS * 4);
+    _fx_tf_list = alloc(FILES_FILE_TERMS * 4);
+    _s_score = alloc(_fx_cap * 8);
+    _s_mask = alloc(_fx_cap * 2);
+    _s_touched = alloc(_fx_cap * 4);
+    _s_heap = alloc(FILES_SEARCH_TOP * 16);
+    _s_gcount = alloc(_fx_cap * 4);
+    _s_words = alloc(FILES_QUERY_TERMS * (FX_WORD_MAX + 2));
+    if ((_fx_remap == 0) || (_fx_sort_next == 0) || (_s_score == 0) || (_s_mask == 0)) { return 0; }
+    if ((_s_touched == 0) || (_s_heap == 0) || (_s_gcount == 0)) { return 0; }
+    memset(_fx_tf_val, 0, FX_TF_SLOTS * 4);
+    memset(_s_score, 0, _fx_cap * 8);
+    memset(_s_mask, 0, _fx_cap * 2);
+    memset(_s_gcount, 0, _fx_cap * 4);
+    _fx_tf_stamp = 0;
+    _fx_stops = map_new();
+    _fx_stop_add("the,an,and,are,as,at,be,but,by,for,from,has,have,in,is,it,its,me,my,of,on,or", 1);
+    _fx_stop_add("our,that,this,to,was,we,were,with,you,your", 1);
+    _fx_stop_add("all,any,about,containing,document,documents,file,files,find,folder,get,give", 2);
+    _fx_stop_add("list,mention,mentioning,named,show,some,which,where,what", 2);
+    _fx_kind_map = map_new();
+    _fx_kind_add(FX_KIND_DOCUMENT, "pdf,doc,docx,odt,rtf,txt,md,tex,ppt,pptx,odp,xls,xlsx,ods,csv,epub");
+    _fx_kind_add(FX_KIND_IMAGE, "png,jpg,jpeg,gif,webp,bmp,tif,tiff,svg,heic,arw,cr2,cr3,dng,nef,orf,raf,rw2");
+    _fx_kind_add(FX_KIND_AUDIO, "mp3,flac,wav,ogg,opus,m4a,aac");
+    _fx_kind_add(FX_KIND_VIDEO, "mp4,mkv,webm,mov,avi,m4v");
+    _fx_kind_add(FX_KIND_ARCHIVE, "zip,tar,gz,xz,zst,bz2,7z,rar");
+    _fx_kind_add(FX_KIND_CODE, "c,h,cyr,rs,py,js,ts,go,sh,json,toml,yml,yaml,cyml,html,css");
+    return 1;
+}
+
+fn _s_window_set(label, newer_days, older_days, now) {
+    _s_window = label;
+    _s_lo = now - newer_days * 86400;
+    _s_hi = now - older_days * 86400;
+    return 0;
+}
+
+# A window in words, at word `i` of `words`: rolling, not calendar, as the rest of
+# the query language is. 1 or 2 for the words it took, or 0.
+fn _s_window_at(words, i, now) {
+    var nw = vec_len(words);
+    var a = vec_get(words, i);
+    if (streq(a, "today") == 1) { _s_window_set("today", 1, 0, now); return 1; }
+    if (streq(a, "yesterday") == 1) { _s_window_set("yesterday", 2, 1, now); return 1; }
+    if (i + 1 >= nw) { return 0; }
+    var b = vec_get(words, i + 1);
+    if (streq(a, "this") == 1) {
+        if (streq(b, "week") == 1) { _s_window_set("this week", 7, 0, now); return 2; }
+        if (streq(b, "month") == 1) { _s_window_set("this month", 30, 0, now); return 2; }
+        if (streq(b, "year") == 1) { _s_window_set("this year", 365, 0, now); return 2; }
+    }
+    if (streq(a, "last") == 1) {
+        if (streq(b, "week") == 1) { _s_window_set("last week", 14, 7, now); return 2; }
+        if (streq(b, "month") == 1) { _s_window_set("last month", 60, 30, now); return 2; }
+        if (streq(b, "year") == 1) { _s_window_set("last year", 730, 365, now); return 2; }
+    }
+    return 0;
+}
+
+# Split a question into words, lower case, into `out` (a vec of cstr).
+fn _s_split(q, out) {
+    var n = strlen(q);
+    var i = 0;
+    while (i < n) {
+        var s = i;
+        while (i < n) {
+            var c = load8(q + i);
+            if ((c >= 65) && (c <= 90)) { }
+            elif ((c >= 97) && (c <= 122)) { }
+            elif ((c >= 48) && (c <= 57)) { }
+            elif (c < 128) { break; }
+            i = i + 1;
+        }
+        var len = i - s;
+        if ((len >= 2) && (len <= FX_WORD_MAX)) {
+            var w = alloc(len + 1);
+            var j = 0;
+            while (j < len) {
+                var d = load8(q + s + j);
+                if ((d >= 65) && (d <= 90)) { d = d + 32; }
+                store8(w + j, d);
+                j = j + 1;
+            }
+            store8(w + len, 0);
+            vec_push(out, w);
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# The words that count, into _s_terms and _s_words, and any window into _s_lo.
+fn _s_parse(q, now) {
+    _s_term_n = 0;
+    _s_lo = 0;
+    _s_hi = 0;
+    _s_window = 0;
+    var words = vec_new();
+    _s_split(q, words);
+    var nw = vec_len(words);
+    var i = 0;
+    while (i < nw) {
+        var took = _s_window_at(words, i, now);
+        if (took > 0) { i = i + took; }
+        else {
+            var w = vec_get(words, i);
+            i = i + 1;
+            if ((_fx_stop_kind(w) == 0) && (_s_term_n < FILES_QUERY_TERMS)) {
+                var slot = _s_words + _s_term_n * (FX_WORD_MAX + 2);
+                var n = strlen(w);
+                memcpy(slot, w, n + 1);
+                var st = alloc(n + 1);
+                memcpy(st, w, n + 1);
+                var m = _fx_stem(st, n);
+                var t = _fx_term(st, m);
+                var dup = 0;
+                var j = 0;
+                while (j < _s_term_n) {
+                    if (_s_terms[j] == t) { dup = 1; }
+                    j = j + 1;
+                }
+                if (dup == 0) {
+                    _s_terms[_s_term_n] = t;
+                    _s_term_n = _s_term_n + 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+# log2(x) in Q8, for an idf. An integer, as a score is: the same on every target.
+fn _s_log2q8(x) {
+    if (x < 1) { return 0; }
+    var whole = 0;
+    var v = x;
+    while (v >= 2) {
+        v = v >> 1;
+        whole = whole + 1;
+    }
+    # The remainder, linearly: close enough to weigh a word.
+    var frac = ((x << 8) >> whole) - 256;
+    return (whole << 8) + frac;
+}
+
+fn _s_touch(idx) {
+    store32(_s_touched + _s_touched_n * 4, idx);
+    _s_touched_n = _s_touched_n + 1;
+    return 0;
+}
+
+# Add one term's postings to the scores: BM25 (k1 1.2, b 0.75) in integers, and a name
+# match worth three times the term's weight, because a name is what a person chose.
+fn _s_term_score(g, term, i, avg) {
+    var post = load64(g + FX_G_POST);
+    var heads = load64(g + FX_G_HEADS);
+    var b = (term >> 16) & 0xFFFF;
+    var start = load32(heads + b * 4);
+    var end = load32(heads + (b + 1) * 4);
+    var df = 0;
+    var p = start;
+    while (p < end) {
+        if (((load64(post + p * 8) >> 32) & 0xFFFFFFFF) == term) { df = df + 1; }
+        p = p + 1;
+    }
+    if (df == 0) { return 0; }
+    var files = load64(g + FX_G_FILES);
+    var idf = _s_log2q8(((files + 1) << 4) / (df + 1)) - 1024 + 64;   # log2 of N/df, floored low
+    if (idf < 64) { idf = 64; }
+    p = start;
+    while (p < end) {
+        var e = load64(post + p * 8);
+        if (((e >> 32) & 0xFFFFFFFF) == term) {
+            var rec = (e >> 8) & 0xFFFFFF;
+            var byte = e & 255;
+            var tf = byte & 127;
+            var s = 0;
+            var bits = 0;
+            if (tf > 0) {
+                var dl = load32(_fx_rec(g, rec) + FX_R_DL);
+                var norm = 30 + (90 * dl) / avg;
+                s = (((tf * 220 * 256) / (100 * tf + norm)) * idf) >> 8;
+                bits = 1 << i;
+            }
+            if ((byte & 128) != 0) {
+                s = s + idf * 3;
+                bits = bits | (1 << (i + 8));
+            }
+            if (load16(_s_mask + rec * 2) == 0) { _s_touch(rec); }
+            store64(_s_score + rec * 8, load64(_s_score + rec * 8) + s);
+            store16(_s_mask + rec * 2, load16(_s_mask + rec * 2) | bits);
+        }
+        p = p + 1;
+    }
+    return 1;
+}
+
+fn _s_bits(m) {
+    var v = (m | (m >> 8)) & 255;
+    var c = 0;
+    while (v != 0) {
+        c = c + (v & 1);
+        v = v >> 1;
+    }
+    return c;
+}
+
+fn _s_heap_less(a, b) {
+    # Least on top: lower score, then later record, so ties rank in index order.
+    var sa = load64(_s_heap + a * 16);
+    var sb = load64(_s_heap + b * 16);
+    if (sa != sb) { return sa < sb; }
+    return load64(_s_heap + a * 16 + 8) > load64(_s_heap + b * 16 + 8);
+}
+
+fn _s_heap_swap(a, b) {
+    var s = load64(_s_heap + a * 16);
+    var r = load64(_s_heap + a * 16 + 8);
+    store64(_s_heap + a * 16, load64(_s_heap + b * 16));
+    store64(_s_heap + a * 16 + 8, load64(_s_heap + b * 16 + 8));
+    store64(_s_heap + b * 16, s);
+    store64(_s_heap + b * 16 + 8, r);
+    return 0;
+}
+
+fn _s_heap_down(i, n) {
+    while (1 == 1) {
+        var l = i * 2 + 1;
+        var r = l + 1;
+        var m = i;
+        if ((l < n) && (_s_heap_less(l, m) == 1)) { m = l; }
+        if ((r < n) && (_s_heap_less(r, m) == 1)) { m = r; }
+        if (m == i) { return 0; }
+        _s_heap_swap(i, m);
+        i = m;
+    }
+    return 0;
+}
+
+fn _s_heap_keep(score, rec, cap) {
+    if (_s_heap_n < cap) {
+        var i = _s_heap_n;
+        store64(_s_heap + i * 16, score);
+        store64(_s_heap + i * 16 + 8, rec);
+        _s_heap_n = i + 1;
+        while (i > 0) {
+            var up = (i - 1) / 2;
+            if (_s_heap_less(i, up) == 0) { return 0; }
+            _s_heap_swap(i, up);
+            i = up;
+        }
+        return 0;
+    }
+    if ((score > load64(_s_heap)) || ((score == load64(_s_heap)) && (rec < load64(_s_heap + 8)))) {
+        store64(_s_heap, score);
+        store64(_s_heap + 8, rec);
+        _s_heap_down(0, cap);
+    }
+    return 0;
+}
+
+# Best first, in place.
+fn _s_heap_sort() {
+    var n = _s_heap_n;
+    while (n > 1) {
+        _s_heap_swap(0, n - 1);
+        n = n - 1;
+        _s_heap_down(0, n);
+    }
+    return 0;
+}
+
+fn _s_facet_date(mtime, now) {
+    var age = now - mtime;
+    if (age < 86400) { return 7; }
+    if (age < 604800) { return 8; }
+    if (age < 2592000) { return 9; }
+    if (age < 31536000) { return 10; }
+    return 11;
+}
+
+fn _s_facet_size(size) {
+    if (size < 1048576) { return 12; }
+    if (size < 104857600) { return 13; }
+    return 14;
+}
+
+# The directory under the file's root, for Location: a pointer and a length.
+fn _s_facet_location(p, n) {
+    var i = 0;
+    while (i < vec_len(_fx_roots)) {
+        var root = vec_get(_fx_roots, i);
+        var rl = strlen(root);
+        if (files_under(p, n, root, rl) == 1) {
+            var s = rl + 1;
+            if (rl == 1) { s = 1; }
+            var e = s;
+            while ((e < n) && (load8(p + e) != 47)) { e = e + 1; }
+            if (e >= n) { e = rl; }     # the file sits at the root itself
+            var u = 0;
+            while (u < _s_loc_used) {
+                if ((_s_loc_n[u] == e) && (memeq(_s_loc_p[u], p, e) == 1)) {
+                    _s_loc_c[u] = _s_loc_c[u] + 1;
+                    return 0;
+                }
+                u = u + 1;
+            }
+            if (_s_loc_used < 8) {
+                _s_loc_p[_s_loc_used] = p;
+                _s_loc_n[_s_loc_used] = e;
+                _s_loc_c[_s_loc_used] = 1;
+                _s_loc_used = _s_loc_used + 1;
+            }
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# One hit that passed the filter.
+fn _s_hit(g, idx, score, keep, now) {
+    var r = _fx_rec(g, idx);
+    _s_total = _s_total + 1;
+    _s_heap_keep(score, idx, keep);
+    var p = _fx_rec_path(g, r);
+    var n = _fx_rec_plen(r);
+    var k = _fx_kind_of(p, n);
+    _s_facet[k] = _s_facet[k] + 1;
+    var dk = _s_facet_date(load64(r + FX_R_MTIME), now);
+    _s_facet[dk] = _s_facet[dk] + 1;
+    var sk = _s_facet_size(load64(r + FX_R_SIZE));
+    _s_facet[sk] = _s_facet[sk] + 1;
+    _s_facet_location(p, n);
+    var group = load64(r + FX_R_GROUP);
+    if (group > 0) {
+        if (group < _fx_cap) {
+            var c = load32(_s_gcount + group * 4) + 1;
+            store32(_s_gcount + group * 4, c);
+            _s_gcount_used = 1;
+            if (c == 2) { _s_dup_groups = _s_dup_groups + 1; _s_dup_files = _s_dup_files + 2; }
+            if (c > 2) { _s_dup_files = _s_dup_files + 1; }
+        }
+    }
+    return 0;
+}
+
+fn _s_in_window(r) {
+    if (_s_window == 0) { return 1; }
+    var m = load64(r + FX_R_MTIME);
+    if ((m < _s_lo) || (m > _s_hi)) { return 0; }
+    return 1;
+}
+
+# Run filter `f`'s question: _s_total, the best `keep` in the heap, and the facets.
+# Leaves the score and mask of what it touched for the caller to read and clear.
+fn _s_run(f, keep) {
+    var t0 = daimon_now_ms();
+    var g = _fx_active;
+    var now = clock_epoch_secs();
+    _s_parse(load64(f + FX_Q_TEXT), now);
+    _s_touched_n = 0;
+    _s_heap_n = 0;
+    _s_total = 0;
+    _s_loc_used = 0;
+    _s_dup_groups = 0;
+    _s_dup_files = 0;
+    var i = 0;
+    while (i < 32) {
+        _s_facet[i] = 0;
+        i = i + 1;
+    }
+    if (keep > FILES_SEARCH_TOP) { keep = FILES_SEARCH_TOP; }
+    if (keep < 1) { keep = 1; }
+    if (g == 0) { return 0; }
+    var files = load64(g + FX_G_FILES);
+    if (_s_term_n == 0) {
+        # A window and nothing else (`from last week`): newest first.
+        if (_s_window != 0) {
+            var n = load64(g + FX_G_N);
+            var a = 0;
+            while (a < n) {
+                var ra = _fx_rec(g, a);
+                if ((_fx_match(g, ra, f, now) == 1) && (_s_in_window(ra) == 1)) {
+                    _s_hit(g, a, load64(ra + FX_R_MTIME), keep, now);
+                }
+                a = a + 1;
+            }
+        }
+    } else {
+        var avg = 1;
+        if (files > 0) { avg = load64(g + FX_G_WORDS) / files; }
+        if (avg < 1) { avg = 1; }
+        var ti = 0;
+        while (ti < _s_term_n) {
+            _s_term_score(g, _s_terms[ti], ti, avg);
+            ti = ti + 1;
+        }
+        var ix = 0;
+        while (ix < _s_touched_n) {
+            var idx = load32(_s_touched + ix * 4);
+            var r = _fx_rec(g, idx);
+            if ((_fx_match(g, r, f, now) == 1) && (_s_in_window(r) == 1)) {
+                # All of a question's words first: a file with two ranks above one with
+                # one, however often that one says it.
+                var score = load64(_s_score + idx * 8) * _s_bits(load16(_s_mask + idx * 2));
+                store64(_s_score + idx * 8, score);
+                _s_hit(g, idx, score, keep, now);
+            }
+            ix = ix + 1;
+        }
+    }
+    _s_ms = daimon_now_ms() - t0;
+    return 0;
+}
+
+fn _s_clear() {
+    var i = 0;
+    while (i < _s_touched_n) {
+        var idx = load32(_s_touched + i * 4);
+        store64(_s_score + idx * 8, 0);
+        store16(_s_mask + idx * 2, 0);
+        i = i + 1;
+    }
+    _s_touched_n = 0;
+    if (_s_gcount_used == 1) {
+        memset(_s_gcount, 0, _fx_cap * 4);
+        _s_gcount_used = 0;
+    }
+    return 0;
+}
+
+fn files_search_count(f) {
+    _s_run(f, 1);
+    var c = _s_total;
+    _s_clear();
+    return c;
+}
+
+# --- an answer -------------------------------------------------------------
+
+fn _o_list_words(mask_bits) {
+    var said = 0;
+    var total = 0;
+    var i = 0;
+    while (i < _s_term_n) {
+        if ((mask_bits & (1 << i)) != 0) { total = total + 1; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < _s_term_n) {
+        if ((mask_bits & (1 << i)) != 0) {
+            if (said > 0) {
+                if (said + 1 == total) { _o_c(" and "); } else { _o_c(", "); }
+            }
+            var w = _s_words + i * (FX_WORD_MAX + 2);
+            _o_c("\\\"");
+            _o_esc(w, strlen(w));
+            _o_c("\\\"");
+            said = said + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Why it matched, as a sentence built from what matched: nothing here is inferred.
+fn _o_why(mask) {
+    _o_c(",\"why\":\"");
+    var content = mask & 255;
+    var name = (mask >> 8) & 255;
+    var said = 0;
+    if (content != 0) {
+        _o_c("Contains ");
+        _o_list_words(content);
+        said = 1;
+    }
+    if (name != 0) {
+        if (said == 1) { _o_c("; its name or folder has "); } else { _o_c("Its name or folder has "); }
+        _o_list_words(name);
+        said = 1;
+    }
+    if (_s_window != 0) {
+        if (said == 1) { _o_c("; modified "); } else { _o_c("Modified "); }
+        _o_c(_s_window);
+    }
+    _o_c("\"");
+    return 0;
+}
+
+# The smart folders a file is in, by name. A saved question is left out: to ask it
+# here would run a search inside a search, for each row.
+fn _o_folders(g, r, now) {
+    _o_c(",\"folders\":[");
+    var shown = 0;
+    var i = 0;
+    while (i < vec_len(_fx_smart)) {
+        var s = vec_get(_fx_smart, i);
+        var sf = load64(s + 24);
+        if (load64(sf + FX_Q_TEXT) == 0) {
+            _fx_filter_bind(sf);
+            if (_fx_match(g, r, sf, now) == 1) {
+                if (shown > 0) { _o_c(","); }
+                _o_c("\"");
+                _o_esc(load64(s), strlen(load64(s)));
+                _o_c("\"");
+                shown = shown + 1;
+            }
+        }
+        i = i + 1;
+    }
+    _o_c("]");
+    return 0;
+}
+
+fn _o_facet(label, count, query, first) {
+    if (first == 0) { _o_c(","); }
+    _o_c("{\"label\":\"");
+    _o_c(label);
+    _o_c("\"");
+    _o_int("files", count);
+    _o_c(",\"query\":\"");
+    _o_c(query);
+    _o_c("\"}");
+    return 0;
+}
+
+fn _o_pct(p, n) {
+    var i = 0;
+    while (i < n) {
+        var c = load8(p + i);
+        var plain = 0;
+        if ((c >= 97) && (c <= 122)) { plain = 1; }
+        if ((c >= 65) && (c <= 90)) { plain = 1; }
+        if ((c >= 48) && (c <= 57)) { plain = 1; }
+        if ((c == 47) || (c == 45) || (c == 95) || (c == 46)) { plain = 1; }
+        if (plain == 1) { _o_bytes(p + i, 1); }
+        else {
+            var b: u8[3];
+            store8(&b, 37);
+            store8(&b + 1, _json_hex_digit(c >> 4));
+            store8(&b + 2, _json_hex_digit(c & 15));
+            _o_bytes(&b, 3);
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _o_facets() {
+    _o_c(",\"facets\":{\"kind\":[");
+    var first = 1;
+    var k = 0;
+    while (k < FX_KINDS) {
+        if (_s_facet[k] > 0) {
+            if (first == 0) { _o_c(","); }
+            _o_c("{\"label\":\"");
+            _o_c(_fx_kind_name(k));
+            _o_c("\"");
+            _o_int("files", _s_facet[k]);
+            _o_c(",\"query\":\"kind=");
+            _o_c(_fx_kind_name(k));
+            _o_c("\"}");
+            first = 0;
+        }
+        k = k + 1;
+    }
+    _o_c("],\"date\":[");
+    first = 1;
+    if (_s_facet[7] > 0) { _o_facet("today", _s_facet[7], "newer_days=1", first); first = 0; }
+    if (_s_facet[8] > 0) { _o_facet("this week", _s_facet[8], "newer_days=7&older_days=1", first); first = 0; }
+    if (_s_facet[9] > 0) { _o_facet("this month", _s_facet[9], "newer_days=30&older_days=7", first); first = 0; }
+    if (_s_facet[10] > 0) { _o_facet("this year", _s_facet[10], "newer_days=365&older_days=30", first); first = 0; }
+    if (_s_facet[11] > 0) { _o_facet("older", _s_facet[11], "older_days=365", first); first = 0; }
+    _o_c("],\"size\":[");
+    first = 1;
+    if (_s_facet[12] > 0) { _o_facet("under 1 MB", _s_facet[12], "max_size=1048575", first); first = 0; }
+    if (_s_facet[13] > 0) {
+        _o_facet("1 to 100 MB", _s_facet[13], "min_size=1048576&max_size=104857599", first);
+        first = 0;
+    }
+    if (_s_facet[14] > 0) { _o_facet("over 100 MB", _s_facet[14], "min_size=104857600", first); first = 0; }
+    _o_c("],\"location\":[");
+    var u = 0;
+    while (u < _s_loc_used) {
+        if (u > 0) { _o_c(","); }
+        var p = _s_loc_p[u];
+        var n = _s_loc_n[u];
+        _o_c("{\"label\":\"");
+        _o_esc(p, n);
+        _o_c("\"");
+        _o_int("files", _s_loc_c[u]);
+        _o_c(",\"query\":\"under=");
+        _o_pct(p, n);
+        _o_c("\"}");
+        u = u + 1;
+    }
+    _o_c("]}");
+    return 0;
+}
+
+fn files_search_json(f) {
+    var offset = load64(f + FX_Q_OFFSET);
+    var limit = load64(f + FX_Q_LIMIT);
+    _s_run(f, offset + limit);
+    _s_heap_sort();
+    var g = _fx_active;
+    var now = clock_epoch_secs();
+    _o_reset();
+    _o_c("{\"files\":[");
+    var shown = 0;
+    var i = offset;
+    var next = 0;
+    while (i < _s_heap_n) {
+        if ((shown >= limit) || (_fx_o >= FILES_PAGE_BYTES)) {
+            next = i;
+            break;
+        }
+        var idx = load64(_s_heap + i * 16 + 8);
+        var score = load64(_s_heap + i * 16);
+        var r = _fx_rec(g, idx);
+        if (shown > 0) { _o_c(","); }
+        _o_c("{\"path\":\"");
+        _o_esc(_fx_rec_path(g, r), _fx_rec_plen(r));
+        _o_c("\"");
+        _o_int("rank", i + 1);
+        _o_int("score", score);
+        _o_int("size", load64(r + FX_R_SIZE));
+        _o_int("mtime", load64(r + FX_R_MTIME));
+        _o_int("rating", load8(r + FX_R_RATING));
+        _fx_row_tags(load64(r + FX_R_META));
+        _o_int("duplicate_group", load64(r + FX_R_GROUP));
+        _o_why(load16(_s_mask + idx * 2));
+        _o_folders(g, r, now);
+        _o_c("}");
+        shown = shown + 1;
+        i = i + 1;
+    }
+    # The heap holds offset + limit, so the rest of the hits are past it. A page that
+    # ran out of the heap is not the last one, unless the ranking stops there.
+    if ((next == 0) && (_s_total > i) && (i < FILES_SEARCH_TOP) && (shown > 0)) { next = i; }
+    _o_c("]");
+    _o_int("total", _s_total);
+    _o_int("next_offset", next);
+    _o_int("generation", _fx_generation);
+    _o_c(",\"words\":[");
+    var w = 0;
+    while (w < _s_term_n) {
+        if (w > 0) { _o_c(","); }
+        var ws = _s_words + w * (FX_WORD_MAX + 2);
+        _o_c("\"");
+        _o_esc(ws, strlen(ws));
+        _o_c("\"");
+        w = w + 1;
+    }
+    _o_c("]");
+    if (_s_window != 0) { _o_str("window", _s_window, strlen(_s_window)); }
+    _o_facets();
+    _o_c(",\"duplicates\":{\"groups\":");
+    _o_i(_s_dup_groups);
+    _o_int("files", _s_dup_files);
+    _o_c("},\"cost\":{\"ms\":");
+    _o_i(_s_ms);
+    _o_int("hits", _s_total);
+    if (_fx_content == 1) { _o_str("method", "words + name", 12); }
+    else { _o_str("method", "name", 4); }
+    _o_bool("local", 1);
+    _o_c("}}");
+    _s_clear();
+    return 0;
+}

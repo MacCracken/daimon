@@ -1,0 +1,571 @@
+# =========================================================================
+# files_search — tests against THE REAL src/files_search.cyr (2.5.5)
+#
+# crab's M8. A real tree, a real walk, and real postings. The ranking checks name
+# the order, not only the members: a search that finds the right files in the wrong
+# order has failed. The postings' own invariants are checked too, because a query
+# trusts them without looking.
+# =========================================================================
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/io.cyr"
+include "lib/fs.cyr"
+include "lib/hashmap.cyr"
+include "lib/tagged.cyr"
+include "lib/bayan.cyr"
+include "lib/syscalls.cyr"
+include "lib/chrono.cyr"
+include "lib/sigil.cyr"
+include "lib/net.cyr"
+include "lib/tls.cyr"
+include "lib/sandhi.cyr"
+include "lib/assert.cyr"
+
+fn holds(hay, needle) {
+    if (strstr(hay, needle) >= 0) { return 1; }
+    return 0;
+}
+
+var SEV_INFO = 1;
+var SEV_WARNING = 2;
+var SEV_SECURITY = 5;
+var _audit_last = 0;
+fn daimon_audit(sev, source, action, details) { _audit_last = action; return 0; }
+
+include "src/syscalls.cyr"
+include "src/error.cyr"
+include "src/files.cyr"
+include "src/files_search.cyr"
+
+alloc_init();
+files_set_max(4096);
+
+var ROOT = 0;
+var DATA = 0;
+var INDEX = 0;
+
+fn abspath(rel) {
+    var cwd = alloc(1024);
+    assert(syscall(SYS_GETCWD, cwd, 1000) > 0, "(getcwd)");
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, cwd);
+    str_builder_add_cstr(sb, "/");
+    str_builder_add_cstr(sb, rel);
+    return str_data(str_builder_build(sb));
+}
+
+fn in_root(rel) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, ROOT);
+    str_builder_add_cstr(sb, "/");
+    str_builder_add_cstr(sb, rel);
+    return str_data(str_builder_build(sb));
+}
+
+fn put(rel, text) {
+    var p = in_root(rel);
+    assert_eq(file_write_atomic(p, text, strlen(text)), 0, "(fixture written)");
+    return p;
+}
+
+fn rm_tree(p) {
+    var names = dir_list(str_from(p));
+    var i = 0;
+    while (i < vec_len(names)) {
+        var full = str_cstr(path_join(str_from(p), vec_get(names, i)));
+        if (is_dir(str_from(full)) == 1) { rm_tree(full); }
+        else { sys_unlink(full); }
+        i = i + 1;
+    }
+    sys_rmdir(p);
+    return 0;
+}
+
+fn forget() {
+    _fx_enabled = 0;
+    _fx_dir = 0;
+    _fx_phase = FX_IDLE;
+    _fx_want = 0;
+    _fx_want_path = 0;
+    _fx_paused = 0;
+    _fx_active = 0;
+    _fx_generation = 0;
+    _fx_indexed_at = 0;
+    _fx_persisted = 0;
+    _fx_next_at = 0;
+    _fx_meta_skipped = 0;
+    _fx_meta_failed = 0;
+    _fx_journal_bytes = 0;
+    _fx_content = 0;
+    files_init();
+    return 0;
+}
+
+fn open_with(content) {
+    forget();
+    files_set_content(content);
+    files_add_root(ROOT);
+    files_open(DATA);
+    _fx_power_files = vec_new();
+    return 0;
+}
+
+fn run_job() {
+    var i = 0;
+    while (files_busy() == 1) {
+        files_tick(daimon_now_ms());
+        i = i + 1;
+        if (i > 2000000) { assert(0 == 1, "a job ended"); return 0; }
+    }
+    return i;
+}
+
+fn q(text) {
+    var f = files_query_parse(text);
+    assert(f != 0, "(the query parses)");
+    return f;
+}
+
+fn hits(text) { return files_count(q(text)); }
+
+fn search(text) {
+    files_list_json(q(text));
+    var v = bayan_json_v_parse(str_new(files_out(), files_out_len()));
+    assert(v != 0, "the answer is JSON");
+    return v;
+}
+
+fn member(v, key) { return bayan_json_v_obj_get_by_cstr(v, key); }
+fn jint(v, key) { return bayan_json_v_int(member(v, key)); }
+fn jstr(v, key) { return str_cstr(bayan_json_v_str(member(v, key))); }
+fn row(v, i) { return bayan_json_v_arr_get(member(v, "files"), i); }
+fn rows(v) { return bayan_json_v_arr_len(member(v, "files")); }
+
+# --- words ----------------------------------------------------------------
+test_group("_fx_stem");
+fn stem(s) {
+    var n = strlen(s);
+    var b = alloc(n + 1);
+    memcpy(b, s, n + 1);
+    var m = _fx_stem(b, n);
+    store8(b + m, 0);
+    return b;
+}
+assert_streq(stem("invoices"), stem("invoice"), "a plural meets its singular");
+assert_streq(stem("invoiced"), stem("invoice"), "a past");
+assert_streq(stem("invoicing"), stem("invoice"), "a gerund");
+assert_streq(stem("cities"), "city", "ies");
+assert_streq(stem("class"), "class", "ss stays");
+assert_streq(stem("bus"), "bus", "short words stay");
+assert_streq(stem("analysis"), "analysis", "is stays");
+assert_streq(stem("paid"), "paid", "a word with no suffix");
+assert_streq(stem("wing"), "wing", "a short ing stays");
+assert_streq(stem("red"), "red", "a short ed stays");
+
+test_group("_fx_term");
+fn termof(s) { return _fx_term(s, strlen(s)); }
+assert_eq(termof("a"), 0xE40C292C, "FNV-1a 32's published vector");
+assert_eq(termof("foobar"), 0xBF9CF968, "and another");
+
+test_group("_s_log2q8");
+assert_eq(_s_log2q8(1), 0, "log2 1");
+assert_eq(_s_log2q8(2), 256, "log2 2");
+assert_eq(_s_log2q8(1024), 2560, "log2 1024");
+assert_eq(_s_log2q8(3), 384, "between powers, linearly");
+
+# --- the fixture ----------------------------------------------------------
+xmkdir_p("build/files_search_test", 493);
+rm_tree(abspath("build/files_search_test"));
+xmkdir_p("build/files_search_test/root/bills", 493);
+xmkdir_p("build/files_search_test/root/notes", 493);
+ROOT = abspath("build/files_search_test/root");
+DATA = abspath("build/files_search_test/data");
+INDEX = abspath("build/files_search_test/data/files/index");
+
+var BOTH = put("bills/march-invoice.txt", "Invoice total 120.00, paid in full. Paid stamp on page one.\n");
+var ONE = put("bills/old.txt", "invoices invoices invoices invoices but never settled\n");
+var LEAVE = put("notes/paid-leave.md", "a note about taking time off\n");
+var SHOP = put("notes/shopping.txt", "grocery list: milk and eggs\n");
+var DUP1 = put("notes/copy-one.txt", "the very same quarterly report\n");
+var DUP2 = put("bills/copy-two.txt", "the very same quarterly report\n");
+var UTF = put("notes/ümlaut.txt", "Müller wrote the zürich report\n");
+var bin = alloc(64);
+memset(bin, 65, 64);
+memcpy(bin, "secretword ", 11);
+store8(bin + 20, 0);
+assert_eq(file_write_atomic(in_root("notes/data.bin"), bin, 64), 0, "(a file with a NUL)");
+# A word past what is read.
+var big = alloc(FILES_TEXT_BYTES + 64);
+memset(big, 32, FILES_TEXT_BYTES + 64);
+memcpy(big + FILES_TEXT_BYTES + 8, "pastthecap", 10);
+memcpy(big, "nearthestart", 12);
+assert_eq(file_write_atomic(in_root("notes/long.txt"), big, FILES_TEXT_BYTES + 64), 0, "(a long file)");
+
+# --- names alone: the default --------------------------------------------
+test_group("names alone");
+_fx_text_read = 0;
+open_with(0);
+run_job();
+assert_streq(files_state_name(), "fresh", "the index builds");
+assert_eq(_fx_text_read, 0, "⛔ without --index-content no file is opened for its words");
+assert_eq(hits("q=invoice"), 1, "a name is searched");
+assert_eq(hits("q=settled"), 0, "⛔ what a file says is not");
+assert_eq(hits("q=bills"), 3, "a folder's name counts");
+var nm = search("q=invoice");
+assert_streq(jstr(member(nm, "cost"), "method"), "name", "and the answer says how it searched");
+assert_eq(bayan_json_v_bool(member(member(nm, "cost"), "local")), 1, "and that it stayed here");
+
+fn tag_it(path, name) {
+    var add = vec_new();
+    vec_push(add, name);
+    var sb = str_builder_new();
+    assert_eq(files_tag(path, add, vec_new(), sb), 1, "(tagged)");
+    files_journal(sb);
+    return 0;
+}
+
+fn build_text(v) { return str_cstr(bayan_json_v_build(v)); }
+fn out_text() { return str_cstr(str_new(files_out(), files_out_len())); }
+
+# --- content --------------------------------------------------------------
+test_group("content");
+_fx_text_read = 0;
+open_with(1);
+run_job();
+assert(_fx_text_read >= 9, "with --index-content files are read");
+assert_eq(hits("q=settled"), 1, "a word in a file is found");
+assert_eq(hits("q=SETTLED"), 1, "whatever its case");
+assert_eq(hits("q=invoices"), 2, "⛔ a plural finds its singular");
+assert_eq(hits("q=invoicing"), 2, "and any other form of it");
+assert_eq(hits("q=nothinglikeit"), 0, "a word nobody has");
+assert_eq(hits("q=settle"), 1, "settle and settled are one word");
+assert_eq(hits("q=sett"), 0, "⛔ a prefix is not a word");
+assert_eq(hits("q=secretword"), 0, "⛔ a file with a NUL is not text");
+assert_eq(hits("q=nearthestart"), 1, "the start of a long file is read");
+assert_eq(hits("q=pastthecap"), 0, "what lies past the limit is not, and the guide says so");
+assert_eq(hits("q=z%C3%BCrich"), 1, "UTF-8 is a word");
+assert_eq(hits("q=the"), 0, "a stop word finds nothing");
+assert_eq(hits("q=find+all+the+files"), 0, "a question of only stop words holds nothing");
+assert_eq(hits("q=eggs"), 1, "words from the end of a file");
+assert_eq(hits("q=report"), 3, "several files");
+assert_streq(jstr(member(search("q=settled"), "cost"), "method"), "words + name", "the answer says what it used");
+
+test_group("ranking");
+var r1 = search("q=paid+invoice");
+assert_eq(jint(r1, "total"), 3, "three files say one or the other");
+assert_streq(jstr(row(r1, 0), "path"), BOTH, "⛔ the file with both words comes first");
+assert_eq(jint(row(r1, 0), "rank"), 1, "ranked 1");
+assert(jint(row(r1, 0), "score") > jint(row(r1, 1), "score"), "with the higher score");
+assert_eq(jint(row(r1, 1), "rank"), 2, "then 2");
+var r2 = search("q=invoice");
+assert_streq(jstr(row(r2, 0), "path"), BOTH, "⛔ a name match beats saying it four times");
+assert_streq(jstr(row(r2, 1), "path"), ONE, "which still ranks");
+var w0 = jstr(row(r1, 0), "why");
+assert(holds(w0, "Contains \"paid\" and \"invoice\"") == 1, "why says what the file holds");
+assert(holds(w0, "its name or folder has \"invoice\"") == 1, "and what its name has");
+var w1 = jstr(row(search("q=leave"), 0), "why");
+assert(holds(w1, "Its name or folder has \"leave\"") == 1, "a match by name alone says so");
+assert(holds(w1, "Contains") == 0, "⛔ and claims nothing about the content");
+assert_eq(bayan_json_v_arr_len(member(r1, "words")), 2, "the words that counted come back");
+tag_it(BOTH, "finance");
+var r3 = search("q=stamp");
+assert_streq(jstr(row(r3, 0), "path"), BOTH, "(the tagged file)");
+assert(holds(build_text(row(r3, 0)), "\"tags\":[\"finance\"]") == 1, "where it appears: its tags");
+assert(holds(build_text(row(r3, 0)), "\"Recent\"") == 1, "and its smart folders");
+assert(holds(build_text(row(r3, 0)), "\"Untagged\"") == 0, "⛔ and only those that hold it");
+
+test_group("filters beside a question");
+assert_eq(hits("q=paid&ext=md"), 1, "by extension");
+assert_eq(hits("q=paid&tag=finance"), 1, "by tag");
+assert_eq(hits("q=paid&tag=nobody"), 0, "by a tag nobody has");
+assert_eq(hits("q=report&kind=document"), 3, "by kind");
+assert_eq(hits("q=report&kind=image"), 0, "none of that kind");
+assert_eq(hits("kind=other"), 1, "a kind with no question: data.bin");
+assert_eq(files_query_parse("kind=nonsense"), 0, "⛔ a kind that is not one is refused");
+assert_eq(files_query_parse("q="), 0, "⛔ an empty question is refused");
+assert_eq(hits("max_size=30&q=report"), 0, "by size");
+assert_eq(files_query_parse("max_size=0"), 0, "a size of nothing is refused");
+
+test_group("a window in words");
+var now = clock_epoch_secs();
+store64(_fx_rec(_fx_active, _fx_find(_fx_active, ONE, strlen(ONE))) + FX_R_MTIME, now - 10 * 86400);
+assert_eq(hits("q=invoices+last+week"), 1, "last week is a window");
+var wj = search("q=invoices+last+week");
+assert_streq(jstr(row(wj, 0), "path"), ONE, "holding what was modified then");
+assert_streq(jstr(wj, "window"), "last week", "and the answer names it");
+assert(holds(jstr(row(wj, 0), "why"), "modified last week") == 1, "and so does why");
+assert_eq(bayan_json_v_arr_len(member(wj, "words")), 1, "the window's words are not searched for");
+assert_eq(hits("q=invoices+today"), 1, "today");
+assert_eq(hits("q=last+week"), 1, "⛔ a window alone holds what lies in it");
+assert_streq(jstr(row(search("q=last+week"), 0), "path"), ONE, "newest first");
+assert_eq(hits("q=invoices+last+year"), 0, "a window nothing lies in");
+
+test_group("facets");
+var fj = search("q=report");
+var facets = member(fj, "facets");
+var kinds = member(facets, "kind");
+assert_eq(bayan_json_v_arr_len(kinds), 1, "only kinds with hits");
+assert_streq(jstr(bayan_json_v_arr_get(kinds, 0), "label"), "document", "named");
+assert_eq(jint(bayan_json_v_arr_get(kinds, 0), "files"), 3, "and counted");
+var loc = member(facets, "location");
+assert_eq(bayan_json_v_arr_len(loc), 2, "two places hold them");
+
+# ⛔ A facet is only as good as its query: each must give the count it claims.
+fn facet_holds(list) {
+    var i = 0;
+    while (i < bayan_json_v_arr_len(list)) {
+        var fa = bayan_json_v_arr_get(list, i);
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, "q=report&");
+        str_builder_add_cstr(sb, jstr(fa, "query"));
+        assert_eq(hits(str_data(str_builder_build(sb))), jint(fa, "files"), "⛔ refining by a facet gives its count");
+        i = i + 1;
+    }
+    return 0;
+}
+facet_holds(kinds);
+facet_holds(loc);
+facet_holds(member(facets, "date"));
+facet_holds(member(facets, "size"));
+var dj = member(fj, "duplicates");
+assert_eq(jint(dj, "groups"), 1, "duplicates among the results");
+assert_eq(jint(dj, "files"), 2, "two of them");
+assert_eq(jint(member(fj, "cost"), "hits"), 3, "the cost says how many");
+assert_eq(jint(member(search("q=report"), "duplicates"), "groups"), 1, "⛔ and a second query counts afresh");
+
+test_group("pages");
+var p1 = search("q=report&limit=2");
+assert_eq(rows(p1), 2, "a page stops at its limit");
+assert_eq(jint(p1, "total"), 3, "and says how many");
+assert_eq(jint(p1, "next_offset"), 2, "⛔ and where to go on");
+var p2 = search("q=report&limit=2&offset=2");
+assert_eq(rows(p2), 1, "the rest");
+assert_eq(jint(p2, "next_offset"), 0, "the last page says so");
+assert_eq(jint(row(p2, 0), "rank"), 3, "ranks go on across pages");
+assert_eq(rows(search("q=report&offset=50")), 0, "past the end is an empty page");
+
+test_group("nothing is left behind");
+search("q=report");
+assert_eq(_s_touched_n, 0, "the touched list is cleared");
+assert_eq(load16(_s_mask + _fx_find(_fx_active, DUP1, strlen(DUP1)) * 2), 0, "⛔ a query leaves no mask");
+assert_eq(load64(_s_score + _fx_find(_fx_active, DUP1, strlen(DUP1)) * 8), 0, "⛔ or score");
+var a1 = jint(row(search("q=settled"), 0), "score");
+search("q=report");
+assert_eq(jint(row(search("q=settled"), 0), "score"), a1, "⛔ so the same question scores the same");
+
+test_group("saved questions");
+assert_eq(files_smart_save("Money", "q=paid+invoice"), 1, "a question is saved");
+assert_eq(files_count(files_smart_filter("Money")), 3, "and counts");
+var sp = alloc(FX_Q_SIZE);
+memcpy(sp, files_smart_filter("Money"), FX_Q_SIZE);
+store64(sp + FX_Q_LIMIT, 1);
+files_list_json(sp);
+var sj = bayan_json_v_parse(str_new(files_out(), files_out_len()));
+assert_streq(jstr(row(sj, 0), "path"), BOTH, "and ranks");
+files_smart_json();
+assert(holds(out_text(), "\"name\":\"Money\",\"query\":\"q=paid+invoice\",\"files\":3") == 1,
+    "and shows with its count");
+
+# --- postings -------------------------------------------------------------
+fn posts_sum(g) {
+    var n = load64(g + FX_G_POST_N);
+    var p = load64(g + FX_G_POST);
+    var s = 0;
+    var i = 0;
+    while (i < n) {
+        var e = load64(p + i * 8);
+        s = s + (e ^ ((e >> 17) & 0x7FFFFFFFFFFF));
+        i = i + 1;
+    }
+    return s;
+}
+
+fn posts_grouped(g) {
+    var heads = load64(g + FX_G_HEADS);
+    var p = load64(g + FX_G_POST);
+    var b = 0;
+    while (b < FX_BUCKETS) {
+        var i = load32(heads + b * 4);
+        var e = load32(heads + (b + 1) * 4);
+        while (i < e) {
+            if (_fx_bucket_of(load64(p + i * 8)) != b) { return 0; }
+            i = i + 1;
+        }
+        b = b + 1;
+    }
+    return 1;
+}
+
+test_group("the postings' invariants");
+var ag = _fx_active;
+assert_eq(posts_grouped(ag), 1, "every posting lies in its bucket");
+assert_eq(load32(load64(ag + FX_G_HEADS) + FX_BUCKETS * 4), load64(ag + FX_G_POST_N), "and the heads end at the count");
+
+# ⛔ The sort, stopped at every chance: nothing lost, nothing doubled, all in place.
+var sg = _fx_other(_fx_active);
+_fx_gen_clear(sg);
+var fzn = 30000;
+var fp = load64(sg + FX_G_POST);
+var seed = 88172645463325252;
+var si = 0;
+while (si < fzn) {
+    seed = seed ^ (seed << 13);
+    seed = seed ^ ((seed >> 7) & 0x01FFFFFFFFFFFFFF);
+    seed = seed ^ (seed << 17);
+    store64(fp + si * 8, seed & (0 - 256));
+    si = si + 1;
+}
+store64(sg + FX_G_POST_N, fzn);
+var before = posts_sum(sg);
+_fx_phase = FX_SORT;
+_fx_sort_stage = 0;
+var ss = 0;
+while ((_fx_phase == FX_SORT) && (ss < 1000000)) {
+    _fx_sort_slice(sg, 0);       # a deadline already past: it stops at each check
+    ss = ss + 1;
+}
+assert(ss > 2, "(the sort was stopped along the way)");
+assert_eq(posts_sum(sg), before, "⛔ an interrupted sort loses and doubles nothing");
+assert_eq(posts_grouped(sg), 1, "⛔ and leaves every posting in its bucket");
+if (_fx_save_fd >= 0) {
+    file_close(_fx_save_fd);
+    _fx_save_fd = 0 - 1;
+}
+_fx_phase = FX_IDLE;
+
+# --- a re-walk ------------------------------------------------------------
+test_group("a re-walk");
+var pn0 = load64(_fx_active + FX_G_POST_N);
+var words0 = load64(_fx_active + FX_G_WORDS);
+var read0 = _fx_text_read;
+files_request(0);
+run_job();
+assert_eq(_fx_text_read, read0 + 1, "the one file whose mtime differs is read again");
+assert_eq(load64(_fx_active + FX_G_POST_N), pn0, "⛔ postings are neither lost nor doubled");
+assert_eq(load64(_fx_active + FX_G_WORDS), words0, "nor the word count");
+assert_eq(hits("q=settled"), 1, "and it is still found");
+read0 = _fx_text_read;
+files_request(0);
+run_job();
+assert_eq(_fx_text_read, read0, "⛔ an unchanged file is not read again");
+assert_eq(load64(_fx_active + FX_G_POST_N), pn0, "⛔ its postings are neither lost nor doubled");
+
+var used0 = alloc_used();
+var w = 0;
+while (w < 3) {
+    files_request(0);
+    run_job();
+    w = w + 1;
+}
+assert_eq(alloc_used() - used0, 0, "⛔ re-walks allocate nothing, postings included");
+
+put("notes/new.txt", "a brand new zebra\n");
+put("notes/shopping.txt", "grocery list: milk and bread and more besides\n");
+sys_unlink(ONE);
+files_request(0);
+run_job();
+assert_eq(hits("q=zebra"), 1, "a new file is found");
+assert_eq(hits("q=eggs"), 0, "⛔ a word gone from a changed file goes");
+assert_eq(hits("q=bread"), 1, "and its new word comes");
+assert_eq(hits("q=settled"), 0, "⛔ a deleted file's words go");
+assert_eq(hits("q=paid"), 2, "others stay");
+assert_eq(posts_grouped(_fx_active), 1, "the postings stay in their buckets");
+
+test_group("a scoped re-index");
+put("notes/scoped.txt", "scopedword here\n");
+put("bills/outside.txt", "outsideword here\n");
+files_request(in_root("notes"));
+run_job();
+assert_eq(hits("q=scopedword"), 1, "a new file under the path");
+assert_eq(hits("q=outsideword"), 0, "one outside waits");
+assert_eq(hits("q=paid"), 2, "what lies outside keeps its postings");
+files_request(0);
+run_job();
+
+# --- a restart ------------------------------------------------------------
+test_group("a restart");
+var read1 = _fx_text_read;
+var pn1 = load64(_fx_active + FX_G_POST_N);
+open_with(1);
+assert_eq(load64(_fx_active + FX_G_POST_N), pn1, "⛔ postings survive a restart");
+assert_eq(hits("q=zebra"), 1, "⛔ a question is answered before any walk");
+assert_streq(jstr(row(search("q=paid+invoice"), 0), "path"), BOTH, "and ranks the same");
+run_job();
+assert_eq(_fx_text_read, read1, "⛔ the walk after it reads nothing unchanged");
+assert_eq(hits("q=zebra"), 1, "and still answers");
+
+test_group("turning content off");
+open_with(0);
+run_job();
+assert_eq(hits("q=zebra"), 0, "⛔ with content off, nothing read earlier is searched");
+assert_eq(hits("q=new"), 1, "names still are");
+var read2 = _fx_text_read;
+open_with(1);
+run_job();
+assert(_fx_text_read > read2, "turning it on reads what changed in meaning");
+assert_eq(hits("q=zebra"), 1, "and finds it again");
+
+test_group("an index that lies");
+var ib = alloc(8388608);
+var il = file_read_all(INDEX, ib, 8388607);
+assert(il > FILES_INDEX_HDR, "(the index is on disk)");
+var hdr_n = load64(ib + 24);
+var hdr_used = load64(ib + 32);
+var heads_at = FILES_INDEX_HDR + hdr_n * FX_REC + hdr_used;
+var post_at = heads_at + FX_BUCKETS * 4 + 4;
+
+fn rehash(buf, n) {
+    var d: i64[4];
+    sha256(buf, n - 32, &d);
+    memcpy(buf + n - 32, &d, 32);
+    return 0;
+}
+
+fn with_change(off, val, wide) {
+    var c = alloc(il);
+    memcpy(c, ib, il);
+    if (wide == 1) { store64(c + off, val); } else { store32(c + off, val); }
+    rehash(c, il);
+    file_write_atomic(INDEX, c, il);
+    open_with(1);
+    return 0;
+}
+
+with_change(post_at, (load64(ib + post_at) & (0 - 4294967296)) | 0xFFFFFF00, 1);
+assert_streq(files_state_name(), "building", "⛔ a posting naming a record past the table is refused, digest or no");
+run_job();
+with_change(post_at, 0x00000000000000FF, 1);
+assert_streq(files_state_name(), "building", "⛔ one outside its bucket");
+run_job();
+with_change(heads_at + 4, 0xFFFFFFFF, 0);
+assert_streq(files_state_name(), "building", "⛔ heads that overrun");
+run_job();
+with_change(heads_at + FX_BUCKETS * 4, 7, 0);
+assert_streq(files_state_name(), "building", "⛔ heads that end short of the count");
+run_job();
+with_change(64, 0x7FFFFFFFFFFFFFFF, 1);
+assert_streq(files_state_name(), "building", "⛔ a posting count past the reserve");
+run_job();
+assert_eq(hits("q=zebra"), 1, "each is rebuilt");
+
+test_group("a reserve that runs out");
+var per_content = FILES_POST_PER_CONTENT;
+FILES_POST_PER_CONTENT = 1;
+files_set_max(1024);
+open_with(1);
+_fx_post_cap = 3;
+_fx_want = 1;
+run_job();
+assert_eq(load64(_fx_active + FX_G_POST_N), 3, "postings stop at the reserve");
+assert_eq(load64(_fx_active + FX_G_PTRUNC), 1, "⛔ and it is said");
+files_status_json();
+assert(holds(out_text(), "\"terms_truncated\":true") == 1, "to a client");
+FILES_POST_PER_CONTENT = per_content;
+files_set_max(4096);
+
+rm_tree(abspath("build/files_search_test"));
+syscall(SYS_EXIT, assert_summary());

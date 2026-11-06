@@ -1,0 +1,151 @@
+# Fuzz: a question in words (2.5.5)
+#
+# Everything here reads text nobody vetted: a file's bytes, or a query string.
+#   1. _fx_scan takes any bytes, and any length of word, with no overrun of the
+#      kept word or the per-file table;
+#   2. _fx_stem never lengthens a word, and leaves it at least two bytes;
+#   3. files_query_parse takes any text, and answers a filter or 0;
+#   4. any question that parses runs, on an index holding real postings, and leaves
+#      no score or mask behind;
+#   5. _fx_posts_check takes any postings and heads, and passes only what a query
+#      may trust: a posting in its bucket, naming a record.
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/io.cyr"
+include "lib/fs.cyr"
+include "lib/hashmap.cyr"
+include "lib/tagged.cyr"
+include "lib/bayan.cyr"
+include "lib/syscalls.cyr"
+include "lib/chrono.cyr"
+include "lib/sigil.cyr"
+include "lib/net.cyr"
+include "lib/tls.cyr"
+include "lib/sandhi.cyr"
+
+var SEV_INFO = 1;
+var SEV_WARNING = 2;
+var SEV_SECURITY = 5;
+fn daimon_audit(sev, source, action, details) { return 0; }
+
+include "src/syscalls.cyr"
+include "src/error.cyr"
+include "src/files.cyr"
+include "src/files_search.cyr"
+include "fuzz/rng.cyr"
+
+alloc_init();
+
+fn main() {
+    files_init();
+    files_set_max(2048);
+    files_set_content(1);
+    files_add_root("/fuzz");
+    files_open("build/fuzz_files_search");
+    _fx_power_files = vec_new();
+    _fx_want = 0;
+    var g = _fx_active;
+    # 1 and 2: noise as content.
+    var n = 0;
+    while (n < 3000) {
+        var len = fz_below(2000);
+        var text = fz_bytes(len, 0, 255);
+        _fx_tf_begin();
+        _fx_scan(str_data(text), len, fz_below(2));
+        if (_fx_tf_n > FILES_FILE_TERMS) { sys_exit(1); }
+        var wl = fz_below(FX_WORD_MAX) + 2;
+        var w = fz_bytes(wl, 97, 122);
+        var m = _fx_stem(str_data(w), wl);
+        if ((m > wl) || (m < 2)) { sys_exit(2); }
+        n = n + 1;
+    }
+    # 4 needs records with postings: names drawn from a small alphabet of words.
+    var words = "alpha,bravo,charlie,delta,echo,foxtrot,golf,hotel";
+    var v = _fx_exts_parse(words);
+    n = 0;
+    while (n < 1500) {
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, "/fuzz/");
+        str_builder_add_cstr(sb, vec_get(v, fz_below(8)));
+        str_builder_add_cstr(sb, "/");
+        str_builder_add_cstr(sb, vec_get(v, fz_below(8)));
+        str_builder_add_int(sb, n);
+        str_builder_add_cstr(sb, ".txt");
+        var p = str_builder_build(sb);
+        var idx = _fx_add(g, str_data(p), str_len(p), fz_below(100000), 1790000000 + fz_below(1000000), 0);
+        if (idx < 0) { sys_exit(3); }
+        _fx_tf_begin();
+        _fx_scan_names(str_data(p), str_len(p));
+        _fx_scan(str_data(p), str_len(p), 0);
+        _fx_tf_flush(g, idx);
+        n = n + 1;
+    }
+    _fx_phase = FX_SORT;
+    _fx_sort_stage = 0;
+    _fx_dir = 0;
+    var far = daimon_now_ms() + 3600000;
+    while (_fx_phase == FX_SORT) { _fx_sort_slice(g, far); }
+    _fx_phase = FX_IDLE;
+    if (_fx_posts_check(g, load64(g + FX_G_N), load64(g + FX_G_POST_N)) != 1) { sys_exit(4); }
+    # 3 and 4: noise as a query, and queries with real words in them.
+    var keys = "q,tag,ext,under,kind,min_size,max_size,limit,offset,untagged,duplicates";
+    var kv = _fx_exts_parse(keys);
+    n = 0;
+    while (n < 20000) {
+        var qb = str_builder_new();
+        var parts = fz_below(4) + 1;
+        var i = 0;
+        while (i < parts) {
+            if (i > 0) { str_builder_add_cstr(qb, "&"); }
+            str_builder_add_cstr(qb, vec_get(kv, fz_below(11)));
+            str_builder_add_cstr(qb, "=");
+            var kind = fz_below(3);
+            if (kind == 0) { str_builder_add_cstr(qb, vec_get(v, fz_below(8))); }
+            elif (kind == 1) { str_builder_add_int(qb, fz_below(100)); }
+            else { str_builder_add(qb, fz_bytes(fz_below(12), 33, 126)); }
+            i = i + 1;
+        }
+        var text2 = str_builder_build(qb);
+        var f = files_query_parse(str_cstr(text2));
+        if (f != 0) {
+            if (load64(f + FX_Q_TEXT) != 0) {
+                files_search_json(f);
+                if (_s_touched_n != 0) { sys_exit(5); }
+            } else {
+                files_list_json(f);
+            }
+            var tail = load8(files_out() + files_out_len() - 1);
+            if (tail != 125) { sys_exit(6); }
+        }
+        n = n + 1;
+    }
+    var clean = 0;
+    while (clean < load64(g + FX_G_N)) {
+        if (load16(_s_mask + clean * 2) != 0) { sys_exit(7); }
+        if (load64(_s_score + clean * 8) != 0) { sys_exit(8); }
+        clean = clean + 1;
+    }
+    # 5: postings that lie. A corrupted word must be refused, or be harmless.
+    var post = load64(g + FX_G_POST);
+    var pn = load64(g + FX_G_POST_N);
+    n = 0;
+    while (n < 2000) {
+        var at = fz_below(pn);
+        var keep = load64(post + at * 8);
+        store64(post + at * 8, fz_next());
+        if (_fx_posts_check(g, load64(g + FX_G_N), pn) == 1) {
+            var e = load64(post + at * 8);
+            if (((e >> 8) & 0xFFFFFF) >= load64(g + FX_G_N)) { sys_exit(9); }
+        }
+        store64(post + at * 8, keep);
+        n = n + 1;
+    }
+    return 0;
+}
+
+var r = main();
+fz_done("files_search", 25000);
+sys_exit(r);
