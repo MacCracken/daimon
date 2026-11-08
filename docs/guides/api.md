@@ -25,7 +25,9 @@ without blocking, so a slow client holds only its own connection:
 - at most 128 connections are open at once (5 on AGNOS), and more wait in the kernel's queue;
 - when all 128 are taken and another is waiting, the oldest request still arriving gives way, once
   it is 1 s old (2.4.2). It is closed unanswered and counted (`http_evicted`). One client trickling
-  in 128 requests held every slot for 30 s before.
+  in 128 requests held every slot for 30 s before;
+- an answer a client has not taken within 10 s is given up (2.5.6). Each write making progress used
+  to restart the timer, so a client reading a trickle of a large answer held the server as long as it liked.
 
 ## Request bodies
 
@@ -251,7 +253,7 @@ GET /v1/mcp/tools
    "count":13,"pins":{"state":"loaded","durable":true,"count":14,"unpinned":0}}
 
 # Register an external tool. inputSchema is optional (alias: input_schema), stored in bayan's compact
-# form, {} when omitted. callback_url must be http:// or https:// (a scheme check, not a host allowlist).
+# form, {} when omitted. callback_url must be http:// or https://, and its host one the operator lists, if any.
 POST /v1/mcp/tools
 {"name":"scan","description":"port scanner","callback_url":"http://localhost:9000",
  "inputSchema":{"type":"object","properties":{"target":{"type":"string"}},"required":["target"]}}
@@ -365,7 +367,12 @@ That covers a forwarded call, `resources/read`, `prompts/get`, `web_fetch` and `
 that has not finished within 60 s is answered 504 (2.3.4; on AGNOS since 2.4.1). On AGNOS a server
 that sends nothing for 30 s is taken to have closed (502). Through 2.4.1 that was about a second
 whenever the guest was busy (2.4.2). A JSON-RPC error from the server answers 200 with
-`"isError":true` and its `code`.
+`"isError":true`, a `"type":"text"` block (`text/plain` through 2.5.5, which MCP does not define) and its `code`.
+
+⛔ **Where daimon may forward** is the operator's to say. `serve --mcp-callback-host HOST` (repeatable) allows those hosts
+and no others, checked at registration and again at each forward, with the parser the forward itself uses. With none, any
+http or https host is allowed, as it always has been: that includes loopback and private addresses, and a caller can point
+a registration at them. List your servers if that matters here. A name on the list is that name, and implies no address.
 
 ### Resources and prompts (2.1.0)
 
@@ -426,13 +433,15 @@ that is not valid UTF-8, which JSON could not carry. `skipped` counts what it co
 ```
 GET /v1/files/index
 → {"state":"fresh","files":41208,"bytes":8123456,"duplicates":12,"skipped":0,"truncated":false,
-   "content":true,"terms":8228414,"terms_truncated":false,"indexed_at":1793990381,"generation":3,"persisted":true,"meta_durable":true,"meta_skipped":0,
+   "content":true,"vectors":true,"vectors_model":"glove-6B-100d","vectors_dims":100,"vectors_words":72472,"vectors_files":41208,
+   "terms":8228414,"terms_truncated":false,"indexed_at":1793990381,"generation":3,"persisted":true,"meta_durable":true,"meta_skipped":0,
    "power":"mains","roots":["/home/me"]}
 ```
 
-`progress` appears while a job runs: `{"phase":"walk","done":251,"total":812}`, the phases being `copy`,
-`walk`, `sizes`, `hash`, `group`, `terms`, `read`, `sort` and `save`. During a walk `total` is the last walk's count, and 0 the
-first time.
+`progress` appears while a job runs: `{"phase":"embed","done":251,"total":812}`, the phases being `copy`,
+`walk`, `sizes`, `hash`, `group`, `terms`, `read` (`embed` with a table of word vectors), `sort` and `save`. During a walk
+`total` is the last walk's count, and 0 the first time. While reading it is the files left to read. `vectors` says whether
+search can rank by meaning, and `vectors_files` how many files have a vector: one with no word the table holds has none.
 
 | state | meaning |
 |---|---|
@@ -562,14 +571,33 @@ GET /v1/files?q=paid+invoices+last+month&limit=20
    "cost":{"ms":6,"hits":3,"method":"words + name","local":true}}
 ```
 
-⛔ **It ranks by words, not by meaning, and `cost.method` says so.** `invoices` finds `invoice`, and
-`receipt` does not. Ranking by meaning needs a local embedding model, which does not exist yet.
+**By meaning (2.5.6).** With a table of word vectors, a file that never says a word can be found for it: `receipt` finds a
+file about an `invoice`. Its `why` says so, and never that it contains the word:
+
+```
+{"path":"/home/me/finance/acme.txt","rank":2,"score":999,...,"why":"Close in meaning to the question (0.64)",...}
+...
+"cost":{"ms":2,"hits":80,"method":"vector + words + name","vectors":"glove-6B-100d","local":true}
+```
+
+```bash
+# Word vectors in the text form they ship in, most frequent first: GloVe, word2vec or fastText.
+daimon vectors build glove.6B.100d.txt /var/lib/agnos/vectors --name glove-6B-100d   # --top N, default 100,000 words
+daimon serve --index-root /home/me --index-content --index-vectors /var/lib/agnos/vectors
+```
+
+⛔ **`cost.method` says what ran.** Without `--index-vectors`, or when no word of the question is in the table, search
+is by words: `invoices` finds `invoice`, and `receipt` does not. A table that is absent or damaged stops `serve`. It is
+word vectors and not a sentence model: a file's vector is the weighted sum of its words', the first 256 distinct ones of
+its first 64 KB, so it says what a file is about and nothing about word order. A file is close if it stands out against
+every other file for this question, by two deviations, and is at least 0.25 similar; at most 64 are admitted. Moving to
+another table rebuilds the index once.
 
 **What is searched** depends on the operator. With `--index-root`, the file's name and its folder's:
-`method` is `name`. With `serve --index-content` too, the first 64 KB of each file with no NUL in its
-first 4 KB: `method` is `words + name`. That is a second opt-in, because a local process can then ask
-whether a file it could not open holds a word. So a PDF is found by name alone. Status says which
-(`content`), and `terms_truncated` if the reserve for words ran out.
+`method` is `name` (`vector + name` with a table). With `serve --index-content` too, the first 64 KB of each file with no NUL
+in its first 4 KB: `method` is `words + name` (`vector + words + name`). That is a second opt-in, because a local process can
+then ask whether a file it could not open holds a word. So a PDF is found by name alone. Status says which (`content`), and
+`terms_truncated` if the reserve for words ran out.
 
 A file with more of the question's words ranks first, and a name match counts for more than saying a
 word often. Words are folded and lightly stemmed (`invoicing` meets `invoice`, in English), and at most

@@ -4,6 +4,105 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.5.6] - 2026-11-08
+
+**A question answered by meaning, from a table of word vectors, on every target, with nothing called.** crab's filing is closed and
+archived: every item it lists is answered. What it did not ask for is on the roadmap: this is word vectors, not a sentence model, and no
+table ships on an agnos image yet. Most of 2.8.x's serving items are done, and a new smoke check found that a JSON-RPC error
+from an external server had never worked as documented. **2,172 tests** across 22 suites, **300 HTTP smoke checks** (26 new)
+and 10 fuzz harnesses, all green on Linux. On a real aarch64 kernel: all 2,172 checks and the binary's 20-check smoke. The AGNOS guest
+test passes 120 checks on agnos 1.57.17 (61 + 59; three new), ranking by meaning among them. fmt, lint and vet are clean; x86_64,
+aarch64 and agnos build; `cyrius.lock` verifies 93 of 93.
+
+### Added — ranking by meaning (crab's item 5, ADR-010's second addendum)
+
+- **`serve --index-vectors FILE`**, and `GET /v1/files?q=receipt` finds a file about an `invoice` that never says the word. `why`
+  says *"Close in meaning to the question (0.64)"*, and never that a file contains a word it does not. `cost.method` says which
+  ran: `vector + words + name`, `vector + name` without `--index-content`, `words + name` when no word of the question is in
+  the table or there is no table. `cost.vectors` names the table.
+- **`daimon vectors build SRC OUT [--top N] [--name NAME]`** turns GloVe, word2vec or fastText text into the table, once, on any machine.
+- ⛔ **Nothing is called.** A file's vector is arithmetic over a table in memory, in the walk's slices: no model server, no socket,
+  no fork. So it pauses on battery, allocates nothing per file, and runs on agnos, where no model server exists.
+- ⛔ **A trained embedding, not a hash of a word's bytes**, which is what the filing faults RAG for. Measured on GloVe at 100
+  dimensions: `invoice` and `receipt` 0.639, `invoice` and `banana` 0.069.
+- **What it is not**: a sentence model. A file's vector is the weighted sum of its words', the first 256 distinct ones of its first
+  64 KB, so it says what a file is about and nothing about word order.
+- **A table that is absent or damaged stops `serve`**, each with its own message. A flag that named a table and got words
+  would be worse than no flag.
+- **A similarity means nothing by itself** (the same 0.5 is one question's best and another's average), so a file must stand two
+  deviations above what this question scores against the whole index, be at least 0.25 similar, and be among the best 64.
+- **Status** adds `vectors`, `vectors_model`, `vectors_dims`, `vectors_words`, `vectors_files`. While reading, `progress.phase` is
+  `embed`, and `progress.total` is now the files left to read, which is the canvas's *"251 / 812"*. It was a count of
+  something else before.
+- **`index` is format 3**: a 2.5.5 file is dropped and rebuilt, once. Moving to another table does the same.
+
+### Added — serving hardening (roadmap 2.8.x)
+
+- **An answer has a deadline** of 10 s on Linux, 30 s on agnos. daimon writes every answer itself now (the same bytes as sandhi's, which
+  `tests/http.tcyr` compares), one write offering at most 64 KB. Before, a client reading a trickle of a large answer held the
+  loop for as long as it liked, each write that made progress restarting `SO_SNDTIMEO`.
+- **`serve --mcp-callback-host HOST`** (repeatable): where daimon may forward, checked at registration and at each forward. With none, any
+  http(s) host, as before.
+- **A digest or a word read through a swapped directory** is refused on Linux (2.5.4 audit R-3): `openat2` with `RESOLVE_BENEATH |
+  RESOLVE_NO_SYMLINKS`, beneath each root, so a link above a root, which is the operator's, still works.
+- **nein's live readers run in a child** when an operator has opened them, each waiting on `nft` for up to 60 s. `nein.live.read` is audited
+  first.
+- **CI and the release workflow verify with `cyrius deps --locked`**, which also re-resolves each tag. Rehearsed in CI's steps: it
+  fails on a tampered file, an extra file and a tampered lock, as `--verify` does.
+
+### Fixed
+
+- **A JSON-RPC error from an external server was never the `isError` result the API guide promises.** sandhi counts one as a failed call,
+  so each became a 502, and a resource or prompt read lost the server's code. bote's consumer audit reported the branch dead, and it was.
+  The JSON-RPC error is now looked for first.
+- **That error's content block said `"type":"text/plain"`**, which MCP does not define. It says `"text"`.
+- **Its message was escaped twice**: sandhi answers the value as it stands in the JSON. Read with the typed parser now.
+
+### Measured, nothing to change
+
+- **The agent-frame arena** (2.5.1 lead) has a high-water mark: after frames rising to the cap, 200 of the largest grow daimon by 0 bytes.
+
+### Changed — dependency pins
+
+| dep | was | now |
+|---|---|---|
+| nein | 1.9.1 | **1.9.3** |
+
+nein 1.9.3 validates each rule against its table's family and its base chains' hooks: what is refused now is what nft always refused at
+apply. No contract change, and nein's own pins now match daimon's in full. Every other pin is still its repo's latest tag.
+
+### Fixed before shipping
+
+- **The first callback host check parsed the URL itself**, taking the host after `@`. sandhi, which connects, has no userinfo, so
+  `http://evil.test:80@127.0.0.1/` passed a list of `127.0.0.1` and would have connected to `evil.test:80`. It asks sandhi's parser now.
+  Found reading sandhi after the research (CVE-2025-68458, CVE-2026-25960). (SV-1)
+- **Among fewer than 32 files, nothing matched by meaning**: a sample of five cannot stand two deviations above its own mean. (WV-1)
+- **A file 0.08 similar was called close.** The floor is 0.25. (WV-2)
+- **One large write on a stream was not bounded by its timeout**, seen as a 40 s write on AF_UNIX. (SV-2)
+
+### Tests
+
+- **`tests/files_vectors.tcyr`** (new, 203): the number parser, the builder, tables that are short, long, flipped, and well-formed under a digest
+  they pass, meaning-only hits by name, a restart, a change of table, names alone, and nothing allocated by a re-walk or a comparison.
+- **`tests/mcp_builtin.tcyr`** (new, 24): what waits and what answers on the loop, against nein's own classes.
+- **`tests/http.tcyr`**, **`tests/mcp.tcyr`**, **`tests/ipc.tcyr`**, **`tests/files_search.tcyr`**: the deadline over real TCP, the URL bypasses, the arena, a
+  swapped directory and a link above a root.
+- **`fuzz/files_vectors.fcyr`** (new, 44,000 cases): noise as numbers, lines, sources and tables, and tables lying under a digest they pass.
+- **`tests/smoke.sh`** (274 → 300): by meaning against the linked binary, the relayed error on both paths, the host list. **`tests/agnos/`**: ranking by
+  meaning on the released kernel, with daimon's arguments now passed as an argv (a line past 127 bytes answers -6).
+- **Mutation**: 19 of 19 against the code as shipped. Another showed a check that could never fail, and it was removed.
+
+### Performance
+
+`BENCHMARKS.md`, 2.5.6. 27 of 36 rows within ±2.0% of 2.5.5, 10 interleaved runs, load 0.8–1.3. With a table of 100 dimensions over 41,200 files:
+a question gains about 9 ms (`files_vector_stage_41k_100d` 8.62 ms), a walk 12.32 → 15.71 s, RSS 75 → 95 MB, and `/v1/health` during the walk stays at
+p99 3.41 ms (3.35 without).
+
+### Security
+
+`docs/audit/2026-11-08-word-vectors-and-serving-audit.md`: the table as a parsed file (the GGUF CVE class), a symlink swapped in after the walk, a slow
+reader, and URL parser disagreement. Residuals are listed there.
+
 ## [2.5.5] - 2026-11-06
 
 **A question in words answered with ranked files; a consumer that accepts a tool definition for itself,

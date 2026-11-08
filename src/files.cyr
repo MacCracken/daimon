@@ -3,7 +3,7 @@
 #         tags and rating, and saved queries over them (2.5.4)
 # =========================================================================
 #
-# The surface crab's M7 asks for: docs/development/issues/2026-09-23-crab-needs-
+# The surface crab's M7 asks for: docs/development/issues/archive/2026-09-23-crab-needs-
 # a-file-index-tags-and-ranked-search.md. ADR-010 records the decisions; the API
 # is in docs/guides/api.md. A file's identity is its absolute path.
 #
@@ -100,7 +100,8 @@ var FX_F_DUP = 4;      # shares its content with another file
 var FX_F_TAGGED = 8;
 var FX_F_RATED = 16;
 var FX_F_TERMS = 32;   # its postings are in this generation (src/files_search.cyr)
-var FX_F_DISK = 5;     # what `index` may say: DIR and DUP. The rest is resolved here.
+var FX_F_VEC = 64;     # its vector is in this generation (src/files_vectors.cyr)
+var FX_F_DISK = 69;    # what `index` may say: DIR, DUP and VEC. The rest is resolved here.
 
 # A generation.
 var FX_G_RECS = 0;
@@ -120,7 +121,9 @@ var FX_G_HEADS = 104;  # u32 * 65537: where each bucket of postings starts
 var FX_G_WORDS = 112;  # words read from content, across the generation
 var FX_G_PTRUNC = 120; # postings ran out of room
 var FX_G_CONTENT = 128;# 1 when content was read: postings are not reused across a change
-var FX_G_SIZE = 136;
+var FX_G_VEC = 136;    # u8 * records * dims, biased, when a word-vector table is open
+var FX_G_VEC_ID = 144; # the table those are from; 0 for none
+var FX_G_SIZE = 152;
 
 # The phases of a job.
 var FX_IDLE = 0;
@@ -135,9 +138,10 @@ var FX_POSTS = 8;      # ... with their postings
 var FX_READ = 9;       # tokenize what is new
 var FX_SORT = 10;      # group postings by bucket
 
-var FILES_INDEX_MAGIC = "DAIMON-FILEIDX-2\n";
+var FILES_INDEX_MAGIC = "DAIMON-FILEIDX-3\n";
 var FILES_INDEX_MAGIC_LEN = 17;
-var FILES_INDEX_HDR = 96;
+var FILES_INDEX_HDR = 112;
+var FX_SAVE_STAGES = 6;
 
 var _fx_roots = 0;         # vec of cstr
 var _fx_enabled = 0;       # the index is open
@@ -175,6 +179,7 @@ var _fx_power_files = 0;   # vec of cstr: battery status files
 var _fx_power_state = 0;   # 0 unknown, 1 mains, 2 battery
 
 var _fx_cursor = 0;        # record reached, per phase
+var _fx_carried = 0;       # records whose postings carried over, in this job
 var _fx_path = 0;          # kept: the path being built
 var _fx_plen = 0;
 var _fx_stat = 0;
@@ -187,6 +192,9 @@ var _fx_list_i = 0;
 var _fx_io = 0;
 var _fx_ctx = 0;           # kept SHA-256 state
 var _fx_hash_fd = 0 - 1;
+var _fx_root_fds: i64[16]; # each root, opened for this job: what a read is held beneath
+var _fx_root_fd_n = 0;
+var _fx_openat2_gone = 0;  # the kernel has no openat2
 var _fx_hash_left = 0;
 var _fx_hashed = 0;        # files read for a digest, since the index opened
 var _fx_groups = 0;
@@ -360,6 +368,11 @@ fn _fx_gen_new() {
     store64(g + FX_G_POOL, pool);
     store64(g + FX_G_TABLE, t1);
     store64(g + FX_G_TABLE2, t2);
+    if (_fv_on == 1) {
+        var vec = alloc(_fx_cap * _fv_dims);
+        if (vec == 0) { return 0; }
+        store64(g + FX_G_VEC, vec);
+    }
     return g;
 }
 
@@ -375,6 +388,7 @@ fn _fx_gen_clear(g) {
     store64(g + FX_G_WORDS, 0);
     store64(g + FX_G_PTRUNC, 0);
     store64(g + FX_G_CONTENT, _fx_content);
+    store64(g + FX_G_VEC_ID, _fv_id);
     memset(load64(g + FX_G_HEADS), 0, FX_BUCKETS * 4 + 4);
     memset(load64(g + FX_G_TABLE), 0, _fx_tbl * 4);
     return 0;
@@ -720,7 +734,7 @@ fn _fx_hash_slice(g, deadline) {
             } else {
                 # NOFOLLOW and NONBLOCK: this was a regular file when it was lstat'd,
                 # and a FIFO put in its place since must not hold the loop.
-                _fx_hash_fd = file_open(_fx_rec_path(g, r), O_RDONLY | O_NOFOLLOW | FILES_O_NONBLOCK, 0);
+                _fx_hash_fd = _fx_open_read(g, r);
                 if (_fx_hash_fd < 0) {
                     _fx_hash_fd = 0 - 1;
                     _fx_rec_clear_flag(r, FX_F_CAND);
@@ -735,6 +749,63 @@ fn _fx_hash_slice(g, deadline) {
         }
         if (daimon_now_ms() >= deadline) { return 0; }
     }
+    return 0;
+}
+
+# Open a file a walk found. O_NOFOLLOW covers the last component, so a directory
+# swapped for a link after the walk could lead the read outside the roots: audit R-3
+# in 2.5.4. openat2 refuses a link anywhere below the root, and only there: a root's
+# own parents are the operator's. An older kernel, or agnos, has only O_NOFOLLOW.
+fn _fx_open_read(g, r) {
+    var p = _fx_rec_path(g, r);
+    var plen = _fx_rec_plen(r);
+    #ifndef CYRIUS_TARGET_AGNOS
+    if (_fx_openat2_gone == 0) {
+        var i = 0;
+        while (i < _fx_root_fd_n) {
+            var root = vec_get(_fx_roots, i);
+            var rl = strlen(root);
+            if ((_fx_root_fds[i] >= 0) && (plen > rl) && (files_under(p, plen, root, rl) == 1)) {
+                var s = rl + 1;
+                if (rl == 1) { s = 1; }
+                var how: i64[3];
+                store64(&how, O_RDONLY | O_NOFOLLOW | FILES_O_NONBLOCK);
+                store64(&how + 8, 0);
+                store64(&how + 16, 12);   # RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS
+                var fd = syscall(437, _fx_root_fds[i], p + s, &how, 24);
+                if (fd != 0 - 38) { return fd; }
+                _fx_openat2_gone = 1;
+                i = _fx_root_fd_n;
+            }
+            i = i + 1;
+        }
+    }
+    #endif
+    return file_open(p, O_RDONLY | O_NOFOLLOW | FILES_O_NONBLOCK, 0);
+}
+
+fn _fx_roots_close() {
+    #ifndef CYRIUS_TARGET_AGNOS
+    var i = 0;
+    while (i < _fx_root_fd_n) {
+        if (_fx_root_fds[i] >= 0) { file_close(_fx_root_fds[i]); }
+        i = i + 1;
+    }
+    _fx_root_fd_n = 0;
+    #endif
+    return 0;
+}
+
+fn _fx_roots_open() {
+    #ifndef CYRIUS_TARGET_AGNOS
+    _fx_roots_close();
+    var i = 0;
+    while (i < vec_len(_fx_roots)) {
+        _fx_root_fds[i] = file_open(vec_get(_fx_roots, i), O_RDONLY | O_DIRECTORY, 0);
+        i = i + 1;
+    }
+    _fx_root_fd_n = i;
+    #endif
     return 0;
 }
 
@@ -799,7 +870,7 @@ fn _fx_save_fail() {
 
 fn _fx_save_start(g) {
     _fx_persisted = 0;
-    _fx_save_stage = 5;           # nothing to write unless the file opens
+    _fx_save_stage = FX_SAVE_STAGES;   # nothing to write unless the file opens
     if (_fx_dir == 0) { return 0; }
     _fx_save_fd = file_open(_fx_tmp_path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 384);   # 0600
     if (_fx_save_fd < 0) { _fx_save_fail(); return 0; }
@@ -814,6 +885,8 @@ fn _fx_save_start(g) {
     store64(_fx_hdr + 72, load64(g + FX_G_WORDS));
     store64(_fx_hdr + 80, load64(g + FX_G_CONTENT));
     store64(_fx_hdr + 88, load64(g + FX_G_PTRUNC));
+    store64(_fx_hdr + 96, load64(g + FX_G_VEC_ID));
+    store64(_fx_hdr + 104, _fv_dims);
     sha256_init_into(_fx_ctx);
     _fx_save_stage = 0;
     _fx_save_off = 0;
@@ -838,16 +911,17 @@ fn _fx_save_chunk(buf, len) {
 }
 
 fn _fx_save_slice(g, deadline) {
-    while (_fx_save_stage < 5) {
+    while (_fx_save_stage < FX_SAVE_STAGES) {
         var st = 0;
         if (_fx_save_stage == 0) { st = _fx_save_chunk(_fx_hdr, FILES_INDEX_HDR); }
         elif (_fx_save_stage == 1) { st = _fx_save_chunk(load64(g + FX_G_RECS), load64(g + FX_G_N) * FX_REC); }
         elif (_fx_save_stage == 2) { st = _fx_save_chunk(load64(g + FX_G_POOL), load64(g + FX_G_USED)); }
         elif (_fx_save_stage == 3) { st = _fx_save_chunk(load64(g + FX_G_HEADS), FX_BUCKETS * 4 + 4); }
-        else { st = _fx_save_chunk(load64(g + FX_G_POST), load64(g + FX_G_POST_N) * 8); }
+        elif (_fx_save_stage == 4) { st = _fx_save_chunk(load64(g + FX_G_POST), load64(g + FX_G_POST_N) * 8); }
+        else { st = _fx_save_chunk(load64(g + FX_G_VEC), load64(g + FX_G_N) * _fv_dims); }
         if (st < 0) {
             _fx_save_fail();
-            _fx_save_stage = 5;
+            _fx_save_stage = FX_SAVE_STAGES;
         } elif (st == 1) {
             _fx_save_stage = _fx_save_stage + 1;
         }
@@ -904,6 +978,7 @@ fn _fx_load_check(g, n, used) {
         }
         if (load64(r + FX_R_SIZE) < 0) { return 0; }
         var fl = load8(r + FX_R_FLAGS) & FX_F_DISK;
+        if (_fv_on == 0) { fl = fl & (255 - FX_F_VEC); }
         store8(r + FX_R_FLAGS, fl);
         store8(r + FX_R_RATING, 0);
         store64(r + FX_R_META, 0);
@@ -924,6 +999,8 @@ fn _fx_load(g) {
     var fd = file_open(_fx_index_path, O_RDONLY, 0);
     if (fd < 0) { return 0; }
     var ok = 0;
+    var other_table = 0;
+    var vbytes = 0;
     _fx_gen_clear(g);
     if (_fx_read_full(fd, _fx_hdr, FILES_INDEX_HDR) == 1) {
         var n = load64(_fx_hdr + 24);
@@ -933,11 +1010,19 @@ fn _fx_load(g) {
         if (memeq(_fx_hdr, FILES_INDEX_MAGIC, FILES_INDEX_MAGIC_LEN) != 1) { good = 0; }
         if ((n < 0) || (n > _fx_cap) || (used < 8) || (used > _fx_pool_cap)) { good = 0; }
         if ((post_n < 0) || (post_n > _fx_post_cap)) { good = 0; }
+        # Vectors from another table mean another thing, and from none, nothing:
+        # the file is good, and of no use to this run. A walk rebuilds it.
+        if ((good == 1) && ((load64(_fx_hdr + 96) != _fv_id) || (load64(_fx_hdr + 104) != _fv_dims))) {
+            good = 0;
+            other_table = 1;
+        }
         if (good == 1) {
+            vbytes = n * _fv_dims;
             if ((_fx_read_full(fd, load64(g + FX_G_RECS), n * FX_REC) == 1)
               && (_fx_read_full(fd, load64(g + FX_G_POOL), used) == 1)
               && (_fx_read_full(fd, load64(g + FX_G_HEADS), FX_BUCKETS * 4 + 4) == 1)
-              && (_fx_read_full(fd, load64(g + FX_G_POST), post_n * 8) == 1)) {
+              && (_fx_read_full(fd, load64(g + FX_G_POST), post_n * 8) == 1)
+              && ((vbytes == 0) || (_fx_read_full(fd, load64(g + FX_G_VEC), vbytes) == 1))) {
                 var want: i64[4];
                 var have: i64[4];
                 sha256_init_into(_fx_ctx);
@@ -946,6 +1031,7 @@ fn _fx_load(g) {
                 sha256_update(_fx_ctx, load64(g + FX_G_POOL), used);
                 sha256_update(_fx_ctx, load64(g + FX_G_HEADS), FX_BUCKETS * 4 + 4);
                 sha256_update(_fx_ctx, load64(g + FX_G_POST), post_n * 8);
+                if (vbytes > 0) { sha256_update(_fx_ctx, load64(g + FX_G_VEC), vbytes); }
                 sha256_finalize(_fx_ctx, &want);
                 if (_fx_read_full(fd, &have, 32) == 1) {
                     if (memeq(&want, &have, 32) == 1) {
@@ -957,6 +1043,7 @@ fn _fx_load(g) {
                         store64(g + FX_G_WORDS, load64(_fx_hdr + 72));
                         store64(g + FX_G_CONTENT, load64(_fx_hdr + 80));
                         store64(g + FX_G_PTRUNC, load64(_fx_hdr + 88));
+                        store64(g + FX_G_VEC_ID, _fv_id);
                         ok = _fx_load_check(g, n, used);
                         if (ok == 1) { ok = _fx_posts_check(g, n, post_n); }
                         _fx_indexed_at = load64(_fx_hdr + 40);
@@ -969,8 +1056,13 @@ fn _fx_load(g) {
     if (ok == 0) {
         _fx_indexed_at = 0;
         _fx_gen_clear(g);
-        daimon_audit(SEV_WARNING, "files", "files.index.rejected",
-          "the file index failed its checks and will be rebuilt");
+        if (other_table == 1) {
+            daimon_audit(SEV_INFO, "files", "files.index.vectors.changed",
+              "the file index was built with other word vectors and will be rebuilt");
+        } else {
+            daimon_audit(SEV_WARNING, "files", "files.index.rejected",
+              "the file index failed its checks and will be rebuilt");
+        }
     }
     return ok;
 }
@@ -983,6 +1075,7 @@ fn _fx_other(g) {
 }
 
 fn _fx_job_start() {
+    _fx_roots_open();
     var g = _fx_other(_fx_active);
     _fx_next = g;
     _fx_gen_clear(g);
@@ -1010,6 +1103,7 @@ fn _fx_job_start() {
 }
 
 fn _fx_job_finish(g) {
+    _fx_roots_close();
     _fx_active = g;
     _fx_generation = _fx_generation + 1;
     _fx_version = _fx_version + 1;
@@ -1900,7 +1994,10 @@ fn _fx_phase_name() {
     if (_fx_phase == FX_HASH) { return "hash"; }
     if (_fx_phase == FX_GROUP) { return "group"; }
     if ((_fx_phase == FX_REMAP) || (_fx_phase == FX_POSTS)) { return "terms"; }
-    if (_fx_phase == FX_READ) { return "read"; }
+    if (_fx_phase == FX_READ) {
+        if (_fv_on == 1) { return "embed"; }
+        return "read";
+    }
     if (_fx_phase == FX_SORT) { return "sort"; }
     return "save";
 }
@@ -1949,6 +2046,15 @@ fn files_status_json() {
         ptrunc = load64(g + FX_G_PTRUNC);
     }
     _o_bool("content", _fx_content);
+    _o_bool("vectors", _fv_on);
+    if (_fv_on == 1) {
+        var with_vec = 0;
+        if (g != 0) { with_vec = _fx_vec_count(g); }
+        _o_str("vectors_model", _fv_name, strlen(_fv_name));
+        _o_int("vectors_dims", _fv_dims);
+        _o_int("vectors_words", _fv_words);
+        _o_int("vectors_files", with_vec);
+    }
     _o_int("terms", posts);
     _o_bool("terms_truncated", ptrunc);
     _o_int("indexed_at", _fx_indexed_at);

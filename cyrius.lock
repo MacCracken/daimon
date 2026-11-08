@@ -3,7 +3,7 @@ commit	965298dfaa16587ac1835e1ced8482184bd864a6	bayan	https://github.com/MacCrac
 commit	1503109df263d74006ae16f76a4c4209b680a49d	bote-core	https://github.com/MacCracken/bote.git	3.8.15
 commit	f4a31a450a112587d6fcc46a946e1b6061878e6f	libro	https://github.com/MacCracken/libro.git	2.11.3
 commit	40b827f275c452f592e0735b19b0cb47448c2794	majra	https://github.com/MacCracken/majra.git	2.13.0
-commit	aab55de52140a5c68964efa66bf485e30720d35f	nein	https://github.com/MacCracken/nein.git	1.9.1
+commit	30203ec7cf7a6fb4dcbec412b7c8f0fff44904e9	nein	https://github.com/MacCracken/nein.git	1.9.3
 commit	efa2e34aefcb1dc65a01e734b2b19bfe18b10c7f	patra	https://github.com/MacCracken/patra.git	1.16.6
 commit	569e9f8d5fbaffa0d68f0271796da4d72d68588d	sakshi	https://github.com/MacCracken/sakshi.git	2.5.10
 commit	a65f7e4c4f4e08d32c65a6ef09f4a61333cd053b	samay	https://github.com/MacCracken/samay.git	1.5.1
@@ -47,7 +47,7 @@ f38092748e5a9197f7a526e54801fd15fab70d2a04d1c23f4f71003f564fb3d6  lib/keccak.cyr
 df88b5cf68aa94ddd132cf9a71dc23dcdc325bf418cd5d8c9ec99af9c600358e  lib/majra.cyr
 3a85748ee6bf83fe72bb310f21341c97232649def8c6064213da5502d86888f4  lib/math.cyr
 6390e2b0611636af94078acc9a6122eaaeab59b31c5cffe95bbcbc77d89748e5  lib/mmap.cyr
-4808bb8e1c9626a0ed4bb501355c440d69880d864fe76437f86b9a7143fbefbc  lib/nein-mcp.cyr
+78a9c9a9527acf687b0b728d9a262ecbb6eefd35b3ee0615337a37b161899f84  lib/nein-mcp.cyr
 69eb81d777646d1b4dbaf69ebc38cb7ed680231d44cc833eb861978ef2255262  lib/net.cyr
 4a8f6db7d99bbc2934c3d36e8d440e7e004d9d2b6566a2a59066063c623d721d  lib/patra.cyr
 52d8879572df7a9ab0c5d1b97eb1f41799b06e684c01876d8023f04a4c63ee0d  lib/poison.cyr

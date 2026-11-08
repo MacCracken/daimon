@@ -323,7 +323,11 @@ fn _http_reason(status) {
 #   machine. daimon_write_all writes in pieces and yields between them.
 var _http_pipe_fd = 0 - 1;
 var _http_pipe_deadline = 0;
-var HTTP_SEND_MAX_MS = 30000;   # agnos: a socket answer is given up after this
+#ifdef CYRIUS_TARGET_AGNOS
+var HTTP_SEND_MAX_MS = 30000;   # a socket answer is given up after this
+#else
+var HTTP_SEND_MAX_MS = 10000;   # ... and sooner here: while it is written, the loop waits
+#endif
 
 fn http_answer_into_pipe(fd, deadline) {
     _http_pipe_fd = fd;
@@ -353,22 +357,13 @@ fn _http_send_built(fd, status, body_data, body_len) {
     return 0;
 }
 
-# Sandhi-backed shim. Same signature as the pre-sandhi version so
-# every api_* call site stays unchanged. Always emits
-# Content-Type: application/json + Connection: close, matching
-# daimon original behaviour.
+# Always Content-Type: application/json and Connection: close, with X-Trace-Id when
+# `serve --trace` is on. daimon writes it on every target (2.5.6): sandhi's sender is
+# the same bytes with no bound on the whole answer, and a client that reads a trickle
+# of an answer bigger than its socket buffer held the loop for as long as it liked,
+# each write making progress and so restarting SO_SNDTIMEO.
 fn http_send_response(fd, status, body_data, body_len) {
-    #ifdef CYRIUS_TARGET_AGNOS
     return _http_send_built(fd, status, body_data, body_len);
-    #else
-    # Linux names no pipe (a detached child's pipe blocks when full); the test
-    # of the agnos writer does.
-    if (fd == _http_pipe_fd) { return _http_send_built(fd, status, body_data, body_len); }
-    # extra_headers echoes X-Trace-Id when `serve --trace` is on (else 0).
-    sandhi_server_send_response(fd, status, _http_reason(status),
-      "application/json", body_data, body_len, trace_response_header());
-    return 0;
-    #endif
 }
 
 fn http_ok(fd, body) {

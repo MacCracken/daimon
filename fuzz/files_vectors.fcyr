@@ -1,0 +1,212 @@
+# Fuzz: a table of word vectors (2.5.6)
+#
+# Everything here reads text or bytes nobody vetted:
+#   1. _fvb_q16 takes any bytes and answers a number or FVB_BAD;
+#   2. _fvb_take takes any line, whatever the builder's state, with no overrun;
+#   3. files_vectors_build takes any source, and what it writes opens;
+#   4. files_vectors_open takes any file. A table that passes its digest may hold
+#      anything: if it opens, every probe ends, inside the arrays;
+#   5. any question runs over an index with vectors, and leaves no similarity behind.
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/io.cyr"
+include "lib/fs.cyr"
+include "lib/hashmap.cyr"
+include "lib/tagged.cyr"
+include "lib/bayan.cyr"
+include "lib/syscalls.cyr"
+include "lib/chrono.cyr"
+include "lib/sigil.cyr"
+include "lib/net.cyr"
+include "lib/tls.cyr"
+include "lib/sandhi.cyr"
+
+var SEV_INFO = 1;
+var SEV_WARNING = 2;
+var SEV_SECURITY = 5;
+fn daimon_audit(sev, source, action, details) { return 0; }
+
+include "src/syscalls.cyr"
+include "src/error.cyr"
+include "src/files.cyr"
+include "src/files_vectors.cyr"
+include "src/files_search.cyr"
+include "fuzz/rng.cyr"
+
+alloc_init();
+
+var DIR = "build/fuzz_files_vectors";
+var TXT = "build/fuzz_files_vectors/v.txt";
+var TBL = "build/fuzz_files_vectors/v.tbl";
+var BAD = "build/fuzz_files_vectors/b.tbl";
+
+fn join_out(n) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "build/fuzz_files_vectors/m");
+    str_builder_add_int(sb, n % 4);
+    return str_cstr(str_builder_build(sb));
+}
+
+# A real source: words from a small alphabet, 16 numbers each.
+fn source(words) {
+    var sb = str_builder_new();
+    str_builder_add_int(sb, words);
+    str_builder_add_cstr(sb, " 16\n");
+    var i = 0;
+    while (i < words) {
+        str_builder_add_cstr(sb, "word");
+        str_builder_add_int(sb, i);
+        var d = 0;
+        while (d < 16) {
+            str_builder_add_cstr(sb, " ");
+            if (fz_below(2) == 0) { str_builder_add_cstr(sb, "-"); }
+            str_builder_add_cstr(sb, "0.");
+            str_builder_add_int(sb, fz_below(1000));
+            d = d + 1;
+        }
+        str_builder_add_cstr(sb, "\n");
+        i = i + 1;
+    }
+    return str_builder_build(sb);
+}
+
+fn main() {
+    xmkdir_p(DIR, 493);
+    # 1.
+    var n = 0;
+    while (n < 20000) {
+        var len = fz_below(40);
+        var s = fz_bytes(len, 32, 126);
+        _fvb_q16(str_data(s), len);
+        n = n + 1;
+    }
+    # A real table, to work from.
+    var src = source(200);
+    if (file_write_atomic(TXT, str_data(src), str_len(src)) != 0) { sys_exit(1); }
+    if (files_vectors_build(TXT, TBL, 1000, "fuzz") != 0) { sys_exit(2); }
+    if (files_vectors_open(TBL) != 1) { sys_exit(3); }
+    var cap = 1048576;
+    var good = alloc(cap);
+    var good_n = file_read_all(TBL, good, cap);
+    if (good_n <= FV_HDR) { sys_exit(4); }
+    # 2. Noise as a line, with the state the builder would have.
+    _fvb_word = alloc(FX_WORD_MAX + 2);
+    _fvb_dims = 16;
+    _fvb_cap = 64;
+    _fvb_n = 0;
+    _fvb_map_n = 1024;
+    _fvb_q = alloc(16 * 8);
+    _fvb_sums = alloc(64 * 16 * 8);
+    _fvb_terms = alloc(64 * 4);
+    _fvb_ranks = alloc(64 * 4);
+    _fvb_map = alloc(1024 * 4);
+    memset(_fvb_map, 0, 1024 * 4);
+    n = 0;
+    while (n < 20000) {
+        var ll = fz_below(300);
+        var line = fz_bytes(ll, 9, 126);
+        _fvb_take(str_data(line), ll, n + 1);
+        if (_fvb_n > _fvb_cap) { sys_exit(5); }
+        n = n + 1;
+    }
+    # 3. Noise as a source. What is written opens, or the builder said why not.
+    n = 0;
+    while (n < 40) {
+        var t = fz_below(4000);
+        var noise = fz_bytes(t, 9, 126);
+        if (file_write_atomic(BAD, str_data(noise), t) != 0) { sys_exit(6); }
+        var made = join_out(n);
+        if (files_vectors_build(BAD, made, 32, "fuzz") == 0) {
+            if (files_vectors_open(made) != 1) { sys_exit(7); }
+        }
+        n = n + 1;
+    }
+    # 4. A table that lies under a digest it passes, and noise that lies under none.
+    n = 0;
+    while (n < 400) {
+        var c = alloc(good_n);
+        memcpy(c, good, good_n);
+        var flips = fz_below(8) + 1;
+        var i = 0;
+        while (i < flips) {
+            store8(c + FV_HDR + fz_below(good_n - FV_HDR), fz_below(256));
+            i = i + 1;
+        }
+        if (fz_below(8) != 0) {
+            var ctx: i64[18];
+            sha256_init_into(&ctx);
+            sha256_update(&ctx, c + FV_HDR, good_n - FV_HDR);
+            sha256_finalize(&ctx, c + 112);
+        }
+        if (fz_below(16) == 0) { store64(c + 8 * fz_below(3) + 24, fz_next()); }
+        if (file_write_atomic(BAD, c, good_n) != 0) { sys_exit(8); }
+        var st = files_vectors_open(BAD);
+        if ((st != 1) && (st != 0 - 1)) { sys_exit(9); }
+        if (st == 1) {
+            var p = 0;
+            while (p < 2000) {
+                var idx = _fv_find(fz_next() & 0xFFFFFFFF);
+                if (idx >= _fv_words) { sys_exit(10); }
+                p = p + 1;
+            }
+        }
+        n = n + 1;
+    }
+    # 5. An index with vectors, and any question.
+    if (files_vectors_open(TBL) != 1) { sys_exit(11); }
+    files_init();
+    files_set_max(2048);
+    files_set_content(1);
+    files_add_root("/fuzz");
+    files_open("build/fuzz_files_vectors/d");
+    _fx_power_files = vec_new();
+    _fx_want = 0;
+    var g = _fx_active;
+    n = 0;
+    while (n < 800) {
+        var sb2 = str_builder_new();
+        str_builder_add_cstr(sb2, "/fuzz/word");
+        str_builder_add_int(sb2, fz_below(200));
+        str_builder_add_cstr(sb2, "/word");
+        str_builder_add_int(sb2, fz_below(200));
+        str_builder_add_int(sb2, n);
+        str_builder_add_cstr(sb2, ".txt");
+        var pth = str_builder_build(sb2);
+        var rec = _fx_add(g, str_data(pth), str_len(pth), fz_below(1000), 1790000000, 0);
+        if (rec < 0) { sys_exit(12); }
+        _fx_tf_begin();
+        _fx_scan_names(str_data(pth), str_len(pth));
+        _fx_tf_flush(g, rec);
+        _fv_record(g, rec);
+        n = n + 1;
+    }
+    n = 0;
+    while (n < 4000) {
+        var qb = str_builder_new();
+        str_builder_add_cstr(qb, "q=");
+        if (fz_below(2) == 0) {
+            str_builder_add_cstr(qb, "word");
+            str_builder_add_int(qb, fz_below(200));
+        } else {
+            str_builder_add(qb, fz_bytes(fz_below(40), 33, 126));
+        }
+        var f = files_query_parse(str_cstr(str_builder_build(qb)));
+        if (f != 0) {
+            if (load64(f + FX_Q_TEXT) != 0) { files_search_json(f); }
+            if (_s_touched_n != 0) { sys_exit(13); }
+        }
+        n = n + 1;
+    }
+    var clean = 0;
+    while (clean < load64(g + FX_G_N)) {
+        if (load16(_s_cos + clean * 2) != 0) { sys_exit(14); }
+        clean = clean + 1;
+    }
+    return 0;
+}
+
+var r = main();
+fz_done("files_vectors", 44000);

@@ -39,6 +39,7 @@ fn daimon_audit(sev, source, action, details) { _audit_last = action; return 0; 
 include "src/syscalls.cyr"
 include "src/error.cyr"
 include "src/files.cyr"
+include "src/files_vectors.cyr"
 include "src/files_search.cyr"
 
 alloc_init();
@@ -566,6 +567,60 @@ files_status_json();
 assert(holds(out_text(), "\"terms_truncated\":true") == 1, "to a client");
 FILES_POST_PER_CONTENT = per_content;
 files_set_max(4096);
+
+# ⛔ audit R-3: O_NOFOLLOW covers a file's last component only. A directory swapped
+# for a link between the walk and the read is the case it does not. Two files of one
+# size, so the digest path is exercised as well as the content path.
+test_group("a directory swapped for a link after the walk");
+files_set_max(4096);
+var sw_out = abspath("build/files_search_out");
+rm_tree(sw_out);
+xmkdir_p(sw_out, 493);
+var sw_a = "outsidesecret one";
+var sw_b = "outsidesecret two";
+file_write_atomic(str_cstr(path_join(str_from(sw_out), str_from("one.txt"))), sw_a, strlen(sw_a));
+file_write_atomic(str_cstr(path_join(str_from(sw_out), str_from("two.txt"))), sw_b, strlen(sw_b));
+xmkdir_p(in_root("sw"), 493);
+put("sw/one.txt", "harmless words 1");
+put("sw/two.txt", "harmless words 2");
+open_with(1);
+var sw_guard = 0;
+while ((_fx_phase != FX_HASH) && (sw_guard < 2000000)) {
+    files_tick(daimon_now_ms());
+    sw_guard = sw_guard + 1;
+}
+assert_eq(_fx_phase, FX_HASH, "(the walk is done, and nothing has been read)");
+var sw_side = in_root("sw.orig");
+assert_eq(daimon_rename(in_root("sw"), strlen(in_root("sw")), sw_side, strlen(sw_side)), 0, "(the directory moved)");
+assert_eq(sys_symlink(sw_out, in_root("sw")), 0, "(a link in its place)");
+run_job();
+assert_eq(hits("q=outsidesecret"), 0, "⛔ nothing outside a root is read through the link");
+assert_eq(hits("q=harmless"), 0, "(and the files that were there are gone from the words)");
+var sw_st = in_root("sw/one.txt");
+var sw_rec = _fx_find(_fx_active, sw_st, strlen(sw_st));
+assert(sw_rec >= 0, "(the walk recorded it)");
+assert_eq(load64(_fx_rec(_fx_active, sw_rec) + FX_R_DIGEST), 0, "⛔ and no digest was taken through the link");
+sys_unlink(in_root("sw"));
+rm_tree(sw_side);
+rm_tree(sw_out);
+
+test_group("a read below a root with a link above it");
+var sw_real = abspath("build/files_search_real");
+rm_tree(sw_real);
+xmkdir_p(sw_real, 493);
+var sw_alias = abspath("build/files_search_alias");
+sys_unlink(sw_alias);
+assert_eq(sys_symlink(sw_real, sw_alias), 0, "(a link to the real directory)");
+var sw_keep = ROOT;
+ROOT = str_cstr(path_join(str_from(sw_alias), str_from("inner")));
+xmkdir_p(in_root("sub"), 493);
+put("sub/doc.txt", "operatorsparent words");
+open_with(1);
+ROOT = sw_keep;
+run_job();
+assert_eq(hits("q=operatorsparent"), 1, "⛔ a link in the root's own path is the operator's, and allowed");
+rm_tree(sw_real);
+sys_unlink(sw_alias);
 
 rm_tree(abspath("build/files_search_test"));
 syscall(SYS_EXIT, assert_summary());

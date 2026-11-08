@@ -87,6 +87,15 @@ curl -s '127.0.0.1:8090/v1/files?q=quarterly+report'   # a question, ranked. Nam
 `serve --index-content` also searches what files say. That is a second opt-in: anything local can then
 ask whether a file holds a word.
 
+Search can rank by meaning, so `receipt` finds a file about an invoice that never says the word. It needs a table of word
+vectors, which you build once from any GloVe, word2vec or fastText text file:
+
+```bash
+./build/daimon vectors build glove.6B.100d.txt ~/.local/share/daimon/vectors --name glove-6B-100d
+./build/daimon serve --data-dir ~/.local/share/daimon --index-root "$HOME/Documents" --index-content \
+    --index-vectors ~/.local/share/daimon/vectors
+```
+
 ## Run Tests
 
 ```bash
@@ -110,12 +119,12 @@ cyrius bench tests/daimon.bcyr
 
 ```
 src/                  Source: 34 modules, entry src/main.cyr
-tests/*.tcyr          20 test suites, 1881 checks, each including the real src/ module it tests
-tests/smoke.sh        HTTP smoke checks against the built binary (274); runs tests/containment.sh
+tests/*.tcyr          22 test suites, 2172 checks, each including the real src/ module it tests
+tests/smoke.sh        HTTP smoke checks against the built binary (300); runs tests/containment.sh
 tests/agnos/          The AGNOS guest test: sh tests/agnos/run.sh --release boots agnos under QEMU
 tests/aarch64/        The aarch64 VM test: every suite and a smoke of the binary under a real kernel
 tests/daimon.bcyr     Benchmarks (37; tests/rag_ingest.bcyr has 2 more)
-fuzz/                 Property-based fuzz harnesses (9), sharing fuzz/rng.cyr
+fuzz/                 Property-based fuzz harnesses (10), sharing fuzz/rng.cyr
 build/daimon          The binary: 2,636,472 bytes, static; unreachable code removed (2.5.1)
 docs/                 Architecture, guides, ADRs, audit reports, roadmap
 ```

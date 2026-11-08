@@ -290,6 +290,52 @@ fn mcp_find_external_url(reg, name_cstr) {
 }
 
 # Validate a callback URL (basic SSRF protection)
+# The hosts `serve --mcp-callback-host` allows (2.5.6). None means any, as it always
+# has: refusing private addresses by default would break the servers on loopback that
+# are the main use. An operator who wants to say where daimon may forward, says.
+var _mcp_callback_hosts = 0;   # vec of cstr, or 0
+var _mcp_url_arena = 0;        # rewound per check: a forward re-validates, on the loop
+var _mcp_url_buf: u8[2048];
+
+# A bracketed IPv6 address is listed without its brackets, as sandhi stores the host.
+fn mcp_callback_host_add(h) {
+    if (_mcp_callback_hosts == 0) { _mcp_callback_hosts = vec_new(); }
+    var n = strlen(h);
+    if ((n > 2) && (load8(h) == 91) && (load8(h + n - 1) == 93)) {
+        var bare = alloc(n);
+        memcpy(bare, h + 1, n - 2);
+        store8(bare + n - 2, 0);
+        h = bare;
+    }
+    vec_push(_mcp_callback_hosts, h);
+    return 0;
+}
+
+# 1 if the host daimon would connect to is on the list. ⛔ Asked of sandhi's own URL
+# parser, the one the forward uses, and never worked out here: the known way to get
+# past a list like this is a checker and a client that read one URL differently
+# (CVE-2025-68458, CVE-2026-25960). The first version of this function took what
+# follows the last @ as the host. sandhi has no userinfo, so it would have passed
+# `http://evil.test:80@127.0.0.1/` as 127.0.0.1 and then connected to evil.test:80.
+# Compared as written: a name on the list is that name, and implies no address.
+fn _mcp_callback_host_ok(url) {
+    var n = str_len(url);
+    if (n >= 2048) { return 0; }
+    if (_mcp_url_arena == 0) { _mcp_url_arena = arena_allocator_growable(1024); }
+    reset_via(_mcp_url_arena);
+    memcpy(&_mcp_url_buf, str_data(url), n);
+    store8(&_mcp_url_buf + n, 0);
+    var u = sandhi_url_parse_a(_mcp_url_arena, &_mcp_url_buf);
+    if (u == 0) { return 0; }
+    var host = sandhi_url_host(u);
+    var j = 0;
+    while (j < vec_len(_mcp_callback_hosts)) {
+        if (streq(host, vec_get(_mcp_callback_hosts, j)) == 1) { return 1; }
+        j = j + 1;
+    }
+    return 0;
+}
+
 fn validate_callback_url(url) {
     if (url == 0) { return Err(DAIMON_ERR_INVALID_PARAM); }
     if (str_len(url) == 0) { return Err(DAIMON_ERR_INVALID_PARAM); }
@@ -299,7 +345,21 @@ fn validate_callback_url(url) {
             return Err(DAIMON_ERR_INVALID_PARAM);
         }
     }
+    if (_mcp_callback_hosts != 0) {
+        if (_mcp_callback_host_ok(url) == 0) { return Err(DAIMON_ERR_INVALID_PARAM); }
+    }
     return Ok(0);
+}
+
+# What to tell the registrant: an operator's list is a different refusal from a URL
+# that is not http(s).
+fn mcp_callback_reason(url) {
+    if ((url != 0) && (_mcp_callback_hosts != 0)) {
+        if ((str_starts_with(url, str_from("http://")) == 1) || (str_starts_with(url, str_from("https://")) == 1)) {
+            return str_from("callback_url's host is not one this daimon may forward to (serve --mcp-callback-host)");
+        }
+    }
+    return str_from("invalid callback_url (must be http:// or https://)");
 }
 
 fn mcp_deregister(reg, name_cstr) {

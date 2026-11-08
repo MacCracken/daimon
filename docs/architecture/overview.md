@@ -136,9 +136,14 @@ main.cyr             CLI: serve [port] [--async] [--trace] [--agents-dir DIR] [-
 │   ├── duplicates         Same size, then a whole SHA-256 of the whole content
 │   ├── meta               Tags, ratings, saved queries: a synced journal under <data_dir>/files
 │   └── files_query_parse  Query-string text, shared by GET /v1/files and smart folders
+├── files_vectors.cyr (2.5.6, ADR-010) A table of word vectors: ranking by meaning. Off with no --index-vectors
+│   ├── files_vectors_open  The table, checked before anything trusts it
+│   ├── _fv_record          One file's vector, from the words the walk already read
+│   └── files_vectors_build `daimon vectors build`: text word vectors into a table
 ├── files_search.cyr (2.5.5, ADR-010) A question in words, answered with ranked files
 │   ├── postings           (term << 32) | (record << 8) | byte, grouped in place by bucket
 │   ├── _fx_read_slice     Names, and with --index-content the start of each file; only what changed
+│   ├── _s_vec_stage       The question against every file's vector; who stands out (2.5.6)
 │   └── _s_run             BM25 in integers over a question's buckets; facets; why it matched
 └── server.cyr       Server lifecycle
     ├── rate_check         120 requests a minute per IP, a fixed window; one shared bucket for
@@ -207,7 +212,7 @@ Every AGNOS agent (over the HTTP API and, once started by daimon, its channel on
 
 ## Key Design Decisions
 
-1. **Single compilation unit, multi-file source** — `src/main.cyr` `include`s 33 per-domain `src/*.cyr` modules. Cyrius flattens the includes into one global scope and compiles in one pass; no separate library crate. The 1.2.8 split kept the monolith's source order; later modules came with their features (`mcp_builtin.cyr` / `audit.cyr` at 1.3.0, `secmem.cyr` at 1.3.2, `trace.cyr` at 1.3.3, `syscalls.cyr` at 2.1.6, `sched.cyr` at 2.3.1). At 2.5.5 `src/` is 15,151 lines; the largest modules are `files.cyr` (2,308), `agent.cyr` (1,683) and `server.cyr` (1,244).
+1. **Single compilation unit, multi-file source** — `src/main.cyr` `include`s 34 per-domain `src/*.cyr` modules. Cyrius flattens the includes into one global scope and compiles in one pass; no separate library crate. The 1.2.8 split kept the monolith's source order; later modules came with their features (`mcp_builtin.cyr` / `audit.cyr` at 1.3.0, `secmem.cyr` at 1.3.2, `trace.cyr` at 1.3.3, `syscalls.cyr` at 2.1.6, `sched.cyr` at 2.3.1). At 2.5.6 `src/` is 16,298 lines; the largest modules are `files.cyr` (2,414), `agent.cyr` (1,683) and `files_search.cyr` (1,387).
 2. **daimon's own event loop, sandhi's HTTP** (2.3.4, ADR-006) — `server_loop` owns accept and reads (one thread, epoll). Requests are framed, smuggling-checked and answered with sandhi's public functions, as sandhi's own loops did through 2.3.3. `serve --async` is accepted and runs the same loop. On AGNOS (2.4.0, ADR-007) the loop polls instead of waiting on epoll, and yields with `pause`. Single trust domain.
 3. **Bump allocator** — fast allocation, no individual free. Single trust domain (see VULN-007 security gate for multi-tenant). So upkeep on the loop's tick must not allocate: `agents_tick` allocates nothing, idle or with a live agent (measured at 2.4.2).
 4. **Everything is i64** — Cyrius type system. Structs are manually laid out with `alloc()` + `store64()`/`load64()` at fixed offsets.

@@ -74,8 +74,28 @@ fn _l_join(a, b) {
     memcpy(&_l_cmd + n, b, strlen(b) + 1);
     return &_l_cmd;
 }
-var d = _l_run(_l_join("/bin/daimon serve --agents-dir /agents --data-dir /d --index-root /agents ",
-    "--index-content --index-max 4096 --tron-policy /d/p"));
+# 2.5.6: past SPAWN_LINE_MAX (127 bytes) the line form answers -6, so this one goes as
+# an argv, which holds 1024.
+var _l_blob: u8[320];
+fn _l_run_argv(line) {
+    var n = strlen(line);
+    var i = 0;
+    while (i <= n) {
+        var c = load8(line + i);
+        if (c == 32) { c = 0; }
+        store8(&_l_blob + i, c);
+        i = i + 1;
+    }
+    var pid = sys_spawn_argv(&_l_blob, n + 1, 0, 0, 0);
+    _l_put("LAUNCHER started ");
+    _l_put(line);
+    _l_put(" as pid ");
+    fmt_int(pid);
+    _l_put("\n");
+    return pid;
+}
+var d = _l_run_argv(_l_join("/bin/daimon serve --agents-dir /agents --data-dir /d --index-root /agents ",
+    "--index-content --index-max 4096 --index-vectors /d/v --tron-policy /d/p"));
 _l_wait_ms(1500);
 var c = _l_run("/bin/client");
 if (c >= 0) { _l_report("client", _l_wait_exit(c, 120000)); }

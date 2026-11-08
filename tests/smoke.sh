@@ -1068,8 +1068,121 @@ fx_stop
 fx_serve --index-root "$FX_ROOT2" --index-content
 fx_has "⛔ a question is answered at once after a restart" "$(fx_get '?q=settled')" '"total":1'
 fx_stop
+
+# 2.5.6: by meaning, from a table of word vectors. acme.txt never says "receipt".
+FX_ROOT3="$FX_DIR/root3"
+mkdir -p "$FX_ROOT3"
+printf 'invoice due net thirty' > "$FX_ROOT3/acme.txt"
+printf 'airline boarding at the gate' > "$FX_ROOT3/trip.txt"
+printf 'noodles and sauce' > "$FX_ROOT3/sunday.txt"
+FX_VEC="$FX_DIR/vectors.txt"
+{
+    printf '12 8\n'
+    printf 'the 0.3 0.3 0.3 0.3 0.3 0.3 0.3 0.3\n'
+    printf 'invoice 0.9 0.8 0.1 0.0 0.1 0.0 0.0 0.0\n'
+    printf 'invoices 0.9 0.8 0.1 0.0 0.1 0.0 0.0 0.0\n'
+    printf 'receipt 0.8 0.9 0.0 0.1 0.0 0.1 0.0 0.0\n'
+    printf 'flight 0.0 0.1 0.9 0.8 0.0 0.0 0.1 0.0\n'
+    printf 'airline 0.1 0.0 0.8 0.9 0.0 0.1 0.0 0.0\n'
+    printf 'boarding 0.0 0.0 0.7 0.8 0.1 0.0 0.0 0.1\n'
+    printf 'noodles 0.0 0.0 0.1 0.0 0.9 0.8 0.0 0.0\n'
+    printf 'sauce 0.1 0.0 0.0 0.0 0.8 0.9 0.1 0.0\n'
+    printf 'zebra 0.0 0.0 0.0 0.0 0.0 0.1 0.9 0.8\n'
+    printf 'filler -0.6 0.3 -0.3 0.6 0.1 -0.6 0.3 -0.3\n'
+    printf 'other 0.6 -0.3 0.1 -0.6 0.3 0.6 -0.3 0.1\n'
+} > "$FX_VEC"
+fx_has "the builder says what it made" "$(./build/daimon vectors build "$FX_VEC" "$FX_DIR/v.tbl" --name smoke-table)" 'words of 8 dimensions'
+fx_code "the builder writes a table" "$(test -s "$FX_DIR/v.tbl"; echo $?)" 0
+fx_has "⛔ an absent table stops serve, by name" "$(timeout 5 ./build/daimon serve $FX_PORT --index-vectors "$FX_DIR/nope" 2>&1)" 'no such file'
+printf 'not a table' > "$FX_DIR/bad.tbl"
+fx_has "⛔ a damaged one stops it too, saying so" "$(timeout 5 ./build/daimon serve $FX_PORT --index-vectors "$FX_DIR/bad.tbl" 2>&1)" 'damaged'
+fx_serve --index-root "$FX_ROOT3" --index-content --index-vectors "$FX_DIR/v.tbl"
+fx_code "with a table it comes to fresh" "$(fx_fresh; echo $?)" 0
+fx_has "the index says what it was built with" "$(fx_get /index)" '"vectors_model":"smoke-table"'
+fx_has "... and how many files have one" "$(fx_get /index)" '"vectors_files":3'
+FX_Q=$(fx_get '?q=receipt')
+fx_has "⛔ a file that never says the word is found" "$FX_Q" "$FX_ROOT3/acme.txt"
+fx_has "⛔ ... and why, in words that are true" "$FX_Q" 'Close in meaning to the question ('
+fx_hasnt "⛔ ... never that it contains it" "$FX_Q" 'Contains'
+fx_hasnt "⛔ ... and a file about something else is not" "$FX_Q" "$FX_ROOT3/trip.txt"
+fx_has "⛔ the answer says it ranked by meaning" "$FX_Q" '"method":"vector + words + name","vectors":"smoke-table","local":true'
+fx_has "a question it cannot read says words" "$(fx_get '?q=qqqqzz')" '"method":"words + name"'
+fx_stop
+fx_serve --index-root "$FX_ROOT3" --index-content --index-vectors "$FX_DIR/v.tbl"
+fx_has "⛔ by meaning at once after a restart" "$(fx_get '?q=receipt')" "$FX_ROOT3/acme.txt"
+fx_stop
 rm -rf "$FX_DIR"
 if [ $FX_OK -ne 1 ]; then echo "  file index smoke FAILED"; SMOKE_EXIT=1; fi
+
+echo "=== 2.5.6 a relayed MCP error, and the callback host list ==="
+# An external server answers a JSON-RPC error over HTTP 200, the usual way to refuse
+# a call. It reaches the caller as MCP's isError result.
+RE_OK=1
+re_has() {
+    printf "  %s: " "$1"
+    if printf '%s' "$2" | grep -qF "$3"; then echo "PASS"; else echo "FAIL (no '$3' in: $(printf '%s' "$2" | cut -c1-200))"; RE_OK=0; fi
+}
+re_hasnt() {
+    printf "  %s: " "$1"
+    if printf '%s' "$2" | grep -qF "$3"; then echo "FAIL (found '$3')"; RE_OK=0; else echo "PASS"; fi
+}
+if command -v python3 >/dev/null 2>&1; then
+    RE_DIR=$(mktemp -d)
+    cat > "$RE_DIR/err_mcp.py" <<'PY'
+import json, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_POST(self):
+        req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
+        body = json.dumps({"jsonrpc": "2.0", "id": req.get("id"), "error": {"code": -32601,
+            "message": "no such \"tool\" here"}}).encode()
+        self.send_response(200); self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+PY
+    python3 "$RE_DIR/err_mcp.py" 18098 >/dev/null 2>&1 &
+    RE_UP=$!
+    sleep 0.3
+    ./build/daimon serve 18099 --data-dir "$RE_DIR/d1" >/dev/null 2>&1 &
+    RE_SRV=$!
+    i=0
+    while [ $i -lt 25 ] && ! curl -s --max-time 1 http://127.0.0.1:18099/v1/health >/dev/null 2>&1; do i=$((i + 1)); sleep 0.1; done
+    curl -s --max-time 2 -X POST http://127.0.0.1:18099/v1/mcp/tools \
+        -d '{"name":"rpcerr","description":"d","callback_url":"http://127.0.0.1:18098/x"}' >/dev/null
+    RE_OUT=$(curl -s --max-time 5 -w ' HTTP=%{http_code}' -X POST http://127.0.0.1:18099/v1/mcp/call -d '{"name":"rpcerr","arguments":{}}')
+    re_has "a JSON-RPC error over HTTP 200 reaches the caller as a result" "$RE_OUT" 'HTTP=200'
+    re_has "⛔ ... marked an error" "$RE_OUT" '"isError":true'
+    re_has "⛔ ... in a text block MCP defines" "$RE_OUT" '"type":"text"'
+    re_hasnt "⛔ ... not the type it was through 2.5.5" "$RE_OUT" 'text/plain'
+    re_has "... with the upstream's words, escaped" "$RE_OUT" 'no such \"tool\" here'
+    re_has "... and its code" "$RE_OUT" '"code":-32601'
+    curl -s --max-time 2 -X POST http://127.0.0.1:18099/v1/mcp/resources \
+        -d '{"uri":"x://y","name":"n","description":"d","mimeType":"text/plain","callback_url":"http://127.0.0.1:18098/x"}' >/dev/null
+    RE_OUT=$(curl -s --max-time 5 -w ' HTTP=%{http_code}' -X POST http://127.0.0.1:18099/v1/mcp/resources/read -d '{"uri":"x://y"}')
+    re_has "⛔ a forwarded read keeps the server's code" "$RE_OUT" '"code":-32601'
+    re_has "... and its words" "$RE_OUT" 'no such \"tool\" here'
+    re_has "... answered 502, as the guide says" "$RE_OUT" 'HTTP=502'
+    kill $RE_SRV 2>/dev/null; wait $RE_SRV 2>/dev/null
+
+    ./build/daimon serve 18099 --data-dir "$RE_DIR/d2" --mcp-callback-host 127.0.0.1 >/dev/null 2>&1 &
+    RE_SRV=$!
+    i=0
+    while [ $i -lt 25 ] && ! curl -s --max-time 1 http://127.0.0.1:18099/v1/health >/dev/null 2>&1; do i=$((i + 1)); sleep 0.1; done
+    RE_REG=$(curl -s --max-time 2 -w ' HTTP=%{http_code}' -X POST http://127.0.0.1:18099/v1/mcp/tools \
+        -d '{"name":"elsewhere","description":"d","callback_url":"http://localhost:18098/x"}')
+    re_has "⛔ a host not on the operator's list is refused" "$RE_REG" 'HTTP=400'
+    re_has "... saying it is the list" "$RE_REG" 'serve --mcp-callback-host'
+    RE_REG=$(curl -s --max-time 2 -w ' HTTP=%{http_code}' -X POST http://127.0.0.1:18099/v1/mcp/tools \
+        -d '{"name":"here","description":"d","callback_url":"http://127.0.0.1:18098/x"}')
+    re_has "a host on it is taken" "$RE_REG" 'HTTP=201'
+    kill $RE_SRV 2>/dev/null; wait $RE_SRV 2>/dev/null
+    kill $RE_UP 2>/dev/null; wait $RE_UP 2>/dev/null
+    rm -rf "$RE_DIR"
+else
+    echo "  SKIP: python3 is not installed"
+fi
+if [ $RE_OK -ne 1 ]; then echo "  relayed error smoke FAILED"; SMOKE_EXIT=1; fi
 
 echo "=== 2.4.2 agent containment (a cgroup per agent) ==="
 # tests/containment.sh: a stop reaches a process that left the agent's group, an

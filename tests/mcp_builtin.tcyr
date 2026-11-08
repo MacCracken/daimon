@@ -1,0 +1,104 @@
+# =========================================================================
+# mcp_builtin — tests against THE REAL src/mcp_builtin.cyr (2.5.6)
+#
+# Which builtins answer on the loop and which in a child, and the gate that decides
+# whether a nein tool runs. Against nein's own tool table and classes, so a change in
+# how nein classifies a tool is seen here.
+# =========================================================================
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/syscalls.cyr"
+include "lib/io.cyr"
+include "lib/fs.cyr"
+include "lib/hashmap.cyr"
+include "lib/tagged.cyr"
+include "lib/bayan.cyr"
+include "lib/net.cyr"
+include "lib/mmap.cyr"
+include "lib/dynlib.cyr"
+include "lib/fdlopen.cyr"
+include "lib/tls.cyr"
+include "lib/sandhi.cyr"
+include "lib/args.cyr"
+include "lib/chrono.cyr"
+include "lib/fnptr.cyr"
+include "lib/math.cyr"
+include "lib/process.cyr"
+include "lib/async.cyr"
+include "lib/thread.cyr"
+include "lib/callback.cyr"
+include "lib/assert.cyr"
+include "lib/freelist.cyr"
+include "lib/ct.cyr"
+include "lib/keccak.cyr"
+include "lib/random.cyr"
+include "lib/slice.cyr"
+include "lib/thread_local.cyr"
+include "lib/ws_server.cyr"
+include "lib/sync.cyr"
+include "lib/sakshi.cyr"
+include "lib/sigil.cyr"
+include "lib/libro.cyr"
+include "lib/majra.cyr"
+include "lib/bote-core_bote.cyr"
+include "lib/nein-mcp.cyr"
+
+var SEV_INFO = 1;
+var SEV_WARNING = 2;
+var SEV_SECURITY = 5;
+var _audit_last = 0;
+var _audit_n = 0;
+fn daimon_audit(sev, source, action, details) {
+    _audit_last = action;
+    _audit_n = _audit_n + 1;
+    return 0;
+}
+fn daimon_audit_chain() { return 0; }
+
+include "src/error.cyr"
+include "src/mcp.cyr"
+include "src/mcp_builtin.cyr"
+
+alloc_init();
+
+test_group("what waits, and what answers on the loop");
+assert_eq(mcp_builtin_waits("web_fetch"), 1, "bote's web tools wait on the network");
+assert_eq(mcp_builtin_waits("web_search"), 1, "both of them");
+assert_eq(mcp_builtin_waits("libro_export"), 0, "the audit tools answer from memory");
+assert_eq(mcp_builtin_waits("no_such_tool"), 0, "an unknown name does not");
+
+test_group("nein's live readers, refused");
+assert_eq(_nein_live_reads_enabled, 0, "(off, the default)");
+assert_eq(mcp_builtin_waits("nein_status"), 0, "⛔ a reader that will be refused answers on the loop");
+assert_eq(mcp_builtin_waits("nein_list"), 0, "(nein_list)");
+assert_eq(mcp_builtin_waits("nein_diff"), 0, "(nein_diff)");
+_audit_n = 0;
+assert(daimon_nein_gate("nein_status", 0) != NEIN_GATE_PERMIT, "the gate refuses it");
+assert_eq(_audit_n, 1, "⛔ and that is audited, on the loop");
+assert_streq(_audit_last, "nein.gate.deny", "(as nein.gate.deny)");
+
+test_group("nein's live readers, opened by an operator");
+_nein_live_reads_enabled = 1;
+assert_eq(mcp_builtin_waits("nein_status"), 1, "⛔ a permitted reader waits on nft, in a child");
+assert_eq(mcp_builtin_waits("nein_list"), 1, "(nein_list)");
+assert_eq(mcp_builtin_waits("nein_diff"), 1, "(nein_diff)");
+assert_eq(daimon_nein_gate("nein_status", 0), NEIN_GATE_PERMIT, "the gate permits it");
+assert_eq(mcp_builtin_waits("nein_validate"), 0, "⛔ the offline tool is never one of them");
+assert_eq(mcp_builtin_waits("nein_allow"), 0, "⛔ nor a tool that changes the firewall");
+assert_eq(mcp_builtin_waits("nein_deny"), 0, "(nein_deny)");
+assert_eq(mcp_builtin_waits("web_fetch"), 1, "(the web tools are unchanged)");
+assert_eq(mcp_builtin_waits("no_such_tool"), 0, "(an unknown name is unchanged)");
+_nein_live_reads_enabled = 0;
+
+test_group("the gate's other answers");
+assert_eq(daimon_nein_gate("nein_validate", 0), NEIN_GATE_PERMIT, "the offline tool always runs");
+_audit_n = 0;
+assert(daimon_nein_gate("nein_allow", 0) != NEIN_GATE_PERMIT, "⛔ a mutating tool stays refused");
+assert_eq(_audit_n, 1, "... audited");
+assert(daimon_nein_gate("no_such_tool", 0) != NEIN_GATE_PERMIT, "⛔ what it cannot classify is denied");
+
+syscall(SYS_EXIT_GROUP, assert_summary());

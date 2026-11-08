@@ -58,7 +58,7 @@ fn api_mcp_register(fd, body) {
     # contract (sandhi_rpc_mcp_call requires an http:// or https:// URL).
     if (is_err_result(validate_callback_url(url)) == 1) {
         daimon_audit(SEV_SECURITY, "mcp", "mcp.register.reject", "callback_url failed http(s) validation");
-        http_bad_request(fd, str_from("invalid callback_url (must be http:// or https://)"));
+        http_bad_request(fd, mcp_callback_reason(url));
         return 0;
     }
     # Read the optional MCP inputSchema (verbatim object text, {} if absent).
@@ -223,6 +223,8 @@ fn api_mcp_call(fd, body) {
         store64(bw + 8, args);
         # web_fetch / web_search wait on the network: a child answers (2.3.4).
         if (mcp_builtin_waits(name_c) == 1) {
+            # A child's memory is a copy, so what must be recorded is recorded here.
+            if (is_nein_tool(name_c) == 1) { daimon_audit(SEV_INFO, "mcp", "nein.live.read", name_c); }
             if (server_detach(&_mcp_builtin_answer, bw) == 1) { return 0; }
         }
         return _mcp_builtin_answer(fd, bw);
@@ -269,6 +271,19 @@ fn _mcp_builtin_answer(fd, bw) {
 
 # api_mcp_call's external half: forward to the registered endpoint and
 # translate its answer. fw = {url, body}.
+# The server's message from a JSON-RPC error, decoded, or 0. sandhi's accessor answers the
+# value as it stands in the JSON, escapes and all, and escaping that again doubled every
+# backslash a client read back.
+fn _mcp_rpc_error_message(resp) {
+    var body = sandhi_rpc_body(resp);
+    if (body == 0) { return 0; }
+    var root = http_body_json(str_from(body));
+    if (root == 0) { return 0; }
+    var err = bayan_json_v_obj_get_by_cstr(root, "error");
+    if (err == 0) { return 0; }
+    return http_json_str(err, "message");
+}
+
 fn _mcp_call_forward(fd, fw) {
     var url = load64(fw);
     var body = load64(fw + 8);
@@ -279,6 +294,26 @@ fn _mcp_call_forward(fd, fw) {
     trace_span_enter("mcp.forward", 11);
     var resp = trace_mcp_forward(str_cstr(url), str_cstr(body));
     trace_span_exit();
+    # A JSON-RPC error first: sandhi counts one as a failed call (sandhi_rpc_ok is 0, on
+    # any HTTP status), so through 2.5.5 this branch never ran and each became a 502.
+    var ec = sandhi_rpc_mcp_error_code(resp);
+    if (ec != 0) {
+        # JSON-RPC error envelope — return the MCP isError shape with
+        # the upstream error message embedded.
+        var em2 = _mcp_rpc_error_message(resp);
+        var sbm = str_builder_new();
+        str_builder_add_cstr(sbm, "{\"content\":[{\"type\":\"text\",\"text\":\"");
+        if (em2 != 0) {
+            str_builder_add(sbm, json_escape_str(em2));
+        } else {
+            str_builder_add_cstr(sbm, "upstream MCP error");
+        }
+        str_builder_add_cstr(sbm, "\"}],\"isError\":true,\"code\":");
+        str_builder_add_int(sbm, ec);
+        str_builder_add_cstr(sbm, "}");
+        http_ok(fd, str_builder_build(sbm));
+        return 0;
+    }
     if (sandhi_rpc_ok(resp) == 0) {
         # Transport-level failure — connect / TLS / timeout / non-2xx.
         # Map to 502 with the upstream error message.
@@ -289,24 +324,6 @@ fn _mcp_call_forward(fd, fw) {
         str_builder_add_cstr(sbe, "\"}");
         var bbody = str_builder_build(sbe);
         http_send_response(fd, 502, str_data(bbody), str_len(bbody));
-        return 0;
-    }
-    var ec = sandhi_rpc_mcp_error_code(resp);
-    if (ec != 0) {
-        # JSON-RPC error envelope — return the MCP isError shape with
-        # the upstream error message embedded.
-        var em2 = sandhi_rpc_mcp_error_message(resp);
-        var sbm = str_builder_new();
-        str_builder_add_cstr(sbm, "{\"content\":[{\"type\":\"text/plain\",\"text\":\"");
-        if (em2 != 0) {
-            str_builder_add(sbm, json_escape_str(str_from(em2)));
-        } else {
-            str_builder_add_cstr(sbm, "upstream MCP error");
-        }
-        str_builder_add_cstr(sbm, "\"}],\"isError\":true,\"code\":");
-        str_builder_add_int(sbm, ec);
-        str_builder_add_cstr(sbm, "}");
-        http_ok(fd, str_builder_build(sbm));
         return 0;
     }
     # Success — pass the `result` value through as the response body.
@@ -364,6 +381,21 @@ fn _mcp_forward_one_answer(fd, w) {
     trace_span_enter("mcp.forward", 11);
     var resp = trace_mcp_forward_method(str_cstr(url), method_cstr, body);
     trace_span_exit();
+    # The JSON-RPC error first, as api_mcp_call's half does and for the same reason.
+    var ec = sandhi_rpc_mcp_error_code(resp);
+    if (ec != 0) {
+        var em2 = _mcp_rpc_error_message(resp);
+        var sbm = str_builder_new();
+        str_builder_add_cstr(sbm, "{\"error\":\"");
+        if (em2 != 0) { str_builder_add(sbm, json_escape_str(em2)); }
+        else { str_builder_add_cstr(sbm, "upstream MCP error"); }
+        str_builder_add_cstr(sbm, "\",\"code\":");
+        str_builder_add_int(sbm, ec);
+        str_builder_add_cstr(sbm, "}");
+        var bm = str_builder_build(sbm);
+        http_send_response(fd, 502, str_data(bm), str_len(bm));
+        return 0;
+    }
     if (sandhi_rpc_ok(resp) == 0) {
         var em = sandhi_rpc_err_message(resp);
         var sbe = str_builder_new();
@@ -372,19 +404,6 @@ fn _mcp_forward_one_answer(fd, w) {
         str_builder_add_cstr(sbe, "\"}");
         var bb = str_builder_build(sbe);
         http_send_response(fd, 502, str_data(bb), str_len(bb));
-        return 0;
-    }
-    var ec = sandhi_rpc_mcp_error_code(resp);
-    if (ec != 0) {
-        var em2 = sandhi_rpc_mcp_error_message(resp);
-        var sbm = str_builder_new();
-        str_builder_add_cstr(sbm, "{\"error\":\"");
-        if (em2 != 0) { str_builder_add(sbm, json_escape_str(str_from(em2))); }
-        else { str_builder_add_cstr(sbm, "upstream MCP error"); }
-        str_builder_add_cstr(sbm, "\",\"code\":");
-        str_builder_add_int(sbm, ec);
-        str_builder_add_cstr(sbm, "}");
-        http_send_response(fd, 502, str_data(str_builder_build(sbm)), str_len(str_builder_build(sbm)));
         return 0;
     }
     var rr = sandhi_rpc_mcp_result_raw(resp);
@@ -501,7 +520,7 @@ fn api_mcp_resource_register(fd, body) {
     if (url == 0) { http_bad_request(fd, str_from("missing callback_url")); return 0; }
     if (is_err_result(validate_callback_url(url)) == 1) {
         daimon_audit(SEV_SECURITY, "mcp", "mcp.resource.register.reject", "callback_url failed http(s) validation");
-        http_bad_request(fd, str_from("invalid callback_url (must be http:// or https://)"));
+        http_bad_request(fd, mcp_callback_reason(url));
         return 0;
     }
     var rr_t, rr_v = mcp_register_resource_external(_mcp_resources, mcp_resource_new(uri, name, desc, mime), url);
@@ -535,7 +554,7 @@ fn api_mcp_prompt_register(fd, body) {
     if (url == 0) { http_bad_request(fd, str_from("missing callback_url")); return 0; }
     if (is_err_result(validate_callback_url(url)) == 1) {
         daimon_audit(SEV_SECURITY, "mcp", "mcp.prompt.register.reject", "callback_url failed http(s) validation");
-        http_bad_request(fd, str_from("invalid callback_url (must be http:// or https://)"));
+        http_bad_request(fd, mcp_callback_reason(url));
         return 0;
     }
     # arguments is a nested ARRAY — the typed engine, never the flat jget scanner.

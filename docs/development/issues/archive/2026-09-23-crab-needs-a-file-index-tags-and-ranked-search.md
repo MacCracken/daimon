@@ -1,18 +1,29 @@
 # crab needs a file index, per-file tags and ranked file search — and daimon has no surface for any of them
 
-**Status:** 🟡 **M7 (items 1–4) shipped in daimon 2.5.4. M8 (item 5) shipped in 2.5.5 by words, not by meaning, so this
-stays open.** `/v1/files` answers paths, tags, ratings, smart folders and ranked questions, survives a restart, and
-reaches a GUI client on agnos in bounded pages (`docs/guides/api.md`, `docs/adr/010-file-index.md`). The filing also asks
-for a local embedding, and faults RAG for not ranking by meaning. No local embedding model exists to do that, so
-`invoices` finds `invoice`, and `receipt` does not, and `cost.method` says `words + name`, where the canvas says
-*"vector + name match"*. ⚠ What crab should read before building on it:
-- **It is off unless the operator passes `serve --index-root`**, and reading file contents for search is a second
-  opt-in, `--index-content`, because the API has no caller authentication until 2.6.x.
-- *"no external service · index stays on device"* is true: no byte leaves daimon.
-- `why` is built from what matched: *"Contains "paid" and "invoices"; its name or folder has "invoices""*. It will not
-  say *"a paid stamp"* unless the question did.
+**Status:** ✅ **RESOLVED in daimon 2.5.6.** M7 (items 1–4) shipped in 2.5.4. M8 (item 5) shipped by words in 2.5.5 and **by
+meaning in 2.5.6**: with `serve --index-vectors`, `receipt` finds a file that says `invoice` and never `receipt`, and
+`cost.method` says `vector + words + name`, where the canvas says *"vector + name match"*. Measured on real GloVe vectors over
+6,005 files. Against *What would close it* below: `/v1/files` is documented and answers file identities crab can turn into
+paths (`docs/guides/api.md`, `docs/adr/010-file-index.md`); the index, tags, ratings and saved queries survive a restart; and
+it reaches a GUI client on agnos in bounded pages, where the guest test ranks by meaning on the released kernel. Item 5's
+ranks, reasons, folders, facets, duplicates, cost and saved questions all shipped, and the embedding is local. ⚠ What crab
+should read before building on it:
+- **Meaning needs a table the operator supplies**, and none ships with agnos yet. Without one, search is by words and says
+  so. `daimon vectors build` makes one from any GloVe, word2vec or fastText text file; getting one onto an agnos image is
+  a packaging step that has not been done.
+- **It is word vectors, not a sentence model.** A file's vector is the weighted sum of its words', so it knows what a file
+  is about, and nothing about word order. *"a paid stamp"* is closer to `paid` and `stamp` than to a stamped invoice.
+- **It is off unless the operator passes `serve --index-root`**, and reading file contents is a second opt-in,
+  `--index-content`, because the API has no caller authentication until 2.6.x. Without it a file's vector comes from its
+  name and folder.
+- *"no external service · index stays on device"* is true, with a table as without: no byte leaves daimon. The table is a
+  file; nothing is called.
+- `why` is built from what matched: *"Contains "paid"; close in meaning to the question (0.55)"*. It will not say
+  *"a paid stamp"* unless the question did.
 - `Pauses on battery` holds on Linux. On agnos `power` is `unknown` and a walk runs (filed with agnos, 2026-11-06).
 - The canvas defines no smart folder, so "Large & old" and "Raw only" are daimon's reading. A saved query replaces either.
+- The canvas's *"Index · embedding new files 31% · 251 / 812"* is `progress` in `GET /v1/files/index`: `phase` is `embed`,
+  and `total` is the files left to read.
 *(Was: 🔴 OPEN.)* This filing states what crab has to be able to ask and get back, and the constraints the answer has to fit.
 **Filed:** 2026-09-23, by crab (the AGNOS file manager), at the daimon 2.1.4 → 2.4.3 pin move —
 the first pin at which daimon builds and runs on agnos.
@@ -23,7 +34,7 @@ persisted, disk-wide view of files.
 
 ## Thank you, and what the agnos build did and did not unblock
 
-[`archive/2026-09-14-daimon-does-not-build-for-agnos.md`](archive/2026-09-14-daimon-does-not-build-for-agnos.md)
+[`2026-09-14-daimon-does-not-build-for-agnos.md`](2026-09-14-daimon-does-not-build-for-agnos.md)
 is resolved, and crab re-derived that rather than reading it: at 2.4.3, `cyrius build --agnos
 src/main.cyr` is **0 errors** (one unreachable `sys_dup2` warning), and the 2.4.3 commit's CI job
 **"AGNOS guest test — Guest test on the released agnos kernel" passed**.
@@ -156,6 +167,6 @@ Item 5 (M8) can be a later daimon release; it is crab's release after M7.
 - crab `docs/development/roadmap.md` § M7 and § M8 — what the index is for, and what it must not
   require.
 - crab's copy of this filing: `crab/docs/development/issues/2026-09-23-daimon-has-no-file-index-tags-or-ranked-search.md`.
-- [`archive/2026-09-14-daimon-does-not-build-for-agnos.md`](archive/2026-09-14-daimon-does-not-build-for-agnos.md) — the predecessor.
+- [`2026-09-14-daimon-does-not-build-for-agnos.md`](2026-09-14-daimon-does-not-build-for-agnos.md) — the predecessor.
 - `docs/guides/api.md`; `src/memory.cyr` (the KNOWN GAP note); `src/rag.cyr`.
 - mneme `README.md` — `/v1/rag/*` and `/v1/knowledge/*`.

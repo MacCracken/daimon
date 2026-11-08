@@ -62,6 +62,12 @@ that outlives a restart, under `serve --data-dir` (default `/var/lib/agnos`, cre
   one it could not open. Do not name a root that crosses a trust boundary, such as `/home` on a
   shared machine with daimon running as root. See
   [the 2.5.4 audit](docs/audit/2026-11-06-tool-pins-and-file-index-audit.md).
+- **A table of word vectors** (`serve --index-vectors`, 2.5.6) is a file daimon parses and trusts no further than its
+  checks. It is not signed: whoever can replace it can change how files rank, and read nothing. Keep it where only
+  the operator can write. No byte of a file leaves daimon because of it. See
+  [the 2.5.6 audit](docs/audit/2026-11-08-word-vectors-and-serving-audit.md).
+- **External MCP servers.** With no `serve --mcp-callback-host`, a caller can register any http or https address,
+  loopback and private ones included, and daimon relays what it answers. List your servers where that matters.
 
 ## Disclosure
 

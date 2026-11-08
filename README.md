@@ -31,8 +31,9 @@ Rust. AGNOS is its primary target; it also runs on Linux, x86_64 and aarch64.
 - **File index** (2.5.4), off unless the operator names a root with `serve --index-root`. An index of
   the files under it, built in the background, with tags, ratings, duplicates by content, and saved
   queries with counts, all surviving a restart. A question in words answers with ranked files and why
-  each matched (2.5.5): by name, and by content with `--index-content`. It ranks by words, not meaning,
-  and stays on the machine ([ADR-010](docs/adr/010-file-index.md)).
+  each matched (2.5.5): by name, and by content with `--index-content`. Given a table of word vectors
+  (`--index-vectors`, 2.5.6) it ranks by meaning as well, so `receipt` finds an invoice. It stays on the
+  machine: the table is a file, and nothing is called ([ADR-010](docs/adr/010-file-index.md)).
 - **Audit trail.** daimon records its lifecycle and security events on a hash-linked
   [libro](https://github.com/MacCracken/libro) chain, which the `libro_*` tools query, verify and
   export.
@@ -94,10 +95,10 @@ Each tagged release publishes:
 
 ```bash
 sh tests/test.sh                    # every suite, the HTTP smoke and the fuzz harnesses
-cyrius test tests                   # every suite in tests/: 1881 checks, 20 files
+cyrius test tests                   # every suite in tests/: 2172 checks, 22 files
 cyrius fuzz                         # 7 property-based harnesses, 176,349 generated cases
 cyrius bench tests/daimon.bcyr      # 28 benchmarks, one only where agents can be contained (+2 in tests/rag_ingest.bcyr)
-sh tests/smoke.sh                   # the linked binary over HTTP, 274 checks: libro, tracing, regressions,
+sh tests/smoke.sh                   # the linked binary over HTTP, 300 checks: libro, tracing, regressions,
                                     # the agent lifecycle, the bind address, task start/complete,
                                     # request-string decoding, agent channels and messages,
                                     # the event loop, hosts and origins, captured output,

@@ -4,8 +4,8 @@
 >
 > **Severity legend**: **P0** blocking (security / correctness — must-fix before ship) · **P1** high (must-have for the current arc) · **P2** medium (schedule when capacity opens) · **P3 / Low** nice-to-have, no urgency. Upstream-blocker items quote the upstream tracker's own severity.
 
-**Where daimon stands** — `2.5.5`, cyrius 6.7.18, every dependency at its latest release (bote 3.8.15,
-nein 1.9.1). It builds for x86_64, aarch64 and AGNOS, and CI runs the suites, the HTTP smoke and the
+**Where daimon stands** — `2.5.6`, cyrius 6.7.18, every dependency at its latest release (bote 3.8.15,
+nein 1.9.3). It builds for x86_64, aarch64 and AGNOS, and CI runs the suites, the HTTP smoke and the
 fuzz harnesses on Linux, every suite and the binary's smoke on a real aarch64 kernel, and the AGNOS
 guest test on agnos 1.57.17.
 - Agents are registered, started under their limits, stopped, paused, resumed and deleted through
@@ -17,7 +17,8 @@ guest test on agnos 1.57.17.
   the audit chain is refused until it does (2.6.x).
 - Each MCP tool's first definition is pinned across restarts, and a change is marked and audited.
 - With `--index-root`, daimon holds an index of the files there, with tags, ratings and smart folders, and
-  answers a question in words with ranked files (names, and content with `--index-content`).
+  answers a question in words with ranked files (names, and content with `--index-content`), and by
+  meaning given a table of word vectors (`--index-vectors`).
 
 ## The releases ahead
 
@@ -27,7 +28,7 @@ Each line is a release train, not a single release. One bite at a time, suite gr
 |---|---|---|---|
 | **2.6.x** | **Caller identity and MCP authentication** | P1 | Every gated tool, the memory API and task reporting wait on it, and 3.0.0 needs it to know what a tenant is. |
 | **2.7.x** | **Adopting agnos 1.57.7** — limits, pause and resume, captured output, one write per answer | P2 | agnos closed every gap daimon filed; daimon still runs its interims. Independent of 2.6.x. |
-| **2.8.x** | **Serving hardening** — the leads 2.4.4 – 2.5.2 left, bote's consumer audit | P2 | Bounded, measurable items; none blocks another. |
+| **2.8.x** | **Serving hardening** — what 2.5.6 left | P2 | Bounded, measurable items; none blocks another. |
 | **2.9.x** | **Modules without a route** — federation, screen capture, the memory API | P3 | The memory API needs 2.6.x. |
 | **3.0.0** | **Per-agent arena isolation** (VULN-007's open half) | P0 when any gate below opens | Changes the allocation model under every agent. Needs 2.6.x. |
 
@@ -90,6 +91,7 @@ Still to adopt, each verified in the guest test:
 | `sock-send-and-connect-hold-the-cpu` (P1 for daimon) | answers written 512 bytes at a time, 1 ms apart | measure a whole-answer write on the pinned kernel under a CPU quota; one write per answer if it holds |
 | `tcp-server-cannot-be-loopback-only` | loopback-only listener (2.4.4), one rate-limit bucket for every client | per-client rate limiting, if agnos gives a peer address |
 | `no-way-to-read-the-power-source` (filed 2026-11-06, **open** in agnos) | `power` is `unknown`, and a file walk runs on battery | an agnos arm in `_fx_power_find`, once a source exists |
+| a digest through a swapped directory (2.5.4 audit R-3; closed on Linux in 2.5.6) | agnos has only `O_NOFOLLOW`, so a directory swapped for a link after the walk can have a file outside a root read | an `openat2` peer in agnos |
 | `inbound-tcp-syn-dropped-by-isr-drain`, `socket-ids-have-no-owner` | nothing in daimon | re-measure accept from the host; close audit AG-1 and AG-8 |
 
 Nothing to change in daimon for `sleep-ms-holds-the-cpu`, `sock-recv-never-reports-eof-after-peer-fin`
@@ -97,30 +99,18 @@ and `tsc-calibration-refused-stops-the-us-clock` (`daimon_now_ms` stays for olde
 
 ## 2.8.x · P2 — Serving hardening
 
-- [ ] **A whole-answer deadline for writes on Linux** (2.4.4). An answer goes through sandhi's
-  `sock_send_all` or daimon's `_srv_send_all`, both bounded per write by `SO_SNDTIMEO`, so a local
-  client that reads a trickle of an answer larger than its socket buffer holds the loop while each
-  write makes progress. Not measured.
-- [ ] **External MCP callback URLs** (bote's consumer audit, Medium). A registration's `callback_url`
-  is checked for its scheme only, so daimon forwards calls wherever a caller points it, loopback
-  and private addresses included. Local MCP servers on loopback are the main use, so this needs a
-  policy (an allow-list, or the operator's), not bote's `web_fetch` guard as it is.
-- [ ] **The relayed-error envelope** (bote's consumer audit, Medium): what an external server's error
-  answer may put into daimon's reply.
-- [ ] **The agent-frame arena** (2.5.1 lead, not measured). `_ipc_arena` is the stdlib's growable
-  arena, which bote found keeps a new chunk for each allocation larger than any before (filed with
-  cyrius by bote, 2026-11-02). Frames are capped at 64 KB and the arena is rewound per frame, so
-  growth should stop at a high-water mark: measure it with frames of rising size.
+- [ ] **An answer that does not hold the loop at all** (2.5.6's lead). Since 2.5.6 an answer a client will not take is
+  given up after 10 s, and one write offers at most 64 KB, so a slow reader's cost is bounded. It is not gone: for up to
+  those 10 s the loop waits on that client. Non-blocking writes, queued per connection and driven by `EPOLLOUT`.
+- [ ] **Which callback hosts are allowed by default** (bote's consumer audit, Medium). `serve --mcp-callback-host` (2.5.6)
+  lets an operator say. With none, any http(s) host is allowed, loopback and private addresses included, and daimon
+  relays what it answers. Local MCP servers on loopback are the main use, so a default that refuses them breaks working
+  setups: decide it with caller identity (2.6.x), when who may register is known.
+- [ ] **The vector pass on the loop at the largest sizes** (2.5.6). See `BENCHMARKS.md`: it is linear in files times
+  dimensions, and an operator with 262,144 files and a 300-dimension table pays for that on each question. Defer or slice
+  it if anyone does.
 - [ ] **The request-body parse cost** (2.5.1). bayan 1.11's bounds-checked parser made
   `http_body_read3` 47% slower (1.30 → 1.91 µs). Upstream's; re-measure at each bayan move.
-- [ ] **nein's live readers on the loop.** If an operator sets `_nein_live_reads_enabled`, each call
-  waits on `nft` on the loop, up to 60 s since nein 1.8.2. Detach them (`mcp_builtin_waits`), with
-  the gate's audit entry made before the child is forked.
-- [ ] **A digest through a swapped directory** (2.5.4 audit R-3). `O_NOFOLLOW` covers a file's final
-  component, so a directory replaced by a link after the walk can have a file outside a root read for
-  its digest. `openat2(RESOLVE_NO_SYMLINKS)` closes it on Linux; agnos would need a peer.
-- [ ] P3: CI resolves with `cyrius deps --no-lock` then `--verify`; `cyrius deps --locked` (cyrius
-  6.7.6) checks the resolve against the lock in one step. Rehearse it in CI's own steps first.
 
 ## 2.9.x · P3 — Modules without a route
 
@@ -142,10 +132,13 @@ prerequisite. Needs 2.6.x to know what a tenant is.
 
 Severity assigned when one is scheduled.
 
-- [ ] **Ranking files by meaning.** 2.5.5's search ranks by words: `receipt` does not find `invoice`. Meaning
-  needs a local embedding model, and none exists to run (mneme's embedder is a stub, hoosh forwards to Ollama).
-  With one, a vector beside each file's postings; share it with mneme, whose README names `/v1/knowledge/*`,
-  which no route serves.
+- [ ] **A table of word vectors on an agnos image.** 2.5.6 ranks by meaning given one, and the guest test proves it on the
+  real kernel with a small fixture. Nothing puts a real one on a machine: a recipe, and a decision about which one.
+- [ ] **Ranking files by a sentence model.** 2.5.6's word vectors know what a file is about, not what it says. A sentence
+  model would mean running one locally; none exists to run on agnos. Share whatever comes of it with mneme, whose README
+  names `/v1/knowledge/*`, which no route serves.
+- [ ] A breaking `2.x` → `3.0.0` item: drop the non-standard `code` from a relayed tool error (bote's consumer audit). Kept
+  in 2.5.6 because it is documented and a client may read it.
 - [ ] Search inside PDFs and office files, which 2.5.5 finds by name alone.
 - [ ] jnana integration — grounded knowledge queries backed by verified AGNOS science data
 - [ ] gRPC transport option alongside HTTP

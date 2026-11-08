@@ -1,0 +1,620 @@
+# =========================================================================
+# files_vectors — tests against THE REAL src/files_vectors.cyr (2.5.6)
+#
+# crab's M8: a question answered by meaning, from a table of word vectors. A real
+# table built by the real builder from a fixture whose geometry is known, a real
+# walk, and real answers. Each ranking check names a file that does NOT contain the
+# word asked for: that is the whole point, and a word match would pass it otherwise.
+# =========================================================================
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/io.cyr"
+include "lib/fs.cyr"
+include "lib/hashmap.cyr"
+include "lib/tagged.cyr"
+include "lib/bayan.cyr"
+include "lib/syscalls.cyr"
+include "lib/chrono.cyr"
+include "lib/sigil.cyr"
+include "lib/net.cyr"
+include "lib/tls.cyr"
+include "lib/sandhi.cyr"
+include "lib/assert.cyr"
+
+fn holds(hay, needle) {
+    if (strstr(hay, needle) >= 0) { return 1; }
+    return 0;
+}
+
+var SEV_INFO = 1;
+var SEV_WARNING = 2;
+var SEV_SECURITY = 5;
+var _audit_last = 0;
+fn daimon_audit(sev, source, action, details) { _audit_last = action; return 0; }
+
+include "src/syscalls.cyr"
+include "src/error.cyr"
+include "src/files.cyr"
+include "src/files_vectors.cyr"
+include "src/files_search.cyr"
+
+alloc_init();
+files_set_max(4096);
+
+var ROOT = 0;
+var DATA = 0;
+var BASE = 0;
+var V_SRC = 0;
+var V_TBL = 0;
+var V_TBL2 = 0;
+
+fn abspath(rel) {
+    var cwd = alloc(1024);
+    assert(syscall(SYS_GETCWD, cwd, 1000) > 0, "(getcwd)");
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, cwd);
+    str_builder_add_cstr(sb, "/");
+    str_builder_add_cstr(sb, rel);
+    return str_data(str_builder_build(sb));
+}
+
+fn join(dir, rel) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, dir);
+    str_builder_add_cstr(sb, "/");
+    str_builder_add_cstr(sb, rel);
+    return str_data(str_builder_build(sb));
+}
+
+fn put(rel, text) {
+    var p = join(ROOT, rel);
+    assert_eq(file_write_atomic(p, text, strlen(text)), 0, "(fixture written)");
+    return p;
+}
+
+fn rm_tree(p) {
+    if (is_dir(str_from(p)) != 1) { return 0; }
+    var names = dir_list(str_from(p));
+    var i = 0;
+    while (i < vec_len(names)) {
+        var full = str_cstr(path_join(str_from(p), vec_get(names, i)));
+        if (is_dir(str_from(full)) == 1) { rm_tree(full); }
+        else { sys_unlink(full); }
+        i = i + 1;
+    }
+    sys_rmdir(p);
+    return 0;
+}
+
+fn forget() {
+    _fx_enabled = 0;
+    _fx_dir = 0;
+    _fx_phase = FX_IDLE;
+    _fx_want = 0;
+    _fx_want_path = 0;
+    _fx_paused = 0;
+    _fx_active = 0;
+    _fx_generation = 0;
+    _fx_indexed_at = 0;
+    _fx_persisted = 0;
+    _fx_next_at = 0;
+    _fx_meta_skipped = 0;
+    _fx_meta_failed = 0;
+    _fx_journal_bytes = 0;
+    _fx_content = 0;
+    files_init();
+    return 0;
+}
+
+fn open_with(content) {
+    forget();
+    files_set_content(content);
+    files_add_root(ROOT);
+    files_open(DATA);
+    _fx_power_files = vec_new();
+    return 0;
+}
+
+fn run_job() {
+    var i = 0;
+    while (files_busy() == 1) {
+        files_tick(daimon_now_ms());
+        i = i + 1;
+        if (i > 2000000) { assert(0 == 1, "a job ended"); return 0; }
+    }
+    return i;
+}
+
+fn q(text) {
+    var f = files_query_parse(text);
+    assert(f != 0, "(the query parses)");
+    return f;
+}
+
+fn search(text) {
+    files_list_json(q(text));
+    var v = bayan_json_v_parse(str_new(files_out(), files_out_len()));
+    assert(v != 0, "the answer is JSON");
+    return v;
+}
+
+fn member(v, key) { return bayan_json_v_obj_get_by_cstr(v, key); }
+fn jint(v, key) { return bayan_json_v_int(member(v, key)); }
+fn jstr(v, key) { return str_cstr(bayan_json_v_str(member(v, key))); }
+fn row(v, i) { return bayan_json_v_arr_get(member(v, "files"), i); }
+fn rows(v) { return bayan_json_v_arr_len(member(v, "files")); }
+fn out_text() {
+    var b = alloc(files_out_len() + 1);
+    memcpy(b, files_out(), files_out_len());
+    store8(b + files_out_len(), 0);
+    return b;
+}
+
+fn row_named(v, tail) {
+    var i = 0;
+    while (i < rows(v)) {
+        var r = row(v, i);
+        if (holds(jstr(r, "path"), tail) == 1) { return r; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# --- the fixture ----------------------------------------------------------
+#
+# Eight dimensions, three topics, in frequency order: finance on the first two axes,
+# travel on the next two, cooking on the next. `swap` trades `receipt` and `flight`,
+# to make a second table where receipt means travel.
+
+var GROUPS = 0;
+fn fixture(path, swap) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "60 8\n");
+    str_builder_add_cstr(sb, "the 0.3 0.3 0.3 0.3 0.3 0.3 0.3 0.3\n");
+    var a = "0.9 0.8 0.1 0.0 0.1 0.0 0.0 0.0";
+    var b = "0.8 0.9 0.0 0.1 0.0 0.1 0.0 0.0";
+    var c = "0.7 0.7 0.1 0.1 0.0 0.0 0.1 0.0";
+    var d = "0.0 0.1 0.9 0.8 0.0 0.0 0.1 0.0";
+    var e = "0.1 0.0 0.8 0.9 0.0 0.1 0.0 0.0";
+    var f = "0.0 0.0 0.7 0.8 0.1 0.0 0.0 0.1";
+    if (swap == 1) {
+        var t = b;
+        b = d;
+        d = t;
+    }
+    str_builder_add_cstr(sb, "invoice "); str_builder_add_cstr(sb, a); str_builder_add_cstr(sb, "\n");
+    str_builder_add_cstr(sb, "invoices "); str_builder_add_cstr(sb, a); str_builder_add_cstr(sb, "\n");
+    str_builder_add_cstr(sb, "receipt "); str_builder_add_cstr(sb, b); str_builder_add_cstr(sb, "\n");
+    str_builder_add_cstr(sb, "payment "); str_builder_add_cstr(sb, c); str_builder_add_cstr(sb, "\n");
+    str_builder_add_cstr(sb, "flight "); str_builder_add_cstr(sb, d); str_builder_add_cstr(sb, "\n");
+    str_builder_add_cstr(sb, "airline "); str_builder_add_cstr(sb, e); str_builder_add_cstr(sb, "\n");
+    str_builder_add_cstr(sb, "boarding "); str_builder_add_cstr(sb, f); str_builder_add_cstr(sb, "\n");
+    str_builder_add_cstr(sb, "noodles 0.0 0.0 0.1 0.0 0.9 0.8 0.0 0.0\n");
+    str_builder_add_cstr(sb, "sauce 0.1 0.0 0.0 0.0 0.8 0.9 0.1 0.0\n");
+    str_builder_add_cstr(sb, "recipe 0.0 0.1 0.0 0.1 0.7 0.8 0.0 0.0\n");
+    str_builder_add_cstr(sb, "zebra 0.0 0.0 0.0 0.0 0.0 0.1 0.9 0.8\n");
+    str_builder_add_cstr(sb, "don't 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5\n");
+    str_builder_add_cstr(sb, "short 0.5 0.5\n");
+    str_builder_add_cstr(sb, "broken 0.1 nan 0.1 0.1 0.1 0.1 0.1 0.1\n");
+    # Filler in every direction, so the common direction is the fixture's, not one topic's.
+    var i = 0;
+    while (i < 40) {
+        str_builder_add_cstr(sb, "filler");
+        str_builder_add_cstr(sb, str_cstr(str_from_int(i)));
+        var j = 0;
+        while (j < 8) {
+            var v = (i * 7 + j * 3) % 5;
+            if (v == 0) { str_builder_add_cstr(sb, " -0.6"); }
+            elif (v == 1) { str_builder_add_cstr(sb, " -0.3"); }
+            elif (v == 2) { str_builder_add_cstr(sb, " 0.1"); }
+            elif (v == 3) { str_builder_add_cstr(sb, " 0.3"); }
+            else { str_builder_add_cstr(sb, " 0.6"); }
+            j = j + 1;
+        }
+        str_builder_add_cstr(sb, "\n");
+        i = i + 1;
+    }
+    var text = str_builder_build(sb);
+    assert_eq(file_write_atomic(path, str_data(text), str_len(text)), 0, "(the source written)");
+    return 0;
+}
+
+fn wvec(w) {
+    var n = strlen(w);
+    var b = alloc(n + 1);
+    memcpy(b, w, n + 1);
+    var m = _fx_stem(b, n);
+    var i = _fv_find(_fx_term(b, m));
+    assert(i >= 0, "(the word is in the table)");
+    if (i < 0) { return 0; }
+    return _fv_vec + i * _fv_dims;
+}
+
+fn sim(a, b) { return _fv_dot(wvec(a), wvec(b), _fv_dims); }
+
+# The whole of a file, for the tampering tests.
+var _copy_len = 0;
+fn read_file(p) {
+    var cap = 4194304;
+    var b = alloc(cap);
+    _copy_len = file_read_all(p, b, cap);
+    assert(_copy_len > 0, "(read back)");
+    return b;
+}
+
+fn write_file(p, b, n) { assert_eq(file_write_atomic(p, b, n), 0, "(written)"); return 0; }
+
+# Put the body's real digest into the header: a file made well enough to pass it.
+fn redigest(b, n) {
+    var ctx: i64[18];
+    sha256_init_into(&ctx);
+    sha256_update(&ctx, b + FV_HDR, n - FV_HDR);
+    sha256_finalize(&ctx, b + 112);
+    return 0;
+}
+
+BASE = abspath("build/files_vectors_test");
+rm_tree(BASE);
+xmkdir_p(BASE, 493);
+ROOT = join(BASE, "root");
+DATA = join(BASE, "data");
+xmkdir_p(ROOT, 493);
+xmkdir_p(DATA, 493);
+V_SRC = join(BASE, "vectors.txt");
+V_TBL = join(BASE, "vectors.tbl");
+V_TBL2 = join(BASE, "vectors2.tbl");
+var BAD = join(BASE, "bad.tbl");
+
+# --- numbers --------------------------------------------------------------
+test_group("_fv_isqrt");
+assert_eq(_fv_isqrt(0), 0, "of zero");
+assert_eq(_fv_isqrt(1), 1, "of one");
+assert_eq(_fv_isqrt(15), 3, "rounds down");
+assert_eq(_fv_isqrt(16), 4, "exact");
+assert_eq(_fv_isqrt(1 << 40), 1 << 20, "large");
+assert_eq(_fv_isqrt(0 - 5), 0, "of a negative: none");
+
+test_group("_fvb_q16");
+fn num(s) { return _fvb_q16(s, strlen(s)); }
+assert_eq(num("1"), 65536, "a whole number");
+assert_eq(num("-0.5"), 0 - 32768, "a negative fraction");
+assert_eq(num("+0.25"), 16384, "a leading plus");
+assert_eq(num("1e-2"), 655, "an exponent");
+assert_eq(num("1.5E+1"), 983040, "a capital exponent with a plus");
+assert_eq(num("3."), 196608, "a trailing point");
+assert_eq(num(".5"), 32768, "no whole part");
+assert_eq(num("0.038194"), 2503, "as GloVe writes them");
+assert_eq(num("0.0000000000000000000001"), 0, "too small to matter is nothing");
+assert_eq(num("nan"), FVB_BAD, "⛔ nan refused");
+assert_eq(num("inf"), FVB_BAD, "⛔ inf refused");
+assert_eq(num(""), FVB_BAD, "nothing refused");
+assert_eq(num("-"), FVB_BAD, "a sign alone refused");
+assert_eq(num("1.2.3"), FVB_BAD, "two points refused");
+assert_eq(num("1e"), FVB_BAD, "an exponent with no digits refused");
+assert_eq(num("1e99999"), FVB_BAD, "too large refused");
+assert_eq(num("12x"), FVB_BAD, "trailing junk refused");
+
+# --- the builder ----------------------------------------------------------
+test_group("files_vectors_build");
+fixture(V_SRC, 0);
+assert_eq(files_vectors_build(V_SRC, V_TBL, 1000, "fixture"), 0, "builds");
+fixture(join(BASE, "other.txt"), 1);
+assert_eq(files_vectors_build(join(BASE, "other.txt"), V_TBL2, 1000, "other"), 0, "builds a second");
+assert_eq(files_vectors_build(join(BASE, "nope"), V_TBL, 1000, "x"), 1, "no source refused");
+assert_eq(files_vectors_build(V_SRC, V_TBL, 0, "x"), 1, "--top 0 refused");
+assert_eq(files_vectors_build(V_SRC, V_TBL, 1000, ""), 1, "an empty name refused");
+assert_eq(files_vectors_build(V_SRC, V_TBL, 1000, "not\tprintable"), 1, "a control character in a name refused");
+write_file(BAD, "just some words here\n", 21);
+assert_eq(files_vectors_build(BAD, join(BASE, "x.tbl"), 1000, "x"), 1, "too few numbers on a line refused");
+
+# --- the table ------------------------------------------------------------
+test_group("files_vectors_open");
+assert_eq(files_vectors_open(join(BASE, "absent")), 0, "⛔ absent is 0");
+assert_eq(files_vectors_on(), 0, "(and nothing is on)");
+write_file(BAD, "garbage that is far too short", 29);
+assert_eq(files_vectors_open(BAD), 0 - 1, "⛔ short is -1, not 0");
+assert_eq(files_vectors_open(V_TBL), 1, "a good one opens");
+assert_eq(files_vectors_on(), 1, "and is on");
+assert_eq(files_vectors_dims(), 8, "its dimensions");
+assert_streq(files_vectors_name(), "fixture", "its name");
+# the, invoice(+invoices), receipt, payment, flight, airline, boarding, noodles, sauce,
+# recipe, zebra, 40 fillers. don't, short and broken are set aside.
+assert_eq(files_vectors_words(), 11 + 40, "⛔ forms merged, unreadable lines set aside");
+
+var good = read_file(V_TBL);
+var good_n = _copy_len;
+
+fn tampered(off, byte, fix) {
+    var c = alloc(good_n);
+    memcpy(c, good, good_n);
+    store8(c + off, byte);
+    if (fix == 1) { redigest(c, good_n); }
+    write_file(BAD, c, good_n);
+    return files_vectors_open(BAD);
+}
+
+assert_eq(tampered(0, 88, 0), 0 - 1, "a wrong magic");
+assert_eq(tampered(24, 0, 0), 0 - 1, "dimensions of 0");
+assert_eq(tampered(24, 7, 0), 0 - 1, "too few dimensions");
+assert_eq(tampered(good_n - 1, 1, 0), 0 - 1, "⛔ a flipped byte fails the digest");
+assert_eq(tampered(48, 7, 0), 0 - 1, "a control character in the name");
+write_file(BAD, good, good_n - 1);
+assert_eq(files_vectors_open(BAD), 0 - 1, "⛔ truncated");
+var longer = alloc(good_n + 8);
+memcpy(longer, good, good_n);
+write_file(BAD, longer, good_n + 8);
+assert_eq(files_vectors_open(BAD), 0 - 1, "⛔ bytes left over");
+
+# Well-formed enough to pass its own digest. A probe trusts what these check.
+var slots = load64(good + 40);
+var empty_slot = 0;
+while (load32(good + FV_HDR + empty_slot * 4) != 0) { empty_slot = empty_slot + 1; }
+var filled_slot = 0;
+while (load32(good + FV_HDR + filled_slot * 4) == 0) { filled_slot = filled_slot + 1; }
+
+fn with_u32(off, v) {
+    var c = alloc(good_n);
+    memcpy(c, good, good_n);
+    store32(c + off, v);
+    redigest(c, good_n);
+    write_file(BAD, c, good_n);
+    return files_vectors_open(BAD);
+}
+
+assert_eq(with_u32(FV_HDR + filled_slot * 4, 1000000), 0 - 1, "⛔ a slot past the words, under a valid digest");
+assert_eq(with_u32(FV_HDR + empty_slot * 4, 1), 0 - 1, "⛔ more slots used than words");
+assert_eq(with_u32(FV_HDR + slots * 4 + files_vectors_words() * 4, 0), 0 - 1, "⛔ a word with no weight");
+
+fn with_i64(off, v) {
+    var c = alloc(good_n);
+    memcpy(c, good, good_n);
+    store64(c + off, v);
+    write_file(BAD, c, good_n);
+    return files_vectors_open(BAD);
+}
+assert_eq(with_i64(40, slots + 1), 0 - 1, "slots not a power of two");
+assert_eq(with_i64(40, 1 << 40), 0 - 1, "⛔ slots so large the sizes would wrap");
+assert_eq(with_i64(32, 1 << 40), 0 - 1, "⛔ words so large the sizes would wrap");
+assert_eq(files_vectors_on(), 1, "(a refusal leaves the good table on)");
+assert_eq(files_vectors_open(V_TBL), 1, "(reopened)");
+
+# --- meaning --------------------------------------------------------------
+test_group("word vectors");
+assert(sim("invoice", "receipt") > FV_FULL / 2, "⛔ receipt is near invoice");
+assert(sim("invoice", "invoices") > FV_FULL - 1000, "a plural is its singular");
+assert(sim("flight", "airline") > FV_FULL / 2, "airline is near flight");
+assert(sim("invoice", "noodles") < FV_FULL / 4, "⛔ noodles are not");
+assert(sim("flight", "sauce") < FV_FULL / 4, "⛔ nor is a sauce a flight");
+assert(sim("invoice", "invoice") > FV_FULL - FV_FULL / 16, "⛔ a word is itself: unit length after quantizing");
+assert_eq(_fv_find(_fx_term("nonesuch", 8)), 0 - 1, "a word it lacks");
+
+test_group("_fv_dot");
+var va = alloc(16);
+var vb = alloc(16);
+var di = 0;
+while (di < 16) { store8(va + di, 128 + 100); store8(vb + di, 128 - 100); di = di + 1; }
+assert_eq(_fv_dot(va, va, 16), 160000, "with itself, eight at a time and the rest");
+assert_eq(_fv_dot(va, vb, 16), 0 - 160000, "⛔ the bias is taken out");
+assert_eq(_fv_dot(va, va, 13), 130000, "a length that does not divide by eight");
+
+# --- files ----------------------------------------------------------------
+put("acme.txt", "invoice due net thirty invoice");
+put("store-slip.txt", "payment made in full");
+put("trip.txt", "airline boarding at gate");
+put("sunday.txt", "noodles and sauce for dinner");
+put("zoo.txt", "zebra zebra");
+put("empty.txt", "");
+put("nonsense.txt", "qqqqqq wwwwww");
+
+test_group("a walk with a table");
+open_with(1);
+run_job();
+files_status_json();
+var st = out_text();
+assert(holds(st, "\"vectors\":true") == 1, "⛔ the status says it is on");
+assert(holds(st, "\"vectors_model\":\"fixture\"") == 1, "and what it is");
+assert(holds(st, "\"vectors_dims\":8") == 1, "its dimensions");
+assert(holds(st, "\"vectors_files\":5") == 1, "⛔ the files with a known word: not the empty one or the nonsense");
+
+test_group("a question by meaning");
+var r1 = search("q=receipt");
+assert_streq(jstr(member(r1, "cost"), "method"), "vector + words + name", "⛔ it says how");
+assert_streq(jstr(member(r1, "cost"), "vectors"), "fixture", "with what");
+assert_eq(load8(member(member(r1, "cost"), "local")) != 0, 1, "and that it is local");
+var acme = row_named(r1, "/acme.txt");
+assert(acme != 0, "⛔ a file that never says the word is found");
+if (acme != 0) {
+    assert(holds(jstr(acme, "why"), "Close in meaning to the question (0.") == 1, "⛔ and says why");
+    assert_eq(holds(jstr(acme, "why"), "Contains"), 0, "⛔ never that it contains the word");
+    assert(jint(acme, "rank") <= 2, "and ranks at the top");
+}
+assert_eq(row_named(r1, "/sunday.txt"), 0, "⛔ what is about something else is not");
+assert_eq(row_named(r1, "/zoo.txt"), 0, "nor the zebra");
+
+var r2 = search("q=airline+ticket");
+assert(row_named(r2, "/trip.txt") != 0, "a topic");
+assert_eq(row_named(r2, "/acme.txt"), 0, "and only that topic");
+
+test_group("words and meaning together");
+var r3 = search("q=noodles");
+assert(rows(r3) >= 1, "(an answer)");
+assert(holds(jstr(row(r3, 0), "path"), "/sunday.txt") == 1, "⛔ a file with the word and the meaning comes first");
+assert(holds(jstr(row(r3, 0), "why"), "Contains \\\"noodles\\\"; close in meaning") == 1
+  || holds(jstr(row(r3, 0), "why"), "Contains \"noodles\"; close in meaning") == 1, "and says both");
+assert_eq(row_named(r3, "/acme.txt"), 0, "⛔ a file far from the question is not admitted");
+
+test_group("a question the table cannot read");
+var r4 = search("q=zzqqzz");
+assert_streq(jstr(member(r4, "cost"), "method"), "words + name", "⛔ it says words, because that is what ran");
+assert_eq(jint(r4, "total"), 0, "and finds nothing");
+assert_eq(member(member(r4, "cost"), "vectors"), 0, "and names no table");
+
+test_group("the filters still filter");
+var r5 = search("q=receipt&under=/nowhere");
+assert_eq(jint(r5, "total"), 0, "a filter that excludes everything");
+var r6 = search(str_cstr(str_cat(str_from("q=receipt&under="), str_from(ROOT))));
+assert(row_named(r6, "/acme.txt") != 0, "and one that does not");
+
+test_group("how little it takes to count as close");
+var low = sim("sauce", "zebra");
+assert(low > 0, "(the fixture has two words slightly toward each other)");
+assert(low < FV_FULL / 4, "(and less than the floor)");
+assert_eq(row_named(search("q=sauce"), "/zoo.txt"), 0, "⛔ a little similar is not close, and is not called close");
+
+test_group("a word match counts, with or without a vector");
+# odd.txt holds a word the table does not have, so it has no vector and only its word.
+put("odd.txt", "zzqqzz zzqqzz");
+files_request(0);
+run_job();
+var r_odd = search("q=zzqqzz+invoice");
+assert_streq(jstr(member(r_odd, "cost"), "method"), "vector + words + name", "(the question has a vector)");
+var odd_row = row_named(r_odd, "/odd.txt");
+assert(odd_row != 0, "(the word finds it)");
+if (odd_row != 0) {
+    assert(jint(odd_row, "score") > 0, "⛔ a word match is worth something beside the meanings");
+    assert(holds(jstr(odd_row, "why"), "Contains") == 1, "and says so");
+    assert_eq(holds(jstr(odd_row, "why"), "meaning"), 0, "⛔ and claims no meaning it has no vector for");
+}
+sys_unlink(join(ROOT, "odd.txt"));
+files_request(0);
+run_job();
+
+test_group("nothing is left behind");
+var g0 = _fx_active;
+var ci = 0;
+var dirty = 0;
+while (ci < load64(g0 + FX_G_N)) {
+    if (load16(_s_cos + ci * 2) != 0) { dirty = dirty + 1; }
+    ci = ci + 1;
+}
+assert_eq(dirty, 0, "⛔ no similarity outlives its question");
+
+test_group("what it costs");
+var fq = q("q=invoice");
+_s_parse(load64(fq + FX_Q_TEXT), clock_epoch_secs());
+var used_q = alloc_used();
+var loops = 0;
+while (loops < 200) {
+    _s_touched_n = 0;
+    _s_vec_stage(_fx_active);
+    _s_clear();
+    loops = loops + 1;
+}
+assert_eq(alloc_used() - used_q, 0, "⛔ comparing every file allocates nothing");
+
+var used0 = alloc_used();
+var w = 0;
+while (w < 5) {
+    files_request(0);
+    run_job();
+    w = w + 1;
+}
+assert_eq(alloc_used() - used0, 0, "⛔ re-walks allocate nothing, vectors included");
+
+test_group("an unchanged file keeps its vector");
+var before = _fx_text_read;
+var vbase = load64(_fx_active + FX_G_VEC);
+var one = _fx_find(_fx_active, join(ROOT, "acme.txt"), strlen(join(ROOT, "acme.txt")));
+assert(one >= 0, "(found)");
+var saved = alloc(8);
+memcpy(saved, vbase + one * 8, 8);
+files_request(0);
+run_job();
+assert_eq(_fx_text_read, before, "⛔ nothing was read again");
+var one2 = _fx_find(_fx_active, join(ROOT, "acme.txt"), strlen(join(ROOT, "acme.txt")));
+assert_eq(memeq(load64(_fx_active + FX_G_VEC) + one2 * 8, saved, 8), 1, "⛔ the same vector");
+assert(row_named(search("q=receipt"), "/acme.txt") != 0, "and it is still found");
+
+test_group("a changed file gets a new one");
+syscall(SYS_NANOSLEEP, "\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", 0);
+put("store-slip.txt", "noodles and sauce and recipe notes");
+files_request(0);
+run_job();
+var r7 = search("q=receipt");
+assert_eq(row_named(r7, "/store-slip.txt"), 0, "⛔ what it was about no longer finds it");
+assert(row_named(search("q=recipe"), "/store-slip.txt") != 0, "⛔ what it is about now does");
+put("store-slip.txt", "payment made in full");
+files_request(0);
+run_job();
+
+test_group("progress is about what is left to read");
+files_request(0);
+_fx_want = 1;
+var seen_phase = 0;
+var ticks = 0;
+syscall(SYS_NANOSLEEP, "\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", 0);
+put("trip.txt", "airline boarding at gate two");
+files_request(0);
+while ((files_busy() == 1) && (ticks < 2000000)) {
+    files_tick(daimon_now_ms());
+    if (_fx_phase == FX_READ) {
+        files_status_json();
+        seen_phase = holds(out_text(), "\"phase\":\"embed\"");
+        var prog = out_text();
+        assert(holds(prog, "\"total\":1") == 1, "⛔ one file changed, so one is left");
+        ticks = 2000000;
+    }
+    ticks = ticks + 1;
+}
+assert_eq(seen_phase, 1, "⛔ the phase says it is embedding");
+run_job();
+
+test_group("a restart");
+var kept_gen = _fx_generation;
+assert_eq(_fx_persisted, 1, "(it was kept)");
+assert(kept_gen > 0, "(it was walked)");
+_audit_last = 0;
+open_with(1);
+assert_eq(_fx_generation, 1, "⛔ the index is back");
+files_status_json();
+assert(holds(out_text(), "\"vectors_files\":5") == 1, "⛔ with its vectors, before any walk");
+assert(row_named(search("q=receipt"), "/acme.txt") != 0, "⛔ and it answers by meaning at once");
+var text_read = _fx_text_read;
+run_job();
+assert_eq(_fx_text_read, text_read, "⛔ and nothing is read again");
+
+test_group("a change of table");
+assert_eq(files_vectors_open(V_TBL2), 1, "(another table)");
+_audit_last = 0;
+open_with(1);
+assert_eq(_fx_generation, 0, "⛔ what it was built with no longer applies");
+assert_streq(_audit_last, "files.index.open", "(it opened)");
+files_status_json();
+var read0 = _fx_text_read;
+run_job();
+assert(_fx_text_read > read0, "⛔ so every file is read again");
+var r8 = search("q=receipt");
+assert(row_named(r8, "/trip.txt") != 0, "⛔ and receipt now means what this table says");
+assert_eq(row_named(r8, "/acme.txt"), 0, "⛔ and no longer what the last one said");
+
+test_group("names alone");
+assert_eq(files_vectors_open(V_TBL), 1, "(the first table)");
+rm_tree(join(DATA, "files"));
+put("receipts.dat", "qqqqqq");
+open_with(0);
+run_job();
+var r9 = search("q=invoice");
+assert_streq(jstr(member(r9, "cost"), "method"), "vector + name", "⛔ it says it read names");
+assert(row_named(r9, "/receipts.dat") != 0, "⛔ a file named for it is found");
+assert_eq(row_named(r9, "/acme.txt") != 0 && holds(jstr(row_named(r9, "/acme.txt"), "why"), "Contains") == 1, 0,
+  "⛔ and nothing claims to have read content");
+
+test_group("with no table");
+files_vectors_off();
+rm_tree(join(DATA, "files"));
+open_with(1);
+run_job();
+var r10 = search("q=receipt");
+assert_streq(jstr(member(r10, "cost"), "method"), "words + name", "⛔ it says words");
+assert_eq(row_named(r10, "/acme.txt"), 0, "⛔ and by words this was never found");
+assert_eq(member(member(r10, "cost"), "vectors"), 0, "and names no table");
+files_status_json();
+assert(holds(out_text(), "\"vectors\":false") == 1, "the status says it is off");
+assert_eq(holds(out_text(), "vectors_model"), 0, "and names nothing");
+
+rm_tree(BASE);
+syscall(SYS_EXIT, assert_summary());

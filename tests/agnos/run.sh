@@ -86,6 +86,21 @@ cp "$WORK/agent_service" "$WORK/seed/agents/agnos-agent-service-agent"
 mkdir -p "$WORK/seed/d/mcp"
 printf 'guest\t%s\n' "$(printf 'guest-token' | sha256sum | cut -d' ' -f1)" > "$WORK/seed/d/mcp/consumers"
 printf '[agent."guest"]\nallow = ["mcp_accept.*"]\n' > "$WORK/seed/d/p"
+# 2.5.6: a table of word vectors, built on the host by the same code, so the guest
+# ranks by meaning on the real kernel. "helper" is near the fixtures' "agent".
+cyrius build src/main.cyr "$WORK/daimon-host" > "$WORK/daimon-host.build" 2>&1 \
+    || { echo "agnos-guest: build of the host daimon failed:"; tail -5 "$WORK/daimon-host.build"; exit 2; }
+cat > "$WORK/v.txt" <<'VECTORS'
+the 0.3 0.3 0.3 0.3 0.3 0.3 0.3 0.3
+agent 0.9 0.8 0.1 0.0 0.1 0.0 0.0 0.0
+agnos 0.7 0.7 0.1 0.1 0.0 0.0 0.1 0.0
+helper 0.8 0.9 0.0 0.1 0.0 0.1 0.0 0.0
+banana 0.0 0.0 0.1 0.0 0.9 0.8 0.0 0.0
+filler -0.6 0.3 -0.3 0.6 0.1 -0.6 0.3 -0.3
+other 0.6 -0.3 0.1 -0.6 0.3 0.6 -0.3 0.1
+VECTORS
+"$WORK/daimon-host" vectors build "$WORK/v.txt" "$WORK/seed/d/v" --name guest-table > "$WORK/v.build" 2>&1 \
+    || { echo "agnos-guest: the table did not build:"; tail -5 "$WORK/v.build"; exit 2; }
 
 IMG="$WORK/agnos.img"
 PART_OFFSET=$(( 33 * 1048576 )); PART_BYTES=$(( 67 * 1048576 )); PART_BLOCKS=$(( PART_BYTES / 4096 ))

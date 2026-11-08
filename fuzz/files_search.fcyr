@@ -34,6 +34,7 @@ fn daimon_audit(sev, source, action, details) { return 0; }
 include "src/syscalls.cyr"
 include "src/error.cyr"
 include "src/files.cyr"
+include "src/files_vectors.cyr"
 include "src/files_search.cyr"
 include "fuzz/rng.cyr"
 

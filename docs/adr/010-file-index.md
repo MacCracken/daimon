@@ -3,7 +3,7 @@
 **Status**: Accepted
 **Date**: 2026-11-06 (2.5.4)
 **Context**: crab, the AGNOS file manager, needs a persisted, disk-wide view of files: an index, tags,
-ratings and smart folders ([the filing](../development/issues/2026-09-23-crab-needs-a-file-index-tags-and-ranked-search.md),
+ratings and smart folders ([the filing](../development/issues/archive/2026-09-23-crab-needs-a-file-index-tags-and-ranked-search.md),
 items 1–4; the addendum below covers item 5, ranked search). None of it existed. Four things constrain
 the answer: the HTTP API has no caller authentication until 2.6.x, daimon is one thread whose handlers
 must not block (ADR-006), `alloc` never frees, and on agnos the machine has 16 process slots.
@@ -81,8 +81,8 @@ among the results and what it cost. `src/files_search.cyr`.
 to run locally: mneme's embedder is a stub that defers to the same stack, hoosh forwards to Ollama,
 and this machine has no model to test one against. A hash of a word's bytes is not an embedding,
 which is the filing's complaint about RAG, so daimon did not ship another and call it one. crab prints
-"no external service" only if it is true, and it is: no byte leaves daimon. Ranking by meaning is on the
-roadmap for when a local model exists.
+"no external service" only if it is true, and it is: no byte leaves daimon. (2.5.6 found the embedding
+this paragraph said did not exist: the second addendum.)
 
 **Content is a second opt-in** (`serve --index-content`). `--index-root` offers names. Content offers more:
 with no caller authentication, a local process can ask whether a file it could not open holds a word.
@@ -107,3 +107,60 @@ what to add to the question, and `tests/files_search.tcyr` checks each one gives
 
 What it does not do: a PDF or an office file is found by name alone, since content is the first 64 KB of a
 file with no NUL in it. Stemming is English. 256 distinct words are kept per file, first seen first.
+
+## Addendum — 2.5.6: by meaning, from a table of word vectors
+
+`serve --index-vectors FILE`. `src/files_vectors.cyr`. crab's item 5 asks for a local embedding, and 2.5.5 said none
+existed to run. That was too narrow: it looked only for a model *server*.
+
+**A table of word vectors, not a model server.** A model server is a process to call, so every file would be a socket
+round trip in a child, and a question would wait on one. It would also not exist on agnos, where crab lives: nothing
+there serves a model. Trained word vectors (GloVe, word2vec, fastText) are an embedding that is just numbers in a file.
+A file's vector is arithmetic over a table in memory, in the walk's own slices, so it pauses on battery, allocates
+nothing per file, uses no fork and no socket, and runs the same on agnos. `daimon vectors build` turns the text form they
+ship in into a compact table, once, on any machine, and the table is portable between targets.
+
+**What this is, and is not.** A file's vector is the weighted sum of the vectors of its distinct words, so it knows what a
+file is *about*, and nothing about word order: it is not a sentence model. It is an embedding in the sense the filing
+asks for, and not a hash: `receipt` sits near `invoice` because of how the words are used. Measured with GloVe at 100
+dimensions: the cosine of `invoice` and `receipt` is 0.639, and of `invoice` and `banana` 0.069.
+
+**The operator supplies the table.** It is data with its own licence, and 8.7 MB at the useful size, so it is not in this
+repository. With none, search is exactly what 2.5.5 was and says so. A flag that named a table and got words would be
+worse than no flag, so a table that is absent or damaged stops `serve`, in a different message for each.
+
+**A word's weight falls with how common it is, and the common direction is taken out** (Arora, Liang and Ma, *A Simple
+but Tough-to-Beat Baseline for Sentence Embeddings*, ICLR 2017): a / (a + p(w)), with p(w) from the word's rank by
+Zipf, so `the` counts for little. The table is mean-centred by frequency when it is built. Removing a corpus-wide
+direction from the files' own vectors was tried and rejected: at 6,454 real documents it cost `receipt` all three of the
+files it should find, and it would have needed a second pass over the whole index.
+
+**Biased int8, compared on the loop.** A word's vector is int8, stored plus 128, so a dot product needs no sign fix per
+byte: 26.4 ms with one, 7.7 without, over 41,200 files of 100 dimensions, and 6.8 unrolled by eight. So a question
+compares itself with every file, on the loop. A 1-bit prefilter was reasoned through and rejected: at 100 dimensions its
+noise is as large as the gap it would have to see.
+
+**A similarity means nothing by itself, so a file must stand out.** Measured on GloVe: the same 0.5 is the best answer one
+question has and an average file for another. A file is admitted if it stands two deviations above what this question
+scores against the whole index, is at least 0.25 similar, and is among the best 64. Two deviations need a population, as
+the most a sample of n can stand above its mean is (n − 1)/√n of them, so below 32 files only the floor applies.
+
+**Words and meaning on one scale**, each worth up to 1000: the best word match, and the closest file. A file with both
+comes first, and a strong meaning outranks a weak mention. Without a table a score is what it always was.
+
+**`why` and `cost.method` say which ran.** *"Close in meaning to the question (0.64)"* is built from the similarity, and
+never says a file contains a word it does not. `method` is `vector + words + name`, or `vector + name` without
+`--index-content`, and `words + name` when no word of the question is in the table, because that is then what ran.
+
+**A generation holds its files' vectors beside its postings**, carried over for an unchanged file the same way, so a
+re-walk reads only what changed. `index` is format 3. A file built with another table is not of use to this run, and is
+rebuilt; that is a different audit entry from a damaged one (`files.index.vectors.changed`).
+
+**A table is trusted no further than its checks.** A digest proves the file is the one that was written, not that it is
+well made, so every slot and weight is checked whatever the digest says, and a probe is known to end before it is ever
+run. A model file's parser is a known way in: the GGUF CVEs are in the audit
+(`docs/audit/2026-11-08-word-vectors-and-serving-audit.md`).
+
+What it does not do: a file is the first 256 distinct words of its first 64 KB, so a long file is judged by how it opens.
+Without `--index-content` a file's vector comes from its name and its folder's. Whether a machine's files have words
+the table holds is the table's business: `vectors_files` in the status says how many got a vector.

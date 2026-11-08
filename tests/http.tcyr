@@ -286,7 +286,8 @@ var pa: i32[2];
 var pb: i32[2];
 assert_eq(syscall(_DAIMON_SYS_PIPE2, &pa, 0), 0, "a pipe for sandhi's answer");
 assert_eq(syscall(_DAIMON_SYS_PIPE2, &pb, 0), 0, "a pipe for the detached child's");
-http_send_response(load32(&pa + 4), 503, str_data(big), str_len(big));   # no pipe named: sandhi
+sandhi_server_send_response(load32(&pa + 4), 503, _http_reason(503),   # sandhi's own writer
+  "application/json", str_data(big), str_len(big), trace_response_header());
 sys_close(load32(&pa + 4));
 http_answer_into_pipe(load32(&pb + 4), daimon_now_ms() + 5000);
 assert_eq(http_send_response(load32(&pb + 4), 503, str_data(big), str_len(big)), 0,
@@ -301,5 +302,87 @@ assert(load64(&lb) > 10000, "... all of it: more than an agnos pipe holds");
 assert_eq(load64(&lb), load64(&la), "... as many bytes as sandhi sends");
 assert_eq(memeq(ba, bb, load64(&la)), 1, "... and the same bytes");
 assert_eq(memeq(bb, "HTTP/1.1 503 Service Unavailable\r\n", 34), 1, "... beginning with the status line");
+
+# --- 2.5.6: a whole-answer deadline ----------------------------------------
+# A client that reads a trickle makes every write progress, which restarts
+# SO_SNDTIMEO, so nothing bounded how long it held the loop. A real socket with a
+# small buffer and a real reader in another process.
+test_group("a whole-answer deadline");
+
+var slow_n = 2097152;
+var slow_buf = alloc(slow_n);
+memset(slow_buf, 120, slow_n);
+
+# A TCP connection over loopback, the kind daimon serves: [writer, reader] into `sv`,
+# the writer with little send buffer and writes that time out, as SO_SNDTIMEO sets.
+fn _stream_pair(sv, port) {
+    var l = sys_socket(2, 1, 0);
+    assert(l >= 0, "(a listener)");
+    var on: i64[1];
+    store32(&on, 1);
+    sys_setsockopt(l, 1, 2, &on, 4);
+    assert_eq(sys_bind(l, sockaddr_in(0x0100007F, port), 16), 0, "(bound)");
+    assert_eq(sys_listen(l, 1), 0, "(listening)");
+    var c = sys_socket(2, 1, 0);
+    var small: i64[1];
+    store32(&small, 4096);
+    sys_setsockopt(c, 1, 8, &small, 4);       # SO_RCVBUF, before connect
+    assert_eq(sys_connect(c, sockaddr_in(0x0100007F, port), 16), 0, "(connected)");
+    var s = sys_accept4(l, 0, 0, 0);
+    assert(s >= 0, "(accepted)");
+    sys_close(l);
+    assert_eq(sys_setsockopt(s, 1, 7, &small, 4), 0, "(a small send buffer)");
+    var tv: i64[2];
+    store64(&tv, 0);
+    store64(&tv + 8, 200000);
+    assert_eq(sys_setsockopt(s, 1, 21, &tv, 16), 0, "(writes that time out)");
+    store32(sv, s);
+    store32(sv + 4, c);
+    return 0;
+}
+
+# In a child: read `chunk` bytes every `gap_ms`, until the pair closes.
+fn _stream_reader(fd, chunk, gap_ms) {
+    var pid = sys_fork();
+    if (pid != 0) { return pid; }
+    var b = alloc(65536);
+    var r = 1;
+    while (r > 0) {
+        r = sys_read(fd, b, chunk);
+        if (gap_ms > 0) {
+            var ts: i64[2];
+            store64(&ts, 0);
+            store64(&ts + 8, gap_ms * 1000000);
+            syscall(SYS_NANOSLEEP, &ts, 0);
+        }
+    }
+    sys_exit_group(0);
+    return 0;
+}
+
+var sa: i32[2];
+_stream_pair(&sa, 18711);
+var sa_kid = _stream_reader(load32(&sa + 4), 256, 5);
+var sa_t0 = daimon_now_ms();
+var sa_rc = daimon_write_all(load32(&sa), slow_buf, slow_n, sa_t0 + 300);
+var sa_ms = daimon_now_ms() - sa_t0;
+assert_eq(sa_rc, 0 - 1, "⛔ a trickle does not finish, and the writer gives up");
+assert(sa_ms >= 300, "... not before the deadline");
+assert(sa_ms < 2000, "⛔ ... and soon after it, though every write made progress");
+assert_eq(DAIMON_WRITE_MAX, 65536, "(one write offers no more than this)");
+sys_close(load32(&sa));
+sys_close(load32(&sa + 4));
+sys_kill(sa_kid, 9);
+sys_waitpid(sa_kid, 0, 0);
+
+var sb: i32[2];
+_stream_pair(&sb, 18712);
+var sb_kid = _stream_reader(load32(&sb + 4), 65536, 0);
+assert_eq(daimon_write_all(load32(&sb), slow_buf, slow_n, daimon_now_ms() + 30000), 0,
+  "a reader that keeps up gets all of it");
+sys_close(load32(&sb));
+sys_close(load32(&sb + 4));
+sys_kill(sb_kid, 9);
+sys_waitpid(sb_kid, 0, 0);
 
 syscall(SYS_EXIT, assert_summary());

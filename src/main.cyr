@@ -18,6 +18,7 @@
 #   mcp        — MCP tool registry and dispatch types
 #   mcp_pin    — what each tool's definition was at first sight; its store
 #   files      — an index of the operator's roots; tags, ratings, smart folders
+#   files_vectors — a table of word vectors: ranking files by meaning
 #   files_search — a question in words, answered with ranked files
 #   screen     — capture permissions, rate limiting, recording sessions
 #   sched      — task start / complete over samay (the scheduler since 2.0.0)
@@ -50,6 +51,7 @@ include "src/mcp.cyr"
 include "src/mcp_pin.cyr"
 include "src/mcp_builtin.cyr"
 include "src/files.cyr"
+include "src/files_vectors.cyr"
 include "src/files_search.cyr"
 include "src/screen.cyr"
 include "src/federation.cyr"
@@ -104,6 +106,37 @@ fn _main_consumer() {
     }
     println("usage: daimon consumer add|remove NAME [--data-dir DIR]");
     return 1;
+}
+
+# daimon vectors build SRC OUT [--top N] [--name NAME] (2.5.6). Word vectors in the
+# text form they ship in, into the table `serve --index-vectors` reads. Run once by
+# the operator, with no daimon needed.
+fn _main_vectors() {
+    if ((argc() < 5) || (streq(argv(2), "build") != 1)) {
+        println("usage: daimon vectors build SRC OUT [--top N] [--name NAME]");
+        return 1;
+    }
+    var src = argv(3);
+    var out = argv(4);
+    var top = FVB_TOP_DEFAULT;
+    var name = src;
+    var i = strlen(src);
+    while ((i > 0) && (load8(src + i - 1) != 47)) { i = i - 1; }
+    if (strlen(src + i) >= 1) { name = src + i; }
+    var a = 5;
+    while (a < argc()) {
+        if ((streq(argv(a), "--top") == 1) && (a + 1 < argc())) {
+            top = _fx_int(argv(a + 1));
+            a = a + 2;
+        } elif ((streq(argv(a), "--name") == 1) && (a + 1 < argc())) {
+            name = argv(a + 1);
+            a = a + 2;
+        } else {
+            println("usage: daimon vectors build SRC OUT [--top N] [--name NAME]");
+            return 1;
+        }
+    }
+    return files_vectors_build(src, out, top, name);
 }
 
 fn main() {
@@ -176,6 +209,26 @@ fn main() {
                     # file it could not open holds a word.
                     files_set_content(1);
                 }
+                elif (streq(arg, "--index-vectors") == 1) {
+                    # 2.5.6: rank files by meaning, with this table of word vectors
+                    # (`daimon vectors build`). A flag that named a table and got no
+                    # ranking by meaning would be worse than no flag, so a bad one
+                    # stops serve.
+                    argi = argi + 1;
+                    if (argi >= argc()) {
+                        println("serve: --index-vectors needs a file");
+                        return 1;
+                    }
+                    var vst = files_vectors_open(argv(argi));
+                    if (vst == 0) {
+                        println("serve: --index-vectors: no such file");
+                        return 1;
+                    }
+                    if (vst < 0) {
+                        println("serve: --index-vectors: not a table of word vectors, or damaged");
+                        return 1;
+                    }
+                }
                 elif (streq(arg, "--index-max") == 1) {
                     argi = argi + 1;
                     if (argi >= argc()) {
@@ -201,6 +254,16 @@ fn main() {
                         println("serve: t-ron refused that policy file");
                         return 1;
                     }
+                }
+                elif (streq(arg, "--mcp-callback-host") == 1) {
+                    # 2.5.6: a host an external MCP server may be at. Repeatable; with
+                    # none, any. Checked at registration and again at every forward.
+                    argi = argi + 1;
+                    if (argi >= argc()) {
+                        println("serve: --mcp-callback-host needs a host name or address");
+                        return 1;
+                    }
+                    mcp_callback_host_add(argv(argi));
                 }
                 elif (streq(arg, "--mcp-pin-accept") == 1) {
                     # 2.5.4: reopens POST /v1/mcp/tools/{name}/accept, which is
@@ -275,6 +338,7 @@ fn main() {
             return serve(port);
         }
         if (streq(cmd, "consumer") == 1) { return _main_consumer(); }
+        if (streq(cmd, "vectors") == 1) { return _main_vectors(); }
         if (streq(cmd, "version") == 1) {
             println(daimon_version());
             return 0;
@@ -286,11 +350,15 @@ fn main() {
             println("Commands:");
             println("  serve [port] [--async] [--trace] [--agents-dir DIR] [--listen ADDR]");
             println("        [--data-dir DIR] [--mcp-pin-accept] [--tron-policy FILE]");
+            println("        [--mcp-callback-host HOST]...");
             println("        [--index-root DIR]... [--index-content] [--index-max N]");
+            println("        [--index-vectors FILE]");
             println("        [--agent-env inherit|minimal] [--agent-output inherit|capture]");
             println("                          Start HTTP API server (default: 127.0.0.1:8090)");
             println("  consumer add|remove NAME [--data-dir DIR]");
             println("                          Issue or revoke a consumer's token (ADR-009)");
+            println("  vectors build SRC OUT [--top N] [--name NAME]");
+            println("                          Make the table --index-vectors reads, from word vectors");
             println("  version                 Print version");
             println("  help                    Show this help");
             return 0;

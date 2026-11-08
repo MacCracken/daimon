@@ -300,6 +300,7 @@ fn daimon_clock_source() { return _daimon_clock_src; }
 # 512 bytes a piece leaves the 2048-byte ring room for four; the gap is several
 # rounds of the scheduler, not one; and the relay waits it between reads too.
 var DAIMON_WRITE_PIECE = 512;
+var DAIMON_WRITE_MAX = 65536;     # Linux: the most one write offers
 var DAIMON_WRITE_GAP_MS = 1;
 
 # agnos: a blocking socket read (sandhi's client, in a detached call's child) is
@@ -315,6 +316,10 @@ fn daimon_write_all(fd, buf, n, deadline) {
         var want = n - off;
         #ifdef CYRIUS_TARGET_AGNOS
         if (want > DAIMON_WRITE_PIECE) { want = DAIMON_WRITE_PIECE; }
+        #else
+        # A bound for each write as well as for the answer: one large write on a
+        # stream can stay in the kernel for as long as its peer keeps taking bytes.
+        if (want > DAIMON_WRITE_MAX) { want = DAIMON_WRITE_MAX; }
         #endif
         var w = sys_write(fd, buf + off, want);
         if (w == 0 - 4) { w = 0; }   # EINTR: as if nothing was taken
@@ -322,6 +327,10 @@ fn daimon_write_all(fd, buf, n, deadline) {
             off = off + w;
             #ifdef CYRIUS_TARGET_AGNOS
             if (off < n) { daimon_yield_ms(DAIMON_WRITE_GAP_MS); }   # the receiver's turns
+            #else
+            # Progress restarts a socket's SO_SNDTIMEO, so it says nothing about how
+            # long the whole answer has held the loop. This does.
+            if ((off < n) && (daimon_now_ms() > deadline)) { return 0 - 1; }
             #endif
         } elif (w == 0) {
             if (daimon_now_ms() > deadline) { return 0 - 1; }

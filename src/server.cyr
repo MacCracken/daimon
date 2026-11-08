@@ -987,18 +987,7 @@ var _srv_reap_n = 0;
 # Write all of `n` bytes to a client. 0, or -1 when it cannot take them
 # (gone, or stalled past SO_SNDTIMEO). agnos: in pieces (daimon_write_all).
 fn _srv_send_all(fd, buf, n) {
-    #ifdef CYRIUS_TARGET_AGNOS
     return daimon_write_all(fd, buf, n, daimon_now_ms() + SERVE_IDLE_MS);
-    #else
-    var off = 0;
-    while (off < n) {
-        var w = sys_write(fd, buf + off, n - off);
-        if (w == 0 - _SRV_EINTR) { w = 0; }
-        elif (w <= 0) { return 0 - 1; }
-        off = off + w;
-    }
-    return 0;
-    #endif
 }
 
 fn _srv_reap_later(pid) {

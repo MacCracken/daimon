@@ -98,7 +98,7 @@ modules = ["dist/t-ron.cyr"]
 
 [deps.nein]
 git = "https://github.com/MacCracken/nein.git"
-tag = "1.9.1"
+tag = "1.9.3"
 modules = ["dist/nein-mcp.cyr"]
 
 [release]

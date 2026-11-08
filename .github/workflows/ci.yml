@@ -69,10 +69,13 @@ jobs:
         # cyrius.lock has been generated and committed. Once present,
         # enforce. Every file the committed lock names must be vendored with
         # that hash: a leftover in a local lib/ that got into the lock, or a
-        # sibling checkout's mid-change copy of a path dep, fails here.
+        # sibling checkout's mid-change copy of a path dep, fails here. --locked
+        # (2.5.6) does what --verify does and also re-resolves each tag: a tag
+        # moved under the lock fails too. It writes nothing, so the step above
+        # still has to populate lib/.
         run: |
           if [ -f cyrius.lock ]; then
-            cyrius deps --verify
+            cyrius deps --locked
           else
             echo "::warning::cyrius.lock not committed — skipping hash verification"
           fi

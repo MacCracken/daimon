@@ -75,6 +75,40 @@ assert(rb_tool != 0, "buffer-backed tool findable after clobber");
 assert(str_eq(mcp_tool_name(rb_tool), str_from("buftool")) == 1,
   "tool name deep-copied, not aliased to request buffer");
 
+# serve --mcp-callback-host (2.5.6): the host as written, however the URL dresses it.
+fn cb_ok(u) { return is_ok(validate_callback_url(str_from(u))); }
+mcp_callback_host_add("127.0.0.1");
+mcp_callback_host_add("[::1]");
+mcp_callback_host_add("mcp.internal");
+assert_eq(cb_ok("http://127.0.0.1/mcp"), 1, "a listed address");
+assert_eq(cb_ok("http://127.0.0.1:9000/mcp"), 1, "with a port");
+assert_eq(cb_ok("https://mcp.internal"), 1, "a listed name, no path");
+assert_eq(cb_ok("http://mcp.internal:80/x?q=1"), 1, "a port, a path and a query");
+assert_eq(cb_ok("http://user:pw@127.0.0.1/"), 0, "⛔ userinfo: sandhi has none, so this is host `user`, and no port");
+assert_eq(cb_ok("http://[::1]:8080/mcp"), 1, "IPv6, in its brackets");
+assert_eq(cb_ok("http://evil.test/"), 0, "⛔ a host not listed");
+assert_eq(cb_ok("http://127.0.0.1@evil.test/"), 0, "⛔ a listed name before an @");
+assert_eq(cb_ok("http://127.0.0.1:x@evil.test:80/"), 0, "⛔ nor with a colon in it");
+assert_eq(cb_ok("http://evil.test:80@127.0.0.1/"), 0, "⛔ a listed name after an @: sandhi would connect to evil.test");
+assert_eq(cb_ok("http://evil.test@127.0.0.1/"), 0, "⛔ nor with no port: this is one host to sandhi");
+assert_eq(cb_ok("http://evil.test#@127.0.0.1/"), 0, "⛔ nor behind a fragment sandhi does not stop at");
+assert_eq(cb_ok("http://127.0.0.1#@evil.test/"), 0, "⛔ in either order");
+assert_eq(cb_ok("http://127.0.0.1?x@evil.test/"), 1, "what sandhi stops at is the end of the host: this is 127.0.0.1");
+assert_eq(cb_ok("http://127.0.0.1.evil.test/"), 0, "⛔ a listed name as a prefix");
+assert_eq(cb_ok("http://evil.test/127.0.0.1"), 0, "⛔ a listed name in the path");
+assert_eq(cb_ok("http://evil.test?x=127.0.0.1"), 0, "⛔ or in the query");
+assert_eq(cb_ok("http://mcp.internal.evil.test/"), 0, "⛔ a listed name as a label");
+assert_eq(cb_ok("http://[::2]:8080/"), 0, "⛔ another IPv6 address");
+assert_eq(cb_ok("http:///mcp"), 0, "no host at all");
+assert_eq(is_err_result(validate_callback_url(str_from("ftp://127.0.0.1/"))), 1, "⛔ a scheme is still checked first");
+assert(str_eq(mcp_callback_reason(str_from("http://evil.test/")),
+    str_from("callback_url's host is not one this daimon may forward to (serve --mcp-callback-host)")) == 1,
+  "it says it is the operator's list");
+assert(str_eq(mcp_callback_reason(str_from("ftp://x/")),
+    str_from("invalid callback_url (must be http:// or https://)")) == 1, "and a bad scheme says so");
+_mcp_callback_hosts = 0;
+assert_eq(cb_ok("http://anywhere.test/"), 1, "⛔ with no list, any host, as before");
+
 # validate_callback_url — boundary cases for the SSRF guard.
 assert(is_err_result(validate_callback_url(0)) == 1, "null url rejected");
 assert(is_err_result(validate_callback_url(str_from(""))) == 1, "empty url rejected");

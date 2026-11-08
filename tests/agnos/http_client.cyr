@@ -512,6 +512,12 @@ _c_check(_c_req("GET", "/v1/files?q=system+agent", "") == 200 && _c_has("\"total
 _c_check(_c_has("\"rank\":1") == 1 && _c_has("\"path\":\"/agents/agnos-agent-system-agent\"") == 1,
   "... and ranks the one with both words first");
 _c_check(_c_has("\"local\":true") == 1, "... and says it stayed on the machine");
+# 2.5.6: by meaning, from a table built on the host. No fixture is named "helper".
+_c_check(_c_req("GET", "/v1/files?q=helper", "") == 200 && _c_has("Close in meaning") == 1,
+  "a question finds the fixtures by meaning, on the real kernel");
+_c_check(_c_has("\"method\":\"vector + words + name\"") == 1, "... and says that is how");
+_c_check(_c_req("GET", "/v1/files?q=banana", "") == 200 && _c_has("\"total\":0") == 1,
+  "... and what is far from every file finds none");
 
 # 2.5.5: the t-ron gate on the real kernel. run.sh seeds a consumer and a policy.
 var gt_one = "{\"name\":\"gt\",\"description\":\"one\",\"callback_url\":\"http://127.0.0.1:1/x\"}";

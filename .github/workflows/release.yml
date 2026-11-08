@@ -60,12 +60,14 @@ jobs:
         run: cyrius --version
 
       - name: Resolve deps
-        run: cyrius deps
+        # --no-lock: a plain `cyrius deps` rewrites cyrius.lock from what it just
+        # vendored, so what follows would check the file it had just written.
+        run: cyrius deps --no-lock
 
       - name: Verify dep hashes
         run: |
           if [ -f cyrius.lock ]; then
-            cyrius deps --verify
+            cyrius deps --locked
           else
             echo "::warning::cyrius.lock not committed — skipping hash verification"
           fi

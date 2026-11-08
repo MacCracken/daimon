@@ -1,0 +1,735 @@
+# =========================================================================
+# files_vectors — ranking files by meaning, from a table of word vectors (2.5.6)
+# =========================================================================
+#
+# crab's M8 asks for a local embedding: docs/development/issues/archive/2026-09-23-crab-
+# needs-a-file-index-tags-and-ranked-search.md, item 5. ADR-010's second addendum
+# records the decisions.
+#
+# ⛔ NOT A HASH OF A WORD'S BYTES. That is the complaint the filing makes of RAG.
+# These are trained word vectors (GloVe, word2vec, fastText), which place `receipt`
+# near `invoice` because of how the words are used. The operator supplies them:
+# `daimon vectors build` turns the text form they ship in into a table, and `serve
+# --index-vectors FILE` reads it. With none, search ranks by words and says so.
+#
+# ⛔ NOTHING LEAVES THE PROCESS. No model server, no fork, no socket: a file's vector
+# is arithmetic over a table in memory, in the walk's own slices, so it pauses on
+# battery and allocates nothing per file. That is also why it runs on agnos, where
+# no model server exists to call.
+#
+# WHAT IT IS NOT: a sentence model. A file's vector is the weighted sum of the
+# vectors of its distinct words, so word order means nothing, and a file is the first
+# 256 distinct words of its first 64 KB, or its name alone without --index-content.
+#
+# EVERYTHING IS INTEGER, the same on every target, as BM25 is. A word's vector is
+# int8, stored biased by 128 so a dot product needs no sign fix per byte (measured:
+# 26.4 ms with one, 7.7 without, over 41,200 files of 100 dimensions).
+#
+# THE FILE, whatever `--index-vectors` names:
+#     0   "DAIMON-VECTORS-1\n"
+#     24  dims, 32 words, 40 slots (i64)
+#     48  name[64], printable ASCII, NUL-terminated
+#     112 SHA-256 of the body
+#     160 the body: u32 slots[slots], u32 terms[words], u8 weights[words], padding to
+#         8, u8 vectors[words * dims]
+# A slot holds a word's index + 1, by open addressing on its term: the same 32-bit
+# FNV-1a of the same stemmed word a posting holds, so the file's word list and a
+# question's words are looked up with what they already have.
+
+var FV_MAGIC = "DAIMON-VECTORS-1\n";
+var FV_MAGIC_LEN = 17;
+var FV_HDR = 160;
+var FV_NAME_MAX = 64;
+var FV_DIMS_MIN = 8;
+var FV_DIMS_MAX = 1024;
+var FV_WORDS_MAX = 4194304;
+#ifdef CYRIUS_TARGET_AGNOS
+var FV_BODY_MAX = 67108864;       # agnos's mmap is zero-filled, so what is reserved is held
+#else
+var FV_BODY_MAX = 2147483648;
+#endif
+var FILES_VEC_KEEP = 64;          # files the vector side may admit to a question
+var FILES_VEC_POPULATION = 32;    # files before a deviation means anything
+var FV_FULL = 16129;              # 127 * 127: the dot product of a vector with itself
+
+var FVB_BUF = 1048576;
+var FVB_LINE = 131072;
+var FVB_TOP_DEFAULT = 100000;
+var FVB_TOP_MAX = 2000000;
+var FVB_BAD = 0 - 9223372036854775807;
+
+var _fv_on = 0;
+var _fv_dims = 0;
+var _fv_words = 0;
+var _fv_slots = 0;
+var _fv_slot = 0;          # u32 * slots
+var _fv_term = 0;          # u32 * words
+var _fv_wgt = 0;           # u8 * words
+var _fv_vec = 0;           # u8 * words * dims, biased
+var _fv_id = 0;            # the table's digest, never 0: what a generation's vectors are from
+var _fv_name = 0;          # cstr
+var _fv_sum = 0;           # kept: i64 * dims
+var _fv_sum_n = 0;
+var _fv_q = 0;             # kept: the question's vector
+
+var _fvb_fd = 0 - 1;
+var _fvb_buffer = 0;
+var _fvb_len = 0;
+var _fvb_pos = 0;
+var _fvb_dims = 0;
+var _fvb_cap = 0;
+var _fvb_n = 0;
+var _fvb_q = 0;
+var _fvb_sums = 0;
+var _fvb_terms = 0;
+var _fvb_ranks = 0;
+var _fvb_map = 0;
+var _fvb_map_n = 0;
+var _fvb_word = 0;
+
+# --- the table -------------------------------------------------------------
+
+fn _fv_isqrt(x) {
+    if (x <= 0) { return 0; }
+    var r = x;
+    var y = (r >> 1) + 1;
+    while (y < r) {
+        r = y;
+        y = (r + x / r) >> 1;
+    }
+    return r;
+}
+
+fn _fv_body_bytes(dims, words, slots) {
+    return slots * 4 + words * 4 + ((words + 7) & (0 - 8)) + words * dims;
+}
+
+fn _fv_name_ok(p) {
+    var i = 0;
+    while (i < FV_NAME_MAX) {
+        var c = load8(p + i);
+        if (c == 0) { return i > 0; }
+        if ((c < 32) || (c > 126)) { return 0; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Every slot in range and enough left empty that a probe ends, weights non-zero. A
+# probe trusts these without looking, so they are checked whatever the digest says:
+# a digest proves the file is the one that was written, not that it is well made.
+fn _fv_table_check(slot, wgt, words, slots) {
+    var used = 0;
+    var i = 0;
+    while (i < slots) {
+        var e = load32(slot + i * 4);
+        if (e > words) { return 0; }
+        if (e != 0) { used = used + 1; }
+        i = i + 1;
+    }
+    if ((used != words) || (used >= slots)) { return 0; }
+    i = 0;
+    while (i < words) {
+        if (load8(wgt + i) == 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# Read the table at `path` (a cstr). 1, or 0 for no such file, or -1 for one that is
+# there and not a table: a typing mistake and a damaged file are different answers.
+fn files_vectors_open(path) {
+    if (file_exists(path) != 1) { return 0; }
+    var fd = file_open(path, O_RDONLY, 0);
+    if (fd < 0) { return 0 - 1; }
+    var hdr: i64[20];
+    if (_fx_read_full(fd, &hdr, FV_HDR) != 1) { file_close(fd); return 0 - 1; }
+    var dims = load64(&hdr + 24);
+    var words = load64(&hdr + 32);
+    var slots = load64(&hdr + 40);
+    var good = 1;
+    if (memeq(&hdr, FV_MAGIC, FV_MAGIC_LEN) != 1) { good = 0; }
+    if ((dims < FV_DIMS_MIN) || (dims > FV_DIMS_MAX)) { good = 0; }
+    if ((words < 1) || (words > FV_WORDS_MAX)) { good = 0; }
+    # A power of two, more than the words, and bounded, so the sum below cannot wrap.
+    if ((slots < 2) || (slots > FV_WORDS_MAX * 4) || ((slots & (slots - 1)) != 0) || (slots <= words)) { good = 0; }
+    if (_fv_name_ok(&hdr + 48) == 0) { good = 0; }
+    if (good == 0) { file_close(fd); return 0 - 1; }
+    var bytes = _fv_body_bytes(dims, words, slots);
+    if (bytes > FV_BODY_MAX) { file_close(fd); return 0 - 1; }
+    var body = alloc(bytes);
+    if (body == 0) { file_close(fd); return 0 - 1; }
+    if (_fx_read_full(fd, body, bytes) != 1) { file_close(fd); return 0 - 1; }
+    var extra: i64[1];
+    var over = file_read(fd, &extra, 8);
+    file_close(fd);
+    if (over != 0) { return 0 - 1; }
+    var ctx: i64[18];
+    var digest: i64[4];
+    sha256_init_into(&ctx);
+    sha256_update(&ctx, body, bytes);
+    sha256_finalize(&ctx, &digest);
+    if (memeq(&digest, &hdr + 112, 32) != 1) { return 0 - 1; }
+    var term_at = body + slots * 4;
+    var wgt_at = term_at + words * 4;
+    if (_fv_table_check(body, wgt_at, words, slots) == 0) { return 0 - 1; }
+    var name = alloc(FV_NAME_MAX);
+    if (name == 0) { return 0 - 1; }
+    memcpy(name, &hdr + 48, FV_NAME_MAX);
+    _fv_sum = alloc(dims * 8);
+    _fv_q = alloc(dims);
+    if ((_fv_sum == 0) || (_fv_q == 0)) { return 0 - 1; }
+    _fv_slot = body;
+    _fv_term = term_at;
+    _fv_wgt = wgt_at;
+    _fv_vec = wgt_at + ((words + 7) & (0 - 8));
+    _fv_dims = dims;
+    _fv_words = words;
+    _fv_slots = slots;
+    _fv_name = name;
+    _fv_id = load64(&digest) | 1;
+    _fv_on = 1;
+    return 1;
+}
+
+fn files_vectors_on() { return _fv_on; }
+fn files_vectors_name() { return _fv_name; }
+fn files_vectors_dims() { return _fv_dims; }
+fn files_vectors_words() { return _fv_words; }
+
+# For a test: index with no table again.
+fn files_vectors_off() {
+    _fv_on = 0;
+    _fv_dims = 0;
+    _fv_id = 0;
+    return 0;
+}
+
+# The word's index in the table, or -1.
+fn _fv_find(term) {
+    var mask = _fv_slots - 1;
+    var i = term & mask;
+    while (1 == 1) {
+        var e = load32(_fv_slot + i * 4);
+        if (e == 0) { return 0 - 1; }
+        if (load32(_fv_term + (e - 1) * 4) == term) { return e - 1; }
+        i = (i + 1) & mask;
+    }
+    return 0 - 1;
+}
+
+# --- a vector --------------------------------------------------------------
+
+fn _fv_sum_begin() {
+    memset(_fv_sum, 0, _fv_dims * 8);
+    _fv_sum_n = 0;
+    return 0;
+}
+
+# Add a word's vector, `m` times its weight. 1, or 0 for a word the table lacks.
+fn _fv_add_term(term, m) {
+    var idx = _fv_find(term);
+    if (idx < 0) { return 0; }
+    var d = _fv_dims;
+    var weight = load8(_fv_wgt + idx) * m;
+    var v = _fv_vec + idx * d;
+    var sum = _fv_sum;
+    var i = 0;
+    while (i < d) {
+        store64(sum + i * 8, load64(sum + i * 8) + (load8(v + i) - 128) * weight);
+        i = i + 1;
+    }
+    _fv_sum_n = _fv_sum_n + 1;
+    return 1;
+}
+
+# The sum so far, at unit length and biased, into `out`. 1, or 0 for no direction.
+fn _fv_finish(out) {
+    if (_fv_sum_n == 0) { return 0; }
+    var d = _fv_dims;
+    var sum = _fv_sum;
+    var big = 0;
+    var i = 0;
+    while (i < d) {
+        var a = load64(sum + i * 8);
+        if (a < 0) { a = 0 - a; }
+        if (a > big) { big = a; }
+        i = i + 1;
+    }
+    if (big == 0) { return 0; }
+    # Scaled so a sum of squares of 1024 values cannot overflow.
+    var scale = (big >> 20) + 1;
+    var sq = 0;
+    i = 0;
+    while (i < d) {
+        var v = load64(sum + i * 8) / scale;
+        sq = sq + v * v;
+        i = i + 1;
+    }
+    var norm = _fv_isqrt(sq);
+    if (norm == 0) { return 0; }
+    i = 0;
+    while (i < d) {
+        var q = (load64(sum + i * 8) / scale) * 127 / norm;
+        if (q > 127) { q = 127; }
+        if (q < 0 - 127) { q = 0 - 127; }
+        store8(out + i, q + 128);
+        i = i + 1;
+    }
+    return 1;
+}
+
+# Two biased vectors' dot product: FV_FULL for one with itself, about 0 for two
+# unrelated. Eight at a time: a query's whole cost is this loop.
+fn _fv_dot(a, b, n) {
+    var s = 0;
+    var i = 0;
+    while (i + 8 <= n) {
+        s = s + (load8(a + i) - 128) * (load8(b + i) - 128)
+        + (load8(a + i + 1) - 128) * (load8(b + i + 1) - 128)
+        + (load8(a + i + 2) - 128) * (load8(b + i + 2) - 128)
+        + (load8(a + i + 3) - 128) * (load8(b + i + 3) - 128)
+        + (load8(a + i + 4) - 128) * (load8(b + i + 4) - 128)
+        + (load8(a + i + 5) - 128) * (load8(b + i + 5) - 128)
+        + (load8(a + i + 6) - 128) * (load8(b + i + 6) - 128)
+        + (load8(a + i + 7) - 128) * (load8(b + i + 7) - 128);
+        i = i + 8;
+    }
+    while (i < n) {
+        s = s + (load8(a + i) - 128) * (load8(b + i) - 128);
+        i = i + 1;
+    }
+    return s;
+}
+
+# The vector of the file whose words are in the per-file table, for record `idx`.
+# A name counts three times a word said once, as it does in BM25: a person chose it.
+fn _fv_record(g, idx) {
+    if (_fv_on == 0) { return 0; }
+    _fv_sum_begin();
+    var i = 0;
+    while (i < _fx_tf_n) {
+        var slot = load32(_fx_tf_list + i * 4);
+        var term = load32(_fx_tf_term + slot * 4);
+        var byte = load32(_fx_tf_val + slot * 4) & 255;
+        var tf = byte & 127;
+        var m = 1;
+        while (tf >= 2) {
+            tf = tf >> 1;
+            m = m + 1;
+        }
+        if ((byte & 128) != 0) { m = m * 3; }
+        _fv_add_term(term, m);
+        i = i + 1;
+    }
+    if (_fv_finish(load64(g + FX_G_VEC) + idx * _fv_dims) == 1) {
+        _fx_rec_set_flag(_fx_rec(g, idx), FX_F_VEC);
+    }
+    return 0;
+}
+
+# --- `daimon vectors build` ------------------------------------------------
+#
+# The text form word vectors ship in, one word and its numbers to a line, most
+# frequent first: GloVe with no header, word2vec and fastText with one. Run by the
+# operator, once, so this is free to allocate.
+#
+# A word's forms are merged under its stem, because a stem is what is looked up. The
+# direction a typical document has in common is taken out, as a mean weighted by how
+# often words are used (Arora, Liang, Ma, ICLR 2017, calling it the common component).
+# Its weight falls with frequency by their a / (a + p(w)), p from the word's rank by
+# Zipf: `the` counts for little and `invoice` for all of it. Measured on GloVe at 100
+# dimensions: docs/adr/010-file-index.md.
+
+fn _fvb_digit(c) { return (c >= 48) && (c <= 57); }
+
+# One line into `out`, its length, or -1 at the end. A longer line than `cap` still
+# reports its length, and the caller refuses it.
+fn _fvb_line(out, cap) {
+    var n = 0;
+    while (1 == 1) {
+        if (_fvb_pos >= _fvb_len) {
+            _fvb_len = file_read(_fvb_fd, _fvb_buffer, FVB_BUF);
+            _fvb_pos = 0;
+            if (_fvb_len <= 0) {
+                _fvb_len = 0;
+                if (n > 0) { return n; }
+                return 0 - 1;
+            }
+        }
+        var c = load8(_fvb_buffer + _fvb_pos);
+        _fvb_pos = _fvb_pos + 1;
+        if (c == 10) {
+            if ((n > 0) && (n <= cap) && (load8(out + n - 1) == 13)) { n = n - 1; }
+            return n;
+        }
+        if (n < cap) { store8(out + n, c); }
+        n = n + 1;
+    }
+    return 0 - 1;
+}
+
+# A number as Q16: -0.038194, 1.5e-05, 3. FVB_BAD for anything else, "nan" among
+# them, so a file with one loses that word and not a wrong direction.
+fn _fvb_q16(p, n) {
+    var i = 0;
+    var neg = 0;
+    if (i < n) {
+        if (load8(p) == 45) { neg = 1; i = 1; }
+        elif (load8(p) == 43) { i = 1; }
+    }
+    var m = 0;
+    var digits = 0;
+    var frac = 0;
+    var seen = 0;
+    while ((i < n) && (_fvb_digit(load8(p + i)) == 1)) {
+        if (digits < 13) { m = m * 10 + load8(p + i) - 48; digits = digits + 1; }
+        else { frac = frac - 1; }
+        seen = 1;
+        i = i + 1;
+    }
+    if ((i < n) && (load8(p + i) == 46)) {
+        i = i + 1;
+        while ((i < n) && (_fvb_digit(load8(p + i)) == 1)) {
+            if (digits < 13) { m = m * 10 + load8(p + i) - 48; digits = digits + 1; frac = frac + 1; }
+            seen = 1;
+            i = i + 1;
+        }
+    }
+    if (seen == 0) { return FVB_BAD; }
+    var e = 0;
+    if ((i < n) && ((load8(p + i) == 101) || (load8(p + i) == 69))) {
+        i = i + 1;
+        var eneg = 0;
+        if (i < n) {
+            if (load8(p + i) == 45) { eneg = 1; i = i + 1; }
+            elif (load8(p + i) == 43) { i = i + 1; }
+        }
+        var edigits = 0;
+        while ((i < n) && (_fvb_digit(load8(p + i)) == 1) && (edigits < 4)) {
+            e = e * 10 + load8(p + i) - 48;
+            edigits = edigits + 1;
+            i = i + 1;
+        }
+        if (edigits == 0) { return FVB_BAD; }
+        if (eneg == 1) { e = 0 - e; }
+    }
+    if (i != n) { return FVB_BAD; }
+    var scale = frac - e;
+    while (scale < 0) {
+        if (m > 100000000000000) { return FVB_BAD; }
+        m = m * 10;
+        scale = scale + 1;
+    }
+    if (scale > 18) { return 0; }
+    var d = 1;
+    while (scale > 0) {
+        d = d * 10;
+        scale = scale - 1;
+    }
+    if (m > 100000000000000) { return FVB_BAD; }
+    var v = m * 65536 / d;
+    if (neg == 1) { v = 0 - v; }
+    return v;
+}
+
+# How many fields a line has, split on spaces and tabs.
+fn _fvb_fields(p, n) {
+    var fields = 0;
+    var i = 0;
+    while (i < n) {
+        while ((i < n) && ((load8(p + i) == 32) || (load8(p + i) == 9) || (load8(p + i) == 13))) { i = i + 1; }
+        if (i < n) { fields = fields + 1; }
+        while ((i < n) && (load8(p + i) != 32) && (load8(p + i) != 9) && (load8(p + i) != 13)) { i = i + 1; }
+    }
+    return fields;
+}
+
+# The first field as a word a walk could read: folded, and its stem's term. 0 for a
+# token the tokenizer would never produce (`don't`, `.`), since nothing could look it up.
+fn _fvb_term(p, n) {
+    var len = 0;
+    while ((len < n) && (load8(p + len) != 32) && (load8(p + len) != 9)) {
+        var c = load8(p + len);
+        if ((c >= 65) && (c <= 90)) { c = c + 32; }
+        elif ((c >= 97) && (c <= 122)) { }
+        elif ((c >= 48) && (c <= 57)) { }
+        elif (c < 128) { return 0; }
+        if (len >= FX_WORD_MAX) { return 0; }
+        store8(_fvb_word + len, c);
+        len = len + 1;
+    }
+    if (len < 2) { return 0; }
+    store8(_fvb_word + len, 0);
+    return _fx_term(_fvb_word, _fx_stem(_fvb_word, len)) + 1;
+}
+
+# Its numbers, as Q16 at unit length, into _fvb_q. 1, or 0 for a line to refuse.
+fn _fvb_numbers(p, n) {
+    var i = 0;
+    while ((i < n) && (load8(p + i) != 32) && (load8(p + i) != 9)) { i = i + 1; }
+    var d = 0;
+    while (i < n) {
+        while ((i < n) && ((load8(p + i) == 32) || (load8(p + i) == 9) || (load8(p + i) == 13))) { i = i + 1; }
+        if (i < n) {
+            var s = i;
+            while ((i < n) && (load8(p + i) != 32) && (load8(p + i) != 9) && (load8(p + i) != 13)) { i = i + 1; }
+            if (d >= _fvb_dims) { return 0; }
+            var v = _fvb_q16(p + s, i - s);
+            if (v == FVB_BAD) { return 0; }
+            store64(_fvb_q + d * 8, v);
+            d = d + 1;
+        }
+    }
+    if (d != _fvb_dims) { return 0; }
+    var sq = 0;
+    var j = 0;
+    while (j < d) {
+        var a = load64(_fvb_q + j * 8) / 16;
+        sq = sq + a * a;
+        j = j + 1;
+    }
+    var norm = _fv_isqrt(sq);
+    if (norm == 0) { return 0; }
+    j = 0;
+    while (j < d) {
+        store64(_fvb_q + j * 8, (load64(_fvb_q + j * 8) / 16) * 65536 / norm);
+        j = j + 1;
+    }
+    return 1;
+}
+
+# Merge one line under its stem. 1 if it counted.
+fn _fvb_take(line, n, rank) {
+    var t = _fvb_term(line, n);
+    if (t == 0) { return 0; }
+    var term = t - 1;
+    if (_fvb_numbers(line, n) == 0) { return 0; }
+    var mask = _fvb_map_n - 1;
+    var i = term & mask;
+    var idx = 0 - 1;
+    while (idx < 0) {
+        var e = load32(_fvb_map + i * 4);
+        if (e == 0) {
+            if (_fvb_n >= _fvb_cap) { return 0; }
+            idx = _fvb_n;
+            _fvb_n = _fvb_n + 1;
+            store32(_fvb_map + i * 4, idx + 1);
+            store32(_fvb_terms + idx * 4, term);
+            store32(_fvb_ranks + idx * 4, rank);
+            memset(_fvb_sums + idx * _fvb_dims * 8, 0, _fvb_dims * 8);
+        } elif (load32(_fvb_terms + (e - 1) * 4) == term) {
+            idx = e - 1;
+        } else {
+            i = (i + 1) & mask;
+        }
+    }
+    var at = _fvb_sums + idx * _fvb_dims * 8;
+    var d = 0;
+    while (d < _fvb_dims) {
+        store64(at + d * 8, load64(at + d * 8) + load64(_fvb_q + d * 8));
+        d = d + 1;
+    }
+    return 1;
+}
+
+# Write the table: the common direction out, each word to unit length, biased.
+fn _fvb_write(out, name) {
+    var dims = _fvb_dims;
+    var words = _fvb_n;
+    var slots = 1024;
+    while (slots < words * 2) { slots = slots * 2; }
+    var bytes = _fv_body_bytes(dims, words, slots);
+    var body = alloc(bytes);
+    var mean = alloc(dims * 8);
+    if ((body == 0) || (mean == 0)) { println("vectors: not enough memory to write the table"); return 1; }
+    memset(body, 0, bytes);
+    memset(mean, 0, dims * 8);
+    var slot = body;
+    var term = body + slots * 4;
+    var wgt = term + words * 4;
+    var vec = wgt + ((words + 7) & (0 - 8));
+    var total = 0;
+    var i = 0;
+    while (i < words) {
+        var f = 1048576 / load32(_fvb_ranks + i * 4);
+        total = total + f;
+        var at = _fvb_sums + i * dims * 8;
+        var d = 0;
+        while (d < dims) {
+            store64(mean + d * 8, load64(mean + d * 8) + load64(at + d * 8) * f);
+            d = d + 1;
+        }
+        i = i + 1;
+    }
+    if (total == 0) { total = 1; }
+    var k = 0;
+    while (k < dims) {
+        store64(mean + k * 8, load64(mean + k * 8) / total);
+        k = k + 1;
+    }
+    var mask = slots - 1;
+    i = 0;
+    while (i < words) {
+        var src = _fvb_sums + i * dims * 8;
+        var sq = 0;
+        var d2 = 0;
+        while (d2 < dims) {
+            var x = (load64(src + d2 * 8) - load64(mean + d2 * 8)) / 16;
+            sq = sq + x * x;
+            d2 = d2 + 1;
+        }
+        var norm = _fv_isqrt(sq);
+        var out_v = vec + i * dims;
+        var d3 = 0;
+        while (d3 < dims) {
+            var y = 0;
+            if (norm > 0) { y = ((load64(src + d3 * 8) - load64(mean + d3 * 8)) / 16) * 127 / norm; }
+            if (y > 127) { y = 127; }
+            if (y < 0 - 127) { y = 0 - 127; }
+            store8(out_v + d3, y + 128);
+            d3 = d3 + 1;
+        }
+        var r = load32(_fvb_ranks + i * 4);
+        var w = 255 * r * 12 / (r * 12 + 1000);
+        if (w < 1) { w = 1; }
+        if (w > 255) { w = 255; }
+        store8(wgt + i, w);
+        var t = load32(_fvb_terms + i * 4);
+        store32(term + i * 4, t);
+        var s = t & mask;
+        while (load32(slot + s * 4) != 0) { s = (s + 1) & mask; }
+        store32(slot + s * 4, i + 1);
+        i = i + 1;
+    }
+    var hdr: i64[20];
+    memset(&hdr, 0, FV_HDR);
+    memcpy(&hdr, FV_MAGIC, FV_MAGIC_LEN);
+    store64(&hdr + 24, dims);
+    store64(&hdr + 32, words);
+    store64(&hdr + 40, slots);
+    memcpy(&hdr + 48, name, strlen(name));
+    var ctx: i64[18];
+    sha256_init_into(&ctx);
+    sha256_update(&ctx, body, bytes);
+    sha256_finalize(&ctx, &hdr + 112);
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, out);
+    str_builder_add_cstr(sb, ".tmp");
+    var tmp = str_data(str_builder_build(sb));
+    var fd = file_open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 420);   # 0644
+    if (fd < 0) { println("vectors: cannot write the output file"); return 1; }
+    var ok = (file_write(fd, &hdr, FV_HDR) == FV_HDR);
+    var off = 0;
+    while ((ok == 1) && (off < bytes)) {
+        var want = bytes - off;
+        if (want > 1048576) { want = 1048576; }
+        var wr = file_write(fd, body + off, want);
+        if (wr <= 0) { ok = 0; }
+        else { off = off + wr; }
+    }
+    file_close(fd);
+    if (ok == 1) {
+        if (daimon_rename(tmp, strlen(tmp), out, strlen(out)) != 0) { ok = 0; }
+    }
+    if (ok == 0) { println("vectors: cannot write the output file"); return 1; }
+    print("vectors: ", 9);
+    print_num(words);
+    print(" words of ", 10);
+    print_num(dims);
+    println(" dimensions");
+    return 0;
+}
+
+# `name` must already be short printable ASCII. 0, or 1 having said why.
+fn files_vectors_build(src, out, top, name) {
+    if ((top < 1) || (top > FVB_TOP_MAX)) {
+        println("vectors: --top takes a number from 1 to 2000000");
+        return 1;
+    }
+    if ((strlen(name) < 1) || (strlen(name) >= FV_NAME_MAX)) {
+        println("vectors: a name is 1 to 63 characters");
+        return 1;
+    }
+    var i = 0;
+    while (i < strlen(name)) {
+        if ((load8(name + i) < 32) || (load8(name + i) > 126)) {
+            println("vectors: a name is printable ASCII");
+            return 1;
+        }
+        i = i + 1;
+    }
+    _fvb_fd = file_open(src, O_RDONLY, 0);
+    if (_fvb_fd < 0) { println("vectors: cannot read the source file"); return 1; }
+    _fvb_buffer = alloc(FVB_BUF);
+    var line = alloc(FVB_LINE + 8);
+    _fvb_word = alloc(FX_WORD_MAX + 2);
+    _fvb_len = 0;
+    _fvb_pos = 0;
+    var n = _fvb_line(line, FVB_LINE);
+    if (n < 0) { println("vectors: the source is empty"); return 1; }
+    var fields = _fvb_fields(line, n);
+    var header = 0;
+    var dims = fields - 1;
+    if ((fields == 2) && (n <= FVB_LINE)) {
+        # "400000 100": word2vec's and fastText's first line, two whole numbers.
+        store8(line + n, 0);
+        var sp = 0;
+        while ((sp < n) && (load8(line + sp) != 32)) { sp = sp + 1; }
+        if (sp < n) {
+            store8(line + sp, 0);
+            var said_words = _fx_int(line);
+            var said_dims = _fx_int(line + sp + 1);
+            store8(line + sp, 32);
+            if ((said_words > 0) && (said_dims > 0)) {
+                header = 1;
+                dims = said_dims;
+            }
+        }
+    }
+    if ((dims < FV_DIMS_MIN) || (dims > FV_DIMS_MAX)) {
+        println("vectors: the first line does not say how many numbers a word has (8 to 1024)");
+        return 1;
+    }
+    _fvb_dims = dims;
+    _fvb_cap = top;
+    _fvb_n = 0;
+    _fvb_map_n = 1024;
+    while (_fvb_map_n < top * 2) { _fvb_map_n = _fvb_map_n * 2; }
+    _fvb_q = alloc(dims * 8);
+    _fvb_sums = alloc(top * dims * 8);
+    _fvb_terms = alloc(top * 4);
+    _fvb_ranks = alloc(top * 4);
+    _fvb_map = alloc(_fvb_map_n * 4);
+    if ((_fvb_q == 0) || (_fvb_sums == 0) || (_fvb_terms == 0) || (_fvb_ranks == 0) || (_fvb_map == 0)) {
+        println("vectors: not enough memory for that many words");
+        return 1;
+    }
+    memset(_fvb_map, 0, _fvb_map_n * 4);
+    var rank = 0;
+    var kept = 0;
+    var bad = 0;
+    if (header == 0) {
+        rank = 1;
+        if ((n <= FVB_LINE) && (_fvb_take(line, n, rank) == 1)) { kept = 1; }
+        else { bad = 1; }
+    }
+    while (rank < top) {
+        n = _fvb_line(line, FVB_LINE);
+        if (n < 0) { break; }
+        if (n > 0) {
+            rank = rank + 1;
+            if (n > FVB_LINE) { bad = bad + 1; }
+            elif (_fvb_take(line, n, rank) == 1) { kept = kept + 1; }
+            else { bad = bad + 1; }
+        }
+    }
+    file_close(_fvb_fd);
+    print("vectors: read ", 14);
+    print_num(kept);
+    print(" lines, set aside ", 18);
+    print_num(bad);
+    println("");
+    if (_fvb_n == 0) { println("vectors: no usable word in the source"); return 1; }
+    return _fvb_write(out, name);
+}

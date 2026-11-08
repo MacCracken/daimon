@@ -675,6 +675,73 @@ while (rk < 50) {
 }
 assert(alloc_used() - rh0 < 50 * 8, "refused frames allocate nothing on the shared heap");
 
+# --- 2.5.6: the frame arena, with frames of rising size ----------------------
+# The roadmap's lead, measured: the stdlib's growable arena keeps a new chunk for
+# each allocation larger than any before. An agent chooses its frames' sizes, so the
+# arena has to stop growing at a high-water mark and not at the agent's pleasure.
+fn _t_big_frame(payload_len) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"target\":\"7\",\"type\":\"command\",\"payload\":\"");
+    var i = 0;
+    while (i < payload_len) {
+        str_builder_add_cstr(sb, "z");
+        i = i + 1;
+    }
+    str_builder_add_cstr(sb, "\"}");
+    return str_data(str_builder_build(sb));
+}
+
+fn _t_big_rt(fd, body) {
+    var r = _t_rt(fd, body);
+    msg_bus_drop_front(tbus, "7", 1000000);
+    return r;
+}
+
+var ar_ok = 0;
+var ar_n = 0;
+var ar_size = 512;
+while (ar_size < 64000) {
+    var ar_f = _t_big_frame(ar_size);
+    var ar_i = 0;
+    while (ar_i < 3) {
+        if (_t_big_rt(a41, ar_f) == ACK) { ar_ok = ar_ok + 1; }
+        ar_n = ar_n + 1;
+        ar_i = ar_i + 1;
+    }
+    ar_size = ar_size + 1536;
+}
+assert_eq(ar_ok, ar_n, "(every frame, however large, is taken)");
+var ar_big = _t_big_frame(63900);
+var ar_warm = 0;
+while (ar_warm < 5) {
+    _t_big_rt(a41, ar_big);
+    ar_warm = ar_warm + 1;
+}
+# The frame built once, so what is measured is daimon and not this test's own buffer.
+var ar_len = strlen(ar_big);
+var ar_wire = _t_frame(ar_big, ar_len);
+var ar_rounds = 0;
+fn _t_wire_rt() {
+    sys_write(a41, ar_wire, ar_len + 4);
+    _t_pump();
+    var rr = _t_reply(a41, 1000);
+    msg_bus_drop_front(tbus, "7", 1000000);
+    return rr;
+}
+while (ar_rounds < 20) {
+    _t_wire_rt();
+    ar_rounds = ar_rounds + 1;
+}
+var ar_used = alloc_used();
+var ar_again = 0;
+var ar_acks = 0;
+while (ar_again < 200) {
+    if (_t_wire_rt() == ACK) { ar_acks = ar_acks + 1; }
+    ar_again = ar_again + 1;
+}
+assert_eq(ar_acks, 200, "(each is taken)");
+assert_eq(alloc_used() - ar_used, 0, "⛔ the arena has a high-water mark: 200 of the largest frames grow nothing");
+
 # exit_group: the program epilogue lib/syscalls prescribes (exit(2) ends only
 # the calling thread).
 syscall(SYS_EXIT_GROUP, assert_summary());

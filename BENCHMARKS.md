@@ -1,6 +1,6 @@
 # Benchmarks
 
-daimon's benchmarks call its real code: 37 in `tests/daimon.bcyr` (`./scripts/bench-history.sh`)
+daimon's benchmarks call its real code: 39 in `tests/daimon.bcyr` (`./scripts/bench-history.sh`)
 and 2 in `tests/rag_ingest.bcyr` (`cyrius bench tests/rag_ingest.bcyr`). The file is laid out as
 follows:
 - **The baseline** is daimon 2.2.3's, the first release whose benchmarks called daimon's own
@@ -44,6 +44,60 @@ those numbers are not comparable.
 | trace_id_hex | 47ns | 46ns | 100000 | 43ns |
 
 `tests/rag_ingest.bcyr` (real since 2.1.6): `rag_ingest_real_5k` 133.1µs, `rag_chunk_only_5k` 508ns.
+
+### 2.5.6 — ranking by meaning, and an answer deadline
+
+2.5.5 against 2.5.6, both on cyrius 6.7.18, `tests/daimon.bcyr`: 10 interleaved runs of each with the order alternating,
+medians, at a load average of 0.8–1.3. `tests/rag_ingest.bcyr` was not re-run: nothing on its path changed. 27 of the 36 rows
+are within ±2.0%. The other nine, none on a path that does more work with no table open:
+- `mcp_find_tool_in_100` 92 → 110 ns (+19.6%, spreads 42% / 46%): noise;
+- `config_default` 95 → 90 ns (−5.8%, spreads 12% / 6%);
+- `files_search_common_41k` 10.36 → 10.89 ms (+5.2%, spreads 13% / 8%), inside its spread. With no table a question gains two
+  branches;
+- `files_find_in_41k` +2.7%, `edge_stats_500` −2.7%, `files_tokenize_64k` +2.4% (spreads 1% / 1%), `edge_register_100` +2.3%,
+  `hashmap_1000_insert_lookup` −2.3%, `mcp_manifest_100_tools` −2.0%.
+
+Two new rows, medians of the same runs, with a table of 100 dimensions:
+
+| Benchmark | median | what it is |
+|---|---:|---|
+| files_vector_stage_41k_100d | 8.62ms | a question against every file's vector: what meaning adds to a question |
+| files_vector_of_a_file_100d | 658µs | one file's words tokenized and its vector built, at the cap of 256 words |
+
+It is linear in files times dimensions, so by that arithmetic (not measured) 262,144 files at 100 dimensions would be about 55 ms a
+question on the loop, and 300 dimensions three times that. Roadmap 2.8.x.
+
+**With a real table.** A scratch copy with only the rate limit lifted, tmpfs, x86_64, at a load average of about 1.2.
+`serve --index-root --index-content`, over 41,200 files of 200 words each drawn from GloVe's own vocabulary, 72,472 words at 100
+dimensions (8.7 MB):
+
+| measure | words | with the table |
+|---|---:|---:|
+| to `fresh` | 12.32 s | 15.71 s |
+| `/v1/health` during it, p50 / p99 / max | 0.68 / 3.35 / 3.57 ms | 0.72 / 3.41 / 4.07 ms |
+| `/v1/health` idle, p50 / p99 / max | 0.24 / 0.34 / 0.83 ms | 0.23 / 0.29 / 0.31 ms |
+| RSS | 75 MB | 95 MB |
+| `<data_dir>/files` | 46 MB | 50 MB |
+| a restart to the first answer | 271 ms | 335 ms |
+| a question, 117 / 137 hits, HTTP p50 / max | 0.55 / 0.63 ms | 9.31 / 10.78 ms |
+| a question, 2,019 / 2,067 hits | 2.00 / 2.13 ms | 11.00 / 11.57 ms |
+| a question, 15,072 / 15,098 hits | 12.55 / 14.22 ms | 21.60 / 24.01 ms |
+
+`to fresh` is not comparable with 2.5.5's 3.13 s below, which was another corpus and another client. On this corpus and client, 2.5.5
+against 2.5.6, interleaved: 12.54 and 12.80 s against 12.84 and 12.70 s, so `openat2` per file costs nothing visible.
+
+**On real documents.** GloVe, 72,472 words, 6,005 real files (five planted among this workspace's Markdown), by rank and with `why`:
+`receipt` finds an invoice that never says the word, second overall at 0.64; `airline ticket` a booking at 0.45; `dinner cooking` a lasagna
+recipe at 0.65. 6,005 files were embedded in about 7 s, and a question took 1–2 ms.
+
+**Choosing the dot product.** 41,200 files at 100 dimensions, the best of five:
+
+| form | ms |
+|---|---:|
+| signed, a sign fix per byte | 26.4 |
+| biased, `load8 - 128` | 9.2 |
+| unsigned | 7.7 |
+| unsigned, eight at a time | 6.8 |
 
 ### 2.5.5 — ranked file search, and a consumer's accept through t-ron
 

@@ -2,17 +2,16 @@
 # files_search — a question in words, answered with ranked files (2.5.5)
 # =========================================================================
 #
-# crab's M8: docs/development/issues/2026-09-23-crab-needs-a-file-index-tags-and-
+# crab's M8: docs/development/issues/archive/2026-09-23-crab-needs-a-file-index-tags-and-
 # ranked-search.md, item 5. `GET /v1/files?q=paid+invoices`. ADR-010
 # records the decisions.
 #
-# ⛔ THIS RANKS BY WORDS, NOT BY MEANING, AND EVERY ANSWER SAYS SO (`cost.method`).
-# It finds `invoices` for `invoice`, and it will not find `receipt` for `invoice`.
-# Meaning needs an embedding model, and none exists to run locally: mneme's own
-# embedder is a stub that defers to the same stack, hoosh forwards to Ollama, and a
+# ⛔ WITHOUT A TABLE OF WORD VECTORS THIS RANKS BY WORDS, AND EVERY ANSWER SAYS WHICH
+# (`cost.method`). By words it finds `invoices` for `invoice`, and not `receipt` for
+# `invoice`. With `serve --index-vectors` it does that too (src/files_vectors.cyr). A
 # hash of a word's bytes is not an embedding, which is the complaint the filing
 # makes of RAG. crab prints "no external service" only if that is true, and here it
-# is: no byte leaves daimon. Roadmap: ranking by meaning, once a local model exists.
+# is: no byte leaves daimon, words or vectors.
 #
 # ⛔ CONTENT IS A SECOND OPT-IN (`serve --index-content`). A name is what --index-root
 # already offers. Content is more: with no caller authentication, a local process can
@@ -98,6 +97,14 @@ var _s_loc_c: i64[8];      # ... how many
 var _s_loc_used = 0;
 var _s_dup_groups = 0;
 var _s_dup_files = 0;
+var _s_cos = 0;            # u16 per record: its similarity to the question, if admitted
+var _s_vec_used = 0;       # the question had a vector, and it was compared
+var _s_vec_top = 0;
+var _s_vec_cut = 0;
+var _s_keep_c: i64[64];    # FILES_VEC_KEEP: the best similarities so far
+var _s_keep_i: i64[64];
+var _s_keep_n = 0;
+var _s_keep_min = 0;       # which of them is the least
 
 # --- words -----------------------------------------------------------------
 
@@ -261,8 +268,21 @@ fn _fx_tf_flush(g, idx) {
 
 # --- phases of a job -------------------------------------------------------
 
+# How many files have a vector.
+fn _fx_vec_count(g) {
+    var n = load64(g + FX_G_N);
+    var c = 0;
+    var i = 0;
+    while (i < n) {
+        if ((_fx_rec_flags(_fx_rec(g, i)) & FX_F_VEC) != 0) { c = c + 1; }
+        i = i + 1;
+    }
+    return c;
+}
+
 # Which served records carry over: the same path, size and mtime, as for a digest.
 # Across a change of --index-content nothing does, as the postings mean another thing.
+# A generation from another table never gets this far: _fx_load refuses it.
 fn _fx_remap_slice(g, deadline) {
     var a = _fx_active;
     var n = load64(a + FX_G_N);
@@ -281,6 +301,12 @@ fn _fx_remap_slice(g, deadline) {
                     _fx_rec_set_flag(r, FX_F_TERMS);
                     store32(r + FX_R_DL, load32(old + FX_R_DL));
                     store64(g + FX_G_WORDS, load64(g + FX_G_WORDS) + load32(old + FX_R_DL));
+                    _fx_carried = _fx_carried + 1;
+                    if ((_fx_rec_flags(old) & FX_F_VEC) != 0) {
+                        var vfrom = load64(a + FX_G_VEC) + _fx_cursor * _fv_dims;
+                        memcpy(load64(g + FX_G_VEC) + j * _fv_dims, vfrom, _fv_dims);
+                        _fx_rec_set_flag(r, FX_F_VEC);
+                    }
                 }
             }
         }
@@ -293,6 +319,10 @@ fn _fx_remap_slice(g, deadline) {
         }
     }
     _fx_phase_next(g, FX_POSTS);
+    # What the read phase has to do, for a progress bar: every file that did not carry.
+    _fx_total = load64(g + FX_G_FILES) - _fx_carried;
+    if (_fx_total < 0) { _fx_total = 0; }
+    _fx_carried = 0;
     return 0;
 }
 
@@ -334,7 +364,7 @@ fn _fx_posts_slice(g, deadline) {
 fn _fx_read_content(g, r) {
     if (_fx_content == 0) { return 0; }
     if (load64(r + FX_R_SIZE) == 0) { return 0; }
-    var fd = file_open(_fx_rec_path(g, r), O_RDONLY | O_NOFOLLOW | FILES_O_NONBLOCK, 0);
+    var fd = _fx_open_read(g, r);
     if (fd < 0) { return 0; }
     _fx_text_read = _fx_text_read + 1;
     var got = file_read(fd, _fx_io, FILES_TEXT_BYTES);
@@ -362,6 +392,7 @@ fn _fx_read_slice(g, deadline) {
             _fx_scan_names(_fx_rec_path(g, r), _fx_rec_plen(r));
             _fx_read_content(g, r);
             _fx_tf_flush(g, _fx_cursor);
+            _fv_record(g, _fx_cursor);
             _fx_rec_set_flag(r, FX_F_TERMS);
             _fx_done = _fx_done + 1;
             _fx_cursor = _fx_cursor + 1;
@@ -543,6 +574,11 @@ fn files_search_open() {
     _s_heap = alloc(FILES_SEARCH_TOP * 16);
     _s_gcount = alloc(_fx_cap * 4);
     _s_words = alloc(FILES_QUERY_TERMS * (FX_WORD_MAX + 2));
+    if (_fv_on == 1) {
+        _s_cos = alloc(_fx_cap * 2);
+        if (_s_cos == 0) { return 0; }
+        memset(_s_cos, 0, _fx_cap * 2);
+    }
     if ((_fx_remap == 0) || (_fx_sort_next == 0) || (_s_score == 0) || (_s_mask == 0)) { return 0; }
     if ((_s_touched == 0) || (_s_heap == 0) || (_s_gcount == 0)) { return 0; }
     memset(_fx_tf_val, 0, FX_TF_SLOTS * 4);
@@ -889,6 +925,100 @@ fn _s_in_window(r) {
     return 1;
 }
 
+fn _s_keep(c, idx) {
+    if (_s_keep_n < FILES_VEC_KEEP) {
+        _s_keep_c[_s_keep_n] = c;
+        _s_keep_i[_s_keep_n] = idx;
+        if ((_s_keep_n == 0) || (c < _s_keep_c[_s_keep_min])) { _s_keep_min = _s_keep_n; }
+        _s_keep_n = _s_keep_n + 1;
+        return 0;
+    }
+    if (c <= _s_keep_c[_s_keep_min]) { return 0; }
+    _s_keep_c[_s_keep_min] = c;
+    _s_keep_i[_s_keep_min] = idx;
+    var m = 0;
+    var j = 1;
+    while (j < FILES_VEC_KEEP) {
+        if (_s_keep_c[j] < _s_keep_c[m]) { m = j; }
+        j = j + 1;
+    }
+    _s_keep_min = m;
+    return 0;
+}
+
+# Compare the question's vector with every file's, and admit the files that stand
+# out. A similarity has no meaning of its own: measured on GloVe, the same 0.5 is
+# the best of a question's answers and an average file for another. So a file must
+# stand two deviations above what this question scores against the whole index (in
+# an index of any size), be at least 0.25 similar, and be among the best FILES_VEC_KEEP.
+fn _s_vec_stage(g) {
+    _s_vec_used = 0;
+    _s_keep_n = 0;
+    _s_keep_min = 0;
+    if (_fv_on == 0) { return 0; }
+    if (_fv_sum_n_for_question() == 0) { return 0; }
+    var n = load64(g + FX_G_N);
+    var recs = load64(g + FX_G_RECS);
+    var vecs = load64(g + FX_G_VEC);
+    var d = _fv_dims;
+    var q = _fv_q;
+    var cnt = 0;
+    var sum = 0;
+    var sq = 0;
+    var i = 0;
+    while (i < n) {
+        if ((load8(recs + i * FX_REC + FX_R_FLAGS) & FX_F_VEC) != 0) {
+            var c = _fv_dot(q, vecs + i * d, d);
+            cnt = cnt + 1;
+            sum = sum + c;
+            sq = sq + c * c;
+            if (c > 0) { _s_keep(c, i); }
+        }
+        i = i + 1;
+    }
+    if (cnt == 0) { return 0; }
+    _s_vec_used = 1;
+    var mean = sum / cnt;
+    var variance = sq / cnt - mean * mean;
+    # Two deviations need a population: the most a sample of n can stand above its
+    # own mean is (n - 1) / sqrt(n) of them, so among five files nothing ever would.
+    var cut = 0;
+    if (cnt >= FILES_VEC_POPULATION) { cut = mean + 2 * _fv_isqrt(variance); }
+    # ... and a floor, for a question most files are far from: two deviations above
+    # a mean below zero is still not close, and `why` would say that it was.
+    if (cut < FV_FULL / 4) { cut = FV_FULL / 4; }
+    var top = 0;
+    var k = 0;
+    while (k < _s_keep_n) {
+        if (_s_keep_c[k] > top) { top = _s_keep_c[k]; }
+        k = k + 1;
+    }
+    _s_vec_top = top;
+    _s_vec_cut = cut;
+    k = 0;
+    while (k < _s_keep_n) {
+        var ck = _s_keep_c[k];
+        var ik = _s_keep_i[k];
+        if ((ck >= cut) && (ck > 0)) {
+            if ((load16(_s_mask + ik * 2) == 0) && (load16(_s_cos + ik * 2) == 0)) { _s_touch(ik); }
+            store16(_s_cos + ik * 2, ck);
+        }
+        k = k + 1;
+    }
+    return 0;
+}
+
+# The question's vector, into _fv_q. 1, or 0 when the table knows none of its words.
+fn _fv_sum_n_for_question() {
+    _fv_sum_begin();
+    var i = 0;
+    while (i < _s_term_n) {
+        _fv_add_term(_s_terms[i], 1);
+        i = i + 1;
+    }
+    return _fv_finish(_fv_q);
+}
+
 # Run filter `f`'s question: _s_total, the best `keep` in the heap, and the facets.
 # Leaves the score and mask of what it touched for the caller to read and clear.
 fn _s_run(f, keep) {
@@ -933,6 +1063,20 @@ fn _s_run(f, keep) {
             _s_term_score(g, _s_terms[ti], ti, avg);
             ti = ti + 1;
         }
+        _s_vec_stage(g);
+        # Words and meaning on one scale, each worth at most 1000: the best word
+        # match and the closest file. A file with both comes first; a strong meaning
+        # outranks a weak mention. With no vector side a score is as it always was.
+        var best = 0;
+        if (_s_vec_used == 1) {
+            var bi = 0;
+            while (bi < _s_touched_n) {
+                var bidx = load32(_s_touched + bi * 4);
+                var bv = load64(_s_score + bidx * 8) * _s_bits(load16(_s_mask + bidx * 2));
+                if (bv > best) { best = bv; }
+                bi = bi + 1;
+            }
+        }
         var ix = 0;
         while (ix < _s_touched_n) {
             var idx = load32(_s_touched + ix * 4);
@@ -941,6 +1085,15 @@ fn _s_run(f, keep) {
                 # All of a question's words first: a file with two ranks above one with
                 # one, however often that one says it.
                 var score = load64(_s_score + idx * 8) * _s_bits(load16(_s_mask + idx * 2));
+                if (_s_vec_used == 1) {
+                    var fused = 0;
+                    if (best > 0) { fused = score * 1000 / best; }
+                    var ccos = load16(_s_cos + idx * 2);
+                    if (ccos > 0) {
+                        fused = fused + 1 + 999 * (ccos - _s_vec_cut) / (_s_vec_top - _s_vec_cut + 1);
+                    }
+                    score = fused;
+                }
                 store64(_s_score + idx * 8, score);
                 _s_hit(g, idx, score, keep, now);
             }
@@ -957,6 +1110,7 @@ fn _s_clear() {
         var idx = load32(_s_touched + i * 4);
         store64(_s_score + idx * 8, 0);
         store16(_s_mask + idx * 2, 0);
+        if (_fv_on == 1) { store16(_s_cos + idx * 2, 0); }
         i = i + 1;
     }
     _s_touched_n = 0;
@@ -1001,8 +1155,19 @@ fn _o_list_words(mask_bits) {
     return 0;
 }
 
+# A similarity as 0.00 to 1.00.
+fn _o_similarity(c) {
+    var pct = c * 100 / FV_FULL;
+    if (pct > 100) { pct = 100; }
+    _o_i(pct / 100);
+    _o_c(".");
+    if (pct % 100 < 10) { _o_c("0"); }
+    _o_i(pct % 100);
+    return 0;
+}
+
 # Why it matched, as a sentence built from what matched: nothing here is inferred.
-fn _o_why(mask) {
+fn _o_why(mask, cos) {
     _o_c(",\"why\":\"");
     var content = mask & 255;
     var name = (mask >> 8) & 255;
@@ -1015,6 +1180,13 @@ fn _o_why(mask) {
     if (name != 0) {
         if (said == 1) { _o_c("; its name or folder has "); } else { _o_c("Its name or folder has "); }
         _o_list_words(name);
+        said = 1;
+    }
+    if (cos > 0) {
+        if (said == 1) { _o_c("; close in meaning to the question ("); }
+        else { _o_c("Close in meaning to the question ("); }
+        _o_similarity(cos);
+        _o_c(")");
         said = 1;
     }
     if (_s_window != 0) {
@@ -1167,7 +1339,9 @@ fn files_search_json(f) {
         _o_int("rating", load8(r + FX_R_RATING));
         _fx_row_tags(load64(r + FX_R_META));
         _o_int("duplicate_group", load64(r + FX_R_GROUP));
-        _o_why(load16(_s_mask + idx * 2));
+        var cos_v = 0;
+        if (_fv_on == 1) { cos_v = load16(_s_cos + idx * 2); }
+        _o_why(load16(_s_mask + idx * 2), cos_v);
         _o_folders(g, r, now);
         _o_c("}");
         shown = shown + 1;
@@ -1199,7 +1373,12 @@ fn files_search_json(f) {
     _o_c("},\"cost\":{\"ms\":");
     _o_i(_s_ms);
     _o_int("hits", _s_total);
-    if (_fx_content == 1) { _o_str("method", "words + name", 12); }
+    if (_s_vec_used == 1) {
+        if (_fx_content == 1) { _o_str("method", "vector + words + name", 21); }
+        else { _o_str("method", "vector + name", 13); }
+        _o_str("vectors", _fv_name, strlen(_fv_name));
+    }
+    elif (_fx_content == 1) { _o_str("method", "words + name", 12); }
     else { _o_str("method", "name", 4); }
     _o_bool("local", 1);
     _o_c("}}");
